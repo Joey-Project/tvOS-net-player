@@ -7090,6 +7090,554 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(model.hasSavedTask)
     }
 
+    func testActivationRevalidationIsSilentWithoutApplicableRestoredPlayback() async throws {
+        let client = FakeBilibiliCacheControlClient(createResponses: [])
+        let model = BilibiliTaskViewModel(clientFactory: { _ in client })
+        let status = model.statusMessage
+        await model.revalidateSavedPlaybackOnActivation(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.statusMessage, status)
+        XCTAssertNil(model.resumptionMessage)
+        let requests = await client.serverInfoRequestCountSnapshot()
+        XCTAssertEqual(requests, 0)
+
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.store.record
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: "other-server.local:50051")
+        XCTAssertTrue(fixture.model.canContinueSavedPlayback)
+        XCTAssertEqual(fixture.store.record, record)
+        XCTAssertNil(fixture.model.resumptionMessage)
+        let fixtureRequests = await fixture.client.serverInfoRequestCountSnapshot()
+        XCTAssertEqual(fixtureRequests, 1)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testActivationRevalidationRevokesContinueCoalescesCallsAndRecoversAfterUnavailableServer() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.store.record
+        await fixture.client.setSuspendsServerInfoResponses(true)
+        let activation = ResumptionTestOperation {
+            await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+            return nil
+        }
+        guard
+            await waitForResumptionPhase(
+                "activation server check held", model: fixture.model, client: fixture.client, operations: [activation],
+                until: {
+                    let pending = await fixture.client.pendingResumptionResponseCountsSnapshot()
+                    return pending.serverInfo == 1 && fixture.model.isRestoringTask
+                })
+        else { return }
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+        let message = fixture.model.resumptionMessage
+        let status = fixture.model.statusMessage
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        XCTAssertEqual(fixture.model.resumptionMessage, message)
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        let heldRequests = await fixture.client.serverInfoRequestCountSnapshot()
+        XCTAssertEqual(heldRequests, 2)
+
+        await fixture.client.completeNextServerInfo(with: .failure(CacheTaskControlError.unavailable))
+        guard
+            await waitForResumptionPhase(
+                "activation unavailable result", model: fixture.model, client: fixture.client, operations: [activation],
+                until: { activation.isFinished })
+        else { return }
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+        XCTAssertFalse(fixture.model.isRestoringTask)
+        XCTAssertEqual(fixture.store.record, record)
+        XCTAssertTrue(fixture.model.resumptionMessage?.contains("Retry") == true)
+
+        await fixture.client.setSuspendsServerInfoResponses(false)
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        XCTAssertTrue(fixture.model.canContinueSavedPlayback)
+        XCTAssertNil(fixture.model.resumptionMessage)
+        XCTAssertEqual(fixture.store.record, record)
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        let taskIDs = await fixture.client.getTaskIDsSnapshot()
+        let sources = await fixture.client.playbackSourceRequestsSnapshot()
+        XCTAssertEqual(taskIDs, [fixture.task.id, fixture.task.id])
+        XCTAssertEqual(sources.count, 2)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testActivationRevalidationRejectsEvictedTerminalLibrarySource() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let record = fixture.store.record
+        await fixture.client.setPlaybackSourceResponse(
+            itemID: fixture.identity.libraryItemID, variantID: fixture.identity.variantID, source: nil
+        )
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+        XCTAssertFalse(fixture.model.isRestoringTask)
+        XCTAssertEqual(fixture.store.record, record)
+        XCTAssertTrue(fixture.model.resumptionMessage?.contains("Retry") == true)
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        let sources = await fixture.client.playbackSourceRequestsSnapshot()
+        XCTAssertEqual(sources.count, 2)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testActivationRevalidationRejectsReplacedExactResultLibraryIdentity() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture(exactChild: true)
+        defer { fixture.cleanup() }
+        let record = fixture.store.record
+        let replaced = BilibiliTaskResultItem.fixture(
+            id: "activation-child", state: "succeeded",
+            libraryItemID: "replacement-library", playbackSourceItemID: "replacement-library"
+        )
+        let sibling = BilibiliTaskResultItem.fixture(
+            id: "activation-sibling", state: "succeeded",
+            libraryItemID: fixture.identity.libraryItemID, playbackSourceItemID: fixture.identity.libraryItemID
+        )
+        let changedTask = CacheTask.fixture(
+            id: fixture.task.id, state: "succeeded", resultItems: [sibling, replaced]
+        )
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(changedTask))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+        XCTAssertEqual(fixture.store.record, record)
+        XCTAssertTrue(fixture.model.resumptionMessage?.contains("different library item") == true)
+        let sources = await fixture.client.playbackSourceRequestsSnapshot()
+        XCTAssertEqual(sources.count, 1)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testActivationRevalidationCachesFreshExactSourceURIWithoutStartingPlayback() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture(exactChild: true)
+        defer { fixture.cleanup() }
+        let freshSource = CachePlaybackSource(
+            itemID: fixture.identity.libraryItemID, variantID: "h264", playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/activation-library/fresh.m3u8"
+        )
+        await fixture.client.setPlaybackSourceResponse(
+            itemID: fixture.identity.libraryItemID, variantID: "h264", source: freshSource
+        )
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        XCTAssertTrue(fixture.model.canContinueSavedPlayback)
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertFalse(fixture.model.statusMessage.hasPrefix("Playing "))
+        let prepared = try fixture.prepared(source: freshSource)
+        let resumed = await fixture.model.resumePreparedPlayback(prepared) { true }
+        XCTAssertTrue(resumed)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        let sources = await fixture.client.playbackSourceRequestsSnapshot()
+        let taskIDs = await fixture.client.getTaskIDsSnapshot()
+        let infoCount = await fixture.client.serverInfoRequestCountSnapshot()
+        XCTAssertEqual(sources.count, 2)
+        XCTAssertTrue(sources.allSatisfy { $0.itemID == fixture.identity.libraryItemID && $0.variantID == "h264" })
+        XCTAssertEqual(taskIDs, [fixture.task.id, fixture.task.id])
+        XCTAssertEqual(infoCount, 2)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testActivationLateReplyCannotOverwriteReplacementTask() async throws {
+        let replacement = CacheTask.fixture(id: "activation-replacement", state: "TASK_STATE_PREPARING")
+        let fixture = try await makeSavedPlaybackActivationFixture(createResponses: [.success(replacement)])
+        defer { fixture.cleanup() }
+        await fixture.client.setSuspendsGetTaskResponses(true)
+        let activation = ResumptionTestOperation {
+            await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+            return nil
+        }
+        guard
+            await waitForResumptionPhase(
+                "activation task check held", model: fixture.model, client: fixture.client, operations: [activation],
+                until: { await fixture.client.pendingResumptionResponseCountsSnapshot().getTask == 1 })
+        else { return }
+        await fixture.client.setSuspendsGetTaskResponses(false)
+        fixture.model.sourceText = "BV1replacement"
+        await fixture.model.submit(serverAddressText: fixture.endpoint.displayAddress)
+        let status = fixture.model.statusMessage
+        let message = fixture.model.resumptionMessage
+        await fixture.client.completeNextGetTask(with: .success(fixture.task))
+        guard
+            await waitForResumptionPhase(
+                "activation late task ignored", model: fixture.model, client: fixture.client, operations: [activation],
+                until: { activation.isFinished })
+        else { return }
+        XCTAssertEqual(fixture.model.currentTask?.id, replacement.id)
+        XCTAssertEqual(fixture.store.record?.task.taskID, replacement.id)
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertEqual(fixture.model.resumptionMessage, message)
+        XCTAssertFalse(fixture.model.isRestoringTask)
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+    }
+
+    func testActivationLateReplyRejectsChangedPlaybackIdentity() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        await fixture.client.setSuspendsServerInfoResponses(true)
+        let activation = ResumptionTestOperation {
+            await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+            return nil
+        }
+        guard
+            await waitForResumptionPhase(
+                "activation identity check held", model: fixture.model, client: fixture.client,
+                operations: [activation],
+                until: { await fixture.client.pendingResumptionResponseCountsSnapshot().serverInfo == 1 })
+        else { return }
+        let changedIdentity = ClientPlaybackIdentity(
+            task: fixture.identity.task, libraryItemID: fixture.identity.libraryItemID, variantID: "vp9"
+        )
+        fixture.store.beginPlayback(
+            changedIdentity,
+            checkpoint: ClientPlaybackCheckpoint(identity: changedIdentity, positionSeconds: 47, durationSeconds: 120)
+        )
+        await fixture.client.completeNextServerInfo(
+            with: .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"])))
+        guard
+            await waitForResumptionPhase(
+                "activation old identity ignored", model: fixture.model, client: fixture.client,
+                operations: [activation],
+                until: { activation.isFinished })
+        else { return }
+        XCTAssertEqual(fixture.store.record?.playback?.identity, changedIdentity)
+        XCTAssertEqual(fixture.store.record?.playback?.positionSeconds, 47)
+        XCTAssertFalse(fixture.model.canContinueSavedPlayback)
+        XCTAssertFalse(fixture.model.isRestoringTask)
+        let taskIDs = await fixture.client.getTaskIDsSnapshot()
+        XCTAssertEqual(taskIDs, [fixture.task.id])
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testAwaitedResumptionClearsOldAssociationBeforeCurrentFailure() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let initialSuccess = await fixture.model.resumePreparedPlayback(prepared) { true }
+        XCTAssertTrue(initialSuccess)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let resume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "resume result held after old association cleared", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { gate.startCount == 1 })
+        else { return }
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertFalse(fixture.model.statusMessage.hasPrefix("Playing "))
+        let status = fixture.model.statusMessage
+        gate.complete(false)
+        guard
+            await waitForResumptionPhase(
+                "current resume failed", model: fixture.model, client: fixture.client, operations: [resume],
+                until: { resume.isFinished })
+        else { return }
+        XCTAssertEqual(resume.didStartPlayback, false)
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertNil(fixture.model.resumptionMessage)
+        await assertNoActivationSideEffects(fixture)
+    }
+
+    func testLateFailedResumptionCannotClearNewerSameItemResume() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let oldGate = ResumptionPlaybackTestGate()
+        let newGate = ResumptionPlaybackTestGate()
+        defer {
+            oldGate.complete(false)
+            newGate.complete(false)
+        }
+        let oldResume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await oldGate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "old same-item resume held", model: fixture.model, client: fixture.client, operations: [oldResume],
+                until: { oldGate.startCount == 1 })
+        else { return }
+        let newResume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await newGate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "new same-item resume held", model: fixture.model, client: fixture.client,
+                operations: [oldResume, newResume], until: { newGate.startCount == 1 })
+        else { return }
+        newGate.complete(true)
+        guard
+            await waitForResumptionPhase(
+                "new same-item resume succeeded", model: fixture.model, client: fixture.client,
+                operations: [oldResume, newResume], until: { newResume.isFinished })
+        else { return }
+        XCTAssertEqual(newResume.didStartPlayback, true)
+        let status = fixture.model.statusMessage
+        oldGate.complete(false)
+        guard
+            await waitForResumptionPhase(
+                "old same-item failure ignored", model: fixture.model, client: fixture.client,
+                operations: [oldResume], until: { oldResume.isFinished })
+        else { return }
+        fixture.model.finishPreparedResumption(prepared, didStartPlayback: false)
+        XCTAssertEqual(oldResume.didStartPlayback, false)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    func testLateSuccessfulResumptionCannotOverwriteNewerSameItemManualPlayback() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let resume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "resume held before manual playback", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { gate.startCount == 1 })
+        else { return }
+        fixture.model.finishPreparedPlayback(didStartPlayback: true)
+        let status = fixture.model.statusMessage
+        gate.complete(true)
+        guard
+            await waitForResumptionPhase(
+                "superseded success ignored", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { resume.isFinished })
+        else { return }
+        XCTAssertEqual(resume.didStartPlayback, false)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    func testLateFailedResumptionCannotClearNewerResultPlayback() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture(exactChild: true)
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let resume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "resume held before sibling playback", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { gate.startCount == 1 })
+        else { return }
+        let sibling = try XCTUnwrap(fixture.model.taskResults.first { $0.id == "activation-sibling" })
+        fixture.model.finishPreparedPlayback(result: sibling, didStartPlayback: true)
+        let status = fixture.model.statusMessage
+        gate.complete(false)
+        guard
+            await waitForResumptionPhase(
+                "older result failure ignored", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { resume.isFinished })
+        else { return }
+        XCTAssertEqual(resume.didStartPlayback, false)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: "sibling-library"))
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    func testLateFailedResumptionCannotClearNewerVariantResume() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let oldResume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "old variant resume held", model: fixture.model, client: fixture.client,
+                operations: [oldResume], until: { gate.startCount == 1 })
+        else { return }
+        let identity = ClientPlaybackIdentity(
+            task: fixture.identity.task, libraryItemID: fixture.identity.libraryItemID, variantID: "vp9"
+        )
+        let source = CachePlaybackSource(
+            itemID: identity.libraryItemID, variantID: identity.variantID, playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/activation-library/vp9.m3u8"
+        )
+        fixture.store.beginPlayback(
+            identity,
+            checkpoint: ClientPlaybackCheckpoint(identity: identity, positionSeconds: 47, durationSeconds: 120)
+        )
+        await fixture.client.setPlaybackSourceResponse(itemID: identity.libraryItemID, variantID: "vp9", source: source)
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        let url = try XCTUnwrap(source.explicitHTTPURL)
+        let newPrepared = ClientPreparedResumption(
+            url: url,
+            progressContext: PlayerPlaybackProgressContext(
+                endpoint: fixture.endpoint, playbackURI: url.absoluteString,
+                libraryItemID: identity.libraryItemID, variantID: identity.variantID, resumptionIdentity: identity
+            ),
+            checkpoint: try XCTUnwrap(fixture.store.record?.playback)
+        )
+        let newSuccess = await fixture.model.resumePreparedPlayback(newPrepared) { true }
+        XCTAssertTrue(newSuccess)
+        let status = fixture.model.statusMessage
+        gate.complete(false)
+        guard
+            await waitForResumptionPhase(
+                "old variant failure ignored", model: fixture.model, client: fixture.client,
+                operations: [oldResume], until: { oldResume.isFinished })
+        else { return }
+        XCTAssertEqual(oldResume.didStartPlayback, false)
+        XCTAssertEqual(fixture.store.record?.playback?.identity, identity)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    func testAwaitedResumptionAcceptsCheckpointOnlyChangesAcrossRevalidation() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let resume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "resume held before checkpoint movement", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { gate.startCount == 1 })
+        else { return }
+        fixture.store.updatePlayback(
+            identity: fixture.identity, positionSeconds: 73, durationSeconds: 180, completed: false)
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        XCTAssertTrue(fixture.model.canContinueSavedPlayback)
+        gate.complete(true)
+        guard
+            await waitForResumptionPhase(
+                "resume accepts mutable checkpoint", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { resume.isFinished })
+        else { return }
+        XCTAssertEqual(resume.didStartPlayback, true)
+        XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.store.record?.playback?.positionSeconds, 73)
+        XCTAssertEqual(fixture.store.record?.playback?.durationSeconds, 180)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    func testAwaitedResumptionRejectsSourceReplacementAcrossAwaitWithoutStartingStalePreparation() async throws {
+        let fixture = try await makeSavedPlaybackActivationFixture()
+        defer { fixture.cleanup() }
+        let prepared = try fixture.prepared()
+        let gate = ResumptionPlaybackTestGate()
+        defer { gate.complete(false) }
+        let resume = ResumptionTestOperation(playback: {
+            await fixture.model.resumePreparedPlayback(prepared) { await gate.start() }
+        })
+        guard
+            await waitForResumptionPhase(
+                "resume held before source replacement", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { gate.startCount == 1 })
+        else { return }
+        let freshSource = CachePlaybackSource(
+            itemID: fixture.identity.libraryItemID, variantID: "h264", playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/activation-library/replaced.m3u8"
+        )
+        await fixture.client.setPlaybackSourceResponse(
+            itemID: fixture.identity.libraryItemID, variantID: "h264", source: freshSource
+        )
+        await fixture.client.enqueueGetTaskResponse(id: fixture.task.id, result: .success(fixture.task))
+        await fixture.model.revalidateSavedPlaybackOnActivation(serverAddressText: fixture.endpoint.displayAddress)
+        let status = fixture.model.statusMessage
+        gate.complete(true)
+        guard
+            await waitForResumptionPhase(
+                "replaced source success ignored", model: fixture.model, client: fixture.client,
+                operations: [resume], until: { resume.isFinished })
+        else { return }
+        XCTAssertEqual(resume.didStartPlayback, false)
+        XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
+        XCTAssertEqual(fixture.model.statusMessage, status)
+        let staleGate = ResumptionPlaybackTestGate()
+        staleGate.complete(true)
+        let staleResult = await fixture.model.resumePreparedPlayback(prepared) { await staleGate.start() }
+        XCTAssertFalse(staleResult)
+        XCTAssertEqual(staleGate.startCount, 0)
+        XCTAssertNil(fixture.model.resumptionMessage)
+    }
+
+    private func makeSavedPlaybackActivationFixture(
+        exactChild: Bool = false,
+        createResponses: [Result<CacheTask, Error>] = []
+    ) async throws -> SavedPlaybackActivationFixture {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint, serverID: "fake-cache-server", taskID: "activation-terminal-task"
+        )
+        let identity = ClientPlaybackIdentity(
+            task: taskIdentity,
+            resultID: exactChild ? "activation-child" : nil,
+            libraryItemID: "activation-library",
+            variantID: "h264"
+        )
+        let child = BilibiliTaskResultItem.fixture(
+            id: "activation-child", state: "succeeded",
+            libraryItemID: identity.libraryItemID, playbackSourceItemID: identity.libraryItemID
+        )
+        let sibling = BilibiliTaskResultItem.fixture(
+            id: "activation-sibling", state: "succeeded",
+            libraryItemID: "sibling-library", playbackSourceItemID: "sibling-library"
+        )
+        let task =
+            exactChild
+            ? CacheTask.fixture(id: taskIdentity.taskID, state: "succeeded", resultItems: [sibling, child])
+            : CacheTask.playableFixture(
+                id: taskIdentity.taskID, state: "completed",
+                libraryItemID: identity.libraryItemID, playbackSourceItemID: identity.libraryItemID
+            )
+        let source = try XCTUnwrap(exactChild ? child.playbackSource : task.playbackSource)
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(
+            identity,
+            checkpoint: ClientPlaybackCheckpoint(identity: identity, positionSeconds: 12, durationSeconds: 120)
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: createResponses,
+            getTaskResponses: [taskIdentity.taskID: [.success(task)]],
+            playbackSourceResponses: ["\(identity.libraryItemID)\u{1F}h264": source]
+        )
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        XCTAssertTrue(model.canContinueSavedPlayback)
+        XCTAssertFalse(model.isWatching)
+        return SavedPlaybackActivationFixture(
+            defaults: defaults, suiteName: suiteName, store: store, endpoint: endpoint,
+            identity: identity, task: task, source: source, client: client, model: model
+        )
+    }
+
+    private func assertNoActivationSideEffects(_ fixture: SavedPlaybackActivationFixture) async {
+        let resolved = await fixture.client.resolvedRequestsSnapshot()
+        let created = await fixture.client.createdRequestsSnapshot()
+        let downloads = await fixture.client.downloadRequestsSnapshot()
+        let cancelled = await fixture.client.cancelledIDsSnapshot()
+        let watches = await fixture.client.watchSubscriptionCountSnapshot()
+        XCTAssertTrue(resolved.isEmpty)
+        XCTAssertTrue(created.isEmpty)
+        XCTAssertTrue(downloads.isEmpty)
+        XCTAssertTrue(cancelled.isEmpty)
+        XCTAssertEqual(watches, 0)
+    }
+
     private func assertTerminalExactChildState(
         usesV2Output: Bool,
         state: String,
@@ -7545,6 +8093,7 @@ private final class ResumptionTestOperation {
     private var task: Task<Void, Never>?
     private(set) var isFinished = false
     private(set) var prepared: ClientPreparedResumption?
+    private(set) var didStartPlayback: Bool?
 
     init(_ operation: @escaping @MainActor @Sendable () async -> ClientPreparedResumption?) {
         task = Task { @MainActor [weak self] in
@@ -7554,8 +8103,74 @@ private final class ResumptionTestOperation {
         }
     }
 
+    init(playback operation: @escaping @MainActor @Sendable () async -> Bool) {
+        task = Task { @MainActor [weak self] in
+            let didStartPlayback = await operation()
+            self?.didStartPlayback = didStartPlayback
+            self?.isFinished = true
+        }
+    }
+
     func cancel() {
         task?.cancel()
+    }
+}
+
+@MainActor
+private final class ResumptionPlaybackTestGate {
+    private let stream: AsyncStream<Bool>
+    private let continuation: AsyncStream<Bool>.Continuation
+    private(set) var startCount = 0
+
+    init() {
+        let pair = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    func start() async -> Bool {
+        startCount += 1
+        var iterator = stream.makeAsyncIterator()
+        return await iterator.next() ?? false
+    }
+
+    func complete(_ result: Bool) {
+        continuation.yield(result)
+        continuation.finish()
+    }
+}
+
+@MainActor
+private struct SavedPlaybackActivationFixture {
+    let defaults: UserDefaults
+    let suiteName: String
+    let store: ClientResumptionStore
+    let endpoint: CacheServerEndpoint
+    let identity: ClientPlaybackIdentity
+    let task: CacheTask
+    let source: CachePlaybackSource
+    let client: FakeBilibiliCacheControlClient
+    let model: BilibiliTaskViewModel
+
+    func prepared(source: CachePlaybackSource? = nil) throws -> ClientPreparedResumption {
+        let source = source ?? self.source
+        let url = try XCTUnwrap(source.explicitHTTPURL)
+        return ClientPreparedResumption(
+            url: url,
+            progressContext: PlayerPlaybackProgressContext(
+                endpoint: endpoint,
+                playbackURI: url.absoluteString,
+                libraryItemID: identity.libraryItemID,
+                variantID: source.variantID,
+                resumptionIdentity: identity
+            ),
+            checkpoint: try XCTUnwrap(store.record?.playback)
+        )
+    }
+
+    func cleanup() {
+        model.clearTask()
+        defaults.removePersistentDomain(forName: suiteName)
     }
 }
 
@@ -7723,7 +8338,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var serverInfoRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var serverInfoResponseCompletionCount = 0
     private var pendingServerInfoContinuations: [CheckedContinuation<CacheServerSummary, Error>] = []
-    private let playbackSourceResponses: [String: CachePlaybackSource]
+    private var playbackSourceResponses: [String: Result<CachePlaybackSource, Error>]
     private var playbackSourceRequests: [(itemID: String, variantID: String)] = []
     private var resolvedRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
     private var downloadRequests: [(urlOrID: String, options: BilibiliDownloadTaskOptions)] = []
@@ -7806,7 +8421,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         self.supportsBilibiliResolutionV2 = supportsBilibiliResolutionV2
         self.supportsBilibiliExecutionV2 = supportsBilibiliExecutionV2
         self.supportsTaskOutputV2 = supportsTaskOutputV2
-        self.playbackSourceResponses = playbackSourceResponses
+        self.playbackSourceResponses = playbackSourceResponses.mapValues { .success($0) }
         self.mediaBaseURIs = mediaBaseURIs
         self.suspendsServerInfoResponses = suspendsServerInfoResponses
         self.suspendsTaskResultResponses = suspendsTaskResultResponses
@@ -7824,6 +8439,19 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func setServerID(_ serverID: String) {
         self.serverID = serverID
+    }
+
+    func enqueueGetTaskResponse(id: String, result: Result<CacheTask, Error>) {
+        getTaskResponses[id, default: []].append(result)
+    }
+
+    func setPlaybackSourceResponse(itemID: String, variantID: String, source: CachePlaybackSource?) {
+        let key = Self.playbackSourceRequestKey(itemID: itemID, variantID: variantID)
+        if let source {
+            playbackSourceResponses[key] = .success(source)
+        } else {
+            playbackSourceResponses[key] = .failure(CacheTaskControlError.notFound)
+        }
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
@@ -7886,11 +8514,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         playbackSourceRequests.append((itemID, variantID))
-        guard let source = playbackSourceResponses[Self.playbackSourceRequestKey(itemID: itemID, variantID: variantID)]
+        guard
+            let response = playbackSourceResponses[Self.playbackSourceRequestKey(itemID: itemID, variantID: variantID)]
         else {
             throw FakeBilibiliCacheControlClientError.notImplemented
         }
-        return source
+        return try response.get()
     }
 
     func deleteLibraryItem(id: String) async throws -> Bool {

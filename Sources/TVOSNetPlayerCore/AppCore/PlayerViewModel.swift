@@ -201,6 +201,35 @@ public final class PlayerViewModel: ObservableObject {
     private var pendingPlaybackResumeObserver: AnyCancellable?
     private var pendingPlaybackResumeTimeout: Task<Void, Never>?
     private var resumePositionUnrestoredItem: AVPlayerItem?
+    private var playbackResumptionOperation: PlaybackResumptionOperation?
+
+    @MainActor
+    private final class PlaybackResumptionOperation {
+        let id = UUID()
+        let identity: ClientPlaybackIdentity
+        weak var player: AVPlayer?
+        weak var item: AVPlayerItem?
+        weak var controller: (any PlayerPlaybackControlling)?
+        var continuation: CheckedContinuation<Bool, Never>?
+        var hasPendingManualSeek = false
+        var initializedByManualTransport = false
+        private(set) var result: Bool?
+        private(set) var isInvalidated = false
+
+        init(identity: ClientPlaybackIdentity) {
+            self.identity = identity
+        }
+
+        func complete(_ success: Bool) {
+            if !success { isInvalidated = true }
+            guard result == nil else { return }
+            result = success
+            hasPendingManualSeek = false
+            let continuation = continuation
+            self.continuation = nil
+            continuation?.resume(returning: success)
+        }
+    }
 
     var playbackControllerFactory: @MainActor (URL) -> (AVPlayer, any PlayerPlaybackControlling) = {
         let player = AVPlayer(url: $0)
@@ -354,12 +383,71 @@ public final class PlayerViewModel: ObservableObject {
         )
     }
 
+    /// Waits for a verified saved position or an initialized same-item manual transport takeover.
+    public func loadTransientResumption(
+        streamURLText: String,
+        progressContext: PlayerPlaybackProgressContext,
+        resumeCheckpoint: ClientPlaybackCheckpoint,
+        ifManualInteractionSequenceMatches expectedSequence: Int
+    ) async -> Bool {
+        guard !Task.isCancelled, manualInteractionSequence == expectedSequence,
+            progressContext.resumptionIdentity == resumeCheckpoint.identity
+        else { return false }
+        guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
+            validationMessage = "Use an HTTP or HTTPS URL."
+            statusMessage = "Cannot load this stream."
+            return false
+        }
+
+        let operation = PlaybackResumptionOperation(identity: resumeCheckpoint.identity)
+        let operationID = operation.id
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, manualInteractionSequence == expectedSequence else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let replacingPendingResume = isCurrentResumePositionUnrestored
+                markManualInteraction()
+                operation.continuation = continuation
+                playbackResumptionOperation = operation
+                load(
+                    url: url,
+                    persist: false,
+                    progressContext: progressContext,
+                    resumeCheckpoint: resumeCheckpoint,
+                    suppressCurrentPosition: replacingPendingResume,
+                    resumptionOperation: operation
+                )
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelPlaybackResumptionOperation(operationID: operationID)
+            }
+        }
+        defer {
+            if playbackResumptionOperation === operation {
+                playbackResumptionOperation = nil
+            }
+        }
+        if Task.isCancelled {
+            cancelPlaybackResumptionOperation(operationID: operationID)
+            return false
+        }
+        // A replacement may run after continuation completion but before this task resumes.
+        return result && !operation.isInvalidated
+            && playbackResumptionOperation === operation
+            && ownsPlaybackResumptionOperation(operation)
+            && !isCurrentResumePositionUnrestored
+    }
+
     private func load(
         url: URL,
         persist: Bool,
         progressContext: PlayerPlaybackProgressContext?,
         resumeCheckpoint: ClientPlaybackCheckpoint? = nil,
-        suppressCurrentPosition: Bool = false
+        suppressCurrentPosition: Bool = false,
+        resumptionOperation: PlaybackResumptionOperation? = nil
     ) {
         let queuedStoppedReport =
             suppressCurrentPosition
@@ -398,6 +486,18 @@ public final class PlayerViewModel: ObservableObject {
         if let matchingCheckpoint, let identity = playbackProgressContext?.resumptionIdentity,
             let item = nextController.currentItem
         {
+            if let resumptionOperation {
+                resumptionOperation.player = nextPlayer
+                resumptionOperation.item = item
+                resumptionOperation.controller = nextController
+                guard playbackResumptionOperation === resumptionOperation,
+                    nextPlayer.currentItem === item
+                else {
+                    finishPlaybackResumptionOperation(operationID: resumptionOperation.id, success: false)
+                    tearDownFailedPlaybackResume(player: nextPlayer, controller: nextController)
+                    return
+                }
+            }
             statusMessage = "Restoring saved playback position."
             nextController.pause()
             resumePositionUnrestoredItem = item
@@ -406,9 +506,10 @@ public final class PlayerViewModel: ObservableObject {
                 item: item,
                 controller: nextController,
                 identity: identity,
-                checkpoint: matchingCheckpoint
+                checkpoint: matchingCheckpoint,
+                requestID: resumptionOperation?.id ?? UUID()
             )
-        } else if matchingCheckpoint != nil {
+        } else if matchingCheckpoint != nil || resumptionOperation != nil {
             tearDownFailedPlaybackResume(player: nextPlayer, controller: nextController)
         } else {
             statusMessage = "Playing \(url.absoluteString)"
@@ -434,11 +535,18 @@ public final class PlayerViewModel: ObservableObject {
 
     func togglePlayback(using controller: (any PlayerPlaybackControlling)?) {
         handlePlaybackTimeJump(using: controller)
+        let resumptionOperationID = pendingManualPlaybackResumptionOperationID
+        var awaitsManualSeek = false
+        defer {
+            if !awaitsManualSeek {
+                finishUninitializedPlaybackResumptionOperation(operationID: resumptionOperationID)
+            }
+        }
         let wasRestarting =
             pendingReplay != nil
             && pendingReplay?.player === player
             && pendingReplay?.item === controller?.currentItem
-        markManualInteraction()
+        markManualInteraction(preservingResumptionResult: true)
         guard let controller else { return }
         if wasRestarting {
             controller.pause()
@@ -455,6 +563,7 @@ public final class PlayerViewModel: ObservableObject {
                 PlayerPlaybackState(timeControlStatus: controller.timeControlStatus).canPause ? .paused : .playing
             let initializedTransport = initializeManualPlaybackTransport(using: controller)
             Self.togglePlayback(player: controller, speed: playbackSpeed)
+            recordInitializedManualResumptionTakeover(using: controller)
             if initializedTransport {
                 queueCurrentPlaybackProgressReport(intent: intent)
                 statusMessage =
@@ -471,13 +580,22 @@ public final class PlayerViewModel: ObservableObject {
                 durationSeconds: Self.playbackDurationSeconds(controller.itemDuration))
         }
         let sequence = manualInteractionSequence
+        recordInitializedManualResumptionTakeover(using: controller)
         pendingReplay = PendingReplay(player: player, item: item, controller: controller, interactionSequence: sequence)
+        awaitsManualSeek = true
+        beginManualPlaybackResumptionSeek(operationID: resumptionOperationID)
         controller.seekForPlayback(to: .zero) { [weak self] finished in
-            self?.completeReplaySeek(finished: finished, interactionSequence: sequence)
+            self?.completeReplaySeek(
+                finished: finished, interactionSequence: sequence, resumptionOperationID: resumptionOperationID)
         }
     }
 
-    private func completeReplaySeek(finished: Bool, interactionSequence: Int) {
+    private func completeReplaySeek(finished: Bool, interactionSequence: Int, resumptionOperationID: UUID?) {
+        defer {
+            finishUninitializedPlaybackResumptionOperation(
+                operationID: resumptionOperationID, interactionSequence: interactionSequence)
+        }
+        guard isPendingManualPlaybackResumptionSeek(operationID: resumptionOperationID) else { return }
         guard let request = pendingReplay, request.interactionSequence == interactionSequence else { return }
         pendingReplay = nil
         guard finished,
@@ -526,7 +644,14 @@ public final class PlayerViewModel: ObservableObject {
 
     func seek(by offset: TimeInterval, using controller: (any PlayerPlaybackControlling)?) {
         handlePlaybackTimeJump(using: controller)
-        markManualInteraction()
+        let resumptionOperationID = pendingManualPlaybackResumptionOperationID
+        var awaitsManualSeek = false
+        defer {
+            if !awaitsManualSeek {
+                finishUninitializedPlaybackResumptionOperation(operationID: resumptionOperationID)
+            }
+        }
+        markManualInteraction(preservingResumptionResult: true)
         guard let controller else {
             statusMessage = "No stream loaded."
             return
@@ -557,12 +682,20 @@ public final class PlayerViewModel: ObservableObject {
         let target =
             durationSeconds.map { targetSeconds >= $0 } == true
             ? duration : CMTime(seconds: targetSeconds, preferredTimescale: 600)
+        recordInitializedManualResumptionTakeover(using: controller)
         if Self.isAtPlaybackEnd(currentTime: target, duration: duration),
             let player, let item = controller.currentItem, player.currentItem === item
         {
             let sequence = manualInteractionSequence
+            awaitsManualSeek = true
+            beginManualPlaybackResumptionSeek(operationID: resumptionOperationID)
             controller.seekForPlayback(to: target) { [weak self, weak player, weak item, weak controller] finished in
+                defer {
+                    self?.finishUninitializedPlaybackResumptionOperation(
+                        operationID: resumptionOperationID, interactionSequence: sequence)
+                }
                 guard let self, let player, let item, let controller,
+                    self.isPendingManualPlaybackResumptionSeek(operationID: resumptionOperationID),
                     finished, self.manualInteractionSequence == sequence,
                     self.player === player, player.currentItem === item, controller.currentItem === item,
                     Self.isAtPlaybackEnd(currentTime: controller.currentTime(), duration: controller.itemDuration),
@@ -720,10 +853,16 @@ public final class PlayerViewModel: ObservableObject {
         _ = await playbackProgressReportChain?.value
     }
 
-    private func markManualInteraction() {
+    private func markManualInteraction(preservingResumptionResult: Bool = false) {
         manualInteractionSequence += 1
         pendingReplay = nil
-        cancelPendingPlaybackResume()
+        if preservingResumptionResult, let operation = playbackResumptionOperation,
+            operation.hasPendingManualSeek, let controller = operation.controller, let item = operation.item
+        {
+            operation.hasPendingManualSeek = false
+            controller.cancelPendingSeeks(for: item)
+        }
+        cancelPendingPlaybackResume(preservingResumptionResult: preservingResumptionResult)
     }
 
     private var isCurrentResumePositionUnrestored: Bool {
@@ -740,11 +879,84 @@ public final class PlayerViewModel: ObservableObject {
             return false
         }
 
-        cancelPendingPlaybackResume()
+        cancelPendingPlaybackResume(preservingResumptionResult: true)
         resumePositionUnrestoredItem = nil
         validationMessage = nil
         startPlaybackProgressReporting()
+        if let operation = playbackResumptionOperation {
+            operation.initializedByManualTransport = operation.controller === controller
+            finishPlaybackResumptionOperation(
+                operationID: operation.id, success: operation.controller === controller)
+        }
         return true
+    }
+
+    private func recordInitializedManualResumptionTakeover(using controller: any PlayerPlaybackControlling) {
+        guard let operation = playbackResumptionOperation, operation.result == true,
+            operation.controller === controller, ownsPlaybackResumptionOperation(operation),
+            !isCurrentResumePositionUnrestored
+        else { return }
+        operation.initializedByManualTransport = true
+    }
+
+    private func ownsPlaybackResumptionOperation(_ operation: PlaybackResumptionOperation) -> Bool {
+        guard let expectedPlayer = operation.player, let item = operation.item,
+            let controller = operation.controller
+        else { return false }
+        return player === expectedPlayer && expectedPlayer.currentItem === item
+            && playbackController === controller && controller.currentItem === item
+            && playbackProgressContext?.resumptionIdentity == operation.identity
+    }
+
+    private func finishPlaybackResumptionOperation(operationID: UUID, success: Bool) {
+        guard let operation = playbackResumptionOperation, operation.id == operationID else { return }
+        pendingPlaybackResumeTimeout?.cancel()
+        pendingPlaybackResumeTimeout = nil
+        let success = success && ownsPlaybackResumptionOperation(operation) && !isCurrentResumePositionUnrestored
+        operation.complete(success)
+        if !success { playbackResumptionOperation = nil }
+    }
+
+    private func finishUninitializedPlaybackResumptionOperation(
+        operationID: UUID?, interactionSequence: Int? = nil
+    ) {
+        guard let operationID, let operation = playbackResumptionOperation,
+            operation.id == operationID, operation.result == nil,
+            interactionSequence == nil || interactionSequence == manualInteractionSequence
+        else { return }
+        cancelPlaybackResumptionOperation(operationID: operationID)
+    }
+
+    private var pendingManualPlaybackResumptionOperationID: UUID? {
+        guard let operation = playbackResumptionOperation, operation.result == nil else { return nil }
+        return operation.id
+    }
+
+    private func isPendingManualPlaybackResumptionSeek(operationID: UUID?) -> Bool {
+        guard let operationID else { return true }
+        guard let operation = playbackResumptionOperation, operation.id == operationID else { return false }
+        return operation.result == nil && operation.hasPendingManualSeek
+    }
+
+    private func beginManualPlaybackResumptionSeek(operationID: UUID?) {
+        guard let operationID, let operation = playbackResumptionOperation,
+            operation.id == operationID, operation.result == nil
+        else { return }
+        operation.hasPendingManualSeek = true
+        startPlaybackResumeTimeout(requestID: operationID, phase: .seeking)
+    }
+
+    private func cancelPlaybackResumptionOperation(operationID: UUID) {
+        guard let operation = playbackResumptionOperation, operation.id == operationID else { return }
+        if operation.result == true, !operation.initializedByManualTransport,
+            ownsPlaybackResumptionOperation(operation)
+        {
+            let controller = operation.controller
+            stop()
+            controller?.pause()
+        } else {
+            cancelPendingPlaybackResume()
+        }
     }
 
     private func beginPlaybackResume(
@@ -752,10 +964,11 @@ public final class PlayerViewModel: ObservableObject {
         item: AVPlayerItem,
         controller: any PlayerPlaybackControlling,
         identity: ClientPlaybackIdentity,
-        checkpoint: ClientPlaybackCheckpoint
+        checkpoint: ClientPlaybackCheckpoint,
+        requestID: UUID
     ) {
         let request = PendingPlaybackResume(
-            id: UUID(),
+            id: requestID,
             player: player,
             item: item,
             controller: controller,
@@ -863,7 +1076,7 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        cancelPendingPlaybackResume(cancelSavedSeek: false)
+        cancelPendingPlaybackResume(cancelSavedSeek: false, preservingResumptionResult: true)
         resumePositionUnrestoredItem = nil
         request.controller.defaultRate = playbackSpeed.rate
         statusMessage =
@@ -880,6 +1093,7 @@ public final class PlayerViewModel: ObservableObject {
             intent: .started
         )
         startPlaybackProgressReporting()
+        finishPlaybackResumptionOperation(operationID: requestID, success: true)
     }
 
     private func isCurrentPlaybackResume(_ request: PendingPlaybackResume) -> Bool {
@@ -901,12 +1115,12 @@ public final class PlayerViewModel: ObservableObject {
             } catch {
                 return
             }
-            guard let self, let request = self.pendingPlaybackResume,
-                request.id == requestID, request.phase == phase
-            else {
-                return
+            guard !Task.isCancelled, let self else { return }
+            if let request = self.pendingPlaybackResume, request.id == requestID, request.phase == phase {
+                self.failPlaybackResume(requestID: requestID)
+            } else if self.pendingPlaybackResume == nil, self.playbackResumptionOperation?.id == requestID {
+                self.cancelPlaybackResumptionOperation(operationID: requestID)
             }
-            self.failPlaybackResume(requestID: requestID)
         }
     }
 
@@ -937,15 +1151,31 @@ public final class PlayerViewModel: ObservableObject {
         statusMessage = validationMessage ?? "Could not restore playback."
     }
 
-    private func cancelPendingPlaybackResume(cancelSavedSeek: Bool = true) {
+    private func cancelPendingPlaybackResume(
+        cancelSavedSeek: Bool = true,
+        preservingResumptionResult: Bool = false
+    ) {
         let request = pendingPlaybackResume
+        let operation = playbackResumptionOperation
+        let preservesResult = preservingResumptionResult && operation != nil
         pendingPlaybackResume = nil
         pendingPlaybackResumeObserver?.cancel()
         pendingPlaybackResumeObserver = nil
-        pendingPlaybackResumeTimeout?.cancel()
-        pendingPlaybackResumeTimeout = nil
+        if !preservesResult {
+            pendingPlaybackResumeTimeout?.cancel()
+            pendingPlaybackResumeTimeout = nil
+        }
         if cancelSavedSeek, let request, request.phase == .seeking {
             request.controller.cancelPendingSeeks(for: request.item)
+        }
+        if !preservesResult, let operation {
+            if operation.hasPendingManualSeek, let controller = operation.controller, let item = operation.item {
+                if let replay = pendingReplay, replay.player === operation.player, replay.item === item {
+                    pendingReplay = nil
+                }
+                controller.cancelPendingSeeks(for: item)
+            }
+            finishPlaybackResumptionOperation(operationID: operation.id, success: false)
         }
     }
 
@@ -1048,7 +1278,7 @@ public final class PlayerViewModel: ObservableObject {
         }
 
         if resumePositionUnrestoredItem === item {
-            markManualInteraction()
+            markManualInteraction(preservingResumptionResult: true)
             if initializeManualPlaybackTransport(using: controller) {
                 queueCurrentPlaybackProgressReport(intent: .playing)
                 statusMessage = "Playing \(loadedURL?.absoluteString ?? "stream")."

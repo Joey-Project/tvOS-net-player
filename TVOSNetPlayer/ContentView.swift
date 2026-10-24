@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var isResolverSettingsPresented = false
     @State private var isAutoDiscoveryConnecting = false
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
+    @State private var needsSavedPlaybackRevalidation = false
     @FocusState private var focusedControl: FocusedControl?
     private let autoDiscoveryRetryDelay: Duration = .seconds(30)
 
@@ -114,9 +115,19 @@ struct ContentView: View {
                 await refreshPlaybackProgressStatus()
             }
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { previousPhase, phase in
             if phase == .inactive || phase == .background {
                 model.checkpointPlayback()
+                if previousPhase == .active {
+                    needsSavedPlaybackRevalidation = true
+                }
+            } else if phase == .active, needsSavedPlaybackRevalidation {
+                needsSavedPlaybackRevalidation = false
+                let address = cacheModel.serverAddressText
+                Task {
+                    guard cacheModel.serverAddressText == address else { return }
+                    await bilibiliModel.revalidateSavedPlaybackOnActivation(serverAddressText: address)
+                }
             }
         }
         .confirmationDialog(
@@ -1271,13 +1282,14 @@ struct ContentView: View {
         }
 
         cacheModel.clearPlaybackStatus()
-        let didStartPlayback = model.loadTransient(
-            streamURLText: prepared.url.absoluteString,
-            progressContext: prepared.progressContext,
-            resumeCheckpoint: prepared.checkpoint,
-            ifManualInteractionSequenceMatches: manualInteractionSequence
-        )
-        bilibiliModel.finishPreparedResumption(prepared, didStartPlayback: didStartPlayback)
+        let didStartPlayback = await bilibiliModel.resumePreparedPlayback(prepared) {
+            await model.loadTransientResumption(
+                streamURLText: prepared.url.absoluteString,
+                progressContext: prepared.progressContext,
+                resumeCheckpoint: prepared.checkpoint,
+                ifManualInteractionSequenceMatches: manualInteractionSequence
+            )
+        }
         if didStartPlayback {
             await refreshPlaybackProgressStatus()
         }

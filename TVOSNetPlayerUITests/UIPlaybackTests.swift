@@ -350,8 +350,9 @@ final class UIPlaybackTests: XCTestCase {
                 + accessibilityDescription(taskStatus)
         )
 
+        remote.press(.up)
         XCTAssertTrue(
-            focusDown(until: selectedPlay, limit: 100),
+            waitUntil(timeout: 5) { selectedPlay.exists && selectedPlay.hasFocus && selectedPlay.isHittable },
             "Remote focus could not reach the exact second result. " + taskWatchFocusDescription(target: selectedPlay)
         )
         remote.press(.select)
