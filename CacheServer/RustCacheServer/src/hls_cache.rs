@@ -42,8 +42,9 @@ use crate::{
     hls_range_cache::{
         HlsRangeCache, HlsRangeError, HlsRangePriority, HlsRangeResourceStatus, HlsReadyRange,
         HlsSessionRemovalGuard, PersistedRangeExtent, PersistedRangeManifest, PersistedRangeOrigin,
-        RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS, RANGE_MAX_SIZE, RANGE_MIN_CHUNK_BYTES,
-        RANGE_STARTUP_CHUNK_BYTES, RangeChunkKey, RangeResourceKey, SessionPublicationMode,
+        RANGE_FOREGROUND_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS,
+        RANGE_MAX_MANIFEST_BYTES, RANGE_MAX_SIZE, RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES,
+        RangeChunkKey, RangeResourceKey, SessionPublicationMode,
     },
     library::{OpenedMediaFile, open_read_no_follow},
     mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
@@ -367,6 +368,16 @@ impl HlsCacheStore {
             return Ok(0);
         };
         Ok(loaded.manifest.durable_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn range_manifest_snapshot(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+    ) -> Result<Option<PersistedRangeManifest>, HlsRangeError> {
+        self.load_range_manifest(session_id, resource)
+            .map(|loaded| loaded.map(|loaded| loaded.manifest))
     }
 
     pub(crate) fn save_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
@@ -2394,6 +2405,9 @@ impl HlsCacheStore {
         let key = self.range_resource_key(session_id, resource)?;
         let publication_lock = self.range_publication_lock(&key);
         let _publication = publication_lock.lock().await;
+        if !expected.manifest.extents.is_empty() {
+            return Err(identity_error_at("checkpoint-total-after-extents"));
+        }
         let current = self
             .load_range_manifest(session_id, resource)?
             .ok_or(HlsRangeError::IdentityChanged)?;
@@ -2407,6 +2421,7 @@ impl HlsCacheStore {
             .checked_add(1)
             .ok_or(HlsRangeError::IdentityChanged)?;
         manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
+        ensure_range_manifest_capacity(&manifest)?;
         validate_range_manifest(&manifest, resource)?;
         let path = self.resource_range_manifest_path(session_id, &resource.id)?;
         let latest = self
@@ -2492,6 +2507,7 @@ impl HlsCacheStore {
             .checked_add(1)
             .ok_or(HlsRangeError::IdentityChanged)?;
         manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
+        ensure_range_manifest_capacity(&manifest)?;
         validate_range_manifest(&manifest, resource)?;
         let path = self.resource_range_manifest_path(session_id, &resource.id)?;
         let latest = self
@@ -2544,7 +2560,7 @@ impl HlsCacheStore {
     // Keep the response validators and expected manifest snapshot explicit at publication.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    async fn commit_range_extent(
+    pub(crate) async fn commit_range_extent(
         &self,
         session_id: &str,
         resource: &HlsMediaResource,
@@ -2672,35 +2688,70 @@ impl HlsCacheStore {
         {
             return Err(identity_error_at("extent-origin-validator-change").into());
         }
-        if loaded
+        let total = loaded
             .manifest
-            .extents
-            .iter()
-            .any(|extent| extent.start < range.end && range.start < extent.end)
-        {
-            let exact = loaded.manifest.extents.iter().any(|extent| {
-                extent.start == range.start
-                    && extent.end == range.end
-                    && extent.sha256 == sha256_hex(bytes)
-            });
-            if exact {
-                return Ok(loaded.manifest.durable_bytes);
-            }
-            return Err(identity_error_at("extent-overlap-content").into());
+            .total_length
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        if range.start >= range.end || range.end > total {
+            return Err(HlsRangeError::InvalidResponse(
+                "invalid requested HLS chunk bounds".to_owned(),
+            )
+            .into());
         }
         let data_path = self.data_path_for_manifest(session_id, resource, &loaded.manifest)?;
         self.reject_cache_path_symlink(&data_path)?;
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true);
         let mut data = open_range_file(&mut options, &data_path)?;
-        if file_object_identity(&data.metadata()?)
-            != loaded.manifest.data_identity.clone().unwrap_or_default()
-        {
+        let opened_metadata = data.metadata()?;
+        let data_identity = file_object_identity(&opened_metadata);
+        if loaded.manifest.data_identity.as_deref() != Some(data_identity.as_str()) {
             return Err(identity_error_at("extent-data-object").into());
         }
-        data.seek(SeekFrom::Start(range.start))?;
-        data.write_all(bytes)?;
-        data.sync_all()?;
+
+        // A sole production flight owns this writer; zero or multiple flights are not quiescent.
+        let can_compact = self.range_cache.active_flight_count(&key) == 1;
+        let gaps = missing_ranges_within(&loaded.manifest.extents, range.clone());
+        let mut extents = loaded.manifest.extents.clone();
+        for gap in &gaps {
+            let start = usize::try_from(gap.start - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let end = usize::try_from(gap.end - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            extents.push(PersistedRangeExtent {
+                start: gap.start,
+                end: gap.end,
+                sha256: sha256_hex(&bytes[start..end]),
+            });
+        }
+        if gaps.is_empty() {
+            for extent in &loaded.manifest.extents {
+                if extent.start < range.end && range.start < extent.end {
+                    verify_extent_bytes(&mut data, extent, &range, bytes, opened_metadata.len())?;
+                }
+            }
+            return Ok(loaded.manifest.durable_bytes);
+        }
+
+        let (mut extents, merged_ranges) = if can_compact {
+            coalesce_range_extents(extents, total, &range)
+        } else {
+            (extents, Vec::new())
+        };
+        for extent in &loaded.manifest.extents {
+            let overlaps_incoming = extent.start < range.end && range.start < extent.end;
+            let participates_in_merge = merged_ranges
+                .iter()
+                .any(|merged| merged.start <= extent.start && extent.end <= merged.end);
+            if overlaps_incoming || participates_in_merge {
+                verify_extent_bytes(&mut data, extent, &range, bytes, opened_metadata.len())?;
+            }
+        }
+        if !self.range_data_object_is_still_bound(session_id, resource, &data_identity)? {
+            return Err(identity_error_at("extent-data-object-replaced").into());
+        }
+
+        extents.sort_by_key(|extent| extent.start);
 
         let prefix_length = if range.start == 0 {
             bytes.len().min(RANGE_STARTUP_CHUNK_BYTES as usize) as u64
@@ -2717,23 +2768,17 @@ impl HlsCacheStore {
             .generation
             .checked_add(1)
             .ok_or(HlsRangeError::IdentityChanged)?;
-        manifest
-            .extents
-            .retain(|extent| extent.end <= range.start || extent.start >= range.end);
-        manifest.extents.push(PersistedRangeExtent {
-            start: range.start,
-            end: range.end,
-            sha256: sha256_hex(bytes),
-        });
-        manifest.extents.sort_by_key(|extent| extent.start);
+        manifest.extents = extents;
         manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
         if range.start == 0 {
-            manifest.prefix_length = prefix_length;
-            manifest.prefix_sha256 = prefix_sha256.clone();
-            manifest.strong_etag = etag.clone();
-            manifest.validator_origin = Some(origin.clone());
-            manifest.last_modified = last_modified.clone();
-            if let Some(prefix_sha256) = prefix_sha256 {
+            if manifest.prefix_sha256.is_none() {
+                manifest.prefix_length = prefix_length;
+                manifest.prefix_sha256 = prefix_sha256.clone();
+                manifest.strong_etag = etag.clone();
+                manifest.validator_origin = Some(origin.clone());
+                manifest.last_modified = last_modified.clone();
+            }
+            if let Some(prefix_sha256) = manifest.prefix_sha256.clone() {
                 manifest.validated_origins.push(PersistedRangeOrigin {
                     origin,
                     prefix_sha256,
@@ -2742,7 +2787,53 @@ impl HlsCacheStore {
                 manifest.validated_origins.truncate(64);
             }
         }
+        ensure_range_manifest_capacity(&manifest)?;
         validate_range_manifest(&manifest, resource)?;
+
+        for gap in &gaps {
+            let start = usize::try_from(gap.start - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let end = usize::try_from(gap.end - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            data.seek(SeekFrom::Start(gap.start))?;
+            data.write_all(&bytes[start..end])?;
+        }
+        data.sync_all()?;
+        let written_length = data.metadata()?.len();
+        for gap in &gaps {
+            let start = usize::try_from(gap.start - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let end = usize::try_from(gap.end - range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            if hash_file_range(&mut data, gap.clone())? != sha256_hex(&bytes[start..end]) {
+                return Err(identity_error_at("extent-write-content").into());
+            }
+        }
+        for old in &loaded.manifest.extents {
+            let overlaps_incoming = old.start < range.end && range.start < old.end;
+            let participates_in_merge = merged_ranges
+                .iter()
+                .any(|merged| merged.start <= old.start && old.end <= merged.end);
+            if overlaps_incoming || participates_in_merge {
+                verify_extent_bytes(&mut data, old, &range, bytes, written_length)?;
+            }
+        }
+        for merged in &merged_ranges {
+            let extent = manifest
+                .extents
+                .iter_mut()
+                .find(|extent| extent.start == merged.start && extent.end == merged.end)
+                .ok_or(HlsRangeError::IdentityChanged)?;
+            extent.sha256 = hash_file_range(&mut data, merged.clone())?;
+        }
+        let final_metadata = data.metadata()?;
+        if file_object_identity(&final_metadata) != data_identity
+            || final_metadata.len() < range.end
+            || !self.range_data_object_is_still_bound(session_id, resource, &data_identity)?
+        {
+            return Err(identity_error_at("extent-data-object-or-length").into());
+        }
+
         let manifest_path = self.resource_range_manifest_path(session_id, &resource.id)?;
         let latest = self
             .load_range_manifest(session_id, resource)?
@@ -3551,7 +3642,11 @@ impl HlsCacheStore {
         let missing = planned
             .into_iter()
             .enumerate()
-            .filter(|(_, chunk)| !range_is_covered(&durable, chunk.clone()))
+            .flat_map(|(index, parent)| {
+                missing_ranges_within(&durable, parent)
+                    .into_iter()
+                    .map(move |gap| (index, gap))
+            })
             .collect::<Vec<_>>();
         let store = self;
         let key = Arc::new(key);
@@ -3669,15 +3764,27 @@ impl HlsCacheStore {
                     .completed_range_after_identity_error(session_id, resource, requested, error);
             }
         }
-        let chunks = planned_range_chunks(total)
-            .into_iter()
-            .enumerate()
-            .filter(|(_, chunk)| {
-                chunk.start < requested.end
-                    && requested.start < chunk.end
-                    && !range_is_covered(&loaded.manifest.extents, chunk.clone())
-            })
-            .collect::<Vec<_>>();
+        loaded = self
+            .load_range_manifest_serialized(session_id, resource)
+            .await?
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        let chunks = if priority == HlsRangePriority::Foreground {
+            planned_foreground_range_chunks(total, &requested, &loaded.manifest.extents)
+        } else {
+            planned_range_chunks(total)
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, parent)| {
+                    if parent.start >= requested.end || requested.start >= parent.end {
+                        return Vec::new();
+                    }
+                    missing_ranges_within(&loaded.manifest.extents, parent)
+                        .into_iter()
+                        .map(move |gap| (index, gap))
+                        .collect()
+                })
+                .collect()
+        };
         let result = futures_util::stream::iter(chunks)
             .map(|(index, chunk)| {
                 let key = key.clone();
@@ -4052,15 +4159,36 @@ impl HlsCacheStore {
         loop {
             self.range_cache
                 .check_priority_control(&chunk_key, priority, control)?;
-            if range_is_covered(&loaded.manifest.extents, range.clone())
-                && self
+            // Claims serialize with compaction; fetch_range_chunk snapshots only after the claim.
+            let publication_lock = self.range_publication_lock(resource_key);
+            let (flight, already_covered) = {
+                let _publication = publication_lock.lock().await;
+                let current = self
+                    .load_range_manifest(session_id, resource)?
+                    .ok_or(HlsRangeError::IdentityChanged)?;
+                if current.manifest.total_length != Some(total) {
+                    return Err(HlsRangeError::IdentityChanged);
+                }
+                if range_is_covered(&current.manifest.extents, range.clone()) {
+                    (None, true)
+                } else {
+                    (
+                        Some(self.range_cache.claim_chunk(chunk_key.clone(), priority)?),
+                        false,
+                    )
+                }
+            };
+            if already_covered {
+                if self
                     .read_durable_range(session_id, resource, range.clone())
                     .await?
                     .is_some()
-            {
-                return Ok(());
+                {
+                    return Ok(());
+                }
+                continue;
             }
-            let flight = self.range_cache.claim_chunk(chunk_key.clone(), priority)?;
+            let flight = flight.ok_or(HlsRangeError::IdentityChanged)?;
             if flight.is_owner() {
                 let _permit = self
                     .range_cache
@@ -5962,6 +6090,200 @@ fn range_is_covered(extents: &[PersistedRangeExtent], requested: Range<u64>) -> 
         }
     }
     false
+}
+
+fn missing_ranges_within(
+    extents: &[PersistedRangeExtent],
+    requested: Range<u64>,
+) -> Vec<Range<u64>> {
+    if requested.start >= requested.end {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+    let mut cursor = requested.start;
+    for extent in extents {
+        if extent.end <= cursor {
+            continue;
+        }
+        if extent.start >= requested.end {
+            break;
+        }
+        if cursor < extent.start {
+            gaps.push(cursor..extent.start.min(requested.end));
+        }
+        cursor = cursor.max(extent.end.min(requested.end));
+        if cursor >= requested.end {
+            break;
+        }
+    }
+    if cursor < requested.end {
+        gaps.push(cursor..requested.end);
+    }
+    gaps
+}
+
+fn planned_foreground_range_chunks(
+    total: u64,
+    requested: &Range<u64>,
+    extents: &[PersistedRangeExtent],
+) -> Vec<(usize, Range<u64>)> {
+    let mut chunks = Vec::new();
+    for (parent_index, parent) in planned_range_chunks(total).into_iter().enumerate() {
+        if parent.start >= requested.end || requested.start >= parent.end {
+            continue;
+        }
+        let mut start = parent.start;
+        while start < parent.end {
+            let end = start
+                .saturating_add(RANGE_FOREGROUND_CHUNK_BYTES)
+                .min(parent.end);
+            let chunk = start..end;
+            if chunk.start < requested.end
+                && requested.start < chunk.end
+                && !range_is_covered(extents, chunk.clone())
+            {
+                chunks.push((parent_index, chunk));
+            }
+            start = end;
+        }
+    }
+    chunks
+}
+
+fn logical_range_parent(total: u64, offset: u64) -> Option<Range<u64>> {
+    if total == 0 || offset >= total {
+        return None;
+    }
+    let first_end = total.min(RANGE_STARTUP_CHUNK_BYTES);
+    if offset < first_end {
+        return Some(0..first_end);
+    }
+    let remaining = total - first_end;
+    let parent_count = RANGE_MAX_CHUNKS.saturating_sub(1).max(1);
+    let parent_size = remaining
+        .div_ceil(parent_count)
+        .clamp(RANGE_MIN_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES);
+    let parent_index = (offset - first_end) / parent_size;
+    let start = first_end.saturating_add(parent_index.saturating_mul(parent_size));
+    Some(start..start.saturating_add(parent_size).min(total))
+}
+
+fn coalesce_range_extents(
+    mut extents: Vec<PersistedRangeExtent>,
+    total: u64,
+    changed_range: &Range<u64>,
+) -> (Vec<PersistedRangeExtent>, Vec<Range<u64>>) {
+    extents.sort_by_key(|extent| extent.start);
+    let mut compacted: Vec<PersistedRangeExtent> = Vec::with_capacity(extents.len());
+    let mut merged_ranges: Vec<Range<u64>> = Vec::new();
+    for extent in extents {
+        let can_merge = compacted.last().is_some_and(|last| {
+            let parent = logical_range_parent(total, last.start);
+            last.end == extent.start
+                && parent.as_ref().is_some_and(|parent| {
+                    extent.end <= parent.end
+                        && parent.start < changed_range.end
+                        && changed_range.start < parent.end
+                        && extent.end.saturating_sub(last.start) <= RANGE_MAX_CHUNK_BYTES
+                })
+        });
+        if can_merge {
+            let last = compacted.last_mut().expect("merge target should exist");
+            last.end = extent.end;
+            last.sha256 = "0".repeat(64);
+            let extends_last_merge = merged_ranges
+                .last()
+                .is_some_and(|merged| merged.start == last.start && merged.end < last.end);
+            if extends_last_merge {
+                merged_ranges
+                    .last_mut()
+                    .expect("merge range should exist")
+                    .end = last.end;
+            } else {
+                merged_ranges.push(last.start..last.end);
+            }
+        } else {
+            compacted.push(extent);
+        }
+    }
+    (compacted, merged_ranges)
+}
+
+fn verify_extent_bytes(
+    file: &mut fs::File,
+    extent: &PersistedRangeExtent,
+    incoming_range: &Range<u64>,
+    incoming_bytes: &[u8],
+    file_length: u64,
+) -> Result<(), HlsRangeError> {
+    if extent.end > file_length {
+        return Err(HlsRangeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "checkpointed HLS range extends past the data file",
+        )));
+    }
+    let overlap = extent.start.max(incoming_range.start)..extent.end.min(incoming_range.end);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; RANGE_FOREGROUND_CHUNK_BYTES as usize];
+    let mut cursor = extent.start;
+    while cursor < extent.end {
+        let count = usize::try_from((extent.end - cursor).min(RANGE_FOREGROUND_CHUNK_BYTES))
+            .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut buffer[..count])?;
+        let chunk_end = cursor + count as u64;
+        hasher.update(&buffer[..count]);
+        let compare_start = cursor.max(overlap.start);
+        let compare_end = chunk_end.min(overlap.end);
+        if compare_start < compare_end {
+            let existing_start = usize::try_from(compare_start - cursor)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let existing_end = usize::try_from(compare_end - cursor)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let incoming_start = usize::try_from(compare_start - incoming_range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let incoming_end = incoming_start + (existing_end - existing_start);
+            if buffer[existing_start..existing_end] != incoming_bytes[incoming_start..incoming_end]
+            {
+                return Err(identity_error_at("extent-overlap-content"));
+            }
+        }
+        cursor = chunk_end;
+    }
+    if format!("{:x}", hasher.finalize()) != extent.sha256 {
+        return Err(identity_error_at("extent-verify-hash"));
+    }
+    Ok(())
+}
+
+fn hash_file_range(file: &mut fs::File, range: Range<u64>) -> Result<String, HlsRangeError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; RANGE_FOREGROUND_CHUNK_BYTES as usize];
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let count = usize::try_from((range.end - cursor).min(RANGE_FOREGROUND_CHUNK_BYTES))
+            .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        cursor += count as u64;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub(crate) fn ensure_range_manifest_capacity(
+    manifest: &PersistedRangeManifest,
+) -> Result<(), HlsRangeError> {
+    if manifest.extents.len() > RANGE_MAX_CHUNKS as usize || manifest.validated_origins.len() > 64 {
+        return Err(HlsRangeError::QuotaExceeded);
+    }
+    let serialized = serde_json::to_vec_pretty(manifest).map_err(|_| {
+        HlsRangeError::InvalidResponse("range checkpoint serialization failed".to_owned())
+    })?;
+    if serialized.len() as u64 + 1 > RANGE_MAX_MANIFEST_BYTES {
+        return Err(HlsRangeError::QuotaExceeded);
+    }
+    Ok(())
 }
 
 const HLS_CROSS_CDN_SAMPLE_BYTES: u64 = 16 * 1024;
