@@ -6272,6 +6272,12 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                         && pending.serverInfo == 1
                 })
         else { return }
+        store.updatePlayback(
+            identity: playbackIdentity,
+            positionSeconds: 46,
+            durationSeconds: 120,
+            completed: false
+        )
         await client.yield(
             .playableFixture(
                 id: taskIdentity.taskID,
@@ -6295,6 +6301,13 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                     return await client.getTaskIDsSnapshot().count == getTaskBaseline + 1 && pending.getTask == 1
                 })
         else { return }
+        store.updatePlayback(
+            identity: playbackIdentity,
+            positionSeconds: 83,
+            durationSeconds: 180,
+            completed: true
+        )
+        let latestCheckpoint = try XCTUnwrap(store.record?.playback)
         await client.yield(
             .playableFixture(
                 id: taskIdentity.taskID,
@@ -6328,8 +6341,290 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let prepared = preparation.prepared
         XCTAssertNotNil(prepared)
         XCTAssertEqual(prepared?.checkpoint.identity, playbackIdentity)
+        XCTAssertEqual(prepared?.checkpoint, latestCheckpoint)
+        XCTAssertEqual(prepared?.checkpoint.positionSeconds, 83)
+        XCTAssertEqual(prepared?.checkpoint.durationSeconds, 180)
+        XCTAssertTrue(prepared?.checkpoint.completed == true)
+        let finalServerInfoCount = await client.serverInfoRequestCountSnapshot()
+        let finalTaskIDs = await client.getTaskIDsSnapshot()
+        XCTAssertEqual(finalServerInfoCount, serverInfoBaseline + 1)
+        XCTAssertEqual(finalTaskIDs.count, getTaskBaseline + 1)
         XCTAssertTrue(model.canContinueSavedPlayback)
         model.clearTask()
+    }
+
+    func testSavedPlaybackPreparationRejectsChangedPlaybackIdentityDuringRPC() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "restore-identity-change"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(task: taskIdentity, variantID: "h264")
+        let changedIdentity = ClientPlaybackIdentity(task: taskIdentity, variantID: "vp9")
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(
+            playbackIdentity,
+            checkpoint: ClientPlaybackCheckpoint(
+                identity: playbackIdentity,
+                positionSeconds: 12,
+                durationSeconds: 120
+            ))
+        let initialTask = CacheTask.playableFixture(id: taskIdentity.taskID)
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [taskIdentity.taskID: [.success(initialTask), .success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        guard
+            await waitForResumptionPhase(
+                "identity-change bootstrap", model: model, client: client,
+                until: {
+                    await client.watchSubscriptionCountSnapshot() == 1
+                })
+        else { return }
+
+        let serverInfoBaseline = await client.serverInfoRequestCountSnapshot()
+        let taskIDsBaseline = await client.getTaskIDsSnapshot()
+        await client.setSuspendsServerInfoResponses(true)
+        let preparation = ResumptionTestOperation {
+            await model.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+        }
+        guard
+            await waitForResumptionPhase(
+                "identity-change preparation held", model: model, client: client, operations: [preparation],
+                until: {
+                    let pending = await client.pendingResumptionResponseCountsSnapshot()
+                    return await client.serverInfoRequestCountSnapshot() == serverInfoBaseline + 1
+                        && pending.serverInfo == 1
+                })
+        else { return }
+
+        store.beginPlayback(
+            changedIdentity,
+            checkpoint: ClientPlaybackCheckpoint(
+                identity: changedIdentity,
+                positionSeconds: 12,
+                durationSeconds: 120
+            ))
+        await client.completeNextServerInfo(with: .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"])))
+        guard
+            await waitForResumptionPhase(
+                "identity-change preparation rejected", model: model, client: client, operations: [preparation],
+                until: {
+                    preparation.isFinished
+                })
+        else { return }
+
+        XCTAssertNil(preparation.prepared)
+        XCTAssertFalse(model.canContinueSavedPlayback)
+        XCTAssertFalse(model.isRestoringTask)
+        let finalTaskIDs = await client.getTaskIDsSnapshot()
+        XCTAssertEqual(finalTaskIDs, taskIDsBaseline)
+    }
+
+    func testSubmissionDuringBlockedAutomaticValidationIgnoresLateSuccess() async throws {
+        try await assertSubmissionDuringBlockedAutomaticValidationIgnoresLateResponse(
+            .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"]))
+        )
+    }
+
+    func testSubmissionDuringBlockedAutomaticValidationIgnoresLateFailure() async throws {
+        try await assertSubmissionDuringBlockedAutomaticValidationIgnoresLateResponse(
+            .failure(FakeLocalizedError(message: "Late saved-source validation failure."))
+        )
+    }
+
+    func testStalePreparationDeferDoesNotClearNewRestoreOwner() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "restore-owner-replaced"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(task: taskIdentity, variantID: "h264")
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(
+            playbackIdentity,
+            checkpoint: ClientPlaybackCheckpoint(
+                identity: playbackIdentity,
+                positionSeconds: 12,
+                durationSeconds: 120
+            ))
+        let initialTask = CacheTask.playableFixture(id: taskIdentity.taskID)
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [taskIdentity.taskID: Array(repeating: .success(initialTask), count: 8)]
+        )
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        guard
+            await waitForResumptionPhase(
+                "restore-owner bootstrap", model: model, client: client,
+                until: {
+                    await client.watchSubscriptionCountSnapshot() == 1
+                })
+        else { return }
+
+        await client.setSuspendsServerInfoResponses(true)
+        let preparation = ResumptionTestOperation {
+            await model.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+        }
+        guard
+            await waitForResumptionPhase(
+                "older preparation held", model: model, client: client, operations: [preparation],
+                until: {
+                    let pending = await client.pendingResumptionResponseCountsSnapshot()
+                    return pending.serverInfo == 1 && model.isRestoringTask
+                })
+        else { return }
+
+        let restore = ResumptionTestOperation {
+            await model.retrySavedTask(serverAddressText: endpoint.displayAddress)
+            return nil
+        }
+        guard
+            await waitForResumptionPhase(
+                "new restore owns restoring state", model: model, client: client, operations: [restore],
+                until: {
+                    let pending = await client.pendingResumptionResponseCountsSnapshot()
+                    return pending.serverInfo == 2 && model.isRestoringTask
+                })
+        else { return }
+        let newRestoreMessage = model.resumptionMessage
+
+        await client.completeNextServerInfo(with: .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"])))
+        guard
+            await waitForResumptionPhase(
+                "older preparation returns without releasing new owner", model: model, client: client,
+                operations: [preparation, restore],
+                until: {
+                    let pending = await client.pendingResumptionResponseCountsSnapshot()
+                    return preparation.isFinished && pending.serverInfo == 1
+                })
+        else { return }
+        XCTAssertNil(preparation.prepared)
+        XCTAssertTrue(model.isRestoringTask)
+        XCTAssertEqual(model.resumptionMessage, newRestoreMessage)
+        XCTAssertFalse(restore.isFinished)
+
+        await client.setSuspendsServerInfoResponses(false)
+        await client.completeNextServerInfo(with: .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"])))
+        guard
+            await waitForResumptionPhase(
+                "new restore completes", model: model, client: client, operations: [restore],
+                until: {
+                    restore.isFinished && !model.isRestoringTask
+                })
+        else { return }
+
+        XCTAssertEqual(model.currentTask?.id, taskIdentity.taskID)
+        XCTAssertTrue(model.canContinueSavedPlayback)
+        XCTAssertNil(model.resumptionMessage)
+    }
+
+    private func assertSubmissionDuringBlockedAutomaticValidationIgnoresLateResponse(
+        _ lateResponse: Result<CacheServerSummary, Error>
+    ) async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "restore-submit-replacement"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(task: taskIdentity, variantID: "h264")
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(playbackIdentity)
+        let initialTask = CacheTask.playableFixture(id: taskIdentity.taskID)
+        let changedSource = CachePlaybackSource(
+            itemID: taskIdentity.taskID,
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/\(taskIdentity.taskID)/changed.m3u8"
+        )
+        let changedTask = CacheTask.fixture(
+            id: taskIdentity.taskID,
+            state: "TASK_STATE_PLAYABLE",
+            downloadedBytes: 50,
+            totalBytes: 100,
+            playbackSource: changedSource
+        )
+        let replacementTask = CacheTask.fixture(
+            id: "replacement-task",
+            source: "BV1replacement",
+            state: "TASK_STATE_PREPARING"
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(replacementTask)],
+            getTaskResponses: [taskIdentity.taskID: [.success(initialTask), .success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1original",
+            resumptionStore: store,
+            clientFactory: { _ in client }
+        )
+        defer { model.clearTask() }
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        guard
+            await waitForResumptionPhase(
+                "submission-cancellation bootstrap", model: model, client: client,
+                until: {
+                    await client.watchSubscriptionCountSnapshot() == 1
+                })
+        else { return }
+
+        await client.setSuspendsServerInfoResponses(true)
+        await client.yield(changedTask)
+        guard
+            await waitForResumptionPhase(
+                "automatic validation held", model: model, client: client,
+                until: {
+                    let pending = await client.pendingResumptionResponseCountsSnapshot()
+                    return pending.serverInfo == 1 && model.isRestoringTask
+                        && model.currentTask?.playbackSource == changedSource
+                })
+        else { return }
+
+        model.sourceText = "BV1replacement"
+        await client.setSuspendsServerInfoResponses(false)
+        await model.submit(serverAddressText: endpoint.displayAddress)
+        XCTAssertEqual(model.currentTask?.id, replacementTask.id)
+        XCTAssertEqual(store.record?.task.taskID, replacementTask.id)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isRestoringTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertNil(model.resumptionMessage)
+        let acceptedStatus = model.statusMessage
+        let serverInfoCompletionBaseline = await client.serverInfoResponseCompletionCountSnapshot()
+
+        await client.completeNextServerInfo(with: lateResponse)
+        guard
+            await waitForResumptionPhase(
+                "late validation response resumed", model: model, client: client,
+                until: {
+                    await client.serverInfoResponseCompletionCountSnapshot() >= serverInfoCompletionBaseline + 1
+                })
+        else { return }
+        await Task.yield()
+
+        XCTAssertEqual(model.currentTask?.id, replacementTask.id)
+        XCTAssertEqual(store.record?.task.taskID, replacementTask.id)
+        XCTAssertEqual(model.statusMessage, acceptedStatus)
+        XCTAssertNil(model.resumptionMessage)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isRestoringTask)
     }
 
     func testStalePreparationAfterClearDoesNotOverwriteClearState() async throws {
@@ -6986,7 +7281,16 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                 })
         else { return }
         XCTAssertFalse(model.canContinueSavedPlayback, file: file, line: line)
+        XCTAssertTrue(model.isRestoringTask, file: file, line: line)
         XCTAssertEqual(store.record?.playback?.identity, playbackIdentity, file: file, line: line)
+        store.updatePlayback(
+            identity: playbackIdentity,
+            positionSeconds: 81,
+            durationSeconds: 240,
+            completed: true
+        )
+        let latestCheckpoint = try XCTUnwrap(store.record?.playback)
+        XCTAssertTrue(latestCheckpoint.completed, file: file, line: line)
 
         await client.yield(
             .fixture(
@@ -7008,6 +7312,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let heldTaskCount = await client.getTaskIDsSnapshot().count
         XCTAssertEqual(heldInfoCount, infoBaseline + 1, file: file, line: line)
         XCTAssertEqual(heldTaskCount, taskBaseline, file: file, line: line)
+        let heldPending = await client.pendingResumptionResponseCountsSnapshot()
+        XCTAssertEqual(heldPending.serverInfo, 1, file: file, line: line)
         XCTAssertFalse(model.canContinueSavedPlayback, file: file, line: line)
         await client.setSuspendsServerInfoResponses(false)
         await client.completeNextServerInfo(with: .success(.fixture(mediaBaseURIs: ["http://mac-mini.local:8080"])))
@@ -7020,6 +7326,28 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                 })
         else { return }
         XCTAssertEqual(model.canContinueSavedPlayback, !becomesUnplayable, file: file, line: line)
+        XCTAssertEqual(store.record?.playback, latestCheckpoint, file: file, line: line)
+
+        if !becomesUnplayable {
+            let url = try XCTUnwrap(freshSource.explicitHTTPURL)
+            let progressContext = PlayerPlaybackProgressContext(
+                endpoint: endpoint,
+                playbackURI: url.absoluteString,
+                libraryItemID: "",
+                variantID: "h264",
+                resumptionIdentity: playbackIdentity
+            )
+            model.finishPreparedResumption(
+                ClientPreparedResumption(
+                    url: url,
+                    progressContext: progressContext,
+                    checkpoint: latestCheckpoint
+                ),
+                didStartPlayback: true
+            )
+            XCTAssertEqual(model.statusMessage, "Playing Ready video.", file: file, line: line)
+            XCTAssertNil(model.resumptionMessage, file: file, line: line)
+        }
 
         if becomesUnplayable {
             XCTAssertTrue(model.resumptionMessage?.contains("not playable yet") == true, file: file, line: line)
@@ -7393,6 +7721,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var suspendsServerInfoResponses = false
     private var serverInfoRequestCount = 0
     private var serverInfoRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var serverInfoResponseCompletionCount = 0
     private var pendingServerInfoContinuations: [CheckedContinuation<CacheServerSummary, Error>] = []
     private let playbackSourceResponses: [String: CachePlaybackSource]
     private var playbackSourceRequests: [(itemID: String, variantID: String)] = []
@@ -7502,12 +7831,25 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         let ready = serverInfoRequestWaiters.filter { $0.count <= serverInfoRequestCount }
         serverInfoRequestWaiters.removeAll { $0.count <= serverInfoRequestCount }
         ready.forEach { $0.continuation.resume() }
-        if suspendsServerInfoResponses {
-            return try await withCheckedThrowingContinuation { continuation in
-                pendingServerInfoContinuations.append(continuation)
+        do {
+            let response: CacheServerSummary
+            if suspendsServerInfoResponses {
+                response = try await withCheckedThrowingContinuation { continuation in
+                    pendingServerInfoContinuations.append(continuation)
+                }
+            } else {
+                response = makeServerInfo()
             }
+            recordServerInfoResponseCompletion()
+            return response
+        } catch {
+            recordServerInfoResponseCompletion()
+            throw error
         }
-        return makeServerInfo()
+    }
+
+    private func recordServerInfoResponseCompletion() {
+        serverInfoResponseCompletionCount += 1
     }
 
     private func makeServerInfo() -> CacheServerSummary {
@@ -8035,6 +8377,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func serverInfoRequestCountSnapshot() -> Int {
         serverInfoRequestCount
+    }
+
+    func serverInfoResponseCompletionCountSnapshot() -> Int {
+        serverInfoResponseCompletionCount
     }
 
     func pendingResumptionResponseCountsSnapshot() -> (serverInfo: Int, getTask: Int) {

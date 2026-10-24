@@ -442,6 +442,11 @@ private enum SavedPlaybackPreparationFence {
     case selectedSourceChanged
 }
 
+private enum SavedRestoringOperationOwner: Equatable {
+    case taskRestore(Int)
+    case playbackValidation(Int)
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     public static let playbackTranscodingPreferenceDefaultsKey = "BilibiliPlaybackTranscodingPreference"
@@ -554,6 +559,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var restoreAttemptIdentity: ClientResumptionTaskIdentity?
     private var restoreGeneration = 0
     private var savedPlaybackValidationGeneration = 0
+    private var savedRestoringOperationOwner: SavedRestoringOperationOwner?
     private var savedPlaybackValidationTask: Task<Void, Never>?
     private var validatedSavedPlayback: ClientPreparedResumption?
     private var validatedSavedPlaybackSignature: SavedPlaybackObservationSignature?
@@ -1186,9 +1192,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private func invalidateSavedPlaybackValidation(clearCached: Bool = false) {
+        let owner = SavedRestoringOperationOwner.playbackValidation(savedPlaybackValidationGeneration)
         savedPlaybackValidationGeneration += 1
         savedPlaybackValidationTask?.cancel()
         savedPlaybackValidationTask = nil
+        finishSavedRestoringOperation(owner)
         if clearCached {
             clearValidatedSavedPlayback()
             lastSavedPlaybackValidationTrigger = nil
@@ -1198,6 +1206,33 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private func clearValidatedSavedPlayback() {
         validatedSavedPlayback = nil
         validatedSavedPlaybackSignature = nil
+    }
+
+    private func beginSavedRestoringOperation(_ owner: SavedRestoringOperationOwner) {
+        savedRestoringOperationOwner = owner
+        isRestoringTask = true
+    }
+
+    private func finishSavedRestoringOperation(_ owner: SavedRestoringOperationOwner) {
+        guard savedRestoringOperationOwner == owner else { return }
+        savedRestoringOperationOwner = nil
+        isRestoringTask = false
+    }
+
+    private func latestPreparedResumption(_ prepared: ClientPreparedResumption) -> ClientPreparedResumption? {
+        guard let record = resumptionStore?.record,
+            record.task == prepared.checkpoint.identity.task,
+            let checkpoint = record.playback,
+            checkpoint.identity == prepared.checkpoint.identity,
+            prepared.progressContext.resumptionIdentity == checkpoint.identity
+        else {
+            return nil
+        }
+        return ClientPreparedResumption(
+            url: prepared.url,
+            progressContext: prepared.progressContext,
+            checkpoint: checkpoint
+        )
     }
 
     private func invalidateSavedRestore(message: String?) {
@@ -1226,7 +1261,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
             taskSnapshotGeneration += 1
         }
         restoreAttemptIdentity = nil
-        isRestoringTask = false
+        if let owner = savedRestoringOperationOwner {
+            finishSavedRestoringOperation(owner)
+        }
         resumptionMessage = message
     }
 
@@ -1238,6 +1275,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         restoreGeneration == generation
             && operationSequence == sequence
             && restoreAttemptIdentity == identity
+            && savedRestoringOperationOwner == .taskRestore(generation)
             && resumptionStore?.record?.task == identity
             && isRestoringTask
             && !Task.isCancelled
@@ -1310,13 +1348,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         errorMessage = nil
         retryIntent = nil
         clearResolutionSession()
-        isRestoringTask = true
+        let owner = SavedRestoringOperationOwner.taskRestore(generation)
+        beginSavedRestoringOperation(owner)
         resumptionMessage = "Checking the saved Bilibili task..."
         statusMessage = "Restoring saved Bilibili task..."
 
         defer {
+            finishSavedRestoringOperation(owner)
             if restoreGeneration == generation {
-                isRestoringTask = false
                 restoreAttemptIdentity = nil
             }
         }
@@ -1369,9 +1408,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
                         return
                     }
-                    guard resumptionStore?.record?.playback == checkpoint else {
+                    guard let latestPrepared = latestPreparedResumption(prepared) else {
                         resumptionMessage =
-                            "The saved playback checkpoint changed during restore. Retry the saved task."
+                            "The saved playback identity changed during restore. Retry the saved task."
                         return
                     }
                     guard let currentTask,
@@ -1386,7 +1425,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                         resumptionMessage = "The selected saved source changed during restore. Retry the saved task."
                         return
                     }
-                    validatedSavedPlayback = prepared
+                    validatedSavedPlayback = latestPrepared
                     validatedSavedPlaybackSignature = currentSignature
                     rememberSavedPlaybackValidationAttempt(for: currentTask, taskIdentity: record.task)
                     resumptionMessage = nil
@@ -1450,10 +1489,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return nil
         }
 
-        savedPlaybackValidationGeneration += 1
+        invalidateSavedPlaybackValidation()
         let validationGeneration = savedPlaybackValidationGeneration
-        savedPlaybackValidationTask?.cancel()
-        savedPlaybackValidationTask = nil
         return await runSavedPlaybackPreparation(record, validationGeneration: validationGeneration)
     }
 
@@ -1470,7 +1507,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         guard let record = resumptionStore?.record,
             let checkpoint = record.playback,
-            checkpoint == prepared.checkpoint,
+            checkpoint.identity == prepared.checkpoint.identity,
             checkpoint.identity.task == record.task,
             prepared.progressContext.resumptionIdentity == checkpoint.identity,
             prepared.progressContext.endpoint == record.task.endpoint,
@@ -1507,14 +1544,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let restoreGeneration = self.restoreGeneration
         let operation = operationSequence
-        isRestoringTask = true
+        let owner = SavedRestoringOperationOwner.playbackValidation(validationGeneration)
+        beginSavedRestoringOperation(owner)
         resumptionMessage = "Rechecking the saved playback source..."
         defer {
-            if validationGeneration == savedPlaybackValidationGeneration,
-                restoreGeneration == self.restoreGeneration
-            {
-                isRestoringTask = false
-            }
+            finishSavedRestoringOperation(owner)
         }
 
         let client = clientFactory(record.task.endpoint)
@@ -1577,11 +1611,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return nil
             }
 
-            validatedSavedPlayback = prepared
+            guard let latestPrepared = latestPreparedResumption(prepared) else { return nil }
+            validatedSavedPlayback = latestPrepared
             validatedSavedPlaybackSignature = initialSignature
             rememberSavedPlaybackValidationAttempt(for: observedTask, taskIdentity: record.task)
             resumptionMessage = nil
-            return prepared
+            return latestPrepared
         } catch {
             guard
                 isSavedPlaybackPreparationOperationCurrent(
@@ -1669,11 +1704,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         restoreGeneration: Int,
         operation: Int
     ) -> Bool {
-        validationGeneration == savedPlaybackValidationGeneration
+        guard let playbackIdentity = record.playback?.identity else { return false }
+        return validationGeneration == savedPlaybackValidationGeneration
             && restoreGeneration == self.restoreGeneration
             && operation == operationSequence
+            && savedRestoringOperationOwner == .playbackValidation(validationGeneration)
             && !Task.isCancelled
-            && resumptionStore?.record == record
+            && resumptionStore?.record?.task == record.task
+            && resumptionStore?.record?.playback?.identity == playbackIdentity
             && currentTask?.id == record.task.taskID
             && activeEndpoint == record.task.endpoint
             && activeServerID == record.task.serverID
@@ -1775,8 +1813,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         lastSavedPlaybackValidationTrigger = trigger
-        savedPlaybackValidationTask?.cancel()
-        savedPlaybackValidationGeneration += 1
+        invalidateSavedPlaybackValidation()
         let generation = savedPlaybackValidationGeneration
         savedPlaybackValidationTask = Task { [weak self] in
             guard let self else { return }
@@ -2084,6 +2121,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         operationSequence += 1
         invalidateSavedPlaybackValidation(clearCached: true)
+        if let owner = savedRestoringOperationOwner {
+            finishSavedRestoringOperation(owner)
+        }
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
@@ -2735,6 +2775,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isSubmitting = false
         isResolving = false
         isCancelling = false
+        savedRestoringOperationOwner = nil
         isRestoringTask = false
         clearResolutionSession()
         stopWatching()

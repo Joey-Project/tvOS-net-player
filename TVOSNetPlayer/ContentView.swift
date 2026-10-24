@@ -1043,8 +1043,22 @@ struct ContentView: View {
     private var playerSurface: some View {
         Group {
             if let player = model.player {
-                VideoPlayer(player: player)
-                    .id(model.loadedURL)
+                if model.isPlaybackPositionUnrestored {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(.white.opacity(0.08))
+                        if model.playbackState == .buffering {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Playback position pending")
+                    .accessibilityIdentifier("player-resume-pending")
+                } else {
+                    VideoPlayer(player: player)
+                        .id(model.loadedURL)
+                }
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8)

@@ -1076,7 +1076,20 @@ struct ContentView: View {
     private var playerSurface: some View {
         Group {
             if let player = model.player {
-                MacOSNativePlayerView(player: player)
+                if model.isPlaybackPositionUnrestored {
+                    ZStack {
+                        if model.playbackState == .buffering {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Playback position pending")
+                    .accessibilityIdentifier("player-resume-pending")
+                } else {
+                    MacOSNativePlayerView(player: player)
+                }
             } else {
                 ContentUnavailableView("No Stream Loaded", systemImage: "play.rectangle")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

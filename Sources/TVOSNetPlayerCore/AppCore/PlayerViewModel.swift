@@ -242,6 +242,10 @@ public final class PlayerViewModel: ObservableObject {
         player != nil
     }
 
+    public var isPlaybackPositionUnrestored: Bool {
+        isCurrentResumePositionUnrestored
+    }
+
     public var playbackState: PlayerPlaybackState {
         let item = player?.currentItem
         if let pendingPlaybackResume, pendingPlaybackResume.player === player,
@@ -455,6 +459,8 @@ public final class PlayerViewModel: ObservableObject {
                 queueCurrentPlaybackProgressReport(intent: intent)
                 statusMessage =
                     intent == .playing ? "Playing \(loadedURL?.absoluteString ?? "stream")." : "Playback paused."
+            } else if intent == .paused {
+                handlePlaybackPause(using: controller, reportsProgress: true)
             }
             return
         }
@@ -1015,17 +1021,21 @@ public final class PlayerViewModel: ObservableObject {
         guard let item = player.currentItem else { return }
         playbackResumeObserver = player.publisher(for: \.timeControlStatus)
             .sink { [weak self, weak player, weak item] status in
-                guard status == .playing else {
+                guard status == .playing || status == .paused else {
                     return
                 }
 
                 Task { @MainActor [weak self, weak player, weak item] in
                     guard let self, let player, let item,
-                        self.player === player, player.currentItem === item, player.timeControlStatus == .playing
+                        self.player === player, player.currentItem === item, player.timeControlStatus == status
                     else {
                         return
                     }
-                    self.handlePlaybackResume(using: player)
+                    if status == .playing {
+                        self.handlePlaybackResume(using: player)
+                    } else {
+                        self.handlePlaybackPause(using: player)
+                    }
                 }
             }
     }
@@ -1045,6 +1055,34 @@ public final class PlayerViewModel: ObservableObject {
             }
         }
         handlePlaybackTimeJump(using: controller)
+    }
+
+    func handlePlaybackPause(
+        using controller: (any PlayerPlaybackControlling)?,
+        reportsProgress: Bool = false
+    ) {
+        guard let controller, let item = controller.currentItem,
+            player?.currentItem === item,
+            let activeController = playbackController,
+            activeController === controller,
+            controller.timeControlStatus == .paused,
+            !isCurrentResumePositionUnrestored
+        else {
+            return
+        }
+
+        let position = controller.currentTime().seconds
+        guard position.isFinite, position >= 0 else { return }
+        if reportsProgress {
+            checkpointPlayback()
+            queuePlaybackProgressReport(
+                positionSeconds: position,
+                durationSeconds: Self.playbackDurationSeconds(controller.itemDuration),
+                intent: .paused
+            )
+        } else {
+            checkpointPlayback()
+        }
     }
 
     private func observePlaybackTimeJumps(for item: AVPlayerItem?) {
