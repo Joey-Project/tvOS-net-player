@@ -160,7 +160,7 @@ just test-lan-playback
 
 ## LAN Cache Server
 
-HLS 前台读取与后台整片填充分开选择传输粒度：建立原有 512 KiB 启动身份后，前台按最多约 64 KiB 的小 Range 获取当前需要的字节，后台继续使用较大的逻辑块补齐缺口。两者共享经过验证的缓存，保留原有 ETag、跨 CDN 抽样、取消、配额和抢占规则；截断响应不会作为有效缓存交付。首次启动和跨 CDN 身份验证仍可能需要较大读取，64 KiB 不是端到端响应时间保证。小块合并保持有界，不修改 gRPC 或持久化 schema。设计与验证边界见 [foreground Range cache journal](docs/project_journal/2026/10/2026-10-24-foreground-range-cache-foundation-b46393.md)；这项基础改造不单独证明原生 ABR 降档和恢复已通过。
+HLS 前台读取与后台整片填充分开选择传输粒度：建立原有 512 KiB 启动身份后，前台按最多约 64 KiB 的小 Range 获取当前需要的字节，后台继续使用较大的逻辑块补齐缺口。已验证的连续缓存使用独立、有界的较大交付窗口，避免每个小请求都重新哈希整个大块；缓存未命中时不等待大窗口下载。两者共享经过验证的缓存，保留原有 ETag、跨 CDN 抽样、取消、配额和抢占规则；截断响应不会作为有效缓存交付。首次启动和跨 CDN 身份验证仍可能需要较大读取，64 KiB 不是端到端响应时间保证。小块合并保持有界，不修改 gRPC 或持久化 schema。设计与验证边界见 [foreground Range cache journal](docs/project_journal/2026/10/2026-10-24-foreground-range-cache-foundation-b46393.md)；这项基础改造不单独证明原生 ABR 降档和恢复已通过。
 
 cache server 默认只监听本机 loopback，适合本机开发：
 

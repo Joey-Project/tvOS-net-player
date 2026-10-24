@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -74,6 +74,7 @@ const HLS_TRANSCODING_TEMP_FILE_SUFFIX: &str = ".transcode.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
 const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const RANGE_MAINTENANCE_PASSES_PER_ATTEMPT: usize = 8;
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -125,8 +126,11 @@ pub(crate) struct HlsCacheStore {
     cdn_history: Arc<CdnHistory>,
     range_cache: Arc<HlsRangeCache>,
     range_checkpoint_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::Mutex<()>>>>>,
+    range_maintenance_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::RwLock<()>>>>>,
     #[cfg(test)]
     remove_session_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    range_hash_bytes_read: Arc<AtomicU64>,
 }
 
 pub(crate) struct HlsCacheSessionDirectoryScan {
@@ -256,8 +260,11 @@ impl HlsCacheStore {
             cdn_history: Arc::new(CdnHistory::default()),
             range_cache: Arc::new(HlsRangeCache::new(2, 0)),
             range_checkpoint_locks: Arc::new(Mutex::new(HashMap::new())),
+            range_maintenance_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             remove_session_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            range_hash_bytes_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -334,6 +341,75 @@ impl HlsCacheStore {
             .await
     }
 
+    pub(crate) async fn read_resource_range_prefix(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        requested: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, HlsRangeError> {
+        let _active = self
+            .range_cache
+            .enter(session_id, HlsRangePriority::Foreground)?;
+        if requested.start >= requested.end {
+            return Err(HlsRangeError::InvalidResponse(
+                "requested HLS range is empty or reversed".to_owned(),
+            ));
+        }
+        let _key = self.range_resource_key(session_id, resource)?;
+        let limit = requested
+            .start
+            .saturating_add(RANGE_MAX_CHUNK_BYTES)
+            .min(requested.end);
+        let cached = self.cached_resource(session_id, &resource.id);
+        let (total, extents) = if let Some(cached) = cached.as_ref() {
+            (cached.total_length, None)
+        } else {
+            let Some(loaded) = self.load_range_manifest(session_id, resource)? else {
+                return Ok(None);
+            };
+            let Some(total) = loaded.manifest.total_length else {
+                return Ok(None);
+            };
+            (total, Some(loaded.manifest.extents))
+        };
+        if requested.end > total {
+            return Err(HlsRangeError::InvalidResponse(
+                "requested HLS range exceeds the cached resource".to_owned(),
+            ));
+        }
+
+        let end = if cached.is_some() {
+            limit
+        } else {
+            let extents = extents.as_deref().ok_or(HlsRangeError::IdentityChanged)?;
+            let mut cursor = requested.start;
+            for extent in extents {
+                if extent.end <= cursor {
+                    continue;
+                }
+                if extent.start > cursor {
+                    break;
+                }
+                cursor = extent.end.min(limit);
+                if cursor == limit {
+                    break;
+                }
+            }
+            if cursor == requested.start {
+                return Ok(None);
+            }
+            cursor
+        };
+        if end <= requested.start {
+            return Ok(None);
+        }
+        let range = requested.start..end;
+        let Some(bytes) = self.read_durable_range(session_id, resource, range).await? else {
+            return Ok(None);
+        };
+        Ok(Some(bytes))
+    }
+
     #[cfg(test)]
     pub(crate) async fn fill_missing_resource_ranges<F>(
         &self,
@@ -378,6 +454,11 @@ impl HlsCacheStore {
     ) -> Result<Option<PersistedRangeManifest>, HlsRangeError> {
         self.load_range_manifest(session_id, resource)
             .map(|loaded| loaded.map(|loaded| loaded.manifest))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn range_cache_for_test(&self) -> &Arc<HlsRangeCache> {
+        &self.range_cache
     }
 
     pub(crate) fn save_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
@@ -2332,6 +2413,189 @@ impl HlsCacheStore {
         lock
     }
 
+    fn range_maintenance_lock(&self, key: &RangeResourceKey) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self
+            .range_maintenance_locks
+            .lock()
+            .expect("HLS range maintenance lock registry poisoned");
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn acquire_range_read_admission<F>(
+        &self,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        control: &F,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        let lock = self.range_maintenance_lock(&key.resource);
+        let acquire = lock.read_owned();
+        tokio::pin!(acquire);
+        loop {
+            self.range_cache
+                .check_priority_control(key, priority, control)?;
+            tokio::select! {
+                guard = &mut acquire => return Ok(guard),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    async fn acquire_range_write_admission<F>(
+        &self,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        control: &F,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        let lock = self.range_maintenance_lock(&key.resource);
+        let acquire = lock.write_owned();
+        tokio::pin!(acquire);
+        loop {
+            self.range_cache
+                .check_priority_control(key, priority, control)?;
+            tokio::select! {
+                guard = &mut acquire => return Ok(guard),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    fn range_hash_bytes_counter(&self) -> Option<&AtomicU64> {
+        #[cfg(test)]
+        {
+            Some(self.range_hash_bytes_read.as_ref())
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    async fn compact_one_complete_range_parent<F>(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        chunk_key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        control: &F,
+        force_drain: bool,
+    ) -> Result<bool, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        if !force_drain {
+            let Some(loaded) = self.load_range_manifest(session_id, resource)? else {
+                return Ok(false);
+            };
+            let Some(total) = loaded.manifest.total_length else {
+                return Ok(false);
+            };
+            if first_complete_parent_compaction(&loaded.manifest.extents, total, None).is_none() {
+                return Ok(false);
+            }
+        }
+
+        let _admission = self
+            .acquire_range_write_admission(chunk_key, priority, control)
+            .await?;
+        if self.range_cache.active_flight_count(&chunk_key.resource) != 0 {
+            return Ok(false);
+        }
+        let publication_lock = self.range_publication_lock(&chunk_key.resource);
+        let _publication = publication_lock.lock().await;
+        let Some(loaded) = self.load_range_manifest(session_id, resource)? else {
+            return Ok(false);
+        };
+        let Some(total) = loaded.manifest.total_length else {
+            return Ok(false);
+        };
+        let Some(merged_range) =
+            first_complete_parent_compaction(&loaded.manifest.extents, total, None)
+        else {
+            return Ok(false);
+        };
+        self.range_cache
+            .check_priority_control(chunk_key, priority, control)?;
+
+        let data_path = self.data_path_for_manifest(session_id, resource, &loaded.manifest)?;
+        self.reject_cache_path_symlink(&data_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        let mut data = open_range_file(&mut options, &data_path)?;
+        let metadata = data.metadata()?;
+        let data_identity = file_object_identity(&metadata);
+        if loaded.manifest.data_identity.as_deref() != Some(data_identity.as_str()) {
+            return Err(identity_error_at("maintenance-data-object"));
+        }
+        let merged_sha256 = hash_verified_merged_range(
+            &mut data,
+            &merged_range,
+            &loaded.manifest.extents,
+            (&(0..0), &[]),
+            &[],
+            metadata.len(),
+            self.range_hash_bytes_counter(),
+        )?;
+        self.range_cache
+            .check_priority_control(chunk_key, priority, control)?;
+        let final_metadata = data.metadata()?;
+        if file_object_identity(&final_metadata) != data_identity
+            || final_metadata.len() < metadata.len()
+            || !self.range_data_object_is_still_bound(session_id, resource, &data_identity)?
+        {
+            return Err(identity_error_at("maintenance-data-object-replaced"));
+        }
+
+        let (mut extents, compacted) =
+            coalesce_selected_range(loaded.manifest.extents.clone(), &merged_range);
+        if !compacted {
+            return Ok(false);
+        }
+        let merged_extent = extents
+            .iter_mut()
+            .find(|extent| extent.start == merged_range.start && extent.end == merged_range.end)
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        merged_extent.sha256 = merged_sha256;
+        let mut manifest = loaded.manifest.clone();
+        manifest.generation = manifest
+            .generation
+            .checked_add(1)
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        manifest.extents = extents;
+        manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
+        ensure_range_manifest_capacity(&manifest)?;
+        validate_range_manifest(&manifest, resource)?;
+
+        let path = self.resource_range_manifest_path(session_id, &resource.id)?;
+        let latest = self
+            .load_range_manifest(session_id, resource)?
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        if latest.file_identity != loaded.file_identity
+            || latest.bytes_digest != loaded.bytes_digest
+            || !range_manifest_rebase_compatible(&loaded.manifest, &latest.manifest)
+        {
+            return Err(identity_error_at("maintenance-checkpoint-content"));
+        }
+        self.write_json_atomically(&path, &manifest)?;
+        sync_directory(path.parent().ok_or_else(|| {
+            HlsRangeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cache path",
+            ))
+        })?)?;
+        Ok(true)
+    }
+
     fn range_managed_size(&self, session_id: &str, resource_id: &str) -> io::Result<u64> {
         // Charge staged media files only; sparse file length is conservative quota usage, never progress.
         let mut total = 0_u64;
@@ -2537,19 +2801,20 @@ impl HlsCacheStore {
         manifest: &PersistedRangeManifest,
     ) -> Result<PathBuf, HlsRangeError> {
         let partial = self.resource_range_data_path(session_id, &resource.id)?;
-        match safe_file_identity(self, &partial)? {
+        let partial_replaced = match safe_file_identity(self, &partial)? {
             Some(identity) if Some(identity.as_str()) == manifest.data_identity.as_deref() => {
                 return Ok(partial);
             }
-            Some(_) => {}
-            None => {}
-        }
+            Some(_) => true,
+            None => false,
+        };
         let final_path = self.resource_path(session_id, &resource.id)?;
         match safe_file_identity(self, &final_path)? {
             Some(identity) if Some(identity.as_str()) == manifest.data_identity.as_deref() => {
                 Ok(final_path)
             }
             Some(_) => Err(identity_error_at("completed-path-not-regular")),
+            None if partial_replaced => Err(identity_error_at("partial-data-object-replaced")),
             None => Err(HlsRangeError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "checkpoint data is missing",
@@ -2727,31 +2992,66 @@ impl HlsCacheStore {
         if gaps.is_empty() {
             for extent in &loaded.manifest.extents {
                 if extent.start < range.end && range.start < extent.end {
-                    verify_extent_bytes(&mut data, extent, &range, bytes, opened_metadata.len())?;
+                    verify_extent_bytes(
+                        &mut data,
+                        extent,
+                        &range,
+                        bytes,
+                        opened_metadata.len(),
+                        None,
+                        self.range_hash_bytes_counter(),
+                    )?;
                 }
             }
             return Ok(loaded.manifest.durable_bytes);
         }
 
-        let (mut extents, merged_ranges) = if can_compact {
-            coalesce_range_extents(extents, total, &range)
+        extents.sort_by_key(|extent| extent.start);
+        let merged_range = if can_compact {
+            first_complete_parent_compaction(&extents, total, Some(&range))
         } else {
-            (extents, Vec::new())
+            None
+        };
+        let (extents, compacted) = if let Some(merged_range) = merged_range.as_ref() {
+            coalesce_selected_range(extents, merged_range)
+        } else {
+            (extents, false)
+        };
+        let merged_sha256 = if compacted {
+            Some(hash_verified_merged_range(
+                &mut data,
+                merged_range
+                    .as_ref()
+                    .ok_or(HlsRangeError::IdentityChanged)?,
+                &loaded.manifest.extents,
+                (&range, bytes),
+                &gaps,
+                opened_metadata.len(),
+                self.range_hash_bytes_counter(),
+            )?)
+        } else {
+            None
         };
         for extent in &loaded.manifest.extents {
             let overlaps_incoming = extent.start < range.end && range.start < extent.end;
-            let participates_in_merge = merged_ranges
-                .iter()
-                .any(|merged| merged.start <= extent.start && extent.end <= merged.end);
-            if overlaps_incoming || participates_in_merge {
-                verify_extent_bytes(&mut data, extent, &range, bytes, opened_metadata.len())?;
+            let participates_in_merge = merged_range
+                .as_ref()
+                .is_some_and(|merged| merged.start <= extent.start && extent.end <= merged.end);
+            if overlaps_incoming && !participates_in_merge {
+                verify_extent_bytes(
+                    &mut data,
+                    extent,
+                    &range,
+                    bytes,
+                    opened_metadata.len(),
+                    None,
+                    self.range_hash_bytes_counter(),
+                )?;
             }
         }
         if !self.range_data_object_is_still_bound(session_id, resource, &data_identity)? {
             return Err(identity_error_at("extent-data-object-replaced").into());
         }
-
-        extents.sort_by_key(|extent| extent.start);
 
         let prefix_length = if range.start == 0 {
             bytes.len().min(RANGE_STARTUP_CHUNK_BYTES as usize) as u64
@@ -2805,26 +3105,39 @@ impl HlsCacheStore {
                 .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
             let end = usize::try_from(gap.end - range.start)
                 .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
-            if hash_file_range(&mut data, gap.clone())? != sha256_hex(&bytes[start..end]) {
+            if hash_file_range(&mut data, gap.clone(), self.range_hash_bytes_counter())?
+                != sha256_hex(&bytes[start..end])
+            {
                 return Err(identity_error_at("extent-write-content").into());
             }
         }
         for old in &loaded.manifest.extents {
             let overlaps_incoming = old.start < range.end && range.start < old.end;
-            let participates_in_merge = merged_ranges
-                .iter()
-                .any(|merged| merged.start <= old.start && old.end <= merged.end);
+            let participates_in_merge = merged_range
+                .as_ref()
+                .is_some_and(|merged| merged.start <= old.start && old.end <= merged.end);
             if overlaps_incoming || participates_in_merge {
-                verify_extent_bytes(&mut data, old, &range, bytes, written_length)?;
+                verify_extent_bytes(
+                    &mut data,
+                    old,
+                    &range,
+                    bytes,
+                    written_length,
+                    None,
+                    self.range_hash_bytes_counter(),
+                )?;
             }
         }
-        for merged in &merged_ranges {
+        if compacted {
+            let merged = merged_range
+                .as_ref()
+                .ok_or(HlsRangeError::IdentityChanged)?;
             let extent = manifest
                 .extents
                 .iter_mut()
                 .find(|extent| extent.start == merged.start && extent.end == merged.end)
                 .ok_or(HlsRangeError::IdentityChanged)?;
-            extent.sha256 = hash_file_range(&mut data, merged.clone())?;
+            extent.sha256 = merged_sha256.ok_or(HlsRangeError::IdentityChanged)?;
         }
         let final_metadata = data.metadata()?;
         if file_object_identity(&final_metadata) != data_identity
@@ -3516,6 +3829,9 @@ impl HlsCacheStore {
                     .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
                 file.seek(SeekFrom::Start(cursor))?;
                 file.read_exact(&mut chunk[..count])?;
+                if let Some(read_counter) = self.range_hash_bytes_counter() {
+                    read_counter.fetch_add(count as u64, Ordering::Relaxed);
+                }
                 let chunk_end = cursor + count as u64;
                 hasher.update(&chunk[..count]);
 
@@ -4156,10 +4472,13 @@ impl HlsCacheStore {
         let _reservation =
             self.range_cache
                 .reserve(resource_key.clone(), range.end, current_length, usage)?;
+        let mut maintenance_passes = 0;
         loop {
             self.range_cache
                 .check_priority_control(&chunk_key, priority, control)?;
-            // Claims serialize with compaction; fetch_range_chunk snapshots only after the claim.
+            let admission = self
+                .acquire_range_read_admission(&chunk_key, priority, control)
+                .await?;
             let publication_lock = self.range_publication_lock(resource_key);
             let (flight, already_covered) = {
                 let _publication = publication_lock.lock().await;
@@ -4179,6 +4498,7 @@ impl HlsCacheStore {
                 }
             };
             if already_covered {
+                drop(admission);
                 if self
                     .read_durable_range(session_id, resource, range.clone())
                     .await?
@@ -4190,7 +4510,7 @@ impl HlsCacheStore {
             }
             let flight = flight.ok_or(HlsRangeError::IdentityChanged)?;
             if flight.is_owner() {
-                let _permit = self
+                let permit = self
                     .range_cache
                     .acquire_chunk_permit(&chunk_key, priority, control)
                     .await?;
@@ -4200,9 +4520,11 @@ impl HlsCacheStore {
                     .is_some()
                 {
                     drop(flight);
+                    drop(admission);
+                    drop(permit);
                     return Ok(());
                 }
-                let (durable_bytes, (bytes, final_url, _, _, elapsed, _)) = self
+                let committed = self
                     .fetch_and_commit_range_extent(session_id, resource, range.clone(), || {
                         self.fetch_range_chunk(
                             client,
@@ -4214,12 +4536,36 @@ impl HlsCacheStore {
                             control,
                         )
                     })
-                    .await?;
+                    .await;
+                let (durable_bytes, (bytes, final_url, _, _, elapsed, _)) = match committed {
+                    Ok(committed) => committed,
+                    Err(HlsRangeError::QuotaExceeded)
+                        if maintenance_passes < RANGE_MAINTENANCE_PASSES_PER_ATTEMPT =>
+                    {
+                        drop(permit);
+                        drop(flight);
+                        drop(admission);
+                        self.compact_one_complete_range_parent(
+                            session_id, resource, &chunk_key, priority, control, true,
+                        )
+                        .await?;
+                        maintenance_passes += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        drop(permit);
+                        drop(flight);
+                        drop(admission);
+                        return Err(error);
+                    }
+                };
                 let file_length = self
                     .range_managed_size(session_id, &resource.id)
                     .map_err(HlsRangeError::Io)?;
                 self.range_cache.note_file_length(resource_key, file_length);
                 drop(flight);
+                drop(admission);
+                drop(permit);
                 progress(durable_bytes);
                 self.record_cdn_observation(
                     resource,
@@ -4232,6 +4578,27 @@ impl HlsCacheStore {
                         Some(true),
                     ),
                 );
+                let maintenance_budget = if priority == HlsRangePriority::Background {
+                    RANGE_MAINTENANCE_PASSES_PER_ATTEMPT
+                } else {
+                    1
+                };
+                for _ in 0..maintenance_budget {
+                    if self.range_cache.active_flight_count(resource_key) != 0 {
+                        break;
+                    }
+                    match self
+                        .compact_one_complete_range_parent(
+                            session_id, resource, &chunk_key, priority, control, false,
+                        )
+                        .await
+                    {
+                        Err(HlsRangeError::Cancelled | HlsRangeError::Preempted) => break,
+                        Err(error) => return Err(error),
+                        Ok(false) => break,
+                        Ok(true) => {}
+                    }
+                }
                 return Ok(());
             }
             tokio::select! {
@@ -4241,6 +4608,7 @@ impl HlsCacheStore {
                 }
             }
             drop(flight);
+            drop(admission);
         }
     }
 
@@ -6127,18 +6495,34 @@ fn planned_foreground_range_chunks(
     requested: &Range<u64>,
     extents: &[PersistedRangeExtent],
 ) -> Vec<(usize, Range<u64>)> {
+    planned_foreground_range_chunks_with_parent_visits(total, requested, extents).0
+}
+
+fn planned_foreground_range_chunks_with_parent_visits(
+    total: u64,
+    requested: &Range<u64>,
+    extents: &[PersistedRangeExtent],
+) -> (Vec<(usize, Range<u64>)>, usize) {
     let mut chunks = Vec::new();
-    for (parent_index, parent) in planned_range_chunks(total).into_iter().enumerate() {
-        if parent.start >= requested.end || requested.start >= parent.end {
-            continue;
-        }
+    if total == 0 || requested.start >= requested.end || requested.start >= total {
+        return (chunks, 0);
+    }
+    let requested_end = requested.end.min(total);
+    let mut parent_offset = requested.start;
+    let mut parent_visits = 0;
+    while parent_offset < requested_end {
+        let Some((parent_index, parent)) = logical_range_parent_with_index(total, parent_offset)
+        else {
+            break;
+        };
+        parent_visits += 1;
         let mut start = parent.start;
         while start < parent.end {
             let end = start
                 .saturating_add(RANGE_FOREGROUND_CHUNK_BYTES)
                 .min(parent.end);
             let chunk = start..end;
-            if chunk.start < requested.end
+            if chunk.start < requested_end
                 && requested.start < chunk.end
                 && !range_is_covered(extents, chunk.clone())
             {
@@ -6146,17 +6530,22 @@ fn planned_foreground_range_chunks(
             }
             start = end;
         }
+        parent_offset = parent.end;
     }
-    chunks
+    (chunks, parent_visits)
 }
 
 fn logical_range_parent(total: u64, offset: u64) -> Option<Range<u64>> {
+    logical_range_parent_with_index(total, offset).map(|(_, parent)| parent)
+}
+
+fn logical_range_parent_with_index(total: u64, offset: u64) -> Option<(usize, Range<u64>)> {
     if total == 0 || offset >= total {
         return None;
     }
     let first_end = total.min(RANGE_STARTUP_CHUNK_BYTES);
     if offset < first_end {
-        return Some(0..first_end);
+        return Some((0, 0..first_end));
     }
     let remaining = total - first_end;
     let parent_count = RANGE_MAX_CHUNKS.saturating_sub(1).max(1);
@@ -6165,48 +6554,189 @@ fn logical_range_parent(total: u64, offset: u64) -> Option<Range<u64>> {
         .clamp(RANGE_MIN_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES);
     let parent_index = (offset - first_end) / parent_size;
     let start = first_end.saturating_add(parent_index.saturating_mul(parent_size));
-    Some(start..start.saturating_add(parent_size).min(total))
+    Some((
+        usize::try_from(parent_index + 1).ok()?,
+        start..start.saturating_add(parent_size).min(total),
+    ))
 }
 
-fn coalesce_range_extents(
-    mut extents: Vec<PersistedRangeExtent>,
+fn parent_is_fully_covered(extents: &[PersistedRangeExtent], parent: &Range<u64>) -> bool {
+    let mut cursor = parent.start;
+    let first = extents.partition_point(|extent| extent.end <= cursor);
+    for extent in &extents[first..] {
+        if extent.start > cursor {
+            return false;
+        }
+        cursor = cursor.max(extent.end);
+        if cursor >= parent.end {
+            return true;
+        }
+    }
+    false
+}
+
+fn fragmented_extent_run_in_parent(
+    extents: &[PersistedRangeExtent],
+    parent: &Range<u64>,
+) -> Option<Range<u64>> {
+    if !parent_is_fully_covered(extents, parent) {
+        return None;
+    }
+    let mut index = extents.partition_point(|extent| extent.end <= parent.start);
+    while index < extents.len() && extents[index].start < parent.end {
+        let extent = &extents[index];
+        if extent.start < parent.start || extent.end > parent.end {
+            index += 1;
+            continue;
+        }
+        let start = extent.start;
+        let mut end = extent.end;
+        let mut next = index + 1;
+        while next < extents.len()
+            && extents[next].start == end
+            && extents[next].end <= parent.end
+            && extents[next].end.saturating_sub(start) <= RANGE_MAX_CHUNK_BYTES
+        {
+            end = extents[next].end;
+            next += 1;
+        }
+        if next > index + 1 {
+            return Some(start..end);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn first_complete_parent_compaction(
+    extents: &[PersistedRangeExtent],
     total: u64,
-    changed_range: &Range<u64>,
-) -> (Vec<PersistedRangeExtent>, Vec<Range<u64>>) {
-    extents.sort_by_key(|extent| extent.start);
-    let mut compacted: Vec<PersistedRangeExtent> = Vec::with_capacity(extents.len());
-    let mut merged_ranges: Vec<Range<u64>> = Vec::new();
-    for extent in extents {
-        let can_merge = compacted.last().is_some_and(|last| {
-            let parent = logical_range_parent(total, last.start);
-            last.end == extent.start
-                && parent.as_ref().is_some_and(|parent| {
-                    extent.end <= parent.end
-                        && parent.start < changed_range.end
-                        && changed_range.start < parent.end
-                        && extent.end.saturating_sub(last.start) <= RANGE_MAX_CHUNK_BYTES
-                })
-        });
-        if can_merge {
-            let last = compacted.last_mut().expect("merge target should exist");
-            last.end = extent.end;
-            last.sha256 = "0".repeat(64);
-            let extends_last_merge = merged_ranges
-                .last()
-                .is_some_and(|merged| merged.start == last.start && merged.end < last.end);
-            if extends_last_merge {
-                merged_ranges
-                    .last_mut()
-                    .expect("merge range should exist")
-                    .end = last.end;
-            } else {
-                merged_ranges.push(last.start..last.end);
+    intersecting: Option<&Range<u64>>,
+) -> Option<Range<u64>> {
+    if !range_size_is_resumable(total) {
+        return None;
+    }
+    if let Some(requested) = intersecting {
+        if requested.start >= requested.end || requested.start >= total {
+            return None;
+        }
+        let end = requested.end.min(total);
+        let mut offset = requested.start;
+        while offset < end {
+            let parent = logical_range_parent(total, offset)?;
+            if let Some(run) = fragmented_extent_run_in_parent(extents, &parent) {
+                return Some(run);
             }
+            offset = parent.end;
+        }
+        return None;
+    }
+
+    let mut index = 0;
+    while index + 1 < extents.len() {
+        let first = &extents[index];
+        let second = &extents[index + 1];
+        if first.end != second.start {
+            index += 1;
+            continue;
+        }
+        let parent = logical_range_parent(total, first.start)?;
+        if first.start < parent.start
+            || second.end > parent.end
+            || !parent_is_fully_covered(extents, &parent)
+        {
+            index += 1;
+            continue;
+        }
+        let start = first.start;
+        let mut end = second.end;
+        let mut next = index + 2;
+        while next < extents.len()
+            && extents[next].start == end
+            && extents[next].end <= parent.end
+            && extents[next].end.saturating_sub(start) <= RANGE_MAX_CHUNK_BYTES
+        {
+            end = extents[next].end;
+            next += 1;
+        }
+        return Some(start..end);
+    }
+    None
+}
+
+fn coalesce_selected_range(
+    extents: Vec<PersistedRangeExtent>,
+    selected: &Range<u64>,
+) -> (Vec<PersistedRangeExtent>, bool) {
+    let mut compacted = Vec::with_capacity(extents.len());
+    let mut inserted = false;
+    let mut removed = 0;
+    for extent in extents {
+        if extent.start >= selected.start && extent.end <= selected.end {
+            if !inserted {
+                compacted.push(PersistedRangeExtent {
+                    start: selected.start,
+                    end: selected.end,
+                    sha256: "0".repeat(64),
+                });
+                inserted = true;
+            }
+            removed += 1;
         } else {
             compacted.push(extent);
         }
     }
-    (compacted, merged_ranges)
+    (compacted, inserted && removed > 1)
+}
+
+fn hash_verified_merged_range(
+    file: &mut fs::File,
+    merged: &Range<u64>,
+    old_extents: &[PersistedRangeExtent],
+    incoming: (&Range<u64>, &[u8]),
+    gaps: &[Range<u64>],
+    file_length: u64,
+    read_counter: Option<&AtomicU64>,
+) -> Result<String, HlsRangeError> {
+    let (incoming_range, incoming_bytes) = incoming;
+    let mut hasher = Sha256::new();
+    let mut cursor = merged.start;
+    let mut old_index = old_extents.partition_point(|extent| extent.end <= cursor);
+    let mut gap_index = gaps.partition_point(|gap| gap.end <= cursor);
+    while cursor < merged.end {
+        if let Some(extent) = old_extents.get(old_index)
+            && extent.start == cursor
+            && extent.end <= merged.end
+        {
+            verify_extent_bytes(
+                file,
+                extent,
+                incoming_range,
+                incoming_bytes,
+                file_length,
+                Some(&mut hasher),
+                read_counter,
+            )?;
+            cursor = extent.end;
+            old_index += 1;
+            continue;
+        }
+        if let Some(gap) = gaps.get(gap_index)
+            && gap.start == cursor
+            && gap.end <= merged.end
+        {
+            let start = usize::try_from(gap.start - incoming_range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            let end = usize::try_from(gap.end - incoming_range.start)
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            hasher.update(&incoming_bytes[start..end]);
+            cursor = gap.end;
+            gap_index += 1;
+            continue;
+        }
+        return Err(identity_error_at("extent-merge-segment-gap"));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn verify_extent_bytes(
@@ -6215,6 +6745,8 @@ fn verify_extent_bytes(
     incoming_range: &Range<u64>,
     incoming_bytes: &[u8],
     file_length: u64,
+    mut merged_hasher: Option<&mut Sha256>,
+    read_counter: Option<&AtomicU64>,
 ) -> Result<(), HlsRangeError> {
     if extent.end > file_length {
         return Err(HlsRangeError::Io(io::Error::new(
@@ -6233,6 +6765,12 @@ fn verify_extent_bytes(
         file.read_exact(&mut buffer[..count])?;
         let chunk_end = cursor + count as u64;
         hasher.update(&buffer[..count]);
+        if let Some(merged_hasher) = merged_hasher.as_deref_mut() {
+            merged_hasher.update(&buffer[..count]);
+        }
+        if let Some(read_counter) = read_counter {
+            read_counter.fetch_add(count as u64, Ordering::Relaxed);
+        }
         let compare_start = cursor.max(overlap.start);
         let compare_end = chunk_end.min(overlap.end);
         if compare_start < compare_end {
@@ -6256,7 +6794,11 @@ fn verify_extent_bytes(
     Ok(())
 }
 
-fn hash_file_range(file: &mut fs::File, range: Range<u64>) -> Result<String, HlsRangeError> {
+fn hash_file_range(
+    file: &mut fs::File,
+    range: Range<u64>,
+    read_counter: Option<&AtomicU64>,
+) -> Result<String, HlsRangeError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; RANGE_FOREGROUND_CHUNK_BYTES as usize];
     let mut cursor = range.start;
@@ -6266,6 +6808,9 @@ fn hash_file_range(file: &mut fs::File, range: Range<u64>) -> Result<String, Hls
         file.seek(SeekFrom::Start(cursor))?;
         file.read_exact(&mut buffer[..count])?;
         hasher.update(&buffer[..count]);
+        if let Some(read_counter) = read_counter {
+            read_counter.fetch_add(count as u64, Ordering::Relaxed);
+        }
         cursor += count as u64;
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -10187,6 +10732,717 @@ mod tests {
         );
         assert!(!range_size_is_resumable(RANGE_MAX_SIZE + 1));
         assert!(!range_size_is_resumable(64 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn foreground_planner_matches_full_plan_and_visits_only_intersecting_parents() {
+        let total = RANGE_MAX_SIZE;
+        let plan = planned_range_chunks(total);
+        let ranges = [
+            (RANGE_STARTUP_CHUNK_BYTES - 32 * 1024)..(RANGE_STARTUP_CHUNK_BYTES + 32 * 1024),
+            (RANGE_STARTUP_CHUNK_BYTES + 100 * RANGE_MAX_CHUNK_BYTES - 32 * 1024)
+                ..(RANGE_STARTUP_CHUNK_BYTES + 100 * RANGE_MAX_CHUNK_BYTES + 32 * 1024),
+            (total - 17 * RANGE_MAX_CHUNK_BYTES)..total,
+            0..(RANGE_STARTUP_CHUNK_BYTES + 3 * RANGE_MAX_CHUNK_BYTES),
+        ];
+        let extents = vec![PersistedRangeExtent {
+            start: RANGE_STARTUP_CHUNK_BYTES + 100 * RANGE_MAX_CHUNK_BYTES,
+            end: RANGE_STARTUP_CHUNK_BYTES
+                + 100 * RANGE_MAX_CHUNK_BYTES
+                + RANGE_FOREGROUND_CHUNK_BYTES,
+            sha256: "0".repeat(64),
+        }];
+
+        for requested in ranges {
+            let expected = plan
+                .iter()
+                .enumerate()
+                .filter(|(_, parent)| parent.start < requested.end && requested.start < parent.end)
+                .flat_map(|(parent_index, parent)| {
+                    let mut chunks = Vec::new();
+                    let mut start = parent.start;
+                    while start < parent.end {
+                        let end = start
+                            .saturating_add(RANGE_FOREGROUND_CHUNK_BYTES)
+                            .min(parent.end);
+                        let chunk = start..end;
+                        if chunk.start < requested.end
+                            && requested.start < chunk.end
+                            && !range_is_covered(&extents, chunk.clone())
+                        {
+                            chunks.push((parent_index, chunk));
+                        }
+                        start = end;
+                    }
+                    chunks
+                })
+                .collect::<Vec<_>>();
+            let (actual, _) =
+                planned_foreground_range_chunks_with_parent_visits(total, &requested, &extents);
+            assert_eq!(expected, actual, "planner mismatch for {requested:?}");
+        }
+
+        let boundary = RANGE_STARTUP_CHUNK_BYTES + 100 * RANGE_MAX_CHUNK_BYTES;
+        let (_, visits) = planned_foreground_range_chunks_with_parent_visits(
+            total,
+            &(boundary - RANGE_FOREGROUND_CHUNK_BYTES / 2
+                ..boundary + RANGE_FOREGROUND_CHUNK_BYTES / 2),
+            &[],
+        );
+        assert!(visits <= 2, "64 KiB planning visited {visits} parents");
+    }
+
+    #[tokio::test]
+    async fn durable_range_prefix_preserves_session_admission_errors() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("prefix-retired", "https://cdn.example/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&session.id, &session.variant.video, 0..0)
+                .await,
+            Err(HlsRangeError::InvalidResponse(_))
+        ));
+
+        let unpublished = sample_session("prefix-unpublished", "https://cdn.example/video.m4s");
+        let publication = store
+            .range_cache
+            .begin_session_publication(&unpublished.id, SessionPublicationMode::Fresh)
+            .expect("fresh publication should close range admission");
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&unpublished.id, &unpublished.variant.video, 0..1)
+                .await,
+            Err(HlsRangeError::SessionRemoving)
+        ));
+        drop(publication);
+
+        store
+            .try_begin_session_removal(&session.id)
+            .expect("removal should be available")
+            .expect("no range activity should block removal")
+            .commit();
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&session.id, &session.variant.video, 0..0)
+                .await,
+            Err(HlsRangeError::SessionRemoving)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drained_flights_compact_old_complete_parent_and_reject_stale_snapshot() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("drained-parent-compact", "https://cdn.example/video.m4s");
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_MIN_CHUNK_BYTES;
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let resource = &session.variant.video;
+        let resource_key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let mut loaded = store
+            .ensure_range_manifest(&session.id, resource, &resource_key)
+            .expect("manifest should initialize");
+        let bytes = vec![0; total as usize];
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                0..RANGE_STARTUP_CHUNK_BYTES,
+                &bytes[..RANGE_STARTUP_CHUNK_BYTES as usize],
+                "https://cdn.example/video.m4s",
+                None,
+                None,
+            )
+            .await
+            .expect("startup range should publish");
+
+        let continue_fill = || HlsCacheFillControl::Continue;
+        let dummy_key = RangeChunkKey {
+            resource: resource_key.clone(),
+            total_length: total,
+            range: 0..1,
+        };
+        let dummy_admission = store
+            .acquire_range_read_admission(&dummy_key, HlsRangePriority::Foreground, &continue_fill)
+            .await
+            .expect("overlapping flight admission should succeed");
+        let dummy_flight = store
+            .range_cache
+            .claim_chunk(dummy_key.clone(), HlsRangePriority::Foreground)
+            .expect("overlapping flight should claim");
+        let first =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_MIN_CHUNK_BYTES / 2;
+        let second = first.end..total;
+        for range in [first.clone(), second.clone()] {
+            let chunk_key = RangeChunkKey {
+                resource: resource_key.clone(),
+                total_length: total,
+                range: range.clone(),
+            };
+            let admission = store
+                .acquire_range_read_admission(
+                    &chunk_key,
+                    HlsRangePriority::Foreground,
+                    &continue_fill,
+                )
+                .await
+                .expect("foreground flight admission should succeed");
+            let flight = store
+                .range_cache
+                .claim_chunk(chunk_key, HlsRangePriority::Foreground)
+                .expect("foreground flight should claim");
+            assert!(flight.is_owner());
+            loaded = store
+                .load_range_manifest(&session.id, resource)
+                .expect("current checkpoint should load")
+                .expect("current checkpoint should exist");
+            store
+                .commit_range_extent(
+                    &session.id,
+                    resource,
+                    &loaded.manifest,
+                    range.clone(),
+                    &bytes[range.start as usize..range.end as usize],
+                    "https://cdn.example/video.m4s",
+                    None,
+                    None,
+                )
+                .await
+                .expect("fragment should publish while another flight remains");
+            drop(flight);
+            drop(admission);
+        }
+        let stale = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("fragmented checkpoint should load")
+            .expect("fragmented checkpoint should exist");
+        assert_eq!(3, stale.extents.len());
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let cancel_while_waiting = {
+            let checks = Arc::clone(&checks);
+            move || {
+                if checks.fetch_add(1, Ordering::Relaxed) == 0 {
+                    HlsCacheFillControl::Continue
+                } else {
+                    HlsCacheFillControl::Cancel
+                }
+            }
+        };
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                store.compact_one_complete_range_parent(
+                    &session.id,
+                    resource,
+                    &dummy_key,
+                    HlsRangePriority::Foreground,
+                    &cancel_while_waiting,
+                    true,
+                ),
+            )
+            .await
+            .expect("cancelled maintenance should not hang"),
+            Err(HlsRangeError::Cancelled)
+        ));
+        let waiting_writer = store.acquire_range_write_admission(
+            &dummy_key,
+            HlsRangePriority::Foreground,
+            &continue_fill,
+        );
+        tokio::pin!(waiting_writer);
+        tokio::select! {
+            biased;
+            _ = &mut waiting_writer => panic!("held read admission must block maintenance"),
+            () = tokio::task::yield_now() => {}
+        }
+        let later_lock = store.range_maintenance_lock(&dummy_key.resource);
+        let later_reader = later_lock.read_owned();
+        tokio::pin!(later_reader);
+        tokio::select! {
+            biased;
+            _ = &mut waiting_writer => panic!("original flight still holds read admission"),
+            _ = &mut later_reader => panic!("new reader must not pass a queued maintenance writer"),
+            () = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+        drop(dummy_flight);
+        drop(dummy_admission);
+        let writer_guard = tokio::time::timeout(Duration::from_secs(1), &mut waiting_writer)
+            .await
+            .expect("queued writer should acquire after the old reader drains")
+            .expect("maintenance admission should succeed");
+        drop(writer_guard);
+        let reader_guard = tokio::time::timeout(Duration::from_secs(1), &mut later_reader)
+            .await
+            .expect("later reader should acquire after maintenance releases admission");
+        drop(reader_guard);
+
+        assert!(
+            store
+                .compact_one_complete_range_parent(
+                    &session.id,
+                    resource,
+                    &dummy_key,
+                    HlsRangePriority::Foreground,
+                    &continue_fill,
+                    false,
+                )
+                .await
+                .expect("drained maintenance should complete")
+        );
+        let compacted = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("compacted manifest should load")
+            .expect("compacted manifest should exist");
+        assert_eq!(2, compacted.extents.len());
+        assert!(matches!(
+            store
+                .commit_range_extent(
+                    &session.id,
+                    resource,
+                    &stale,
+                    first.clone(),
+                    &bytes[first.start as usize..first.end as usize],
+                    "https://cdn.example/video.m4s",
+                    None,
+                    None,
+                )
+                .await,
+            Err(HlsRangeError::IdentityChanged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn range_prefix_reads_eight_mib_once_and_rejects_tamper_and_replacement() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let total = RANGE_MAX_CHUNK_BYTES * 2;
+        let mut session = sample_session("range-prefix-proof", "https://cdn.example/video.m4s");
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let resource = &session.variant.video;
+        let key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&session.id, resource, &key)
+            .expect("manifest should initialize");
+        let bytes = vec![0; total as usize];
+
+        assert_eq!(
+            None,
+            store
+                .read_resource_range_prefix(&session.id, resource, 0..total)
+                .await
+                .expect("uncovered manifest should report a miss")
+        );
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                0..RANGE_MAX_CHUNK_BYTES,
+                &bytes[..RANGE_MAX_CHUNK_BYTES as usize],
+                "https://cdn.example/video.m4s",
+                None,
+                None,
+            )
+            .await
+            .expect("first eight MiB extent should publish");
+        let loaded = store
+            .load_range_manifest(&session.id, resource)
+            .expect("updated manifest should load")
+            .expect("updated manifest should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                RANGE_MAX_CHUNK_BYTES..total,
+                &bytes[RANGE_MAX_CHUNK_BYTES as usize..],
+                "https://cdn.example/video.m4s",
+                None,
+                None,
+            )
+            .await
+            .expect("second extent should publish");
+
+        store.range_hash_bytes_read.store(0, Ordering::Relaxed);
+        let prefix = store
+            .read_resource_range_prefix(&session.id, resource, 0..total)
+            .await
+            .expect("verified prefix should read")
+            .expect("durable bytes should begin at offset zero");
+        assert_eq!(RANGE_MAX_CHUNK_BYTES as usize, prefix.len());
+        assert_eq!(&bytes[..RANGE_MAX_CHUNK_BYTES as usize], prefix);
+        assert_eq!(
+            RANGE_MAX_CHUNK_BYTES,
+            store.range_hash_bytes_read.load(Ordering::Relaxed)
+        );
+
+        let data_path = store
+            .resource_range_data_path(&session.id, &resource.id)
+            .expect("data path should be valid");
+        let mut data = fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .expect("range data should open for tampering");
+        data.seek(SeekFrom::Start(1))
+            .expect("tamper offset should seek");
+        data.write_all(&[1]).expect("tampered byte should write");
+        data.sync_all().expect("tampered byte should flush");
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&session.id, resource, 0..total)
+                .await,
+            Err(HlsRangeError::IdentityChanged)
+        ));
+
+        data.seek(SeekFrom::Start(1))
+            .expect("restore offset should seek");
+        data.write_all(&[0]).expect("original byte should restore");
+        data.sync_all().expect("restored byte should flush");
+        let displaced = data_path.with_extension("range.data.displaced");
+        fs::rename(&data_path, &displaced).expect("old data object should remain available");
+        fs::write(&data_path, &bytes).expect("replacement data object should be written");
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&session.id, resource, 0..total)
+                .await,
+            Err(HlsRangeError::IdentityChanged)
+        ));
+        fs::remove_file(&data_path).expect("replacement should be removed for absence validation");
+        assert!(matches!(
+            store
+                .read_resource_range_prefix(&session.id, resource, 0..total)
+                .await,
+            Err(HlsRangeError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn sequential_foreground_appends_hash_one_parent_linearly() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("linear-parent-hash", "https://cdn.example/video.m4s");
+        session.variant.video.request.size = Some(RANGE_MAX_SIZE);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let resource = &session.variant.video;
+        let resource_key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&session.id, resource, &resource_key)
+            .expect("manifest should initialize");
+        let data_path = store
+            .resource_range_data_path(&session.id, &resource.id)
+            .expect("data path should be valid");
+        let data = fs::OpenOptions::new()
+            .write(true)
+            .open(data_path)
+            .expect("range data should open");
+        data.set_len(RANGE_MAX_SIZE)
+            .expect("maximum resource should remain sparse");
+        data.sync_all().expect("sparse length should flush");
+        let startup = vec![0; RANGE_STARTUP_CHUNK_BYTES as usize];
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                0..RANGE_STARTUP_CHUNK_BYTES,
+                &startup,
+                "https://cdn.example/video.m4s",
+                None,
+                None,
+            )
+            .await
+            .expect("startup extent should publish");
+
+        let parent = RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_MAX_CHUNK_BYTES;
+        let parent_bytes = (0..(parent.end - parent.start))
+            .map(|offset| (offset % 251) as u8)
+            .collect::<Vec<_>>();
+        store.range_hash_bytes_read.store(0, Ordering::Relaxed);
+        let continue_fill = || HlsCacheFillControl::Continue;
+        for index in 0..(RANGE_MAX_CHUNK_BYTES / RANGE_FOREGROUND_CHUNK_BYTES) {
+            let start = parent.start + index * RANGE_FOREGROUND_CHUNK_BYTES;
+            let range = start..start + RANGE_FOREGROUND_CHUNK_BYTES;
+            let chunk_key = RangeChunkKey {
+                resource: resource_key.clone(),
+                total_length: RANGE_MAX_SIZE,
+                range: range.clone(),
+            };
+            let admission = store
+                .acquire_range_read_admission(
+                    &chunk_key,
+                    HlsRangePriority::Foreground,
+                    &continue_fill,
+                )
+                .await
+                .expect("append admission should succeed");
+            let flight = store
+                .range_cache
+                .claim_chunk(chunk_key, HlsRangePriority::Foreground)
+                .expect("append flight should claim");
+            assert!(flight.is_owner());
+            let expected = store
+                .load_range_manifest(&session.id, resource)
+                .expect("current manifest should load")
+                .expect("current manifest should exist");
+            let start_in_parent = usize::try_from(range.start - parent.start)
+                .expect("parent offset should fit usize");
+            let end_in_parent =
+                usize::try_from(range.end - parent.start).expect("parent offset should fit usize");
+            store
+                .commit_range_extent(
+                    &session.id,
+                    resource,
+                    &expected.manifest,
+                    range,
+                    &parent_bytes[start_in_parent..end_in_parent],
+                    "https://cdn.example/video.m4s",
+                    None,
+                    None,
+                )
+                .await
+                .expect("foreground append should publish");
+            drop(flight);
+            drop(admission);
+        }
+        assert!(
+            store.range_hash_bytes_read.load(Ordering::Relaxed) <= RANGE_MAX_CHUNK_BYTES * 4,
+            "parent verification should stay linear in its byte length"
+        );
+        let manifest = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("compacted manifest should load")
+            .expect("compacted manifest should exist");
+        assert_eq!(2, manifest.extents.len());
+        assert_eq!(parent, manifest.extents[1].start..manifest.extents[1].end);
+    }
+
+    #[tokio::test]
+    async fn extent_cap_retry_merges_a_completing_parent_without_materializing_resource() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("sparse-parent-cap", "https://cdn.example/video.m4s");
+        session.variant.video.request.size = Some(RANGE_MAX_SIZE);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let resource = &session.variant.video;
+        let resource_key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&session.id, resource, &resource_key)
+            .expect("manifest should initialize");
+        let data_path = store
+            .resource_range_data_path(&session.id, &resource.id)
+            .expect("data path should be valid");
+        let data = fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .expect("sparse range file should open");
+        data.set_len(RANGE_MAX_SIZE)
+            .expect("sparse file should reserve its logical length");
+        data.sync_all().expect("sparse file length should flush");
+
+        let parents = planned_range_chunks(RANGE_MAX_SIZE);
+        let target = parents
+            .last()
+            .expect("maximum plan should have a tail parent")
+            .clone();
+        assert_eq!(RANGE_MAX_CHUNK_BYTES, target.end - target.start);
+        let prefix = vec![0; RANGE_STARTUP_CHUNK_BYTES as usize];
+        let prefix_sha256 = sha256_hex(&prefix);
+        let byte_sha256 = sha256_hex(&[0]);
+        let mut manifest = loaded.manifest;
+        manifest.generation += 1;
+        manifest.prefix_length = RANGE_STARTUP_CHUNK_BYTES;
+        manifest.prefix_sha256 = Some(prefix_sha256.clone());
+        manifest.validator_origin = Some("https://cdn.example:443".to_owned());
+        manifest.validated_origins = vec![PersistedRangeOrigin {
+            origin: "https://cdn.example:443".to_owned(),
+            prefix_sha256,
+            strong_etag: None,
+        }];
+        manifest.extents = parents
+            .iter()
+            .enumerate()
+            .map(|(index, parent)| {
+                if index == 0 {
+                    PersistedRangeExtent {
+                        start: parent.start,
+                        end: parent.end,
+                        sha256: sha256_hex(&prefix),
+                    }
+                } else {
+                    PersistedRangeExtent {
+                        start: parent.start,
+                        end: parent.start + 1,
+                        sha256: byte_sha256.clone(),
+                    }
+                }
+            })
+            .collect();
+        manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
+        ensure_range_manifest_capacity(&manifest)
+            .expect("sparse 8,192-extent fixture should fit the metadata cap");
+        validate_range_manifest(&manifest, resource)
+            .expect("sparse fixture should preserve manifest invariants");
+        let manifest_path = store
+            .resource_range_manifest_path(&session.id, &resource.id)
+            .expect("manifest path should be valid");
+        store
+            .write_json_atomically(&manifest_path, &manifest)
+            .expect("sparse fixture manifest should publish");
+
+        let expected = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("sparse manifest should load")
+            .expect("sparse manifest should exist");
+        assert_eq!(RANGE_MAX_CHUNKS as usize, expected.extents.len());
+        let mut response = vec![0x5a; (target.end - target.start) as usize];
+        response[0] = 0;
+        let candidate_key = RangeChunkKey {
+            resource: resource_key.clone(),
+            total_length: RANGE_MAX_SIZE,
+            range: target.clone(),
+        };
+        let competing_key = RangeChunkKey {
+            resource: resource_key.clone(),
+            total_length: RANGE_MAX_SIZE,
+            range: target.start..target.start + 1,
+        };
+        let continue_fill = || HlsCacheFillControl::Continue;
+        let candidate_admission = store
+            .acquire_range_read_admission(
+                &candidate_key,
+                HlsRangePriority::Background,
+                &continue_fill,
+            )
+            .await
+            .expect("candidate admission should succeed");
+        let candidate_flight = store
+            .range_cache
+            .claim_chunk(candidate_key.clone(), HlsRangePriority::Background)
+            .expect("candidate flight should claim");
+        let competing_admission = store
+            .acquire_range_read_admission(
+                &competing_key,
+                HlsRangePriority::Background,
+                &continue_fill,
+            )
+            .await
+            .expect("competing admission should succeed");
+        let competing_flight = store
+            .range_cache
+            .claim_chunk(competing_key, HlsRangePriority::Background)
+            .expect("competing flight should claim");
+        assert!(candidate_flight.is_owner());
+        assert!(competing_flight.is_owner());
+        assert!(matches!(
+            store
+                .commit_range_extent(
+                    &session.id,
+                    resource,
+                    &expected,
+                    target.clone(),
+                    &response,
+                    "https://cdn.example/video.m4s",
+                    None,
+                    None,
+                )
+                .await,
+            Err(HlsRangeError::QuotaExceeded)
+        ));
+        drop(candidate_flight);
+        drop(candidate_admission);
+        drop(competing_flight);
+        drop(competing_admission);
+        assert_eq!(
+            None,
+            store
+                .read_durable_range(&session.id, resource, target.start + 1..target.start + 2,)
+                .await
+                .expect("unpublished gap should remain a clean miss")
+        );
+
+        assert!(
+            !store
+                .compact_one_complete_range_parent(
+                    &session.id,
+                    resource,
+                    &candidate_key,
+                    HlsRangePriority::Background,
+                    &continue_fill,
+                    true,
+                )
+                .await
+                .expect("capacity drain should preserve an incomplete target parent")
+        );
+        let refreshed = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("fresh manifest should load")
+            .expect("fresh manifest should exist");
+        let admission = store
+            .acquire_range_read_admission(
+                &candidate_key,
+                HlsRangePriority::Background,
+                &continue_fill,
+            )
+            .await
+            .expect("retry admission should succeed");
+        let flight = store
+            .range_cache
+            .claim_chunk(candidate_key, HlsRangePriority::Background)
+            .expect("retry should claim a fresh flight");
+        assert!(flight.is_owner());
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &refreshed,
+                target.clone(),
+                &response,
+                "https://cdn.example/video.m4s",
+                None,
+                None,
+            )
+            .await
+            .expect("sole-writer retry should merge and admit the full parent");
+        drop(flight);
+        drop(admission);
+        let completed_parent = store
+            .range_manifest_snapshot(&session.id, resource)
+            .expect("completed-parent manifest should load")
+            .expect("completed-parent manifest should exist");
+        assert_eq!(RANGE_MAX_CHUNKS as usize, completed_parent.extents.len());
+        assert!(range_is_covered(&completed_parent.extents, target.clone()));
+        assert_eq!(
+            response,
+            store
+                .read_durable_range(&session.id, resource, target)
+                .await
+                .expect("completed parent should validate")
+                .expect("completed parent should be durable")
+        );
     }
 
     #[test]

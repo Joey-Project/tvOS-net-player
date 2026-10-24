@@ -538,14 +538,23 @@ async fn foreground_ranges_are_64k_aligned_and_partial_cache_restores() {
         );
         let partial_manifest = first_store
             .range_manifest_snapshot("foreground-64k-restore", &resource)
-            .expect("coalesced partial manifest should validate")
-            .expect("coalesced partial manifest should exist");
-        assert_eq!(2, partial_manifest.extents.len());
+            .expect("fragmented partial manifest should validate")
+            .expect("fragmented partial manifest should exist");
+        assert_eq!(3, partial_manifest.extents.len());
         assert_eq!(0, partial_manifest.extents[0].start);
         assert_eq!(RANGE_STARTUP_CHUNK_BYTES, partial_manifest.extents[0].end);
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, partial_manifest.extents[1].start);
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES,
+            partial_manifest.extents[1].end
+        );
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES,
+            partial_manifest.extents[2].start
+        );
         assert_eq!(
             RANGE_STARTUP_CHUNK_BYTES + 2 * RANGE_FOREGROUND_CHUNK_BYTES,
-            partial_manifest.extents[1].end
+            partial_manifest.extents[2].end
         );
         assert!(
             first_store
@@ -763,10 +772,8 @@ async fn same_inode_old_extent_tamper_blocks_merge() {
             .expect("seed checkpoint should exist");
         let first =
             RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
-        let second = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES / 2
-            ..RANGE_STARTUP_CHUNK_BYTES
-                + RANGE_FOREGROUND_CHUNK_BYTES
-                + RANGE_FOREGROUND_CHUNK_BYTES / 2;
+        let middle = first.end..total as u64 - RANGE_FOREGROUND_CHUNK_BYTES;
+        let last = middle.end..total as u64;
         store
             .commit_range_extent(
                 session_id,
@@ -780,6 +787,23 @@ async fn same_inode_old_extent_tamper_blocks_merge() {
             )
             .await
             .expect("first trusted range should publish");
+        let expected = store
+            .range_manifest_snapshot(session_id, &resource)
+            .expect("first fragment checkpoint should validate")
+            .expect("first fragment checkpoint should exist");
+        store
+            .commit_range_extent(
+                session_id,
+                &resource,
+                &expected,
+                middle.clone(),
+                &bytes[middle.start as usize..middle.end as usize],
+                &url,
+                None,
+                None,
+            )
+            .await
+            .expect("middle fragment should leave only the tail missing");
         let data_path = temp
             .path()
             .join(".tvos-net-player/hls/old-extent-tamper/video-resource.range.data");
@@ -792,22 +816,41 @@ async fn same_inode_old_extent_tamper_blocks_merge() {
         data.write_all(&[bytes[first.start as usize] ^ 1])
             .expect("same-inode content mutation should write");
         data.sync_all().expect("tampered byte should flush");
+        let expected = store
+            .range_manifest_snapshot(session_id, &resource)
+            .expect("fragmented checkpoint should validate")
+            .expect("fragmented checkpoint should exist");
+        let key = RangeChunkKey {
+            resource: RangeResourceKey {
+                session_id: session_id.to_owned(),
+                resource_id: resource.id.clone(),
+                representation: expected.representation_digest.clone(),
+            },
+            total_length: total as u64,
+            range: last.clone(),
+        };
+        let flight = store
+            .range_cache_for_test()
+            .claim_chunk(key, HlsRangePriority::Foreground)
+            .expect("tail flight should claim");
+        assert!(flight.is_owner());
         let error = store
             .commit_range_extent(
                 session_id,
                 &resource,
                 &expected,
-                second.clone(),
-                &bytes[second.start as usize..second.end as usize],
+                last.clone(),
+                &bytes[last.start as usize..last.end as usize],
                 &url,
                 None,
                 None,
             )
             .await
             .expect_err("old extent hash mismatch must block compaction");
+        drop(flight);
         assert!(matches!(error, HlsRangeError::IdentityChanged));
         assert_eq!(
-            RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES,
+            total as u64 - RANGE_FOREGROUND_CHUNK_BYTES,
             store
                 .range_durable_bytes(session_id, &resource)
                 .expect("old checkpoint should remain readable")
@@ -815,7 +858,7 @@ async fn same_inode_old_extent_tamper_blocks_merge() {
         assert_eq!(
             None,
             store
-                .read_resource_range(session_id, &resource, second)
+                .read_resource_range(session_id, &resource, last)
                 .await
                 .expect("unpublished merged range should remain a cache miss")
         );
