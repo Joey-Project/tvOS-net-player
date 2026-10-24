@@ -19,6 +19,7 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
         let metrics = self.metrics
         let runtime = self.runtime
         let mediaURL = self.mediaURL
+        let mediaBaseURI = Self.mediaBaseURI(for: mediaURL)
 
         Self.registerUnary(TvosNetPlayer_V1_ServerService.Method.GetServerInfo.descriptor, with: &router) {
             (_: TvosNetPlayer_V1_GetServerInfoRequest) in
@@ -27,6 +28,9 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
             response.id = "task-watch-ui-fixture"
             response.name = "Task watch UI fixture"
             response.version = "1"
+            if let mediaBaseURI {
+                response.mediaBaseUris = [mediaBaseURI]
+            }
             response.capabilities = [
                 .bilibiliPlaybackPolicy,
                 .bilibiliResolutionV2,
@@ -48,6 +52,41 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
             (_: TvosNetPlayer_V1_ListLibraryItemsRequest) in
             try await Self.persistMetrics { try await metrics.recordLibraryList() }
             return TvosNetPlayer_V1_ListLibraryItemsResponse()
+        }
+
+        Self.registerUnary(TvosNetPlayer_V1_CacheService.Method.ListCacheRoots.descriptor, with: &router) {
+            (_: TvosNetPlayer_V1_ListCacheRootsRequest) in
+            TvosNetPlayer_V1_ListCacheRootsResponse()
+        }
+
+        Self.registerUnary(
+            TvosNetPlayer_V1_LibraryService.Method.GetPlaybackSource.descriptor,
+            with: &router
+        ) { (request: TvosNetPlayer_V1_GetPlaybackSourceRequest) in
+            let scenario = FixtureScenario.resumption
+            guard request.itemID == scenario.playbackLibraryItemID,
+                request.variantID == scenario.playbackVariantID,
+                await runtime.hasTask(scenario)
+            else {
+                try await Self.reject(metrics)
+                throw RPCError(code: .notFound, message: "Playback source not found.")
+            }
+            _ = try await Self.record(
+                .getPlaybackSource,
+                scenario: scenario,
+                metrics: metrics,
+                playbackSourceRequest: FixturePlaybackSourceRequest(
+                    itemID: request.itemID,
+                    variantID: request.variantID
+                )
+            )
+
+            var response = TvosNetPlayer_V1_PlaybackSource()
+            response.itemID = scenario.playbackLibraryItemID
+            response.variantID = scenario.playbackVariantID
+            response.`protocol` = .httpFile
+            response.uri = mediaURL
+            return response
         }
 
         Self.registerUnary(
@@ -209,6 +248,15 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
                     return [:]
                 }
 
+                if scenario == .resumption {
+                    try await Self.recordWatchStreamOpen(scenario: scenario, metrics: metrics)
+                    await runtime.complete(scenario)
+                    var event = TvosNetPlayer_V1_TaskEvent()
+                    event.task = Self.task(for: scenario, runtimeState: .completed, mediaURL: mediaURL)
+                    try await writer.write(event)
+                    return [:]
+                }
+
                 try await Self.recordWatchStreamOpen(scenario: scenario, metrics: metrics)
                 let failureLimit = scenario == .automatic ? 3 : 7
                 guard attempt > failureLimit else {
@@ -272,10 +320,15 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
     private static func record(
         _ rpc: FixtureRPC,
         scenario: FixtureScenario,
-        metrics: FixtureMetricsStore
+        metrics: FixtureMetricsStore,
+        playbackSourceRequest: FixturePlaybackSourceRequest? = nil
     ) async throws -> UInt64 {
         do {
-            return try await metrics.record(rpc, for: scenario)
+            return try await metrics.record(
+                rpc,
+                for: scenario,
+                playbackSourceRequest: playbackSourceRequest
+            )
         } catch {
             throw RPCError(code: .internalError, message: "Fixture metrics could not be persisted.")
         }
@@ -347,6 +400,21 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
         return response
     }
 
+    private static func mediaBaseURI(for address: String) -> String? {
+        guard let components = URLComponents(string: address),
+            let scheme = components.scheme,
+            let host = components.host
+        else {
+            return nil
+        }
+
+        var origin = URLComponents()
+        origin.scheme = scheme
+        origin.host = host
+        origin.port = components.port
+        return origin.string
+    }
+
     private static func task(
         for scenario: FixtureScenario,
         runtimeState: FixtureTaskRuntime.State,
@@ -377,20 +445,27 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
                 task.message = "Manual recovery complete"
             case .silent:
                 task.message = "Silent task reconciliation complete"
+            case .resumption:
+                task.message = "Relaunch resumption fixture complete"
             }
         } else {
             task.message = "Playable fixture output is available."
         }
-        task.libraryItemID = scenario.taskID
-        task.playbackSource = playbackSource
-        task.resultItems = [resultItem(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)]
+        if scenario == .resumption {
+            task.resultItems = resultItems(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)
+        } else {
+            task.libraryItemID = scenario.taskID
+            task.playbackSource = playbackSource
+            task.resultItems = [resultItem(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)]
+        }
 
         var summary = TvosNetPlayer_V1_TaskOutputSummary()
         summary.revision = finished ? 2 : 1
-        summary.resultCount = 1
-        summary.terminalResultCount = finished ? 1 : 0
-        summary.successfulResultCount = runtimeState == .completed ? 1 : 0
-        summary.cancelledResultCount = runtimeState == .cancelled ? 1 : 0
+        let resultCount: UInt64 = scenario == .resumption ? 2 : 1
+        summary.resultCount = resultCount
+        summary.terminalResultCount = finished ? resultCount : 0
+        summary.successfulResultCount = runtimeState == .completed ? resultCount : 0
+        summary.cancelledResultCount = runtimeState == .cancelled ? resultCount : 0
         summary.primaryResultID = scenario.resultID
         task.outputSummary = summary
         return task
@@ -403,33 +478,55 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
     ) -> TvosNetPlayer_V1_ListTaskResultsResponse {
         let finished = runtimeState == .completed || runtimeState == .cancelled
         var response = TvosNetPlayer_V1_ListTaskResultsResponse()
-        response.results = [result(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)]
+        if scenario == .resumption {
+            response.results = [
+                result(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL, isDecoy: true),
+                result(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL),
+            ]
+        } else {
+            response.results = [result(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)]
+        }
         response.outputRevision = finished ? 2 : 1
-        response.pageInfo.totalSize = 1
+        response.pageInfo.totalSize = scenario == .resumption ? 2 : 1
         response.pageInfo.snapshotID = "\(scenario.taskID)-output-v\(finished ? 2 : 1)"
         return response
+    }
+
+    private static func resultItems(
+        for scenario: FixtureScenario,
+        runtimeState: FixtureTaskRuntime.State,
+        mediaURL: String
+    ) -> [TvosNetPlayer_V1_BilibiliTaskResultItem] {
+        [
+            resultItem(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL, isDecoy: true),
+            resultItem(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL),
+        ]
     }
 
     private static func resultItem(
         for scenario: FixtureScenario,
         runtimeState: FixtureTaskRuntime.State,
-        mediaURL: String
+        mediaURL: String,
+        isDecoy: Bool = false
     ) -> TvosNetPlayer_V1_BilibiliTaskResultItem {
+        let resultID = isDecoy ? scenario.decoyResultID : scenario.resultID
+        let libraryItemID = isDecoy ? scenario.decoyLibraryItemID : scenario.playbackLibraryItemID
+        let variantID = isDecoy ? scenario.decoyVariantID : scenario.playbackVariantID
         var source = TvosNetPlayer_V1_PlaybackSource()
-        source.itemID = scenario.resultID
-        source.variantID = "\(scenario.taskID)-mp4"
+        source.itemID = libraryItemID
+        source.variantID = variantID
         source.`protocol` = .httpFile
         source.uri = mediaURL
 
         var item = TvosNetPlayer_V1_BilibiliTaskResultItem()
-        item.id = scenario.resultID
+        item.id = resultID
         item.selectionID = scenario.candidateToken
-        item.title = scenario.title
+        item.title = isDecoy ? "\(scenario.title) decoy" : scenario.title
         item.sourceKind = "video"
         item.contentID = scenario.source
-        item.index = 1
+        item.index = isDecoy && scenario == .resumption ? 1 : (scenario == .resumption ? 2 : 1)
         item.state = runtimeState == .completed ? .succeeded : (runtimeState == .cancelled ? .cancelled : .playable)
-        item.libraryItemID = scenario.resultID
+        item.libraryItemID = libraryItemID
         item.playbackSource = source
         return item
     }
@@ -437,27 +534,32 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
     private static func result(
         for scenario: FixtureScenario,
         runtimeState: FixtureTaskRuntime.State,
-        mediaURL: String
+        mediaURL: String,
+        isDecoy: Bool = false
     ) -> TvosNetPlayer_V1_TaskResult {
+        let resultID = isDecoy ? scenario.decoyResultID : scenario.resultID
+        let libraryItemID = isDecoy ? scenario.decoyLibraryItemID : scenario.playbackLibraryItemID
+        let variantID = isDecoy ? scenario.decoyVariantID : scenario.playbackVariantID
+        let title = isDecoy ? "\(scenario.title) decoy" : scenario.title
         var source = TvosNetPlayer_V1_PlaybackSource()
-        source.itemID = scenario.resultID
-        source.variantID = "\(scenario.taskID)-mp4"
+        source.itemID = libraryItemID
+        source.variantID = variantID
         source.`protocol` = .httpFile
         source.uri = mediaURL
 
         var result = TvosNetPlayer_V1_TaskResult()
-        result.id = scenario.resultID
+        result.id = resultID
         result.state = runtimeState == .completed ? .succeeded : (runtimeState == .cancelled ? .cancelled : .playable)
-        result.title = scenario.title
-        result.libraryItemID = scenario.resultID
+        result.title = title
+        result.libraryItemID = libraryItemID
         result.playbackSource = source
         var artifact = TvosNetPlayer_V1_TaskArtifact()
-        artifact.id = scenario.resultID + "-media"
+        artifact.id = resultID + "-media"
         artifact.kind = .media
         artifact.state = .available
-        artifact.title = scenario.title
+        artifact.title = title
         artifact.format = "mp4"
-        artifact.libraryItemID = scenario.resultID
+        artifact.libraryItemID = libraryItemID
         artifact.resource.id = artifact.id
         artifact.resource.uri = mediaURL
         artifact.resource.contentType = "video/mp4"

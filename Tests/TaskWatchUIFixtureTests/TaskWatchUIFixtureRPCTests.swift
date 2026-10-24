@@ -209,7 +209,7 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
 
             XCTAssertEqual(model.currentTask?.id, FixtureScenario.silent.taskID)
             XCTAssertEqual(model.currentTask?.message, "Silent task reconciliation complete")
-            XCTAssertEqual(model.statusMessage, "Silent task reconciliation complete")
+            XCTAssertEqual(model.statusMessage, "Silent task reconciliation fixture is cached for LAN playback.")
             XCTAssertEqual(model.currentTask?.progress, 1)
             XCTAssertEqual(model.currentTask?.outputSummary?.revision, 2)
             XCTAssertNil(model.watchErrorMessage)
@@ -240,6 +240,87 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
                 $0 > watchIndex && metrics.rpcTrace[$0] == "get_task"
             }
             XCTAssertNotNil(postWatchGetTaskIndex, "The original watch must open before unary reconciliation.")
+        }
+    }
+
+    func testResumptionFixtureRequiresExactSelectedPlaybackSource() async throws {
+        let (directory, metricsURL) = try makeMetricsFile()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try await withFixtureServer(metricsURL: metricsURL) { endpoint in
+            let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            let scenario = FixtureScenario.resumption
+            let serverInfo = try await client.getServerInfo()
+            XCTAssertEqual(serverInfo.mediaBaseURIs, ["http://127.0.0.1:8080"])
+            let resolution = try await client.startBilibiliResolution(urlOrID: scenario.source)
+            XCTAssertEqual(resolution.session.id, scenario.resolutionSessionID)
+            let task = try await client.createBilibiliPlaybackTaskV2(
+                sessionID: scenario.resolutionSessionID,
+                selection: .single(candidateToken: scenario.candidateToken)
+            )
+            XCTAssertEqual(
+                task.resultItems.map(\.id),
+                [scenario.decoyResultID, scenario.resultID]
+            )
+            XCTAssertEqual(task.outputSummary?.primaryResultID, scenario.resultID)
+
+            let output = try await client.listTaskResults(taskID: scenario.taskID)
+            XCTAssertEqual(output.results.map(\.id), [scenario.decoyResultID, scenario.resultID])
+            XCTAssertEqual(output.totalSize, 2)
+            guard output.results.count == 2 else { return }
+            XCTAssertEqual(output.results[0].libraryItemID, scenario.decoyLibraryItemID)
+            XCTAssertEqual(output.results[1].libraryItemID, scenario.playbackLibraryItemID)
+            XCTAssertEqual(output.results[1].playbackSource?.variantID, scenario.playbackVariantID)
+
+            do {
+                _ = try await client.getPlaybackSource(
+                    itemID: scenario.decoyLibraryItemID,
+                    variantID: scenario.decoyVariantID
+                )
+                XCTFail("The decoy result must not be accepted as the saved playback source.")
+            } catch let error as RPCError {
+                XCTAssertEqual(error.code, .notFound)
+            } catch {
+                XCTFail("The decoy source returned an unexpected error: \(error)")
+            }
+
+            do {
+                _ = try await client.getPlaybackSource(
+                    itemID: scenario.playbackLibraryItemID,
+                    variantID: scenario.decoyVariantID
+                )
+                XCTFail("A mismatched variant must not be accepted for the selected library item.")
+            } catch let error as RPCError {
+                XCTAssertEqual(error.code, .notFound)
+            } catch {
+                XCTFail("The mismatched variant returned an unexpected error: \(error)")
+            }
+
+            let source = try await client.getPlaybackSource(
+                itemID: scenario.playbackLibraryItemID,
+                variantID: scenario.playbackVariantID
+            )
+            XCTAssertEqual(source.itemID, scenario.playbackLibraryItemID)
+            XCTAssertEqual(source.variantID, scenario.playbackVariantID)
+            XCTAssertEqual(source.uri, mediaAddress)
+
+            let document = try readMetrics(from: metricsURL)
+            let metrics = try XCTUnwrap(document.scenarios[scenario.rawValue])
+            XCTAssertEqual(metrics.startResolutionCount, 1)
+            XCTAssertEqual(metrics.createCount, 1)
+            XCTAssertEqual(metrics.outputCount, 1)
+            XCTAssertEqual(metrics.playbackSourceRequestCount, 1)
+            XCTAssertEqual(
+                metrics.playbackSourceRequests,
+                [
+                    MetricsPlaybackSourceRequest(
+                        itemID: scenario.playbackLibraryItemID,
+                        variantID: scenario.playbackVariantID
+                    )
+                ]
+            )
+            XCTAssertEqual(document.rejectedRequestCount, 2)
+            XCTAssertEqual(metrics.cancelCount, 0)
         }
     }
 
@@ -474,24 +555,31 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
     }
 
     private func readScenario(_ name: String, from url: URL) throws -> MetricsScenario {
-        let document = try JSONDecoder().decode(MetricsDocument.self, from: Data(contentsOf: url))
+        let document = try readMetrics(from: url)
         XCTAssertEqual(document.schemaVersion, 1)
         return try XCTUnwrap(document.scenarios[name])
+    }
+
+    private func readMetrics(from url: URL) throws -> MetricsDocument {
+        try JSONDecoder().decode(MetricsDocument.self, from: Data(contentsOf: url))
     }
 }
 
 private struct MetricsDocument: Decodable {
     let schemaVersion: Int
     let scenarios: [String: MetricsScenario]
+    let rejectedRequestCount: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case scenarios
+        case rejectedRequestCount = "rejected_request_count"
     }
 }
 
 private struct MetricsScenario: Decodable {
     let taskID: String
+    let startResolutionCount: UInt64
     let createCount: UInt64
     let watchCount: UInt64
     let watchStreamOpenCount: UInt64
@@ -500,11 +588,14 @@ private struct MetricsScenario: Decodable {
     let completedGetTaskCount: UInt64
     let outputCount: UInt64
     let cancelCount: UInt64
+    let playbackSourceRequestCount: UInt64
+    let playbackSourceRequests: [MetricsPlaybackSourceRequest]
     let manualResumeReadBeforeWatch: Bool
     let rpcTrace: [String]
 
     private enum CodingKeys: String, CodingKey {
         case taskID = "task_id"
+        case startResolutionCount = "start_resolution_count"
         case createCount = "create_count"
         case watchCount = "watch_count"
         case watchStreamOpenCount = "watch_stream_open_count"
@@ -513,8 +604,20 @@ private struct MetricsScenario: Decodable {
         case completedGetTaskCount = "completed_get_task_count"
         case outputCount = "output_count"
         case cancelCount = "cancel_count"
+        case playbackSourceRequestCount = "playback_source_request_count"
+        case playbackSourceRequests = "playback_source_requests"
         case manualResumeReadBeforeWatch = "manual_resume_read_before_watch"
         case rpcTrace = "rpc_trace"
+    }
+}
+
+private struct MetricsPlaybackSourceRequest: Decodable, Equatable {
+    let itemID: String
+    let variantID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case itemID = "item_id"
+        case variantID = "variant_id"
     }
 }
 

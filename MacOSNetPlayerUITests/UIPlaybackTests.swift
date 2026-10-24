@@ -352,7 +352,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Automatic recovery complete")
+                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
@@ -404,7 +404,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Manual recovery complete")
+                status(taskStatus, contains: "Playing Manual recovery fixture.")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
             },
             "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
@@ -469,7 +469,7 @@ final class UIPlaybackTests: XCTestCase {
                 observedFalseWatchState = true
                 return true
             }
-            return status(taskStatus, contains: "Silent task reconciliation complete")
+            return status(taskStatus, contains: "Playing Silent task reconciliation fixture.")
                 && status(identifiedElement("bilibili-result-status-ui-e2e-silent-result"), contains: "Cached")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
@@ -487,6 +487,131 @@ final class UIPlaybackTests: XCTestCase {
             waitForTimeline(timeout: 10) { $0 >= afterReconciliation + 1.5 },
             "Playback did not continue after silent task reconciliation. " + accessibilityDescription(timeline)
         )
+    }
+
+    func testRelaunchRestoresTaskAndExplicitPlaybackPosition() throws {
+        executionTimeAllowance = 600
+        try prepareResumptionScenario()
+        clickVisible(app.buttons["bilibili-submit"], scrollingIn: app.scrollViews["player-control-scroll"])
+
+        let selectedResultID = "ui-e2e-resumption-result"
+        let decoyResultID = "ui-e2e-resumption-decoy-result"
+        let taskStatus = identifiedElement("bilibili-task-status")
+        let selectedStatus = identifiedElement("bilibili-result-status-\(selectedResultID)")
+        let decoyStatus = identifiedElement("bilibili-result-status-\(decoyResultID)")
+        let selectedPlay = app.buttons["bilibili-result-play-\(selectedResultID)"]
+        let decoyPlay = app.buttons["bilibili-result-play-\(decoyResultID)"]
+        XCTAssertTrue(
+            waitUntil(timeout: 75) {
+                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                    && status(selectedStatus, contains: "Cached")
+                    && status(decoyStatus, contains: "Cached")
+                    && selectedPlay.exists && selectedPlay.isEnabled
+                    && decoyPlay.exists && decoyPlay.isEnabled
+            },
+            "The fixture did not restore both the decoy and exact selected task results. "
+                + accessibilityDescription(taskStatus)
+        )
+
+        let controls = app.scrollViews["player-control-scroll"]
+        clickVisible(selectedPlay, scrollingIn: controls)
+        let timeline = identifiedElement("playback-timeline")
+        let playbackState = identifiedElement("playback-state")
+        XCTAssertTrue(timeline.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 20))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 20) { $0 >= 5 },
+            "The exact selected task result did not reach a nonzero checkpoint. "
+                + accessibilityDescription(timeline)
+        )
+        clickVisible(app.buttons["playback-toggle"])
+        let savedCheckpoint = try pausedSeekBaseline(
+            state: playbackState,
+            timeline: timeline,
+            action: "Relaunch checkpoint"
+        )
+        XCTAssertGreaterThan(savedCheckpoint, 0, "The inactive checkpoint must be nonzero.")
+
+        XCUIApplication(bundleIdentifier: "com.apple.finder").activate()
+        XCTAssertTrue(
+            waitUntil(timeout: 15) { app.state == .runningBackground },
+            "The player did not enter the background before termination. State: \(app.state)"
+        )
+        app.terminate()
+        app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
+        app.launch()
+        app.activate()
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { app.state == .runningForeground },
+            "The player did not become foreground after relaunch. State: \(app.state)"
+        )
+
+        let emptyPlayer = identifiedElement("player-empty-state")
+        XCTAssertTrue(emptyPlayer.waitForExistence(timeout: 20))
+        XCTAssertFalse(
+            waitUntilTimelineState(playbackState, equals: "playing", timeout: 2),
+            "Playback started automatically before explicit Continue. \(accessibilityDescription(playbackState))"
+        )
+        XCTAssertTrue(
+            waitUntil(timeout: 75) {
+                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                    && status(selectedStatus, contains: "Cached")
+                    && status(decoyStatus, contains: "Cached")
+                    && selectedPlay.exists && selectedPlay.isEnabled
+                    && decoyPlay.exists && decoyPlay.isEnabled
+            },
+            "The original task/result identity was not restored after relaunch. "
+                + accessibilityDescription(taskStatus)
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(2.2))
+        XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
+        XCTAssertNotEqual(playbackState.value as? String, "playing")
+
+        let continueButton = app.buttons["bilibili-resumption-continue"]
+        XCTAssertTrue(
+            waitUntil(timeout: 75) { continueButton.exists && continueButton.isEnabled },
+            "The validated saved checkpoint did not expose Continue. Continue: "
+                + accessibilityDescription(continueButton)
+                + "; resumption message: "
+                + accessibilityDescription(identifiedElement("bilibili-resumption-message"))
+        )
+        clickVisible(continueButton, scrollingIn: controls)
+        XCTAssertTrue(
+            waitUntil(timeout: 30) {
+                playbackState.value as? String == "playing"
+                    && timelineSeconds().map { abs($0 - savedCheckpoint) <= 2 } == true
+            },
+            "Explicit Continue did not restore the saved position near \(savedCheckpoint). "
+                + accessibilityDescription(timeline)
+        )
+        let restoredAt = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 15) { $0 >= restoredAt + 1.5 },
+            "Playback did not advance after explicit Continue. \(accessibilityDescription(timeline))"
+        )
+    }
+
+    private func prepareResumptionScenario() throws {
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(addressField.waitForExistence(timeout: 15))
+        XCTAssertTrue(serverAddressIsEmpty(addressField))
+        clickVisible(addressField)
+        addressField.typeText(serverAddress)
+
+        let refresh = app.buttons["cache-server-refresh"]
+        XCTAssertTrue(refresh.waitForExistence(timeout: 10))
+        clickVisible(refresh)
+        let libraryStatus = app.staticTexts["cache-library-status"]
+        XCTAssertTrue(
+            waitUntil(timeout: 45) { status(libraryStatus, contains: "Loaded 0 cached item(s)") },
+            "The production Connect flow did not persist the fixture endpoint. "
+                + accessibilityDescription(libraryStatus)
+        )
+
+        let controls = app.scrollViews["player-control-scroll"]
+        let sourceField = app.textFields["bilibili-source"]
+        clickVisible(sourceField, scrollingIn: controls)
+        sourceField.typeText("BV1xK4y1P7mN")
     }
 
     private func prepareTaskWatchScenario(source: String) throws {

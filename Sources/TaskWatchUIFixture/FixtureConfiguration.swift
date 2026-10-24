@@ -4,12 +4,14 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
     case automatic
     case manual
     case silent
+    case resumption
 
     package var taskID: String {
         switch self {
         case .automatic: "ui-e2e-automatic"
         case .manual: "ui-e2e-manual"
         case .silent: "ui-e2e-silent"
+        case .resumption: "ui-e2e-resumption"
         }
     }
 
@@ -18,6 +20,7 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
         case .automatic: "BV1QtjA6BEB8"
         case .manual: "BV1uW4y1s7zN"
         case .silent: "BV1s7ZxqR9Kp"
+        case .resumption: "BV1xK4y1P7mN"
         }
     }
 
@@ -26,6 +29,7 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
         case .automatic: "Automatic recovery fixture"
         case .manual: "Manual recovery fixture"
         case .silent: "Silent task reconciliation fixture"
+        case .resumption: "Relaunch resumption fixture"
         }
     }
 
@@ -39,6 +43,26 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
 
     package var candidateToken: String {
         "\(taskID)-candidate"
+    }
+
+    package var decoyResultID: String {
+        "\(taskID)-decoy-result"
+    }
+
+    package var playbackLibraryItemID: String {
+        self == .resumption ? "\(taskID)-library-item" : resultID
+    }
+
+    package var decoyLibraryItemID: String {
+        "\(taskID)-decoy-library-item"
+    }
+
+    package var playbackVariantID: String {
+        "\(taskID)-mp4"
+    }
+
+    package var decoyVariantID: String {
+        "\(taskID)-decoy-mp4"
     }
 }
 
