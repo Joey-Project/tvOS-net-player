@@ -36,6 +36,20 @@ final class PlayerViewModelTests: XCTestCase {
         return await client.reportsSnapshot()
     }
 
+    private static func waitForReportedPosition(
+        from client: FakePlaybackProgressClient,
+        positionSeconds: Double
+    ) async -> [PlaybackProgressReport] {
+        for _ in 0..<100 {
+            let reports = await client.reportsSnapshot()
+            if reports.contains(where: { $0.positionSeconds == positionSeconds }) {
+                return reports
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await client.reportsSnapshot()
+    }
+
     @MainActor
     private func makeResumableFixture(
         identity: ClientPlaybackIdentity,
@@ -43,6 +57,7 @@ final class PlayerViewModelTests: XCTestCase {
         readiness: AVPlayerItem.Status = .readyToPlay,
         duration: CMTime = .indefinite,
         autoplay: Bool = false,
+        playbackProgressReportInterval: Duration? = nil,
         delayFirstReport: Bool = false,
         failReports: Bool = false,
         readinessTimeout: Duration = .seconds(20),
@@ -58,7 +73,7 @@ final class PlayerViewModelTests: XCTestCase {
         let model = PlayerViewModel(
             defaults: defaults,
             autoplay: autoplay,
-            playbackProgressReportInterval: nil,
+            playbackProgressReportInterval: playbackProgressReportInterval,
             resumptionStore: store,
             cacheClientFactory: { _ in client }
         )
@@ -1526,6 +1541,7 @@ final class PlayerViewModelTests: XCTestCase {
         await model.flushPlaybackProgressReports()
 
         XCTAssertEqual(controller.playCallCount, 1)
+        XCTAssertTrue(controller.cancelledSeekItems.isEmpty)
         XCTAssertEqual(store.record?.playback?.positionSeconds, 37)
         XCTAssertEqual(store.record?.playback?.completed, false)
     }
@@ -1679,6 +1695,195 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testManualToggleWhileResumeWaitsForReadinessStartsCheckpointHeartbeat() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            readiness: .unknown,
+            autoplay: true,
+            playbackProgressReportInterval: .milliseconds(20)
+        )
+        let staleReadiness = controller.lastReadinessObserver
+        controller.positionSeconds = 7
+
+        model.togglePlayback(using: controller)
+
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 7)
+        XCTAssertEqual(controller.playCallCount, 1)
+        staleReadiness?(.readyToPlay)
+        XCTAssertTrue(controller.seekTargets.isEmpty)
+        XCTAssertTrue(controller.cancelledSeekItems.isEmpty)
+        controller.timeControlStatus = .playing
+        controller.positionSeconds = 12
+        let reports = await Self.waitForReportedPosition(from: client, positionSeconds: 12)
+
+        XCTAssertEqual(reports.first?.intent, .playing)
+        XCTAssertEqual(reports.first?.positionSeconds, 7)
+        XCTAssertTrue(reports.contains(where: { $0.intent == .playing && $0.positionSeconds == 12 }))
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 12)
+        XCTAssertEqual(controller.playCallCount, 1)
+        XCTAssertTrue(controller.seekTargets.isEmpty)
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testManualToggleDuringResumeSeekCancelsSavedSeekAndStartsCheckpointHeartbeat() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            autoplay: true,
+            playbackProgressReportInterval: .milliseconds(20)
+        )
+        controller.positionSeconds = 3
+
+        model.togglePlayback(using: controller)
+
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        XCTAssertTrue(controller.cancelledSeekItems.first === controller.currentItem)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 3)
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        XCTAssertEqual(controller.positionSeconds, 3)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 3)
+        XCTAssertEqual(controller.playCallCount, 1)
+        XCTAssertEqual(controller.seekTargets.map(\.seconds), [42])
+
+        controller.timeControlStatus = .playing
+        controller.positionSeconds = 11
+        let reports = await Self.waitForReportedPosition(from: client, positionSeconds: 11)
+
+        XCTAssertEqual(reports.first?.positionSeconds, 3)
+        XCTAssertFalse(reports.contains(where: { $0.positionSeconds == 42 }))
+        XCTAssertTrue(reports.contains(where: { $0.intent == .playing && $0.positionSeconds == 11 }))
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 11)
+        XCTAssertEqual(controller.playCallCount, 1)
+        XCTAssertEqual(controller.seekTargets.map(\.seconds), [42])
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testNativePlayingDuringResumeRequiresCurrentPlayingItemAndStartsCheckpointHeartbeat() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            readiness: .unknown,
+            playbackProgressReportInterval: .milliseconds(20)
+        )
+        let staleReadiness = controller.lastReadinessObserver
+        let sequence = model.manualInteractionSequence
+        controller.positionSeconds = 6
+        controller.timeControlStatus = .waitingToPlayAtSpecifiedRate
+
+        model.handlePlaybackResume(using: controller)
+        let otherItem = AVPlayerItem(url: try XCTUnwrap(URL(string: "http://127.0.0.1:1/media/other.m3u8")))
+        let staleController = PlaybackControlSpy(timeControlStatus: .playing, currentItem: otherItem)
+        model.handlePlaybackResume(using: staleController)
+        model.checkpointPlayback()
+
+        XCTAssertEqual(store.record?.playback, checkpoint)
+        XCTAssertEqual(model.manualInteractionSequence, sequence)
+        let pendingReports = await client.reportsSnapshot()
+        XCTAssertTrue(pendingReports.isEmpty)
+
+        controller.timeControlStatus = .playing
+        model.handlePlaybackResume(using: controller)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 6)
+        staleReadiness?(.readyToPlay)
+        controller.positionSeconds = 9
+        let reports = await Self.waitForReportedPosition(from: client, positionSeconds: 9)
+
+        XCTAssertEqual(reports.first?.intent, .playing)
+        XCTAssertEqual(reports.first?.positionSeconds, 6)
+        XCTAssertTrue(reports.contains(where: { $0.intent == .playing && $0.positionSeconds == 9 }))
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 9)
+        XCTAssertTrue(controller.seekTargets.isEmpty)
+        XCTAssertEqual(controller.playCallCount, 0)
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testRestorationSeekTimeJumpDoesNotBecomeManualTakeover() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            autoplay: true
+        )
+        let sequence = model.manualInteractionSequence
+        let item = try XCTUnwrap(controller.currentItem)
+        controller.positionSeconds = 42
+
+        NotificationCenter.default.post(name: .AVPlayerItemTimeJumped, object: item)
+        for _ in 0..<5 { await Task.yield() }
+        model.handlePlaybackTimeJump(using: controller)
+        model.checkpointPlayback()
+
+        XCTAssertEqual(store.record?.playback, checkpoint)
+        XCTAssertEqual(model.manualInteractionSequence, sequence)
+        XCTAssertTrue(controller.cancelledSeekItems.isEmpty)
+        XCTAssertEqual(controller.playCallCount, 0)
+        let pendingReports = await client.reportsSnapshot()
+        XCTAssertTrue(pendingReports.isEmpty)
+
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(controller.playCallCount, 1)
+        XCTAssertTrue(controller.cancelledSeekItems.isEmpty)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 42)
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testInputEditAndStopDuringPendingResumePreserveCheckpointWithoutStartingReports() async throws {
+        for readiness in [AVPlayerItem.Status.unknown, .readyToPlay] {
+            let identity = makePlaybackIdentity(taskID: "task-edit-\(readiness.rawValue)")
+            let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+            let (model, controller, store, client) = try makeResumableFixture(
+                identity: identity,
+                checkpoint: checkpoint,
+                readiness: readiness,
+                autoplay: true,
+                playbackProgressReportInterval: .milliseconds(20)
+            )
+            let staleReadiness = controller.lastReadinessObserver
+
+            model.streamURLText = "http://127.0.0.1:1/media/edited.m3u8"
+            model.checkpointPlayback()
+            let report = await model.reportCurrentPlaybackProgress()
+            XCTAssertNil(report)
+            XCTAssertEqual(store.record?.playback, checkpoint)
+
+            model.stop()
+            if readiness == .readyToPlay {
+                controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+                XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+                XCTAssertEqual(controller.positionSeconds, 0)
+            } else {
+                staleReadiness?(.readyToPlay)
+                XCTAssertTrue(controller.seekTargets.isEmpty)
+            }
+            await model.flushPlaybackProgressReports()
+            let reports = await client.reportsSnapshot()
+
+            XCTAssertTrue(reports.isEmpty)
+            XCTAssertEqual(store.record?.playback, checkpoint)
+            XCTAssertEqual(ClientResumptionStore(defaults: defaults).record?.playback, checkpoint)
+            XCTAssertEqual(controller.playCallCount, 0)
+        }
+    }
+
+    @MainActor
     func testPendingResumeCheckpointAndStaleReadinessSurviveStop() async throws {
         let identity = makePlaybackIdentity()
         let checkpoint = ClientPlaybackCheckpoint(
@@ -1715,19 +1920,108 @@ final class PlayerViewModelTests: XCTestCase {
             durationSeconds: 100,
             completed: false
         )
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            autoplay: true,
+            playbackProgressReportInterval: .milliseconds(20)
+        )
+        controller.itemDuration = CMTime(seconds: 100, preferredTimescale: 600)
+
+        model.seek(by: 5, using: controller)
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 5)
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(controller.playCallCount, 0)
+        XCTAssertEqual(controller.positionSeconds, 5)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 5)
+        controller.positionSeconds = 8
+        let reports = await Self.waitForReportedPosition(from: client, positionSeconds: 8)
+
+        XCTAssertTrue(reports.contains(where: { $0.intent == .seek && $0.positionSeconds == 5 }))
+        XCTAssertTrue(reports.contains(where: { $0.intent == .paused && $0.positionSeconds == 8 }))
+        XCTAssertFalse(reports.contains(where: { $0.positionSeconds == 0 || $0.positionSeconds == 42 }))
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 8)
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        XCTAssertEqual(controller.seekTargets.map(\.seconds), [42, 5])
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testManualTerminalSeekCancelsOnlySavedSeekAndPreservesChosenPosition() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            duration: CMTime(seconds: 100, preferredTimescale: 600),
+            autoplay: true
+        )
+        controller.positionSeconds = 5
+
+        model.seek(by: 95, using: controller)
+
+        XCTAssertEqual(controller.seekTargets.map(\.seconds), [42, 100])
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        model.checkpointPlayback()
+        XCTAssertEqual(controller.positionSeconds, 5)
+        XCTAssertEqual(store.record?.playback, checkpoint)
+        let pendingReports = await client.reportsSnapshot()
+        XCTAssertTrue(pendingReports.isEmpty)
+
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 100, preferredTimescale: 600))
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(controller.positionSeconds, 100)
+        XCTAssertEqual(store.record?.playback?.positionSeconds, 100)
+        XCTAssertEqual(store.record?.playback?.completed, false)
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        XCTAssertEqual(controller.playCallCount, 0)
+        model.stop()
+        await model.flushPlaybackProgressReports()
+    }
+
+    @MainActor
+    func testReplacingPendingResumeCancelsOnlyOriginalItemAndPreservesCheckpoint() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42, durationSeconds: 100)
         let (model, controller, store, _) = try makeResumableFixture(
             identity: identity,
             checkpoint: checkpoint,
             autoplay: true
         )
-        controller.itemDuration = CMTime(seconds: 100, preferredTimescale: 600)
+        let originalItem = try XCTUnwrap(controller.currentItem)
+        var replacementController: PlaybackControlSpy?
+        model.playbackControllerFactory = { url in
+            let player = AVPlayer(url: url)
+            let nextController = PlaybackControlSpy(timeControlStatus: .paused, currentItem: player.currentItem)
+            replacementController = nextController
+            return (player, nextController)
+        }
 
-        model.seek(by: 5, using: controller)
+        XCTAssertTrue(model.loadTransient(streamURLText: "http://127.0.0.1:1/media/replacement.m3u8"))
+        let replacementPlayer = try XCTUnwrap(model.player)
+        let nextController = try XCTUnwrap(replacementController)
+        let userTarget = CMTime(seconds: 10, preferredTimescale: 600)
+        nextController.seekForPlayback(to: userTarget) { _ in }
         controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        nextController.completeNextSeek(finished: true, position: userTarget)
         await model.flushPlaybackProgressReports()
 
+        XCTAssertTrue(model.player === replacementPlayer)
+        XCTAssertTrue(controller.cancelledSeekItems.first === originalItem)
+        XCTAssertEqual(controller.cancelledSeekItems.count, 1)
+        XCTAssertTrue(nextController.cancelledSeekItems.isEmpty)
+        XCTAssertEqual(nextController.positionSeconds, 10)
+        XCTAssertEqual(nextController.playCallCount, 1)
         XCTAssertEqual(controller.playCallCount, 0)
-        XCTAssertEqual(store.record?.playback?.positionSeconds, 5)
+        XCTAssertEqual(store.record?.playback, checkpoint)
+        model.stop()
+        await model.flushPlaybackProgressReports()
     }
 
     @MainActor
@@ -2171,7 +2465,13 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     private(set) var playCallCount = 0
     private(set) var pauseCallCount = 0
     private(set) var seekTargets: [CMTime] = []
-    private var seekCompletions: [@MainActor @Sendable (Bool) -> Void] = []
+    private(set) var cancelledSeekItems: [AVPlayerItem] = []
+    private struct PendingSeek {
+        let item: AVPlayerItem?
+        let completion: @MainActor @Sendable (Bool) -> Void
+        var cancelled = false
+    }
+    private var pendingSeeks: [PendingSeek] = []
     private var readinessObservers: [UUID: @MainActor @Sendable (AVPlayerItem.Status) -> Void] = [:]
     private(set) var lastReadinessObserver: (@MainActor @Sendable (AVPlayerItem.Status) -> Void)?
 
@@ -2201,7 +2501,14 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
 
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
         seekTargets.append(time)
-        seekCompletions.append(completion)
+        pendingSeeks.append(PendingSeek(item: currentItem, completion: completion))
+    }
+
+    func cancelPendingSeeks(for item: AVPlayerItem) {
+        cancelledSeekItems.append(item)
+        for index in pendingSeeks.indices where pendingSeeks[index].item === item {
+            pendingSeeks[index].cancelled = true
+        }
     }
 
     func observeReadiness(
@@ -2225,8 +2532,9 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     }
 
     func completeNextSeek(finished: Bool, position: CMTime? = nil) {
-        if let position { playbackTime = position }
-        seekCompletions.removeFirst()(finished)
+        let request = pendingSeeks.removeFirst()
+        if let position, !request.cancelled { playbackTime = position }
+        request.completion(finished)
     }
 }
 

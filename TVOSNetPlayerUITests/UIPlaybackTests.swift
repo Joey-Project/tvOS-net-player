@@ -165,7 +165,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Automatic recovery complete")
+                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
@@ -229,7 +229,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Manual recovery complete")
+                status(taskStatus, contains: "Playing Manual recovery fixture.")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
             },
             "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
@@ -305,7 +305,7 @@ final class UIPlaybackTests: XCTestCase {
                 observedFalseWatchState = true
                 return true
             }
-            return status(taskStatus, contains: "Silent task reconciliation complete")
+            return status(taskStatus, contains: "Playing Silent task reconciliation fixture.")
                 && status(identifiedElement("bilibili-result-status-ui-e2e-silent-result"), contains: "Cached")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
@@ -340,7 +340,7 @@ final class UIPlaybackTests: XCTestCase {
         let decoyPlay = app.buttons["bilibili-result-play-\(decoyResultID)"]
         XCTAssertTrue(
             waitUntil(timeout: 75) {
-                status(taskStatus, contains: "Relaunch resumption fixture complete")
+                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
                     && status(selectedStatus, contains: "Cached")
                     && status(decoyStatus, contains: "Cached")
                     && selectedPlay.exists && selectedPlay.isEnabled
@@ -392,9 +392,11 @@ final class UIPlaybackTests: XCTestCase {
         )
         XCTAssertTrue(
             waitUntil(timeout: 75) {
-                status(taskStatus, contains: "Relaunch resumption fixture complete")
+                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
                     && status(selectedStatus, contains: "Cached")
+                    && status(decoyStatus, contains: "Cached")
                     && selectedPlay.exists && selectedPlay.isEnabled
+                    && decoyPlay.exists && decoyPlay.isEnabled
             },
             "The original task/result identity was not restored after relaunch. "
                 + accessibilityDescription(taskStatus)

@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import GRPCCore
 import GRPCNIOTransportHTTP2Posix
 import GRPCProtobuf
@@ -198,6 +199,161 @@ final class TaskWatchTransportIntegrationTests: XCTestCase {
         }
     }
 
+    func testSucceededMultiResultTransportRestoresExactSavedPlaybackWithoutResubmission() async throws {
+        let suiteName = "TaskWatchTransportIntegrationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ClientResumptionStore(defaults: defaults)
+        let probe = TaskWatchRPCProbe(scenario: .succeededResumption)
+        let service = TaskWatchTestService(probe: probe)
+
+        try await withLoopbackServer(service: service) { endpoint in
+            let model = self.makeModel(
+                endpoint: endpoint,
+                source: SucceededResumptionFixture.source,
+                defaults: defaults,
+                resumptionStore: store
+            )
+            defer { model.clearTask() }
+            let cached = self.expectation(description: "succeeded transport results are cached and watch is terminal")
+            let cachedToken = self.observeCachedSucceededResults(in: model, expectation: cached)
+
+            await model.submit(serverAddressText: endpoint.displayAddress)
+            guard await self.assertTaskSubmitted(model: model, probe: probe, expectations: [cached]) else {
+                return
+            }
+            let cachedWait = await XCTWaiter.fulfillment(of: [cached], timeout: 20)
+            XCTAssertEqual(cachedWait, .completed, "status=\(model.statusMessage), watching=\(model.isWatching)")
+            guard cachedWait == .completed else { return }
+
+            XCTAssertEqual(model.currentTask?.state, "succeeded")
+            XCTAssertEqual(model.currentTask?.resultItems.map(\.state), ["succeeded", "succeeded"])
+            XCTAssertEqual(
+                model.currentTask?.resultItems.map(\.id),
+                [SucceededResumptionFixture.decoyResultID, SucceededResumptionFixture.selectedResultID]
+            )
+            XCTAssertEqual(model.currentTask?.outputSummary?.primaryResultID, SucceededResumptionFixture.decoyResultID)
+            XCTAssertEqual(model.statusMessage, "2 Bilibili results are cached for LAN playback.")
+            XCTAssertFalse(model.isWatching)
+            XCTAssertNil(model.watchErrorMessage)
+            XCTAssertTrue(model.taskResults.allSatisfy { $0.isCached && $0.isReady && $0.playbackURL != nil })
+
+            let taskIdentity = try XCTUnwrap(store.record?.task)
+            XCTAssertEqual(taskIdentity.endpoint, endpoint)
+            XCTAssertEqual(taskIdentity.serverID, "loopback-test-server")
+            XCTAssertEqual(taskIdentity.taskID, self.taskID)
+            XCTAssertNil(
+                store.record?.playback,
+                "Normal task acceptance must persist the task before playback begins."
+            )
+
+            let selected = try XCTUnwrap(
+                model.taskResults.first(where: { $0.id == SucceededResumptionFixture.selectedResultID })
+            )
+            XCTAssertEqual(selected.playbackLibraryItemID, SucceededResumptionFixture.selectedLibraryID)
+            XCTAssertEqual(selected.playbackVariantID, SucceededResumptionFixture.selectedVariantID)
+            XCTAssertEqual(selected.playbackURL?.absoluteString, SucceededResumptionFixture.selectedMediaURI)
+            let context = try XCTUnwrap(
+                model.playbackProgressContext(for: selected, serverAddressText: endpoint.displayAddress)
+            )
+            let playbackIdentity = try XCTUnwrap(context.resumptionIdentity)
+            XCTAssertEqual(
+                playbackIdentity,
+                ClientPlaybackIdentity(
+                    task: taskIdentity,
+                    resultID: SucceededResumptionFixture.selectedResultID,
+                    libraryItemID: SucceededResumptionFixture.selectedLibraryID,
+                    variantID: SucceededResumptionFixture.selectedVariantID
+                )
+            )
+            store.beginPlayback(playbackIdentity)
+            store.updatePlayback(
+                identity: playbackIdentity,
+                positionSeconds: 37.25,
+                durationSeconds: 120,
+                completed: false
+            )
+            let savedRecord = try XCTUnwrap(store.record)
+            let savedCheckpoint = try XCTUnwrap(savedRecord.playback)
+            XCTAssertEqual(savedCheckpoint.positionSeconds, 37.25)
+            let beforeRestore = await probe.snapshot()
+            XCTAssertEqual(beforeRestore.resolutionSources, [SucceededResumptionFixture.source])
+            XCTAssertEqual(beforeRestore.createdTaskIDs, [self.taskID])
+            XCTAssertEqual(beforeRestore.watchRequestIDs, [[self.taskID]])
+            XCTAssertTrue(beforeRestore.getTaskIDs.isEmpty)
+            XCTAssertTrue(beforeRestore.playbackSourceRequests.isEmpty)
+            XCTAssertTrue(beforeRestore.cancelledTaskIDs.isEmpty)
+
+            let reopenedStore = ClientResumptionStore(defaults: defaults)
+            XCTAssertEqual(reopenedStore.record, savedRecord)
+            let restored = self.makeModel(
+                endpoint: endpoint,
+                source: "",
+                defaults: defaults,
+                resumptionStore: reopenedStore
+            )
+            defer { restored.clearTask() }
+            let restoredCached = self.expectation(description: "restored succeeded results remain cached and terminal")
+            let restoredToken = self.observeCachedSucceededResults(in: restored, expectation: restoredCached)
+
+            await restored.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+            let restoredWait = await XCTWaiter.fulfillment(of: [restoredCached], timeout: 20)
+            XCTAssertEqual(
+                restoredWait, .completed,
+                "status=\(restored.statusMessage), resumption=\(restored.resumptionMessage ?? "none")"
+            )
+            guard restoredWait == .completed else { return }
+            XCTAssertEqual(restored.currentTask?.id, self.taskID)
+            XCTAssertEqual(restored.currentTask?.state, "succeeded")
+            XCTAssertEqual(restored.currentTask?.resultItems.map(\.state), ["succeeded", "succeeded"])
+            XCTAssertEqual(restored.statusMessage, "2 Bilibili results are cached for LAN playback.")
+            XCTAssertFalse(restored.isWatching)
+            XCTAssertFalse(restored.isRestoringTask)
+            XCTAssertNil(restored.resumptionMessage)
+            XCTAssertTrue(restored.canContinueSavedPlayback)
+
+            let prepared = await restored.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+            let unwrappedPrepared = try XCTUnwrap(prepared, restored.resumptionMessage ?? "No prepared resumption.")
+            XCTAssertEqual(unwrappedPrepared.checkpoint, savedCheckpoint)
+            XCTAssertEqual(unwrappedPrepared.progressContext.resumptionIdentity, playbackIdentity)
+            XCTAssertEqual(unwrappedPrepared.progressContext.endpoint, endpoint)
+            XCTAssertEqual(
+                unwrappedPrepared.progressContext.libraryItemID,
+                SucceededResumptionFixture.selectedLibraryID
+            )
+            XCTAssertEqual(
+                unwrappedPrepared.progressContext.variantID,
+                SucceededResumptionFixture.selectedVariantID
+            )
+            XCTAssertEqual(unwrappedPrepared.url.absoluteString, SucceededResumptionFixture.selectedMediaURI)
+            XCTAssertEqual(reopenedStore.record, savedRecord, "Preparation must not replace the saved checkpoint.")
+
+            let afterPrepare = await probe.snapshot()
+            XCTAssertEqual(afterPrepare.resolutionSources, beforeRestore.resolutionSources)
+            XCTAssertEqual(afterPrepare.createdTaskIDs, beforeRestore.createdTaskIDs)
+            XCTAssertEqual(afterPrepare.cancelledTaskIDs, beforeRestore.cancelledTaskIDs)
+            XCTAssertEqual(afterPrepare.watchRequestIDs, beforeRestore.watchRequestIDs)
+            XCTAssertEqual(afterPrepare.getTaskIDs, [self.taskID, self.taskID])
+            XCTAssertEqual(
+                afterPrepare.playbackSourceRequests,
+                Array(
+                    repeating: TaskWatchRPCProbe.PlaybackSourceRequest(
+                        itemID: SucceededResumptionFixture.selectedLibraryID,
+                        variantID: SucceededResumptionFixture.selectedVariantID
+                    ),
+                    count: 2
+                )
+            )
+            XCTAssertGreaterThanOrEqual(
+                afterPrepare.taskResultQueries.count,
+                beforeRestore.taskResultQueries.count + 2
+            )
+            XCTAssertTrue(afterPrepare.taskResultQueries.allSatisfy { $0 == self.taskID })
+            XCTAssertTrue(afterPrepare.resultOutputRevisions.allSatisfy { $0 == 42 })
+            _ = [cachedToken, restoredToken]
+        }
+    }
+
     func testPermissionDeniedStopsAutomaticRecovery() async throws {
         let probe = TaskWatchRPCProbe(scenario: .permissionDenied)
         let service = TaskWatchTestService(probe: probe)
@@ -373,10 +529,14 @@ final class TaskWatchTransportIntegrationTests: XCTestCase {
     private func makeModel(
         endpoint: CacheServerEndpoint,
         source: String,
+        defaults: UserDefaults = .standard,
+        resumptionStore: ClientResumptionStore? = nil,
         watchReconciliationInterval: Duration = .seconds(30)
     ) -> BilibiliTaskViewModel {
         BilibiliTaskViewModel(
             sourceText: source,
+            defaults: defaults,
+            resumptionStore: resumptionStore,
             operationTimeout: .seconds(10),
             resolutionTimeout: .seconds(10),
             watchReconciliationInterval: watchReconciliationInterval,
@@ -421,6 +581,32 @@ final class TaskWatchTransportIntegrationTests: XCTestCase {
                     model.currentTask?.outputSummary?.revision == 42,
                     !model.isLoadingMoreTaskResults,
                     model.taskResults.contains(where: { $0.id == resultID && $0.title == "Loopback result" })
+                else {
+                    return
+                }
+                once.fulfill()
+            }
+        }
+    }
+
+    private func observeCachedSucceededResults(
+        in model: BilibiliTaskViewModel,
+        expectation: XCTestExpectation
+    ) -> AnyCancellable {
+        let once = TaskWatchExpectationOnce(expectation)
+        return model.objectWillChange.sink {
+            Task { @MainActor in
+                guard model.currentTask?.state == "succeeded",
+                    model.currentTask?.outputSummary?.revision == 42,
+                    model.currentTask?.outputSummary?.resultCount == 2,
+                    !model.isWatching,
+                    !model.isLoadingMoreTaskResults,
+                    model.taskResults.map(\.id) == [
+                        SucceededResumptionFixture.decoyResultID,
+                        SucceededResumptionFixture.selectedResultID,
+                    ],
+                    model.taskResults.allSatisfy({ $0.isCached && $0.isReady && $0.playbackURL != nil }),
+                    model.statusMessage == "2 Bilibili results are cached for LAN playback."
                 else {
                     return
                 }
@@ -477,6 +663,17 @@ private enum TaskWatchFixtureScenario: Equatable, Sendable {
     case notFoundAfterUnavailable
     case interruptThenComplete
     case silentReconciliation
+    case succeededResumption
+}
+
+private enum SucceededResumptionFixture {
+    static let source = "BV1xK4y1P7mN"
+    static let decoyResultID = "loopback-decoy-result"
+    static let selectedResultID = "loopback-selected-result"
+    static let selectedLibraryID = "loopback-selected-library"
+    static let selectedVariantID = "loopback-selected-mp4"
+    static let mediaBaseURI = "http://127.0.0.1:8080"
+    static let selectedMediaURI = "\(mediaBaseURI)/media/selected.mp4"
 }
 
 private enum TaskWatchFixturePlan: Sendable {
@@ -493,6 +690,11 @@ private enum TaskWatchGetTaskPlan: Sendable {
 }
 
 private actor TaskWatchRPCProbe {
+    struct PlaybackSourceRequest: Equatable, Sendable {
+        let itemID: String
+        let variantID: String
+    }
+
     struct Snapshot: Sendable {
         let serverInfoRequests: Int
         let resolutionSources: [String]
@@ -504,6 +706,7 @@ private actor TaskWatchRPCProbe {
         let closedWatchStreams: Int
         let taskResultQueries: [String]
         let resultOutputRevisions: [UInt64]
+        let playbackSourceRequests: [PlaybackSourceRequest]
     }
 
     private enum EventKind: Hashable {
@@ -518,7 +721,7 @@ private actor TaskWatchRPCProbe {
         let continuation: CheckedContinuation<Void, Never>
     }
 
-    private let scenario: TaskWatchFixtureScenario
+    nonisolated let scenario: TaskWatchFixtureScenario
     private var serverInfoRequests = 0
     private var resolutionSources: [String] = []
     private var createdTaskIDs: [String] = []
@@ -529,6 +732,7 @@ private actor TaskWatchRPCProbe {
     private var closedWatchStreams = 0
     private var taskResultQueries: [String] = []
     private var resultOutputRevisions: [UInt64] = []
+    private var playbackSourceRequests: [PlaybackSourceRequest] = []
     private var eventWaiters: [UUID: EventWaiter] = [:]
     private var heldGetTaskAttempts: Set<Int> = []
     private var releasedGetTaskAttempts: Set<Int> = []
@@ -563,6 +767,8 @@ private actor TaskWatchRPCProbe {
             return attempt == 1 ? .permissionDenied : .complete
         case .silentReconciliation:
             return .remainOpen
+        case .succeededResumption:
+            return .complete
         }
     }
 
@@ -580,6 +786,8 @@ private actor TaskWatchRPCProbe {
             attempt >= 3 ? .terminal : .running
         case .recoverAfterUnavailable, .permissionDenied, .interruptThenComplete:
             .running
+        case .succeededResumption:
+            .terminal
         }
     }
 
@@ -695,6 +903,10 @@ private actor TaskWatchRPCProbe {
         resultOutputRevisions.append(outputRevision)
     }
 
+    func recordPlaybackSource(itemID: String, variantID: String) {
+        playbackSourceRequests.append(PlaybackSourceRequest(itemID: itemID, variantID: variantID))
+    }
+
     func snapshot() -> Snapshot {
         Snapshot(
             serverInfoRequests: serverInfoRequests,
@@ -706,7 +918,8 @@ private actor TaskWatchRPCProbe {
             openWatchStreams: openWatchStreams,
             closedWatchStreams: closedWatchStreams,
             taskResultQueries: taskResultQueries,
-            resultOutputRevisions: resultOutputRevisions
+            resultOutputRevisions: resultOutputRevisions,
+            playbackSourceRequests: playbackSourceRequests
         )
     }
 
@@ -774,6 +987,7 @@ private struct TaskWatchTestService: RegistrableRPCService {
 
     func registerMethods<Transport: ServerTransport>(with router: inout RPCRouter<Transport>) {
         let probe = self.probe
+        let succeededResumption = probe.scenario == .succeededResumption
         Self.registerUnary(
             TvosNetPlayer_V1_ServerService.Method.GetServerInfo.descriptor,
             with: &router
@@ -783,6 +997,9 @@ private struct TaskWatchTestService: RegistrableRPCService {
             info.id = "loopback-test-server"
             info.name = "Loopback test server"
             info.version = "test"
+            if succeededResumption {
+                info.mediaBaseUris = [SucceededResumptionFixture.mediaBaseURI]
+            }
             info.capabilities = [
                 .bilibiliResolutionV2,
                 .bilibiliExecutionV2,
@@ -803,7 +1020,7 @@ private struct TaskWatchTestService: RegistrableRPCService {
             with: &router
         ) { (_: TvosNetPlayer_V1_CreateBilibiliTaskV2Request) in
             await probe.recordCreation(taskID: "loopback-task-1")
-            return Self.task(state: .preparing, progress: 0.1)
+            return Self.task(state: .preparing, progress: 0.1, succeededResumption: succeededResumption)
         }
         Self.registerUnary(
             TvosNetPlayer_V1_TaskService.Method.GetTask.descriptor,
@@ -817,7 +1034,12 @@ private struct TaskWatchTestService: RegistrableRPCService {
             case .running:
                 return Self.task(state: .running, progress: 0.65)
             case .terminal:
-                return Self.task(state: .succeeded, progress: 1, outputRevision: 42)
+                return Self.task(
+                    state: .succeeded,
+                    progress: 1,
+                    outputRevision: 42,
+                    succeededResumption: succeededResumption
+                )
             }
         }
         Self.registerUnary(
@@ -833,11 +1055,27 @@ private struct TaskWatchTestService: RegistrableRPCService {
         ) { (request: TvosNetPlayer_V1_ListTaskResultsRequest) in
             await probe.recordTaskResults(id: request.taskID, outputRevision: 42)
             var response = TvosNetPlayer_V1_ListTaskResultsResponse()
-            response.results = [Self.result()]
+            response.results =
+                succeededResumption
+                ? [Self.resumptionResult(isDecoy: true), Self.resumptionResult(isDecoy: false)]
+                : [Self.result()]
             response.outputRevision = 42
-            response.pageInfo.totalSize = 1
+            response.pageInfo.totalSize = succeededResumption ? 2 : 1
             response.pageInfo.snapshotID = "loopback-results-revision-42"
             return response
+        }
+        Self.registerUnary(
+            TvosNetPlayer_V1_LibraryService.Method.GetPlaybackSource.descriptor,
+            with: &router
+        ) { (request: TvosNetPlayer_V1_GetPlaybackSourceRequest) in
+            await probe.recordPlaybackSource(itemID: request.itemID, variantID: request.variantID)
+            guard succeededResumption,
+                request.itemID == SucceededResumptionFixture.selectedLibraryID,
+                request.variantID == SucceededResumptionFixture.selectedVariantID
+            else {
+                throw RPCError(code: .notFound, message: "The exact selected playback source was not requested.")
+            }
+            return Self.resumptionPlaybackSource(isDecoy: false)
         }
 
         router.registerHandler(
@@ -861,7 +1099,8 @@ private struct TaskWatchTestService: RegistrableRPCService {
                             task: Self.task(
                                 state: .succeeded,
                                 progress: 1,
-                                outputRevision: 42
+                                outputRevision: 42,
+                                succeededResumption: succeededResumption
                             )))
                     return [:]
                 case .remainOpen:
@@ -924,24 +1163,30 @@ private struct TaskWatchTestService: RegistrableRPCService {
     private static func task(
         state: TvosNetPlayer_V1_TaskState,
         progress: Double,
-        outputRevision: UInt64? = nil
+        outputRevision: UInt64? = nil,
+        succeededResumption: Bool = false
     ) -> TvosNetPlayer_V1_Task {
         var task = TvosNetPlayer_V1_Task()
         task.id = "loopback-task-1"
         task.kind = .bilibiliProgressivePlayback
         task.state = state
-        task.source = "BV1loopback"
+        task.source = succeededResumption ? SucceededResumptionFixture.source : "BV1loopback"
         task.title = "Loopback video"
         task.progress = progress
-        task.message = "Synthetic task state."
+        task.message = succeededResumption ? "Relaunch resumption fixture complete" : "Synthetic task state."
         if let outputRevision {
             var summary = TvosNetPlayer_V1_TaskOutputSummary()
             summary.revision = outputRevision
-            summary.resultCount = 1
-            summary.terminalResultCount = 1
-            summary.successfulResultCount = 1
-            summary.primaryResultID = "loopback-result-1"
+            summary.resultCount = succeededResumption ? 2 : 1
+            summary.terminalResultCount = succeededResumption ? 2 : 1
+            summary.successfulResultCount = succeededResumption ? 2 : 1
+            summary.primaryResultID =
+                succeededResumption
+                ? SucceededResumptionFixture.decoyResultID : "loopback-result-1"
             task.outputSummary = summary
+            if succeededResumption {
+                task.resultItems = [resumptionResultItem(isDecoy: true), resumptionResultItem(isDecoy: false)]
+            }
         }
         return task
     }
@@ -958,5 +1203,43 @@ private struct TaskWatchTestService: RegistrableRPCService {
         result.state = .succeeded
         result.title = "Loopback result"
         return result
+    }
+
+    private static func resumptionResultItem(isDecoy: Bool) -> TvosNetPlayer_V1_BilibiliTaskResultItem {
+        let source = resumptionPlaybackSource(isDecoy: isDecoy)
+        var item = TvosNetPlayer_V1_BilibiliTaskResultItem()
+        item.id = isDecoy ? SucceededResumptionFixture.decoyResultID : SucceededResumptionFixture.selectedResultID
+        item.selectionID = "candidate-1"
+        item.title = isDecoy ? "Decoy result" : "Selected result"
+        item.sourceKind = "video"
+        item.contentID = SucceededResumptionFixture.source
+        item.index = isDecoy ? 1 : 2
+        item.state = .succeeded
+        item.libraryItemID = source.itemID
+        item.playbackSource = source
+        return item
+    }
+
+    private static func resumptionResult(isDecoy: Bool) -> TvosNetPlayer_V1_TaskResult {
+        let item = resumptionResultItem(isDecoy: isDecoy)
+        var result = TvosNetPlayer_V1_TaskResult()
+        result.id = item.id
+        result.state = .succeeded
+        result.title = item.title
+        result.libraryItemID = item.libraryItemID
+        result.playbackSource = item.playbackSource
+        return result
+    }
+
+    private static func resumptionPlaybackSource(isDecoy: Bool) -> TvosNetPlayer_V1_PlaybackSource {
+        var source = TvosNetPlayer_V1_PlaybackSource()
+        source.itemID = isDecoy ? "loopback-decoy-library" : SucceededResumptionFixture.selectedLibraryID
+        source.variantID = isDecoy ? "loopback-decoy-mp4" : SucceededResumptionFixture.selectedVariantID
+        source.`protocol` = .httpFile
+        source.uri =
+            isDecoy
+            ? "\(SucceededResumptionFixture.mediaBaseURI)/media/decoy.mp4"
+            : SucceededResumptionFixture.selectedMediaURI
+        return source
     }
 }

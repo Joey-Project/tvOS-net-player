@@ -556,6 +556,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var savedPlaybackValidationGeneration = 0
     private var savedPlaybackValidationTask: Task<Void, Never>?
     private var validatedSavedPlayback: ClientPreparedResumption?
+    private var validatedSavedPlaybackSignature: SavedPlaybackObservationSignature?
     private var lastSavedPlaybackValidationTrigger: SavedPlaybackValidationTrigger?
     private var mediaBaseURIs: [String] = []
     private var resolvedInputContext: BilibiliResolvedInputContext?
@@ -654,11 +655,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
             let record = resumptionStore?.record,
             let checkpoint = record.playback,
             let validatedSavedPlayback,
-            checkpoint == validatedSavedPlayback.checkpoint,
+            checkpoint.identity == validatedSavedPlayback.checkpoint.identity,
             validatedSavedPlayback.progressContext.resumptionIdentity == checkpoint.identity,
             validatedSavedPlayback.progressContext.endpoint == record.task.endpoint,
             validatedSavedPlayback.progressContext.playbackURI == validatedSavedPlayback.url.absoluteString,
-            currentTask?.id == record.task.taskID,
+            let currentTask,
+            currentTask.id == record.task.taskID,
+            let validatedSavedPlaybackSignature,
+            let currentSignature = savedPlaybackObservationSignature(for: currentTask, checkpoint: checkpoint),
+            validatedSavedPlaybackSignature.hasSameSelectedSource(as: currentSignature),
             activeEndpoint == record.task.endpoint,
             activeServerID == record.task.serverID
         else {
@@ -1192,6 +1197,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func clearValidatedSavedPlayback() {
         validatedSavedPlayback = nil
+        validatedSavedPlaybackSignature = nil
     }
 
     private func invalidateSavedRestore(message: String?) {
@@ -1381,6 +1387,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                         return
                     }
                     validatedSavedPlayback = prepared
+                    validatedSavedPlaybackSignature = currentSignature
                     rememberSavedPlaybackValidationAttempt(for: currentTask, taskIdentity: record.task)
                     resumptionMessage = nil
                 } catch {
@@ -1571,6 +1578,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             validatedSavedPlayback = prepared
+            validatedSavedPlaybackSignature = initialSignature
             rememberSavedPlaybackValidationAttempt(for: observedTask, taskIdentity: record.task)
             resumptionMessage = nil
             return prepared
@@ -1740,8 +1748,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private func scheduleSavedPlaybackValidationIfNeeded(for task: CacheTask) {
-        guard !isRestoringTask, !isSubmitting, !isResolving, !isCancelling,
-            let record = resumptionStore?.record,
+        guard let record = resumptionStore?.record,
             let checkpoint = record.playback,
             record.task == checkpoint.identity.task,
             restoredTaskIdentity == record.task,
@@ -1751,9 +1758,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
         if let validatedSavedPlayback,
-            validatedSavedPlayback.checkpoint == checkpoint,
-            validatedSavedPlayback.progressContext.resumptionIdentity == checkpoint.identity
+            validatedSavedPlayback.checkpoint.identity == checkpoint.identity,
+            validatedSavedPlayback.progressContext.resumptionIdentity == checkpoint.identity,
+            let validatedSavedPlaybackSignature,
+            validatedSavedPlaybackSignature.hasSameSelectedSource(as: signature)
         {
+            return
+        }
+        clearValidatedSavedPlayback()
+        guard !isRestoringTask, !isSubmitting, !isResolving, !isCancelling else {
             return
         }
         let trigger = SavedPlaybackValidationTrigger(identity: checkpoint.identity, signature: signature)
@@ -1803,7 +1816,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 client: client
             )
             let state = result.state.lowercased().filter(\.isLetter)
-            let isCompleted = state.contains("completed")
+            let isCompleted = state.contains("completed") || state.contains("succeeded")
             let isPlayable =
                 state.contains("playable") || isCompleted
                 || (state.contains("failed")
@@ -1978,7 +1991,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
             title: item.title,
             subtitle: item.subtitle,
             progress: nil,
-            problem: nil,
+            problem: item.message.isEmpty
+                ? nil
+                : CacheTaskProblem(category: "", code: "", message: item.message, retryable: false),
             libraryItemID: item.libraryItemID,
             playbackSource: item.playbackSource,
             artifacts: [],
@@ -4826,12 +4841,12 @@ private extension CacheTask {
     }
 
     var isPlayableBilibiliTaskState: Bool {
-        let state = normalizedBilibiliTaskState
-        return state.contains("playable") || state.contains("completed")
+        normalizedBilibiliTaskState.contains("playable") || isCompletedBilibiliTaskState
     }
 
     var isCompletedBilibiliTaskState: Bool {
-        normalizedBilibiliTaskState.contains("completed")
+        let state = normalizedBilibiliTaskState
+        return state.contains("completed") || state.contains("succeeded")
     }
 
     var isFailedBilibiliTaskState: Bool {
@@ -4867,7 +4882,7 @@ private extension CacheTask {
         if !isTerminalBilibiliTaskState {
             return true
         }
-        guard normalizedBilibiliTaskState.contains("completed") else {
+        guard isCompletedBilibiliTaskState else {
             return false
         }
         return resultItems.contains { item in
@@ -5034,8 +5049,7 @@ private extension BilibiliTaskResultItem {
     }
 
     var isReadyBilibiliResultState: Bool {
-        let state = normalizedBilibiliResultState
-        return state.contains("playable") || state.contains("completed")
+        normalizedBilibiliResultState.contains("playable") || isCompletedBilibiliResultState
     }
 
     var isPlayableBilibiliResultState: Bool {
@@ -5046,7 +5060,8 @@ private extension BilibiliTaskResultItem {
     }
 
     var isCompletedBilibiliResultState: Bool {
-        normalizedBilibiliResultState.contains("completed")
+        let state = normalizedBilibiliResultState
+        return state.contains("completed") || state.contains("succeeded")
     }
 
     var isFailedBilibiliResultState: Bool {

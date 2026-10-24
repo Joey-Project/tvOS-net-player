@@ -88,6 +88,7 @@ protocol PlayerPlaybackControlling: AnyObject {
     func pause()
     func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime)
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void)
+    func cancelPendingSeeks(for item: AVPlayerItem)
     func observeReadiness(
         _ observer: @escaping @MainActor @Sendable (AVPlayerItem.Status) -> Void
     ) -> AnyCancellable
@@ -95,6 +96,10 @@ protocol PlayerPlaybackControlling: AnyObject {
 
 extension PlayerPlaybackControlling {
     var itemDuration: CMTime { currentItem?.duration ?? .invalid }
+
+    func cancelPendingSeeks(for item: AVPlayerItem) {
+        item.cancelPendingSeeks()
+    }
 }
 
 extension AVPlayer: PlayerPlaybackControlling {
@@ -442,7 +447,15 @@ public final class PlayerViewModel: ObservableObject {
             playbackProgressEndedItem === item
                 || Self.isAtPlaybackEnd(currentTime: controller.currentTime(), duration: controller.itemDuration)
         else {
+            let intent: PlaybackProgressIntent =
+                PlayerPlaybackState(timeControlStatus: controller.timeControlStatus).canPause ? .paused : .playing
+            let initializedTransport = initializeManualPlaybackTransport(using: controller)
             Self.togglePlayback(player: controller, speed: playbackSpeed)
+            if initializedTransport {
+                queueCurrentPlaybackProgressReport(intent: intent)
+                statusMessage =
+                    intent == .playing ? "Playing \(loadedURL?.absoluteString ?? "stream")." : "Playback paused."
+            }
             return
         }
 
@@ -479,6 +492,7 @@ public final class PlayerViewModel: ObservableObject {
         }
 
         let durationSeconds = Self.playbackDurationSeconds(request.controller.itemDuration)
+        initializeManualPlaybackTransport(using: request.controller)
         queuePlaybackProgressReport(positionSeconds: 0, durationSeconds: durationSeconds, intent: .seek)
         restartPlaybackProgressReportingAfterEndIfNeeded(
             immediateIntent: .playing, positionSeconds: 0, durationSeconds: durationSeconds)
@@ -550,16 +564,14 @@ public final class PlayerViewModel: ObservableObject {
                 else { return }
                 let position = controller.currentTime()
                 let duration = Self.playbackDurationSeconds(controller.itemDuration)
-                self.resumePositionUnrestoredItem = nil
+                self.initializeManualPlaybackTransport(using: controller)
                 self.queuePlaybackProgressReport(
                     positionSeconds: position.seconds, durationSeconds: duration, intent: .seek)
                 self.finishPlaybackProgressReporting(for: item, terminalTime: position, durationSeconds: duration)
             }
         } else {
             controller.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
-            if controller.currentItem === resumePositionUnrestoredItem {
-                resumePositionUnrestoredItem = nil
-            }
+            initializeManualPlaybackTransport(using: controller)
             queuePlaybackProgressReport(
                 positionSeconds: target.seconds, durationSeconds: durationSeconds, intent: .seek)
             restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: nil)
@@ -713,6 +725,22 @@ public final class PlayerViewModel: ObservableObject {
         return resumePositionUnrestoredItem === item
     }
 
+    @discardableResult
+    private func initializeManualPlaybackTransport(using controller: any PlayerPlaybackControlling) -> Bool {
+        guard let item = controller.currentItem,
+            player?.currentItem === item,
+            resumePositionUnrestoredItem === item
+        else {
+            return false
+        }
+
+        cancelPendingPlaybackResume()
+        resumePositionUnrestoredItem = nil
+        validationMessage = nil
+        startPlaybackProgressReporting()
+        return true
+    }
+
     private func beginPlaybackResume(
         player: AVPlayer,
         item: AVPlayerItem,
@@ -829,7 +857,7 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        cancelPendingPlaybackResume()
+        cancelPendingPlaybackResume(cancelSavedSeek: false)
         resumePositionUnrestoredItem = nil
         request.controller.defaultRate = playbackSpeed.rate
         statusMessage =
@@ -903,12 +931,16 @@ public final class PlayerViewModel: ObservableObject {
         statusMessage = validationMessage ?? "Could not restore playback."
     }
 
-    private func cancelPendingPlaybackResume() {
+    private func cancelPendingPlaybackResume(cancelSavedSeek: Bool = true) {
+        let request = pendingPlaybackResume
         pendingPlaybackResume = nil
         pendingPlaybackResumeObserver?.cancel()
         pendingPlaybackResumeObserver = nil
         pendingPlaybackResumeTimeout?.cancel()
         pendingPlaybackResumeTimeout = nil
+        if cancelSavedSeek, let request, request.phase == .seeking {
+            request.controller.cancelPendingSeeks(for: request.item)
+        }
     }
 
     private func startPlaybackProgressReporting() {
@@ -980,19 +1012,39 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func observePlaybackResume(for player: AVPlayer) {
+        guard let item = player.currentItem else { return }
         playbackResumeObserver = player.publisher(for: \.timeControlStatus)
-            .sink { [weak self, weak player] status in
+            .sink { [weak self, weak player, weak item] status in
                 guard status == .playing else {
                     return
                 }
 
-                Task { @MainActor [weak self, weak player] in
-                    guard let self, let player, self.player === player, player.timeControlStatus == .playing else {
+                Task { @MainActor [weak self, weak player, weak item] in
+                    guard let self, let player, let item,
+                        self.player === player, player.currentItem === item, player.timeControlStatus == .playing
+                    else {
                         return
                     }
-                    self.handlePlaybackTimeJump(using: player)
+                    self.handlePlaybackResume(using: player)
                 }
             }
+    }
+
+    func handlePlaybackResume(using controller: (any PlayerPlaybackControlling)?) {
+        guard let controller, let item = controller.currentItem,
+            player?.currentItem === item, controller.timeControlStatus == .playing
+        else {
+            return
+        }
+
+        if resumePositionUnrestoredItem === item {
+            markManualInteraction()
+            if initializeManualPlaybackTransport(using: controller) {
+                queueCurrentPlaybackProgressReport(intent: .playing)
+                statusMessage = "Playing \(loadedURL?.absoluteString ?? "stream")."
+            }
+        }
+        handlePlaybackTimeJump(using: controller)
     }
 
     private func observePlaybackTimeJumps(for item: AVPlayerItem?) {
@@ -1102,17 +1154,16 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func periodicPlaybackProgressIntent() -> PlaybackProgressIntent? {
-        guard let player else {
+        guard let player, let controller = playbackController,
+            let item = controller.currentItem, player.currentItem === item
+        else {
             return nil
         }
 
-        if player.rate != 0 || player.timeControlStatus == .playing {
+        if player.rate != 0 || controller.timeControlStatus == .playing {
             return .playing
         }
 
-        guard player.currentItem != nil else {
-            return nil
-        }
         return .paused
     }
 
