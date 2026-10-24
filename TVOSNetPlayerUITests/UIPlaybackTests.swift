@@ -325,6 +325,112 @@ final class UIPlaybackTests: XCTestCase {
         )
     }
 
+    func testRelaunchRestoresTaskAndExplicitPlaybackPosition() throws {
+        executionTimeAllowance = 600
+        let remote = XCUIRemote.shared
+        try prepareResumptionScenario()
+        remote.press(.select)
+
+        let selectedResultID = "ui-e2e-resumption-result"
+        let decoyResultID = "ui-e2e-resumption-decoy-result"
+        let taskStatus = identifiedElement("bilibili-task-status")
+        let selectedStatus = identifiedElement("bilibili-result-status-\(selectedResultID)")
+        let decoyStatus = identifiedElement("bilibili-result-status-\(decoyResultID)")
+        let selectedPlay = app.buttons["bilibili-result-play-\(selectedResultID)"]
+        let decoyPlay = app.buttons["bilibili-result-play-\(decoyResultID)"]
+        XCTAssertTrue(
+            waitUntil(timeout: 75) {
+                status(taskStatus, contains: "Relaunch resumption fixture complete")
+                    && status(selectedStatus, contains: "Cached")
+                    && status(decoyStatus, contains: "Cached")
+                    && selectedPlay.exists && selectedPlay.isEnabled
+                    && decoyPlay.exists && decoyPlay.isEnabled
+            },
+            "The fixture did not restore both the decoy and exact selected task results. "
+                + accessibilityDescription(taskStatus)
+        )
+
+        XCTAssertTrue(
+            focusDown(until: selectedPlay, limit: 100),
+            "Remote focus could not reach the exact second result. " + taskWatchFocusDescription(target: selectedPlay)
+        )
+        remote.press(.select)
+        let timeline = identifiedElement("playback-timeline")
+        let playbackState = identifiedElement("playback-state")
+        XCTAssertTrue(timeline.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 20))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 20) { $0 >= 5 },
+            "The exact selected task result did not reach a nonzero checkpoint. "
+                + accessibilityDescription(timeline)
+        )
+
+        let pause = app.buttons["playback-toggle"]
+        XCTAssertTrue(
+            focusDown(until: pause, limit: 100),
+            "Remote focus could not reach Pause. " + taskWatchFocusDescription(target: pause)
+        )
+        remote.press(.select)
+        let savedCheckpoint = try pausedCheckpointBaseline(state: playbackState, timeline: timeline)
+        XCTAssertGreaterThan(savedCheckpoint, 0, "The inactive checkpoint must be nonzero.")
+
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(
+            waitUntil(timeout: 20) { app.state == .runningBackground || app.state == .notRunning },
+            "The player did not leave the foreground before termination. State: \(app.state)"
+        )
+        app.terminate()
+        app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
+        app.launch()
+
+        let emptyPlayer = identifiedElement("player-empty-state")
+        XCTAssertTrue(emptyPlayer.waitForExistence(timeout: 25))
+        XCTAssertNotEqual(
+            playbackState.value as? String,
+            "playing",
+            "Playback started automatically before explicit Continue."
+        )
+        XCTAssertTrue(
+            waitUntil(timeout: 75) {
+                status(taskStatus, contains: "Relaunch resumption fixture complete")
+                    && status(selectedStatus, contains: "Cached")
+                    && selectedPlay.exists && selectedPlay.isEnabled
+            },
+            "The original task/result identity was not restored after relaunch. "
+                + accessibilityDescription(taskStatus)
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(2.2))
+        XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
+        XCTAssertNotEqual(playbackState.value as? String, "playing")
+
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 50),
+            "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
+        )
+        let continueButton = app.buttons["bilibili-resumption-continue"]
+        XCTAssertTrue(
+            focusDown(until: continueButton, limit: 100),
+            "Remote focus could not reach Continue. " + taskWatchFocusDescription(target: continueButton)
+        )
+        XCTAssertTrue(continueButton.isEnabled)
+        remote.press(.select)
+
+        XCTAssertTrue(
+            waitUntil(timeout: 30) {
+                playbackState.value as? String == "playing"
+                    && timelineSeconds().map { abs($0 - savedCheckpoint) <= 2 } == true
+            },
+            "Explicit Continue did not restore the saved position near \(savedCheckpoint). "
+                + accessibilityDescription(timeline)
+        )
+        let restoredAt = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 15) { $0 >= restoredAt + 1.5 },
+            "Playback did not advance after explicit Continue. \(accessibilityDescription(timeline))"
+        )
+    }
+
     private func prepareTaskWatchScenario(source: String) throws {
         let remote = XCUIRemote.shared
         let addressField = app.textFields["cache-server-address"]
@@ -358,6 +464,70 @@ final class UIPlaybackTests: XCTestCase {
             "Remote focus could not reach the visible Bilibili submit control. \(accessibilityDescription(submit))"
         )
         XCTAssertTrue(submit.isEnabled, "The single-result Bilibili input should be ready for one submission.")
+    }
+
+    private func prepareResumptionScenario() throws {
+        let remote = XCUIRemote.shared
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(addressField.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntil(timeout: 10) { addressField.hasFocus })
+        XCTAssertTrue(serverAddressIsEmpty(addressField))
+        remote.press(.select)
+        addressField.typeText(serverAddress)
+        if app.keyboards.firstMatch.exists {
+            remote.press(.menu)
+        }
+        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+
+        let refresh = app.buttons["cache-server-refresh"]
+        XCTAssertTrue(
+            focusDown(until: refresh, limit: 3),
+            "Remote focus could not reach Connect. " + connectionFocusDescription()
+        )
+        remote.press(.select)
+        let libraryStatus = app.staticTexts["cache-library-status"]
+        XCTAssertTrue(
+            waitUntil(timeout: 45) { status(libraryStatus, contains: "Loaded 0 cached item(s)") },
+            "The production Connect flow did not persist the fixture endpoint. "
+                + accessibilityDescription(libraryStatus)
+        )
+
+        let sourceField = app.textFields["bilibili-source"]
+        XCTAssertTrue(
+            focusDown(until: sourceField, limit: 80),
+            "Remote focus could not reach the Bilibili source field. " + accessibilityDescription(sourceField)
+        )
+        remote.press(.select)
+        sourceField.typeText("BV1xK4y1P7mN")
+        if app.keyboards.firstMatch.exists {
+            remote.press(.menu)
+        }
+        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+
+        let submit = app.buttons["bilibili-submit"]
+        XCTAssertTrue(
+            focusDown(until: submit, limit: 80),
+            "Remote focus could not reach the task submit control. " + accessibilityDescription(submit)
+        )
+        XCTAssertTrue(submit.isEnabled)
+    }
+
+    private func pausedCheckpointBaseline(state: XCUIElement, timeline: XCUIElement) throws -> Double {
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "Pause did not settle before checkpointing. \(accessibilityDescription(state)); "
+                + "timeline: \(accessibilityDescription(timeline))"
+        )
+        let baseline = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        RunLoop.current.run(until: Date().addingTimeInterval(2.2))
+        let current = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        XCTAssertEqual(state.value as? String, "paused")
+        XCTAssertLessThanOrEqual(
+            abs(current - baseline),
+            1,
+            "Playback time moved while paused before the relaunch checkpoint. Baseline: \(baseline); current: \(current)"
+        )
+        return current
     }
 
     private func taskWatchFocusDescription(target: XCUIElement) -> String {

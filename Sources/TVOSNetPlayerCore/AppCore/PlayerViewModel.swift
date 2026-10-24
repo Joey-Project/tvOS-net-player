@@ -80,6 +80,7 @@ public enum PlayerPlaybackState: String, Sendable {
 protocol PlayerPlaybackControlling: AnyObject {
     var currentItem: AVPlayerItem? { get }
     var itemDuration: CMTime { get }
+    var readinessStatus: AVPlayerItem.Status { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
     var defaultRate: Float { get set }
     func currentTime() -> CMTime
@@ -87,6 +88,9 @@ protocol PlayerPlaybackControlling: AnyObject {
     func pause()
     func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime)
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void)
+    func observeReadiness(
+        _ observer: @escaping @MainActor @Sendable (AVPlayerItem.Status) -> Void
+    ) -> AnyCancellable
 }
 
 extension PlayerPlaybackControlling {
@@ -94,9 +98,28 @@ extension PlayerPlaybackControlling {
 }
 
 extension AVPlayer: PlayerPlaybackControlling {
+    var readinessStatus: AVPlayerItem.Status {
+        currentItem?.status ?? .unknown
+    }
+
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
         seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
             Task { @MainActor in completion(finished) }
+        }
+    }
+
+    func observeReadiness(
+        _ observer: @escaping @MainActor @Sendable (AVPlayerItem.Status) -> Void
+    ) -> AnyCancellable {
+        guard let item = currentItem else {
+            observer(.failed)
+            return AnyCancellable {}
+        }
+
+        return item.publisher(for: \.status, options: [.initial, .new]).sink { [weak item] _ in
+            Task { @MainActor in
+                observer(item?.status ?? .unknown)
+            }
         }
     }
 }
@@ -106,17 +129,20 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
     public let playbackURI: String
     public let libraryItemID: String
     public let variantID: String
+    public let resumptionIdentity: ClientPlaybackIdentity?
 
     public init(
         endpoint: CacheServerEndpoint,
         playbackURI: String = "",
         libraryItemID: String = "",
-        variantID: String = ""
+        variantID: String = "",
+        resumptionIdentity: ClientPlaybackIdentity? = nil
     ) {
         self.endpoint = endpoint
         self.playbackURI = playbackURI
         self.libraryItemID = libraryItemID
         self.variantID = variantID
+        self.resumptionIdentity = resumptionIdentity
     }
 
     func withPlaybackURI(_ playbackURI: String) -> Self {
@@ -124,7 +150,8 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
             endpoint: endpoint,
             playbackURI: playbackURI,
             libraryItemID: libraryItemID,
-            variantID: variantID
+            variantID: variantID,
+            resumptionIdentity: resumptionIdentity
         )
     }
 }
@@ -133,6 +160,8 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
 public final class PlayerViewModel: ObservableObject {
     public static let lastStreamURLDefaultsKey = "LastStreamURLText"
     public static let defaultSkipInterval: TimeInterval = 10
+    private static let resumeSeekEndSafetyMarginSeconds = 1.0
+    private static let resumeSeekPositionToleranceSeconds = 1.0  // Accept up to one second of seek-position drift.
 
     @Published public var streamURLText: String {
         didSet {
@@ -150,9 +179,11 @@ public final class PlayerViewModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let autoplay: Bool
+    private let resumptionStore: ClientResumptionStore?
     private let cacheClientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let playbackProgressReportInterval: Duration?
     private var playbackProgressContext: PlayerPlaybackProgressContext?
+    private var playbackController: (any PlayerPlaybackControlling)?
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
     private var playbackEndObserver: AnyCancellable?
@@ -161,6 +192,18 @@ public final class PlayerViewModel: ObservableObject {
     private var playbackTimeJumpObserver: AnyCancellable?
     private weak var playbackProgressEndedItem: AVPlayerItem?
     private var playbackProgressEndedTime: CMTime?
+    private var pendingPlaybackResume: PendingPlaybackResume?
+    private var pendingPlaybackResumeObserver: AnyCancellable?
+    private var pendingPlaybackResumeTimeout: Task<Void, Never>?
+    private var resumePositionUnrestoredItem: AVPlayerItem?
+
+    var playbackControllerFactory: @MainActor (URL) -> (AVPlayer, any PlayerPlaybackControlling) = {
+        let player = AVPlayer(url: $0)
+        return (player, player)
+    }
+    var resumptionReadinessTimeout: Duration = .seconds(20)
+    var resumptionSeekTimeout: Duration = .seconds(15)
+
     private struct PendingReplay {
         let player: AVPlayer
         let item: AVPlayerItem
@@ -168,6 +211,23 @@ public final class PlayerViewModel: ObservableObject {
         let interactionSequence: Int
     }
     private var pendingReplay: PendingReplay?
+
+    private struct PendingPlaybackResume {
+        enum Phase: Equatable {
+            case waitingForReadiness
+            case seeking
+        }
+
+        let id: UUID
+        let player: AVPlayer
+        let item: AVPlayerItem
+        let controller: any PlayerPlaybackControlling
+        let identity: ClientPlaybackIdentity
+        let checkpoint: ClientPlaybackCheckpoint
+        let interactionSequence: Int
+        var phase: Phase
+        var targetSeconds: Double?
+    }
 
     public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
@@ -179,6 +239,11 @@ public final class PlayerViewModel: ObservableObject {
 
     public var playbackState: PlayerPlaybackState {
         let item = player?.currentItem
+        if let pendingPlaybackResume, pendingPlaybackResume.player === player,
+            pendingPlaybackResume.item === item
+        {
+            return .buffering
+        }
         if let pendingReplay, pendingReplay.player === player, pendingReplay.item === item {
             return .buffering
         }
@@ -198,6 +263,7 @@ public final class PlayerViewModel: ObservableObject {
         defaults: UserDefaults = .standard,
         autoplay: Bool = true,
         playbackProgressReportInterval: Duration? = .seconds(15),
+        resumptionStore: ClientResumptionStore? = nil,
         cacheClientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
         }
@@ -205,6 +271,7 @@ public final class PlayerViewModel: ObservableObject {
         self.defaults = defaults
         self.autoplay = autoplay
         self.playbackProgressReportInterval = playbackProgressReportInterval
+        self.resumptionStore = resumptionStore
         self.cacheClientFactory = cacheClientFactory
 
         let initialStreamURLText = defaultStreamURLText ?? defaults.string(forKey: Self.lastStreamURLDefaultsKey) ?? ""
@@ -220,6 +287,7 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     public func load() {
+        let replacingPendingResume = isCurrentResumePositionUnrestored
         markManualInteraction()
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
@@ -227,7 +295,7 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        load(url: url, persist: true, progressContext: nil)
+        load(url: url, persist: true, progressContext: nil, suppressCurrentPosition: replacingPendingResume)
     }
 
     public func load(streamURLText: String) {
@@ -238,7 +306,8 @@ public final class PlayerViewModel: ObservableObject {
     @discardableResult
     public func loadTransient(
         streamURLText: String,
-        progressContext: PlayerPlaybackProgressContext? = nil
+        progressContext: PlayerPlaybackProgressContext? = nil,
+        resumeCheckpoint: ClientPlaybackCheckpoint? = nil
     ) -> Bool {
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
@@ -246,8 +315,15 @@ public final class PlayerViewModel: ObservableObject {
             return false
         }
 
+        let replacingPendingResume = isCurrentResumePositionUnrestored
         markManualInteraction()
-        load(url: url, persist: false, progressContext: progressContext)
+        load(
+            url: url,
+            persist: false,
+            progressContext: progressContext,
+            resumeCheckpoint: resumeCheckpoint,
+            suppressCurrentPosition: replacingPendingResume
+        )
         return true
     }
 
@@ -255,41 +331,88 @@ public final class PlayerViewModel: ObservableObject {
     public func loadTransient(
         streamURLText: String,
         progressContext: PlayerPlaybackProgressContext? = nil,
+        resumeCheckpoint: ClientPlaybackCheckpoint? = nil,
         ifManualInteractionSequenceMatches expectedSequence: Int
     ) -> Bool {
         guard manualInteractionSequence == expectedSequence else {
             return false
         }
 
-        return loadTransient(streamURLText: streamURLText, progressContext: progressContext)
+        return loadTransient(
+            streamURLText: streamURLText,
+            progressContext: progressContext,
+            resumeCheckpoint: resumeCheckpoint
+        )
     }
 
-    private func load(url: URL, persist: Bool, progressContext: PlayerPlaybackProgressContext?) {
-        let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
+    private func load(
+        url: URL,
+        persist: Bool,
+        progressContext: PlayerPlaybackProgressContext?,
+        resumeCheckpoint: ClientPlaybackCheckpoint? = nil,
+        suppressCurrentPosition: Bool = false
+    ) {
+        let queuedStoppedReport =
+            suppressCurrentPosition
+            ? false : queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
 
-        let nextPlayer = AVPlayer(url: url)
+        let (nextPlayer, nextController) = playbackControllerFactory(url)
         nextPlayer.defaultRate = playbackSpeed.rate
         player = nextPlayer
+        playbackController = nextController
         loadedURL = url
         playbackProgressContext = progressContext?.withPlaybackURI(url.absoluteString)
         playbackProgressReportingMessage = nil
         validationMessage = nil
+        resumePositionUnrestoredItem = nil
         if persist {
             streamURLText = url.absoluteString
             defaults.set(url.absoluteString, forKey: Self.lastStreamURLDefaultsKey)
         }
-        statusMessage = "Playing \(url.absoluteString)"
 
-        if autoplay {
-            nextPlayer.play()
+        let matchingCheckpoint: ClientPlaybackCheckpoint?
+        if let identity = playbackProgressContext?.resumptionIdentity,
+            let resumeCheckpoint,
+            resumeCheckpoint.identity == identity
+        {
+            matchingCheckpoint = resumeCheckpoint
+            resumptionStore?.beginPlayback(identity, checkpoint: resumeCheckpoint)
+        } else {
+            matchingCheckpoint = nil
+            if let identity = playbackProgressContext?.resumptionIdentity {
+                resumptionStore?.beginPlayback(identity)
+            }
+        }
+
+        if let matchingCheckpoint, let identity = playbackProgressContext?.resumptionIdentity,
+            let item = nextController.currentItem
+        {
+            statusMessage = "Restoring saved playback position."
+            nextController.pause()
+            resumePositionUnrestoredItem = item
+            beginPlaybackResume(
+                player: nextPlayer,
+                item: item,
+                controller: nextController,
+                identity: identity,
+                checkpoint: matchingCheckpoint
+            )
+        } else if matchingCheckpoint != nil {
+            validationMessage = "Could not restore the saved playback position. Try again."
+            statusMessage = validationMessage ?? "Could not restore playback."
+        } else {
+            statusMessage = "Playing \(url.absoluteString)"
+            if autoplay {
+                nextController.play()
+            }
+            queueCurrentPlaybackProgressReport(intent: .started)
+            startPlaybackProgressReporting()
         }
         observePlaybackEnd(for: nextPlayer.currentItem)
         observePlaybackResume(for: nextPlayer)
         observePlaybackTimeJumps(for: nextPlayer.currentItem)
-        queueCurrentPlaybackProgressReport(intent: .started)
-        startPlaybackProgressReporting()
     }
 
     public func skipBackward() {
@@ -427,12 +550,16 @@ public final class PlayerViewModel: ObservableObject {
                 else { return }
                 let position = controller.currentTime()
                 let duration = Self.playbackDurationSeconds(controller.itemDuration)
+                self.resumePositionUnrestoredItem = nil
                 self.queuePlaybackProgressReport(
                     positionSeconds: position.seconds, durationSeconds: duration, intent: .seek)
                 self.finishPlaybackProgressReporting(for: item, terminalTime: position, durationSeconds: duration)
             }
         } else {
             controller.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+            if controller.currentItem === resumePositionUnrestoredItem {
+                resumePositionUnrestoredItem = nil
+            }
             queuePlaybackProgressReport(
                 positionSeconds: target.seconds, durationSeconds: durationSeconds, intent: .seek)
             restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: nil)
@@ -477,13 +604,19 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     public func stop() {
+        handlePlaybackTimeJump(using: playbackController)
+        let suppressCurrentPosition = isCurrentResumePositionUnrestored
         markManualInteraction()
-        let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
+        let queuedStoppedReport =
+            suppressCurrentPosition
+            ? false : queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         player?.pause()
         player = nil
+        playbackController = nil
         loadedURL = nil
         playbackProgressContext = nil
+        resumePositionUnrestoredItem = nil
         statusMessage = "Stopped."
         requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
     }
@@ -520,12 +653,39 @@ public final class PlayerViewModel: ObservableObject {
         }
     }
 
+    public func checkpointPlayback() {
+        handlePlaybackTimeJump(using: playbackController)
+        guard !isCurrentResumePositionUnrestored,
+            let controller = playbackController,
+            let item = controller.currentItem,
+            player?.currentItem === item,
+            let identity = playbackProgressContext?.resumptionIdentity,
+            let resumptionStore
+        else {
+            return
+        }
+
+        let position = controller.currentTime().seconds
+        guard position.isFinite, position >= 0 else { return }
+        let duration = Self.playbackDurationSeconds(controller.itemDuration)
+        let completed =
+            resumptionStore.record?.playback?.identity == identity
+            ? (resumptionStore.record?.playback?.completed ?? false) : false
+        resumptionStore.updatePlayback(
+            identity: identity,
+            positionSeconds: position,
+            durationSeconds: duration,
+            completed: completed
+        )
+    }
+
     @discardableResult
     public func reportCurrentPlaybackProgress(
         intent: PlaybackProgressIntent = .playing
     ) async -> PlaybackProgressReportResult? {
         handlePlaybackTimeJump(using: player)
-        guard let report = currentPlaybackProgressReport(intent: intent),
+        guard !isCurrentResumePositionUnrestored,
+            let report = currentPlaybackProgressReport(intent: intent),
             let endpoint = playbackProgressContext?.endpoint
         else {
             return nil
@@ -545,6 +705,190 @@ public final class PlayerViewModel: ObservableObject {
     private func markManualInteraction() {
         manualInteractionSequence += 1
         pendingReplay = nil
+        cancelPendingPlaybackResume()
+    }
+
+    private var isCurrentResumePositionUnrestored: Bool {
+        guard let item = player?.currentItem else { return false }
+        return resumePositionUnrestoredItem === item
+    }
+
+    private func beginPlaybackResume(
+        player: AVPlayer,
+        item: AVPlayerItem,
+        controller: any PlayerPlaybackControlling,
+        identity: ClientPlaybackIdentity,
+        checkpoint: ClientPlaybackCheckpoint
+    ) {
+        let request = PendingPlaybackResume(
+            id: UUID(),
+            player: player,
+            item: item,
+            controller: controller,
+            identity: identity,
+            checkpoint: checkpoint,
+            interactionSequence: manualInteractionSequence,
+            phase: .waitingForReadiness,
+            targetSeconds: nil
+        )
+        pendingPlaybackResume = request
+
+        switch controller.readinessStatus {
+        case .readyToPlay:
+            beginPlaybackResumeSeek(requestID: request.id)
+        case .failed:
+            failPlaybackResume(requestID: request.id)
+        default:
+            startPlaybackResumeTimeout(requestID: request.id, phase: .waitingForReadiness)
+            let observer = controller.observeReadiness { [weak self] status in
+                self?.handlePlaybackReadiness(status, requestID: request.id)
+            }
+            if pendingPlaybackResume?.id == request.id,
+                pendingPlaybackResume?.phase == .waitingForReadiness
+            {
+                pendingPlaybackResumeObserver = observer
+            } else {
+                observer.cancel()
+            }
+        }
+    }
+
+    private func handlePlaybackReadiness(_ status: AVPlayerItem.Status, requestID: UUID) {
+        guard let request = pendingPlaybackResume, request.id == requestID,
+            request.phase == .waitingForReadiness
+        else {
+            return
+        }
+        guard isCurrentPlaybackResume(request) else {
+            cancelPendingPlaybackResume()
+            return
+        }
+
+        switch status {
+        case .readyToPlay:
+            pendingPlaybackResumeObserver?.cancel()
+            pendingPlaybackResumeObserver = nil
+            pendingPlaybackResumeTimeout?.cancel()
+            pendingPlaybackResumeTimeout = nil
+            beginPlaybackResumeSeek(requestID: requestID)
+        case .failed:
+            failPlaybackResume(requestID: requestID)
+        default:
+            break
+        }
+    }
+
+    private func beginPlaybackResumeSeek(requestID: UUID) {
+        guard var request = pendingPlaybackResume, request.id == requestID,
+            request.phase == .waitingForReadiness,
+            isCurrentPlaybackResume(request)
+        else {
+            return
+        }
+
+        let savedPosition = request.checkpoint.completed ? 0 : request.checkpoint.positionSeconds
+        let currentDuration = Self.playbackDurationSeconds(request.controller.itemDuration)
+        let upperBound =
+            currentDuration.map {
+                max(0, $0 - Self.resumeSeekEndSafetyMarginSeconds)
+            } ?? ClientResumptionStore.maximumPlaybackSeconds
+        let targetSeconds = min(max(0, savedPosition), upperBound)
+        request.phase = .seeking
+        request.targetSeconds = targetSeconds
+        pendingPlaybackResume = request
+        let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+
+        startPlaybackResumeTimeout(requestID: requestID, phase: .seeking)
+        request.controller.seekForPlayback(to: target) { [weak self] finished in
+            self?.completePlaybackResumeSeek(finished: finished, requestID: requestID)
+        }
+    }
+
+    private func completePlaybackResumeSeek(finished: Bool, requestID: UUID) {
+        guard let request = pendingPlaybackResume, request.id == requestID,
+            request.phase == .seeking
+        else {
+            return
+        }
+        guard isCurrentPlaybackResume(request) else {
+            cancelPendingPlaybackResume()
+            return
+        }
+        guard finished else {
+            failPlaybackResume(requestID: requestID)
+            return
+        }
+
+        let position = request.controller.currentTime().seconds
+        guard let targetSeconds = request.targetSeconds,
+            position.isFinite,
+            position >= 0,
+            abs(position - targetSeconds) <= Self.resumeSeekPositionToleranceSeconds
+        else {
+            failPlaybackResume(requestID: requestID)
+            return
+        }
+
+        cancelPendingPlaybackResume()
+        resumePositionUnrestoredItem = nil
+        request.controller.defaultRate = playbackSpeed.rate
+        statusMessage =
+            autoplay
+            ? "Playing \(loadedURL?.absoluteString ?? "stream")."
+            : "Playback ready at the saved position."
+        validationMessage = nil
+        if autoplay {
+            request.controller.play()
+        }
+        queuePlaybackProgressReport(
+            positionSeconds: position,
+            durationSeconds: Self.playbackDurationSeconds(request.controller.itemDuration),
+            intent: .started
+        )
+        startPlaybackProgressReporting()
+    }
+
+    private func isCurrentPlaybackResume(_ request: PendingPlaybackResume) -> Bool {
+        request.interactionSequence == manualInteractionSequence
+            && player === request.player
+            && player?.currentItem === request.item
+            && request.controller.currentItem === request.item
+    }
+
+    private func startPlaybackResumeTimeout(
+        requestID: UUID,
+        phase: PendingPlaybackResume.Phase
+    ) {
+        pendingPlaybackResumeTimeout?.cancel()
+        let timeout = phase == .waitingForReadiness ? resumptionReadinessTimeout : resumptionSeekTimeout
+        pendingPlaybackResumeTimeout = Task { [weak self] in
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            guard let self, let request = self.pendingPlaybackResume,
+                request.id == requestID, request.phase == phase
+            else {
+                return
+            }
+            self.failPlaybackResume(requestID: requestID)
+        }
+    }
+
+    private func failPlaybackResume(requestID: UUID) {
+        guard pendingPlaybackResume?.id == requestID else { return }
+        cancelPendingPlaybackResume()
+        validationMessage = "Could not restore the saved playback position. Try again."
+        statusMessage = validationMessage ?? "Could not restore playback."
+    }
+
+    private func cancelPendingPlaybackResume() {
+        pendingPlaybackResume = nil
+        pendingPlaybackResumeObserver?.cancel()
+        pendingPlaybackResumeObserver = nil
+        pendingPlaybackResumeTimeout?.cancel()
+        pendingPlaybackResumeTimeout = nil
     }
 
     private func startPlaybackProgressReporting() {
@@ -610,7 +954,7 @@ public final class PlayerViewModel: ObservableObject {
                     else {
                         return
                     }
-                    self.finishPlaybackProgressReporting(for: endedItem)
+                    self.finishPlaybackProgressReporting(for: endedItem, completed: true)
                 }
             }
     }
@@ -679,7 +1023,10 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func finishPlaybackProgressReporting(
-        for item: AVPlayerItem, terminalTime: CMTime? = nil, durationSeconds: Double? = nil
+        for item: AVPlayerItem,
+        terminalTime: CMTime? = nil,
+        durationSeconds: Double? = nil,
+        completed: Bool? = nil
     ) {
         guard player?.currentItem === item, playbackProgressEndedItem !== item else {
             return
@@ -687,10 +1034,14 @@ public final class PlayerViewModel: ObservableObject {
         let queuedStoppedReport: Bool
         if let terminalTime {
             queuePlaybackProgressReport(
-                positionSeconds: terminalTime.seconds, durationSeconds: durationSeconds, intent: .stopped)
+                positionSeconds: terminalTime.seconds,
+                durationSeconds: durationSeconds,
+                intent: .stopped,
+                completed: completed
+            )
             queuedStoppedReport = playbackProgressContext != nil
         } else {
-            queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
+            queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped, completed: completed)
         }
         playbackProgressEndedItem = item
         let endTime = terminalTime ?? player?.currentTime() ?? .invalid
@@ -746,14 +1097,17 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) -> Bool {
+    private func queueCurrentPlaybackProgressReport(
+        intent: PlaybackProgressIntent,
+        completed: Bool? = nil
+    ) -> Bool {
         guard let report = currentPlaybackProgressReport(intent: intent),
             let endpoint = playbackProgressContext?.endpoint
         else {
             return false
         }
 
-        queuePlaybackProgressReport(report, endpoint: endpoint)
+        queuePlaybackProgressReport(report, endpoint: endpoint, completed: completed)
         return true
     }
 
@@ -767,7 +1121,8 @@ public final class PlayerViewModel: ObservableObject {
     private func queuePlaybackProgressReport(
         positionSeconds: Double,
         durationSeconds: Double?,
-        intent: PlaybackProgressIntent
+        intent: PlaybackProgressIntent,
+        completed: Bool? = nil
     ) {
         guard let context = playbackProgressContext else {
             return
@@ -781,15 +1136,17 @@ public final class PlayerViewModel: ObservableObject {
             durationSeconds: durationSeconds,
             intent: intent
         )
-        queuePlaybackProgressReport(report, endpoint: context.endpoint)
+        queuePlaybackProgressReport(report, endpoint: context.endpoint, completed: completed)
     }
 
     @discardableResult
     private func queuePlaybackProgressReport(
         _ report: PlaybackProgressReport,
         endpoint: CacheServerEndpoint,
-        updatesReportingMessage: Bool = false
+        updatesReportingMessage: Bool = false,
+        completed: Bool? = nil
     ) -> Task<PlaybackProgressReportResult?, Never> {
+        saveLocalPlaybackCheckpoint(from: report, completed: completed)
         playbackProgressReportingMessage = nil
         let previousReportTask = playbackProgressReportChain
         let cacheClientFactory = cacheClientFactory
@@ -817,6 +1174,35 @@ public final class PlayerViewModel: ObservableObject {
         return reportTask
     }
 
+    private func saveLocalPlaybackCheckpoint(
+        from report: PlaybackProgressReport,
+        completed explicitCompletion: Bool?
+    ) {
+        guard !isCurrentResumePositionUnrestored,
+            let identity = playbackProgressContext?.resumptionIdentity,
+            let resumptionStore
+        else {
+            return
+        }
+
+        let completed: Bool
+        if let explicitCompletion {
+            completed = explicitCompletion
+        } else if report.intent == .started || report.intent == .playing || report.intent == .seek {
+            completed = false
+        } else {
+            completed =
+                resumptionStore.record?.playback?.identity == identity
+                ? (resumptionStore.record?.playback?.completed ?? false) : false
+        }
+        resumptionStore.updatePlayback(
+            identity: identity,
+            positionSeconds: report.positionSeconds,
+            durationSeconds: report.durationSeconds,
+            completed: completed
+        )
+    }
+
     private func currentPlaybackProgressReport(intent: PlaybackProgressIntent) -> PlaybackProgressReport? {
         guard let context = playbackProgressContext else {
             return nil
@@ -833,20 +1219,20 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func currentPlaybackPositionSeconds() -> Double {
-        guard let player else {
+        guard let controller = playbackController else {
             return 0
         }
 
-        let seconds = player.currentTime().seconds
+        let seconds = controller.currentTime().seconds
         return seconds.isFinite && seconds > 0 ? seconds : 0
     }
 
     private func currentPlaybackDurationSeconds() -> Double? {
-        guard let player else {
+        guard let controller = playbackController else {
             return nil
         }
 
-        return Self.playbackDurationSeconds(player.itemDuration)
+        return Self.playbackDurationSeconds(controller.itemDuration)
     }
 
     public nonisolated static func normalizedHTTPURL(from text: String) -> URL? {

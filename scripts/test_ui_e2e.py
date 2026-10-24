@@ -979,11 +979,12 @@ class XcresultValidationTests(unittest.TestCase):
             ]
         }
 
-    def test_platform_case_matrix_requires_four_cases_without_dropping_existing_coverage(self) -> None:
+    def test_platform_case_matrix_requires_five_cases_without_dropping_existing_coverage(self) -> None:
         task_watch_cases = (
             "testAutomaticTaskWatchRecoversWithoutResubmission",
             "testManualTaskWatchReconnectPreservesPlayback",
             "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
+            "testRelaunchRestoresTaskAndExplicitPlaybackPosition",
         )
         self.assertEqual(ui_e2e.EXPECTED_UI_CASES, task_watch_cases)
         self.assertEqual(
@@ -1051,6 +1052,7 @@ class XcresultValidationTests(unittest.TestCase):
                 "testAutomaticTaskWatchRecoversWithoutResubmission",
                 "testManualTaskWatchReconnectPreservesPlayback",
                 "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
+                "testRelaunchRestoresTaskAndExplicitPlaybackPosition",
                 "testConnectBrowseAndControlRealPlayback",
             ),
         )
@@ -1109,6 +1111,7 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
             "scenarios": {
                 name: {
                     "task_id": ui_e2e.EXPECTED_TASK_IDS[name],
+                    "start_resolution_count": 1,
                     "create_count": 1,
                     "watch_count": 1 if name == "silent" else 2,
                     "watch_stream_open_count": 1 if name == "silent" else 2,
@@ -1117,6 +1120,12 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
                     "completed_get_task_count": 1 if name == "silent" else 0,
                     "output_count": 2 if name == "silent" else 1,
                     "cancel_count": 0,
+                    "playback_source_request_count": 2 if name == "resumption" else 0,
+                    "playback_source_requests": (
+                        [ui_e2e.EXPECTED_PLAYBACK_SOURCES["resumption"]] * 2
+                        if name == "resumption"
+                        else []
+                    ),
                     "rpc_trace": ["watch", "get_task", "get_task"] if name == "silent" else [],
                     **(
                         {"manual_resume_read_before_watch": True}
@@ -1124,7 +1133,7 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
                         else {}
                     ),
                 }
-                for name in ("automatic", "manual", "silent")
+                for name in ("automatic", "manual", "silent", "resumption")
             },
         }
 
@@ -1265,6 +1274,58 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ui_e2e.UIE2EError, "before its final watch"):
             ui_e2e.validate_task_fixture_metrics(bad)
 
+    def test_fixture_metrics_require_exact_resolution_and_saved_playback_source(self) -> None:
+        metrics = self._metrics()
+        self.assertEqual(
+            ui_e2e.validate_task_fixture_metrics(metrics)["scenarios"]["resumption"][
+                "playback_source_requests"
+            ],
+            [ui_e2e.EXPECTED_PLAYBACK_SOURCES["resumption"]] * 2,
+        )
+
+        invalid_cases = (
+            ("start_resolution_count", 2, "exactly one resolution"),
+            ("start_resolution_count", 0, "exactly one resolution"),
+            ("playback_source_request_count", 1, "exactly 2 playback source request"),
+            ("playback_source_request_count", 3, "exactly 2 playback source request"),
+            (
+                "playback_source_requests",
+                [{"item_id": "ui-e2e-resumption-decoy-library-item", "variant_id": "ui-e2e-resumption-mp4"}],
+                "unexpected playback source",
+            ),
+            (
+                "playback_source_requests",
+                [{"item_id": "ui-e2e-resumption-library-item", "variant_id": "ui-e2e-resumption-decoy-mp4"}],
+                "unexpected playback source",
+            ),
+        )
+        for key, value, message in invalid_cases:
+            with self.subTest(key=key, value=value):
+                bad = self._metrics()
+                bad["scenarios"]["resumption"][key] = value
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, message):
+                    ui_e2e.validate_task_fixture_metrics(bad)
+
+        bad = self._metrics()
+        bad["scenarios"]["automatic"]["start_resolution_count"] = True
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "exactly one resolution"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+
+        bad = self._metrics()
+        bad["scenarios"]["manual"]["playback_source_request_count"] = 1
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "exactly 0 playback source request"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+
+        bad = self._metrics()
+        bad["scenarios"]["silent"]["playback_source_requests"] = [{"item_id": "unexpected"}]
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "unexpected playback source"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+
+        bad = self._metrics()
+        bad["scenarios"]["unexpected"] = {}
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "unexpected scenario"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+
     def test_fixture_metrics_require_expected_task_ids_and_positive_io(self) -> None:
         metrics = self._metrics()
         metrics["scenarios"]["automatic"]["task_id"] = "unexpected"
@@ -1301,7 +1362,7 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
                     ui_e2e.validate_task_fixture_metrics(bad)
 
     def test_fixture_metrics_reject_cancellation_side_effects(self) -> None:
-        for scenario in ("automatic", "manual", "silent"):
+        for scenario in ("automatic", "manual", "silent", "resumption"):
             for cancel_count in (1, -1, True, "0", None):
                 with self.subTest(scenario=scenario, cancel_count=cancel_count):
                     metrics = self._metrics()

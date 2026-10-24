@@ -37,7 +37,12 @@ final class FixtureConfigurationTests: XCTestCase {
             .manual
         )
         XCTAssertEqual(try FixtureSourceResolver.scenario(for: FixtureScenario.silent.source), .silent)
+        XCTAssertEqual(
+            try FixtureSourceResolver.scenario(for: FixtureScenario.resumption.source),
+            .resumption
+        )
         XCTAssertThrowsError(try FixtureSourceResolver.scenario(for: "BV1unknown"))
+        XCTAssertThrowsError(try FixtureSourceResolver.scenario(for: "BV1xK4y1P7mX"))
         XCTAssertThrowsError(try FixtureSourceResolver.scenario(for: "https://example.com/video/BV1QtjA6BEB8"))
     }
 }

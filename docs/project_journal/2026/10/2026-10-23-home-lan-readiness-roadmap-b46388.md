@@ -3,7 +3,7 @@ id: 20261023-b46388
 title: Home LAN Reliability And Preview Readiness
 status: active
 created: 2026-10-23
-updated: 2026-10-23
+updated: 2026-10-24
 branch:
 pr:
 supersedes: []
@@ -23,7 +23,7 @@ superseded_by:
 | --- | --- | --- |
 | [0. CI stability and diagnostics](2026-10-23-ci-stability-diagnostics-b46389.md) | completed | Add toolchain/source-bound compiled caches, bounded stage logs/JSON, all-helper regressions and redacted test-waiter diagnostics. No warm-cache speedup or timeout root cause is inferred. Preserve all test, lint and build gates. |
 | [1. Silent task-state reconciliation](2026-10-23-silent-task-reconciliation-b46390.md) | completed | Use bounded existing `GetTask` reconciliation when observation stays open but becomes silent. Healthy idle work is not a failure. Preserve task identity, cancellation/generation guards and media playback; never resubmit as a recovery side effect. |
-| 2. Client task and playback resumption | pending | Restore the accepted task and playback position on the same client, bound to the original server and result identity. Offer an explicit Continue action rather than autoplay. Expired tasks, deleted media and a mismatched server produce an honest unavailable state, never an implicit new resolution/download. |
+| [2. Client task and playback resumption](2026-10-23-client-task-playback-resumption-b46391.md) | completed | Restore the accepted task and playback position on the same client, bound to the original server and result identity. Offer an explicit Continue action rather than autoplay. Expired tasks, deleted media and a mismatched server produce an honest unavailable state, never an implicit new resolution/download. |
 | 3. Media weak-network, ABR and transcoding acceptance | pending | Use controlled local upstream faults to validate latency, failed/truncated reads, CDN fallback, actual quality downgrade/recovery, representation isolation and decoding of existing transcoded outputs. Manifest presence alone is not acceptance. |
 | 4. Native cache lifecycle and offline acceptance | pending | Exercise full fill during playback, upstream unavailability, same-root server restart, existing high/low watermark eviction and deletion protection through native workflows. Only genuinely complete selected representations qualify as fully offline. |
 | 5. Native credential and settings UI regression | pending | Use credential-free fixtures for login readiness, expiry, cancellation, unavailable methods, endpoint replacement and existing settings warnings/conflicts. Keep real scanning and authenticated requests separate and opt-in. |

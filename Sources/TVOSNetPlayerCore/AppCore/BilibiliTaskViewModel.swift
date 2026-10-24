@@ -390,6 +390,58 @@ public extension BilibiliPlaybackPolicy {
     }
 }
 
+public struct ClientPreparedResumption: Equatable, Sendable {
+    public let url: URL
+    public let progressContext: PlayerPlaybackProgressContext
+    public let checkpoint: ClientPlaybackCheckpoint
+}
+
+private struct SavedPlaybackSourceSignature: Equatable {
+    let itemID: String
+    let variantID: String
+    let playbackProtocol: String
+    let uri: String
+}
+
+private struct SavedPlaybackObservationSignature: Equatable {
+    let taskID: String
+    let resultID: String?
+    let libraryItemID: String
+    let outputRevision: UInt64?
+    let isPlayable: Bool
+    let source: SavedPlaybackSourceSignature?
+
+    func hasSameSelectedSource(as other: Self) -> Bool {
+        guard taskID == other.taskID, resultID == other.resultID else {
+            return false
+        }
+        if source != nil || other.source != nil {
+            guard let source, let otherSource = other.source else {
+                return false
+            }
+            return libraryItemID == other.libraryItemID && isPlayable == other.isPlayable
+                && source == otherSource
+        }
+        return outputRevision == other.outputRevision && isPlayable == other.isPlayable
+            && libraryItemID == other.libraryItemID
+    }
+}
+
+private struct SavedPlaybackValidationTrigger: Equatable {
+    let identity: ClientPlaybackIdentity
+    let signature: SavedPlaybackObservationSignature
+
+    func representsSameSelectedSource(as other: Self) -> Bool {
+        identity == other.identity && signature.hasSameSelectedSource(as: other.signature)
+    }
+}
+
+private enum SavedPlaybackPreparationFence {
+    case current
+    case obsolete
+    case selectedSourceChanged
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     public static let playbackTranscodingPreferenceDefaultsKey = "BilibiliPlaybackTranscodingPreference"
@@ -451,6 +503,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var isSubmitting = false
     @Published public private(set) var isResolving = false
+    @Published public private(set) var isRestoringTask = false
+    @Published public private(set) var resumptionMessage: String?
     /// True while the task observation lifecycle is active, including recovery delays and reconciliation.
     @Published public private(set) var isWatching = false
     @Published public private(set) var isReconnecting = false
@@ -486,6 +540,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private let defaults: UserDefaults
+    private let resumptionStore: ClientResumptionStore?
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private let resolutionTimeout: Duration
@@ -494,6 +549,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let watchReconciliationSleep: @Sendable (Duration) async throws -> Void
     private let watchReconciliationNow: @Sendable () -> ContinuousClock.Instant
     private var activeEndpoint: CacheServerEndpoint?
+    private var activeServerID: String?
+    private var restoredTaskIdentity: ClientResumptionTaskIdentity?
+    private var restoreAttemptIdentity: ClientResumptionTaskIdentity?
+    private var restoreGeneration = 0
+    private var savedPlaybackValidationGeneration = 0
+    private var savedPlaybackValidationTask: Task<Void, Never>?
+    private var validatedSavedPlayback: ClientPreparedResumption?
+    private var lastSavedPlaybackValidationTrigger: SavedPlaybackValidationTrigger?
     private var mediaBaseURIs: [String] = []
     private var resolvedInputContext: BilibiliResolvedInputContext?
     private var taskWatcher: Task<Void, Never>?
@@ -539,6 +602,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         audioLanguagePreference: String = "",
         playbackPolicy: BilibiliPlaybackPolicy? = nil,
         defaults: UserDefaults = .standard,
+        resumptionStore: ClientResumptionStore? = nil,
         operationTimeout: Duration = .seconds(10),
         resolutionTimeout: Duration = .seconds(120),
         watchReconciliationInterval: Duration = .seconds(30),
@@ -554,6 +618,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         self.encodingPreference = encodingPreference
         self.audioLanguagePreference = audioLanguagePreference
         self.defaults = defaults
+        self.resumptionStore = resumptionStore
         let initialPlaybackPolicy = playbackPolicy ?? Self.loadPlaybackPolicy(from: defaults)
         playbackTranscodingPreference = initialPlaybackPolicy.transcodingPreference
         playbackCompatibleVariantPreference = initialPlaybackPolicy.compatibleVariantPreference
@@ -577,6 +642,30 @@ public final class BilibiliTaskViewModel: ObservableObject {
         taskWatcher?.cancel()
         watchReconciliationTask?.cancel()
         taskResultRefreshTask?.cancel()
+        savedPlaybackValidationTask?.cancel()
+    }
+
+    public var hasSavedTask: Bool {
+        resumptionStore?.record != nil
+    }
+
+    public var canContinueSavedPlayback: Bool {
+        guard !isSubmitting, !isResolving, !isRestoringTask, !isCancelling,
+            let record = resumptionStore?.record,
+            let checkpoint = record.playback,
+            let validatedSavedPlayback,
+            checkpoint == validatedSavedPlayback.checkpoint,
+            validatedSavedPlayback.progressContext.resumptionIdentity == checkpoint.identity,
+            validatedSavedPlayback.progressContext.endpoint == record.task.endpoint,
+            validatedSavedPlayback.progressContext.playbackURI == validatedSavedPlayback.url.absoluteString,
+            currentTask?.id == record.task.taskID,
+            activeEndpoint == record.task.endpoint,
+            activeServerID == record.task.serverID
+        else {
+            return false
+        }
+
+        return true
     }
 
     public var canSubmit: Bool {
@@ -1006,17 +1095,33 @@ public final class BilibiliTaskViewModel: ObservableObject {
     public func playbackProgressContext(serverAddressText: String) -> PlayerPlaybackProgressContext? {
         guard let currentTask,
             let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
-            let playbackURL = currentTask.playableBilibiliURL
+            let playbackURL = currentTask.playableBilibiliURL,
+            let taskIdentity = currentResumptionTaskIdentity(endpoint: endpoint, taskID: currentTask.id)
         else {
             return nil
         }
 
         let playbackSource = currentTask.playableBilibiliPlaybackSource
+        let resultID: String?
+        if currentTask.topLevelPlayableBilibiliURL != nil {
+            resultID = nil
+        } else if let result = currentTask.bilibiliTaskResults.first(where: { $0.playbackURL == playbackURL }) {
+            resultID = result.id
+        } else {
+            return nil
+        }
+        let libraryItemID = currentTask.playableBilibiliLibraryItemID ?? ""
         return PlayerPlaybackProgressContext(
             endpoint: endpoint,
             playbackURI: playbackURL.absoluteString,
             libraryItemID: currentTask.playableBilibiliLibraryItemID ?? playbackSource?.itemID ?? "",
-            variantID: playbackSource?.variantID ?? ""
+            variantID: playbackSource?.variantID ?? "",
+            resumptionIdentity: ClientPlaybackIdentity(
+                task: taskIdentity,
+                resultID: resultID,
+                libraryItemID: libraryItemID,
+                variantID: playbackSource?.variantID ?? ""
+            )
         )
     }
 
@@ -1024,8 +1129,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         for result: BilibiliTaskResultPresentation,
         serverAddressText: String
     ) -> PlayerPlaybackProgressContext? {
-        guard currentTask != nil,
+        guard let currentTask,
             let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
+            let taskIdentity = currentResumptionTaskIdentity(endpoint: endpoint, taskID: currentTask.id),
             let resultItem = taskResults.first(where: { $0.id == result.id }),
             let playbackURL = resultItem.playbackURL
         else {
@@ -1036,7 +1142,835 @@ public final class BilibiliTaskViewModel: ObservableObject {
             endpoint: endpoint,
             playbackURI: playbackURL.absoluteString,
             libraryItemID: resultItem.playbackLibraryItemID,
-            variantID: resultItem.playbackVariantID
+            variantID: resultItem.playbackVariantID,
+            resumptionIdentity: ClientPlaybackIdentity(
+                task: taskIdentity,
+                resultID: resultItem.id,
+                libraryItemID: resultItem.playbackLibraryItemID,
+                variantID: resultItem.playbackVariantID
+            )
+        )
+    }
+
+    private func currentResumptionTaskIdentity(
+        endpoint: CacheServerEndpoint,
+        taskID: String
+    ) -> ClientResumptionTaskIdentity? {
+        guard activeEndpoint == endpoint, let activeServerID else {
+            return nil
+        }
+        return resumptionTaskIdentity(endpoint: endpoint, serverID: activeServerID, taskID: taskID)
+    }
+
+    private func resumptionTaskIdentity(
+        endpoint: CacheServerEndpoint,
+        serverID: String,
+        taskID: String
+    ) -> ClientResumptionTaskIdentity? {
+        let trimmedServerID = serverID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTaskID = taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedServerID.isEmpty, !trimmedTaskID.isEmpty else {
+            return nil
+        }
+        let identity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: trimmedServerID,
+            taskID: trimmedTaskID
+        )
+        return identity.isValidForPersistence ? identity : nil
+    }
+
+    private func invalidateSavedPlaybackValidation(clearCached: Bool = false) {
+        savedPlaybackValidationGeneration += 1
+        savedPlaybackValidationTask?.cancel()
+        savedPlaybackValidationTask = nil
+        if clearCached {
+            clearValidatedSavedPlayback()
+            lastSavedPlaybackValidationTrigger = nil
+        }
+    }
+
+    private func clearValidatedSavedPlayback() {
+        validatedSavedPlayback = nil
+    }
+
+    private func invalidateSavedRestore(message: String?) {
+        let scopedIdentity = resumptionStore?.record?.task ?? restoreAttemptIdentity ?? restoredTaskIdentity
+        restoreGeneration += 1
+        invalidateSavedPlaybackValidation(clearCached: true)
+
+        let belongsToSavedTask =
+            scopedIdentity.map { identity in
+                restoreAttemptIdentity == identity
+                    || restoredTaskIdentity == identity
+                    || (currentTask?.id == identity.taskID && activeEndpoint == identity.endpoint)
+            } ?? false
+        if belongsToSavedTask {
+            operationSequence += 1
+            stopWatching()
+            stopTaskResultPaging()
+            currentTask = nil
+            activeEndpoint = nil
+            activeServerID = nil
+            mediaBaseURIs = []
+            restoredTaskIdentity = nil
+            activePlaybackTaskID = nil
+            activePlaybackResultID = nil
+            activePlaybackLibraryItemID = nil
+            taskSnapshotGeneration += 1
+        }
+        restoreAttemptIdentity = nil
+        isRestoringTask = false
+        resumptionMessage = message
+    }
+
+    private func isSavedRestoreCurrent(
+        _ identity: ClientResumptionTaskIdentity,
+        generation: Int,
+        sequence: Int
+    ) -> Bool {
+        restoreGeneration == generation
+            && operationSequence == sequence
+            && restoreAttemptIdentity == identity
+            && resumptionStore?.record?.task == identity
+            && isRestoringTask
+            && !Task.isCancelled
+    }
+
+    public func restoreSavedTask(serverAddressText: String) async {
+        await restoreSavedTask(serverAddressText: serverAddressText, force: false)
+    }
+
+    public func retrySavedTask(serverAddressText: String) async {
+        await restoreSavedTask(serverAddressText: serverAddressText, force: true)
+    }
+
+    private func restoreSavedTask(serverAddressText: String, force: Bool) async {
+        guard let record = resumptionStore?.record else {
+            invalidateSavedRestore(message: nil)
+            return
+        }
+
+        guard let requestedEndpoint = CacheServerEndpoint.normalized(from: serverAddressText),
+            ClientResumptionTaskIdentity.canonicalEndpoint(requestedEndpoint) == record.task.endpoint
+        else {
+            invalidateSavedRestore(
+                message:
+                    "The saved task belongs to a different cache server. Restore it from its original endpoint, or forget it."
+            )
+            return
+        }
+
+        if !force {
+            if isRestoringTask,
+                restoreAttemptIdentity == record.task
+            {
+                return
+            }
+            if restoredTaskIdentity == record.task,
+                currentTask?.id == record.task.taskID,
+                activeEndpoint == record.task.endpoint,
+                isWatching
+            {
+                return
+            }
+        }
+
+        guard !isSubmitting, !isResolving, !isCancelling else {
+            resumptionMessage = "Wait for the current task operation to finish before restoring the saved task."
+            return
+        }
+
+        restoreGeneration += 1
+        let generation = restoreGeneration
+        operationSequence += 1
+        let sequence = operationSequence
+        invalidateSavedPlaybackValidation(clearCached: true)
+        stopWatching()
+        stopTaskResultPaging()
+        activeEndpoint = nil
+        activeServerID = nil
+        mediaBaseURIs = []
+        activePlaybackTaskID = nil
+        activePlaybackResultID = nil
+        activePlaybackLibraryItemID = nil
+        restoredTaskIdentity = nil
+        restoreAttemptIdentity = record.task
+        currentTask = nil
+        taskSnapshotGeneration += 1
+        isSubmitting = false
+        isResolving = false
+        isCancelling = false
+        errorMessage = nil
+        retryIntent = nil
+        clearResolutionSession()
+        isRestoringTask = true
+        resumptionMessage = "Checking the saved Bilibili task..."
+        statusMessage = "Restoring saved Bilibili task..."
+
+        defer {
+            if restoreGeneration == generation {
+                isRestoringTask = false
+                restoreAttemptIdentity = nil
+            }
+        }
+
+        let client = clientFactory(record.task.endpoint)
+        do {
+            let serverInfo = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                try await client.getServerInfo()
+            }
+            guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                return
+            }
+            let task = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                try await client.getTask(id: record.task.taskID)
+            }
+            guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                return
+            }
+            guard task.id == record.task.taskID else {
+                throw SavedTaskResumptionIssue.taskIdentityChanged
+            }
+            guard task.kind.lowercased().contains("bilibili") else {
+                throw SavedTaskResumptionIssue.notBilibiliTask
+            }
+
+            activeEndpoint = record.task.endpoint
+            activeServerID = record.task.serverID
+            mediaBaseURIs = serverInfo.mediaBaseURIs
+            restoredTaskIdentity = record.task
+            resumptionStore?.rememberTask(record.task)
+            applyTaskUpdate(task)
+
+            if let latestRecord = resumptionStore?.record,
+                latestRecord.task == record.task,
+                let checkpoint = latestRecord.playback
+            {
+                let restoreSourceSignature = savedPlaybackObservationSignature(for: task, checkpoint: checkpoint)
+                rememberSavedPlaybackValidationAttempt(for: task, taskIdentity: record.task)
+                do {
+                    let prepared = try await prepareSavedPlayback(
+                        record: latestRecord,
+                        serverInfo: serverInfo,
+                        task: task,
+                        client: client
+                    )
+                    guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                        return
+                    }
+                    guard resumptionStore?.record?.playback == checkpoint else {
+                        resumptionMessage =
+                            "The saved playback checkpoint changed during restore. Retry the saved task."
+                        return
+                    }
+                    guard let currentTask,
+                        let restoreSourceSignature,
+                        let currentSignature = savedPlaybackObservationSignature(
+                            for: currentTask,
+                            checkpoint: checkpoint
+                        ),
+                        restoreSourceSignature.hasSameSelectedSource(as: currentSignature)
+                    else {
+                        clearValidatedSavedPlayback()
+                        resumptionMessage = "The selected saved source changed during restore. Retry the saved task."
+                        return
+                    }
+                    validatedSavedPlayback = prepared
+                    rememberSavedPlaybackValidationAttempt(for: currentTask, taskIdentity: record.task)
+                    resumptionMessage = nil
+                } catch {
+                    guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                        return
+                    }
+                    clearValidatedSavedPlayback()
+                    resumptionMessage = SavedTaskResumptionIssue.message(for: error)
+                }
+            } else {
+                resumptionMessage = "The saved task was restored. No playback checkpoint is available yet."
+            }
+
+            guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                return
+            }
+            if task.shouldKeepWatchingBilibiliTask {
+                startWatching(
+                    taskID: task.id,
+                    endpoint: record.task.endpoint,
+                    sequence: sequence,
+                    reconcileBeforeSubscribe: true
+                )
+            }
+        } catch {
+            guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
+                return
+            }
+            resumptionMessage = SavedTaskResumptionIssue.message(for: error)
+            statusMessage = "Could not restore the saved Bilibili task."
+        }
+    }
+
+    public func forgetSavedTask() {
+        clearTask()
+        resumptionMessage = "The saved task was forgotten. Server work was not cancelled."
+    }
+
+    public func prepareSavedPlayback(serverAddressText: String) async -> ClientPreparedResumption? {
+        guard let record = resumptionStore?.record, record.playback != nil else {
+            resumptionMessage = "No saved playback checkpoint is available."
+            return nil
+        }
+        guard let requestedEndpoint = CacheServerEndpoint.normalized(from: serverAddressText),
+            ClientResumptionTaskIdentity.canonicalEndpoint(requestedEndpoint) == record.task.endpoint
+        else {
+            invalidateSavedRestore(
+                message:
+                    "The saved playback belongs to a different cache server. Restore it from its original endpoint, or forget it."
+            )
+            return nil
+        }
+        guard !isSubmitting, !isResolving, !isCancelling, !isRestoringTask,
+            currentTask?.id == record.task.taskID,
+            activeEndpoint == record.task.endpoint,
+            activeServerID == record.task.serverID,
+            restoredTaskIdentity == record.task
+        else {
+            resumptionMessage = "Restore the original saved task before continuing playback."
+            return nil
+        }
+
+        savedPlaybackValidationGeneration += 1
+        let validationGeneration = savedPlaybackValidationGeneration
+        savedPlaybackValidationTask?.cancel()
+        savedPlaybackValidationTask = nil
+        return await runSavedPlaybackPreparation(record, validationGeneration: validationGeneration)
+    }
+
+    public func finishPreparedResumption(
+        _ prepared: ClientPreparedResumption,
+        didStartPlayback: Bool
+    ) {
+        guard didStartPlayback else {
+            if let currentTask {
+                statusMessage = Self.statusMessage(for: currentTask)
+            }
+            return
+        }
+
+        guard let record = resumptionStore?.record,
+            let checkpoint = record.playback,
+            checkpoint == prepared.checkpoint,
+            checkpoint.identity.task == record.task,
+            prepared.progressContext.resumptionIdentity == checkpoint.identity,
+            prepared.progressContext.endpoint == record.task.endpoint,
+            prepared.progressContext.playbackURI == prepared.url.absoluteString,
+            validatedSavedPlayback == prepared,
+            currentTask?.id == record.task.taskID,
+            activeEndpoint == record.task.endpoint,
+            activeServerID == record.task.serverID,
+            restoredTaskIdentity == record.task,
+            !isSubmitting, !isResolving, !isRestoringTask, !isCancelling
+        else {
+            resumptionMessage = "The saved task changed before playback started. Recheck it before continuing."
+            return
+        }
+
+        errorMessage = nil
+        activePlaybackTaskID = checkpoint.identity.task.taskID
+        activePlaybackResultID = checkpoint.identity.resultID
+        activePlaybackLibraryItemID = normalizedNonEmpty(prepared.progressContext.libraryItemID)
+        statusMessage = "Playing \(currentTask?.bilibiliDisplayTitle ?? "Bilibili video")."
+        resumptionMessage = nil
+    }
+
+    private func runSavedPlaybackPreparation(
+        _ record: ClientResumptionRecord,
+        validationGeneration: Int
+    ) async -> ClientPreparedResumption? {
+        guard let checkpoint = record.playback,
+            let observedTask = currentTask,
+            let initialSignature = savedPlaybackObservationSignature(for: observedTask, checkpoint: checkpoint)
+        else {
+            return nil
+        }
+
+        let restoreGeneration = self.restoreGeneration
+        let operation = operationSequence
+        isRestoringTask = true
+        resumptionMessage = "Rechecking the saved playback source..."
+        defer {
+            if validationGeneration == savedPlaybackValidationGeneration,
+                restoreGeneration == self.restoreGeneration
+            {
+                isRestoringTask = false
+            }
+        }
+
+        let client = clientFactory(record.task.endpoint)
+        do {
+            let serverInfo = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                try await client.getServerInfo()
+            }
+            guard
+                handleSavedPlaybackPreparationFence(
+                    record,
+                    validationGeneration: validationGeneration,
+                    restoreGeneration: restoreGeneration,
+                    operation: operation,
+                    initialSignature: initialSignature,
+                    checkpoint: checkpoint
+                )
+            else {
+                return nil
+            }
+
+            let task = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                try await client.getTask(id: record.task.taskID)
+            }
+            guard
+                handleSavedPlaybackPreparationFence(
+                    record,
+                    validationGeneration: validationGeneration,
+                    restoreGeneration: restoreGeneration,
+                    operation: operation,
+                    initialSignature: initialSignature,
+                    checkpoint: checkpoint
+                )
+            else {
+                return nil
+            }
+            guard task.id == record.task.taskID else {
+                throw SavedTaskResumptionIssue.taskIdentityChanged
+            }
+
+            let prepared = try await prepareSavedPlayback(
+                record: record,
+                serverInfo: serverInfo,
+                task: task,
+                client: client
+            )
+            guard
+                handleSavedPlaybackPreparationFence(
+                    record,
+                    validationGeneration: validationGeneration,
+                    restoreGeneration: restoreGeneration,
+                    operation: operation,
+                    initialSignature: initialSignature,
+                    checkpoint: checkpoint
+                )
+            else {
+                return nil
+            }
+
+            validatedSavedPlayback = prepared
+            rememberSavedPlaybackValidationAttempt(for: observedTask, taskIdentity: record.task)
+            resumptionMessage = nil
+            return prepared
+        } catch {
+            guard
+                isSavedPlaybackPreparationOperationCurrent(
+                    record,
+                    validationGeneration: validationGeneration,
+                    restoreGeneration: restoreGeneration,
+                    operation: operation
+                )
+            else {
+                return nil
+            }
+            if let currentTask,
+                let currentSignature = savedPlaybackObservationSignature(for: currentTask, checkpoint: checkpoint),
+                !initialSignature.hasSameSelectedSource(as: currentSignature)
+            {
+                clearValidatedSavedPlayback()
+                resumptionMessage =
+                    "The selected saved source changed during validation. Retry the saved task before continuing."
+            } else {
+                clearValidatedSavedPlayback()
+                resumptionMessage = SavedTaskResumptionIssue.message(for: error)
+            }
+            return nil
+        }
+    }
+
+    private func handleSavedPlaybackPreparationFence(
+        _ record: ClientResumptionRecord,
+        validationGeneration: Int,
+        restoreGeneration: Int,
+        operation: Int,
+        initialSignature: SavedPlaybackObservationSignature,
+        checkpoint: ClientPlaybackCheckpoint
+    ) -> Bool {
+        switch savedPlaybackPreparationFence(
+            record,
+            validationGeneration: validationGeneration,
+            restoreGeneration: restoreGeneration,
+            operation: operation,
+            initialSignature: initialSignature,
+            checkpoint: checkpoint
+        ) {
+        case .current:
+            return true
+        case .obsolete:
+            return false
+        case .selectedSourceChanged:
+            clearValidatedSavedPlayback()
+            resumptionMessage =
+                "The selected saved source changed during validation. Retry the saved task before continuing."
+            return false
+        }
+    }
+
+    private func savedPlaybackPreparationFence(
+        _ record: ClientResumptionRecord,
+        validationGeneration: Int,
+        restoreGeneration: Int,
+        operation: Int,
+        initialSignature: SavedPlaybackObservationSignature,
+        checkpoint: ClientPlaybackCheckpoint
+    ) -> SavedPlaybackPreparationFence {
+        guard
+            isSavedPlaybackPreparationOperationCurrent(
+                record,
+                validationGeneration: validationGeneration,
+                restoreGeneration: restoreGeneration,
+                operation: operation
+            ), let currentTask,
+            let currentSignature = savedPlaybackObservationSignature(for: currentTask, checkpoint: checkpoint)
+        else {
+            return .obsolete
+        }
+        return initialSignature.hasSameSelectedSource(as: currentSignature) ? .current : .selectedSourceChanged
+    }
+
+    private func isSavedPlaybackPreparationOperationCurrent(
+        _ record: ClientResumptionRecord,
+        validationGeneration: Int,
+        restoreGeneration: Int,
+        operation: Int
+    ) -> Bool {
+        validationGeneration == savedPlaybackValidationGeneration
+            && restoreGeneration == self.restoreGeneration
+            && operation == operationSequence
+            && !Task.isCancelled
+            && resumptionStore?.record == record
+            && currentTask?.id == record.task.taskID
+            && activeEndpoint == record.task.endpoint
+            && activeServerID == record.task.serverID
+            && restoredTaskIdentity == record.task
+    }
+
+    private func savedPlaybackObservationSignature(
+        for task: CacheTask,
+        checkpoint: ClientPlaybackCheckpoint
+    ) -> SavedPlaybackObservationSignature? {
+        guard task.id == checkpoint.identity.task.taskID else {
+            return nil
+        }
+        if let resultID = checkpoint.identity.resultID {
+            guard let item = task.resultItems.first(where: { $0.id == resultID }) else {
+                return SavedPlaybackObservationSignature(
+                    taskID: task.id,
+                    resultID: resultID,
+                    libraryItemID: "",
+                    outputRevision: task.outputSummary?.revision,
+                    isPlayable: false,
+                    source: nil
+                )
+            }
+            return SavedPlaybackObservationSignature(
+                taskID: task.id,
+                resultID: resultID,
+                libraryItemID: item.libraryItemID,
+                outputRevision: task.outputSummary?.revision,
+                isPlayable: item.playableBilibiliURL != nil,
+                source: item.playbackSource.map {
+                    SavedPlaybackSourceSignature(
+                        itemID: $0.itemID,
+                        variantID: $0.variantID,
+                        playbackProtocol: $0.playbackProtocol,
+                        uri: $0.uri
+                    )
+                }
+            )
+        }
+        return SavedPlaybackObservationSignature(
+            taskID: task.id,
+            resultID: nil,
+            libraryItemID: task.libraryItemID,
+            outputRevision: task.outputSummary?.revision,
+            isPlayable: task.playableBilibiliURL != nil,
+            source: task.playbackSource.map {
+                SavedPlaybackSourceSignature(
+                    itemID: $0.itemID,
+                    variantID: $0.variantID,
+                    playbackProtocol: $0.playbackProtocol,
+                    uri: $0.uri
+                )
+            }
+        )
+    }
+
+    private func rememberSavedPlaybackValidationAttempt(
+        for task: CacheTask,
+        taskIdentity: ClientResumptionTaskIdentity
+    ) {
+        guard let checkpoint = resumptionStore?.record?.playback,
+            checkpoint.identity.task == taskIdentity,
+            let signature = savedPlaybackObservationSignature(for: task, checkpoint: checkpoint)
+        else {
+            return
+        }
+        lastSavedPlaybackValidationTrigger = SavedPlaybackValidationTrigger(
+            identity: checkpoint.identity,
+            signature: signature
+        )
+    }
+
+    private func scheduleSavedPlaybackValidationIfNeeded(for task: CacheTask) {
+        guard !isRestoringTask, !isSubmitting, !isResolving, !isCancelling,
+            let record = resumptionStore?.record,
+            let checkpoint = record.playback,
+            record.task == checkpoint.identity.task,
+            restoredTaskIdentity == record.task,
+            task.id == record.task.taskID,
+            let signature = savedPlaybackObservationSignature(for: task, checkpoint: checkpoint)
+        else {
+            return
+        }
+        if let validatedSavedPlayback,
+            validatedSavedPlayback.checkpoint == checkpoint,
+            validatedSavedPlayback.progressContext.resumptionIdentity == checkpoint.identity
+        {
+            return
+        }
+        let trigger = SavedPlaybackValidationTrigger(identity: checkpoint.identity, signature: signature)
+        guard lastSavedPlaybackValidationTrigger?.representsSameSelectedSource(as: trigger) != true else {
+            return
+        }
+
+        lastSavedPlaybackValidationTrigger = trigger
+        savedPlaybackValidationTask?.cancel()
+        savedPlaybackValidationGeneration += 1
+        let generation = savedPlaybackValidationGeneration
+        savedPlaybackValidationTask = Task { [weak self] in
+            guard let self else { return }
+            _ = await self.runSavedPlaybackPreparation(record, validationGeneration: generation)
+            if self.savedPlaybackValidationGeneration == generation {
+                self.savedPlaybackValidationTask = nil
+            }
+        }
+    }
+
+    private func prepareSavedPlayback(
+        record: ClientResumptionRecord,
+        serverInfo: CacheServerSummary,
+        task: CacheTask,
+        client: any CacheControlClient
+    ) async throws -> ClientPreparedResumption {
+        guard let checkpoint = record.playback,
+            checkpoint.identity.task == record.task,
+            task.id == record.task.taskID,
+            task.kind.lowercased().contains("bilibili"),
+            task.isProgressivePlayback,
+            task.isPlayableBilibiliTaskState,
+            !task.isCancellationPendingBilibiliTaskState
+        else {
+            throw SavedTaskResumptionIssue.playbackUnavailable
+        }
+
+        let exactResultID = checkpoint.identity.resultID
+        var embeddedSource: CachePlaybackSource?
+        var sourceItemID: String
+        var currentLibraryItemID = ""
+
+        if let exactResultID {
+            let result = try await savedResult(
+                id: exactResultID,
+                task: task,
+                client: client
+            )
+            let state = result.state.lowercased().filter(\.isLetter)
+            let isCompleted = state.contains("completed")
+            let isPlayable =
+                state.contains("playable") || isCompleted
+                || (state.contains("failed")
+                    && result.problem?.message.localizedCaseInsensitiveContains("offline cache fill failed") == true)
+            guard isPlayable else {
+                throw SavedTaskResumptionIssue.playbackUnavailable
+            }
+
+            embeddedSource = result.playbackSource
+            currentLibraryItemID = normalizedNonEmpty(result.libraryItemID) ?? ""
+            if currentLibraryItemID.isEmpty,
+                let embeddedSource,
+                embeddedSource.itemID != exactResultID
+            {
+                currentLibraryItemID = embeddedSource.itemID
+            }
+            sourceItemID = currentLibraryItemID.isEmpty ? exactResultID : currentLibraryItemID
+            if let embeddedSource, embeddedSource.itemID != sourceItemID {
+                throw SavedTaskResumptionIssue.libraryIdentityChanged
+            }
+        } else {
+            guard task.topLevelPlayableBilibiliURL != nil else {
+                throw SavedTaskResumptionIssue.playbackUnavailable
+            }
+            embeddedSource = task.playbackSource
+            currentLibraryItemID = normalizedNonEmpty(task.libraryItemID) ?? ""
+            if currentLibraryItemID.isEmpty,
+                let embeddedSource,
+                embeddedSource.itemID != task.id
+            {
+                currentLibraryItemID = embeddedSource.itemID
+            }
+            sourceItemID = currentLibraryItemID.isEmpty ? task.id : currentLibraryItemID
+            if let embeddedSource, embeddedSource.itemID != sourceItemID {
+                throw SavedTaskResumptionIssue.libraryIdentityChanged
+            }
+        }
+
+        let savedLibraryItemID = checkpoint.identity.libraryItemID
+        if !savedLibraryItemID.isEmpty, savedLibraryItemID != currentLibraryItemID {
+            throw SavedTaskResumptionIssue.libraryIdentityChanged
+        }
+
+        let source: CachePlaybackSource
+        if !currentLibraryItemID.isEmpty {
+            let requestedVariantID =
+                checkpoint.identity.variantID.isEmpty
+                ? (embeddedSource?.variantID ?? "")
+                : checkpoint.identity.variantID
+            let requestedLibraryItemID = currentLibraryItemID
+            let freshSource = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                try await client.getPlaybackSource(
+                    itemID: requestedLibraryItemID,
+                    variantID: requestedVariantID
+                )
+            }
+            guard freshSource.itemID == currentLibraryItemID else {
+                throw SavedTaskResumptionIssue.libraryIdentityChanged
+            }
+            source = freshSource
+        } else if let embeddedSource {
+            source = embeddedSource
+        } else {
+            throw SavedTaskResumptionIssue.playbackUnavailable
+        }
+
+        guard source.itemID == sourceItemID,
+            checkpoint.identity.variantID.isEmpty || source.variantID == checkpoint.identity.variantID,
+            let url = TVOSNetPlayerCore.playableURL(for: source, expectedItemID: sourceItemID),
+            let safeURL = serverOwnedMediaURL(url.absoluteString, mediaBaseURIs: serverInfo.mediaBaseURIs)
+        else {
+            throw SavedTaskResumptionIssue.invalidPlaybackSource
+        }
+
+        let progressContext = PlayerPlaybackProgressContext(
+            endpoint: record.task.endpoint,
+            playbackURI: safeURL.absoluteString,
+            libraryItemID: currentLibraryItemID,
+            variantID: source.variantID,
+            resumptionIdentity: checkpoint.identity
+        )
+        return ClientPreparedResumption(url: safeURL, progressContext: progressContext, checkpoint: checkpoint)
+    }
+
+    private func savedResult(
+        id resultID: String,
+        task: CacheTask,
+        client: any CacheControlClient
+    ) async throws -> CacheTaskResult {
+        if let summary = task.outputSummary {
+            guard summary.resultCount > 0,
+                summary.resultCount <= 100
+            else {
+                throw SavedTaskResumptionIssue.resultLimitExceeded
+            }
+
+            var pageToken = ""
+            var visitedTokens: Set<String> = []
+            var visitedResultIDs: Set<String> = []
+            var snapshotID: String?
+            var totalSize: UInt64?
+            var outputRevision: UInt64?
+            var scannedCount = 0
+            var pageCount = 0
+            var exactResult: CacheTaskResult?
+            repeat {
+                guard pageCount < 100, visitedTokens.insert(pageToken).inserted else {
+                    throw SavedTaskResumptionIssue.incoherentResultSnapshot
+                }
+                let requestedPageToken = pageToken
+                let page = try await Self.withCancellableOperationTimeout(operationTimeout) {
+                    try await client.listTaskResults(
+                        taskID: task.id,
+                        pageToken: requestedPageToken,
+                        pageSize: Self.taskResultPageSize
+                    )
+                }
+                pageCount += 1
+                guard !page.snapshotID.isEmpty,
+                    page.outputRevision == summary.revision,
+                    page.totalSize == summary.resultCount,
+                    page.results.count <= Self.taskResultPageSize,
+                    scannedCount + page.results.count <= 100
+                else {
+                    throw SavedTaskResumptionIssue.incoherentResultSnapshot
+                }
+                if let snapshotID {
+                    guard snapshotID == page.snapshotID,
+                        totalSize == page.totalSize,
+                        outputRevision == page.outputRevision
+                    else {
+                        throw SavedTaskResumptionIssue.incoherentResultSnapshot
+                    }
+                } else {
+                    snapshotID = page.snapshotID
+                    totalSize = page.totalSize
+                    outputRevision = page.outputRevision
+                }
+                for result in page.results {
+                    guard visitedResultIDs.insert(result.id).inserted else {
+                        throw SavedTaskResumptionIssue.duplicateResultID
+                    }
+                    if result.id == resultID {
+                        exactResult = result
+                    }
+                }
+                scannedCount += page.results.count
+                pageToken = page.nextPageToken
+            } while !pageToken.isEmpty
+
+            guard scannedCount == summary.resultCount, let exactResult else {
+                throw SavedTaskResumptionIssue.resultUnavailable
+            }
+            return exactResult
+        }
+
+        guard task.resultItems.count <= 100 else {
+            throw SavedTaskResumptionIssue.resultLimitExceeded
+        }
+        var seenIDs: Set<String> = []
+        for item in task.resultItems {
+            guard seenIDs.insert(item.id).inserted else {
+                throw SavedTaskResumptionIssue.duplicateResultID
+            }
+        }
+        guard let item = task.resultItems.first(where: { $0.id == resultID }) else {
+            throw SavedTaskResumptionIssue.resultUnavailable
+        }
+        return CacheTaskResult(
+            id: item.id,
+            state: item.state,
+            title: item.title,
+            subtitle: item.subtitle,
+            progress: nil,
+            problem: nil,
+            libraryItemID: item.libraryItemID,
+            playbackSource: item.playbackSource,
+            artifacts: [],
+            createdAt: nil,
+            updatedAt: nil
         )
     }
 
@@ -1121,14 +2055,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         operationSequence += 1
+        invalidateSavedPlaybackValidation(clearCached: true)
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
+        restoredTaskIdentity = nil
+        restoreAttemptIdentity = nil
         let sequence = operationSequence
 
         stopWatching()
         stopTaskResultPaging()
         activeEndpoint = endpoint
+        activeServerID = nil
         mediaBaseURIs = []
         currentTask = nil
         clearResolutionSession()
@@ -1166,6 +2104,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             mediaBaseURIs = serverInfo.mediaBaseURIs
+            activeServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
             installResolutionPage(
                 page,
                 source: source,
@@ -1298,6 +2237,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopWatching()
         stopTaskResultPaging()
         activeEndpoint = endpoint
+        activeServerID = nil
         mediaBaseURIs = []
         isResolving = true
         isSubmitting = false
@@ -1328,6 +2268,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             activeEndpoint = endpoint
+            activeServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
             mediaBaseURIs = serverInfo.mediaBaseURIs
             installResolutionPage(
                 page,
@@ -1736,12 +2677,29 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func clearTask() {
+        clearTaskState(
+            forgetSavedRecord: true,
+            statusMessage: "No Bilibili playback task submitted.",
+            resumptionMessage: nil
+        )
+    }
+
+    private func clearTaskState(
+        forgetSavedRecord: Bool,
+        statusMessage: String,
+        resumptionMessage: String?
+    ) {
         operationSequence += 1
+        restoreGeneration += 1
+        invalidateSavedPlaybackValidation(clearCached: true)
         activeEndpoint = nil
+        activeServerID = nil
         mediaBaseURIs = []
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
+        restoredTaskIdentity = nil
+        restoreAttemptIdentity = nil
         retryIntent = nil
         stopTaskResultPaging()
         currentTask = nil
@@ -1749,35 +2707,79 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isSubmitting = false
         isResolving = false
         isCancelling = false
+        isRestoringTask = false
         clearResolutionSession()
         stopWatching()
-        statusMessage = "No Bilibili playback task submitted."
+        if forgetSavedRecord {
+            resumptionStore?.forget()
+        }
+        self.statusMessage = statusMessage
+        self.resumptionMessage = resumptionMessage
     }
 
     @discardableResult
     public func clearTaskIfCachedLibraryItemDeleted(id libraryItemID: String) -> Bool {
         let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let currentTask,
-            !trimmedLibraryItemID.isEmpty,
+        guard let currentTask, !trimmedLibraryItemID.isEmpty else {
+            return false
+        }
+
+        let savedRecord = resumptionStore?.record
+        let savedCheckpoint = savedRecord?.playback
+        let savedTaskIsCurrent =
+            savedRecord?.task.taskID == currentTask.id
+            && savedRecord?.task.endpoint == activeEndpoint
+        let deletedSelectedSource =
+            savedTaskIsCurrent
+            && savedCheckpoint.map { checkpoint in
+                checkpoint.identity.libraryItemID == trimmedLibraryItemID
+                    || validatedSavedPlayback?.progressContext.libraryItemID == trimmedLibraryItemID
+            } == true
+        guard
             currentTask.hasBilibiliLibraryItem(id: trimmedLibraryItemID)
+                || taskResultItems.contains(where: { $0.hasBilibiliLibraryItem(id: trimmedLibraryItemID) })
+                || deletedSelectedSource
         else {
             return false
         }
 
+        if deletedSelectedSource {
+            invalidateSavedPlaybackValidation(clearCached: true)
+            resumptionMessage =
+                "The saved playback cache was deleted. Retry the saved task to recheck its source, or forget it."
+        }
+        if deletedSelectedSource
+            || (activePlaybackTaskID == currentTask.id && activePlaybackLibraryItemID == trimmedLibraryItemID)
+        {
+            activePlaybackTaskID = nil
+            activePlaybackResultID = nil
+            activePlaybackLibraryItemID = nil
+        }
+
         guard !currentTask.hasTopLevelBilibiliLibraryItem(id: trimmedLibraryItemID) else {
-            clearTask()
+            clearTaskState(
+                forgetSavedRecord: false,
+                statusMessage: savedTaskIsCurrent
+                    ? "The cached Bilibili source was deleted."
+                    : "No Bilibili playback task submitted.",
+                resumptionMessage: deletedSelectedSource
+                    ? "The saved playback cache was deleted. Retry the saved task to recheck its source, or forget it."
+                    : resumptionMessage
+            )
             return true
         }
 
-        guard let updatedTask = currentTask.clearingBilibiliResultLibraryItem(id: trimmedLibraryItemID) else {
-            return false
+        if let updatedTask = currentTask.clearingBilibiliResultLibraryItem(id: trimmedLibraryItemID) {
+            self.currentTask = updatedTask
         }
 
         taskSnapshotGeneration += 1
-        self.currentTask = updatedTask
-        if isActivePlaybackLibraryItem(id: trimmedLibraryItemID) {
-            clearPlaybackStatus()
-        } else {
+        taskResultItems = taskResultItems.map { result in
+            result.hasBilibiliLibraryItem(id: trimmedLibraryItemID)
+                ? result.clearingDeletedBilibiliLibraryItem()
+                : result
+        }
+        if let updatedTask = self.currentTask {
             statusMessage = Self.statusMessage(for: updatedTask)
         }
         errorMessage = nil
@@ -2382,6 +3384,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
+        invalidateSavedPlaybackValidation(clearCached: true)
         stopWatching()
         stopTaskResultPaging()
         activeEndpoint = endpoint
@@ -2407,6 +3410,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
+            resumptionStore?.forget()
+            if let serverID = activeServerID,
+                let identity = resumptionTaskIdentity(endpoint: endpoint, serverID: serverID, taskID: task.id)
+            {
+                resumptionStore?.rememberTask(identity)
+            }
+            restoredTaskIdentity = nil
+            restoreAttemptIdentity = nil
+            resumptionMessage = nil
             applyTaskUpdate(task)
             isSubmitting = false
             if task.shouldKeepWatchingBilibiliTask {
@@ -3152,6 +4164,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func applyTaskUpdate(_ task: CacheTask) {
         if currentTask?.id != task.id {
+            invalidateSavedPlaybackValidation(clearCached: true)
             stopTaskResultPaging()
         }
         if currentTask != task {
@@ -3179,6 +4192,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             stopWatching()
         }
         refreshTaskResults(for: task)
+        scheduleSavedPlaybackValidationIfNeeded(for: task)
     }
 
     private func updateActivePlaybackTracking(for task: CacheTask) {
@@ -3192,16 +4206,19 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if let activePlaybackResultID {
-            guard let result = taskResults.first(where: { $0.id == activePlaybackResultID }),
-                result.playbackURL != nil
-            else {
+            guard let result = taskResults.first(where: { $0.id == activePlaybackResultID }) else {
+                return
+            }
+            guard result.playbackURL != nil else {
                 activePlaybackTaskID = nil
                 self.activePlaybackResultID = nil
                 activePlaybackLibraryItemID = nil
                 return
             }
 
-            activePlaybackLibraryItemID = normalizedNonEmpty(result.playbackLibraryItemID)
+            activePlaybackLibraryItemID =
+                normalizedNonEmpty(result.playbackLibraryItemID)
+                ?? activePlaybackLibraryItemID
             return
         }
 
@@ -4059,6 +5076,39 @@ private extension BilibiliResolutionCandidate {
 }
 
 private extension CacheTaskResult {
+    func hasBilibiliLibraryItem(id libraryItemID: String) -> Bool {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLibraryItemID.isEmpty else {
+            return false
+        }
+
+        return self.libraryItemID == trimmedLibraryItemID
+            || playbackSource?.itemID == trimmedLibraryItemID
+    }
+
+    func clearingDeletedBilibiliLibraryItem() -> CacheTaskResult {
+        CacheTaskResult(
+            id: id,
+            state: "TASK_RESULT_STATE_FAILED",
+            title: title,
+            subtitle: subtitle,
+            progress: progress,
+            problem: CacheTaskProblem(
+                category: "",
+                code: "",
+                message: "Cached Bilibili result was deleted.",
+                retryable: false
+            ),
+            libraryItemID: "",
+            playbackSource: nil,
+            artifacts: artifacts,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            subject: subject,
+            providerDetails: providerDetails
+        )
+    }
+
     func bilibiliPresentation(mediaBaseURIs: [String]) -> BilibiliTaskResultPresentation {
         let normalizedState = state.normalizedBilibiliState
         let message = problem?.message ?? ""
@@ -4124,6 +5174,105 @@ private extension CacheTaskResult {
 private extension String {
     var normalizedBilibiliState: String {
         lowercased().filter(\.isLetter)
+    }
+}
+
+private enum SavedTaskResumptionIssue: Error {
+    case taskIdentityChanged
+    case notBilibiliTask
+    case playbackUnavailable
+    case resultUnavailable
+    case resultLimitExceeded
+    case duplicateResultID
+    case incoherentResultSnapshot
+    case libraryIdentityChanged
+    case invalidPlaybackSource
+
+    static func message(for error: Error) -> String {
+        guard let issue = error as? Self else {
+            return "The saved playback source could not be verified. Retry the saved task, or forget it."
+        }
+        switch issue {
+        case .taskIdentityChanged:
+            return
+                "The cache server did not return the exact saved task. The saved record is retained for retry or forget."
+        case .notBilibiliTask:
+            return "The saved task is no longer a Bilibili task. The saved record is retained for retry or forget."
+        case .playbackUnavailable:
+            return "The exact saved Bilibili source is not playable yet. Retry the saved task after its output changes."
+        case .resultUnavailable:
+            return
+                "The exact saved Bilibili result is not in the current task output. Retry the saved task or forget it."
+        case .resultLimitExceeded:
+            return
+                "The saved task output is larger than the bounded restore scan. Retry later or forget the saved task."
+        case .duplicateResultID, .incoherentResultSnapshot:
+            return "The saved task output changed while being checked. Retry the saved task or forget it."
+        case .libraryIdentityChanged:
+            return
+                "The exact saved result now refers to a different library item. The saved record is retained for retry or forget."
+        case .invalidPlaybackSource:
+            return
+                "The exact saved playback source is not an allowed LAN media URL or variant. Retry the saved task or forget it."
+        }
+    }
+}
+
+private func serverOwnedMediaURL(_ uri: String, mediaBaseURIs: [String]) -> URL? {
+    guard let candidate = URLComponents(string: uri),
+        let candidateScheme = candidate.scheme?.lowercased(),
+        ["http", "https"].contains(candidateScheme),
+        let candidateHost = candidate.host, !candidateHost.isEmpty,
+        candidate.user == nil, candidate.password == nil,
+        candidate.query == nil, candidate.fragment == nil,
+        let candidateURL = candidate.url,
+        SelfPath.isSafe(candidate.percentEncodedPath)
+    else {
+        return nil
+    }
+
+    for baseURI in mediaBaseURIs {
+        guard let base = URLComponents(string: baseURI),
+            let baseScheme = base.scheme?.lowercased(),
+            ["http", "https"].contains(baseScheme),
+            let baseHost = base.host, !baseHost.isEmpty,
+            base.user == nil, base.password == nil,
+            base.query == nil, base.fragment == nil,
+            SelfPath.isSafe(base.percentEncodedPath),
+            candidateScheme == baseScheme,
+            candidateHost.lowercased() == baseHost.lowercased(),
+            SelfPath.effectivePort(candidate) == SelfPath.effectivePort(base),
+            SelfPath.isWithin(candidate.percentEncodedPath, base.percentEncodedPath)
+        else {
+            continue
+        }
+        return candidateURL
+    }
+    return nil
+}
+
+private enum SelfPath {
+    static func effectivePort(_ components: URLComponents) -> Int? {
+        components.port ?? (components.scheme?.lowercased() == "https" ? 443 : 80)
+    }
+
+    static func isWithin(_ candidatePath: String, _ basePath: String) -> Bool {
+        var normalizedBase = basePath
+        while normalizedBase.count > 1, normalizedBase.hasSuffix("/") {
+            normalizedBase.removeLast()
+        }
+        if normalizedBase.isEmpty || normalizedBase == "/" {
+            return candidatePath.hasPrefix("/")
+        }
+        return candidatePath == normalizedBase || candidatePath.hasPrefix(normalizedBase + "/")
+    }
+
+    static func isSafe(_ encodedPath: String) -> Bool {
+        guard let decodedPath = encodedPath.removingPercentEncoding else {
+            return false
+        }
+        return !decodedPath.split(separator: "/", omittingEmptySubsequences: false)
+            .contains(where: { $0 == "." || $0 == ".." })
     }
 }
 

@@ -20,6 +20,7 @@ package struct FixtureMetricsDocument: Codable, Sendable {
 
 package struct FixtureScenarioMetrics: Codable, Sendable {
     package var taskID: String
+    package var startResolutionCount: UInt64 = 0
     package var createCount: UInt64 = 0
     package var watchCount: UInt64 = 0
     package var watchStreamOpenCount: UInt64 = 0
@@ -29,10 +30,13 @@ package struct FixtureScenarioMetrics: Codable, Sendable {
     package var outputCount: UInt64 = 0
     package var cancelCount: UInt64 = 0
     package var manualResumeReadBeforeWatch = false
+    package var playbackSourceRequestCount: UInt64 = 0
+    package var playbackSourceRequests: [FixturePlaybackSourceRequest] = []
     package var rpcTrace: [String] = []
 
     private enum CodingKeys: String, CodingKey {
         case taskID = "task_id"
+        case startResolutionCount = "start_resolution_count"
         case createCount = "create_count"
         case watchCount = "watch_count"
         case watchStreamOpenCount = "watch_stream_open_count"
@@ -42,13 +46,31 @@ package struct FixtureScenarioMetrics: Codable, Sendable {
         case outputCount = "output_count"
         case cancelCount = "cancel_count"
         case manualResumeReadBeforeWatch = "manual_resume_read_before_watch"
+        case playbackSourceRequestCount = "playback_source_request_count"
+        case playbackSourceRequests = "playback_source_requests"
         case rpcTrace = "rpc_trace"
+    }
+}
+
+package struct FixturePlaybackSourceRequest: Codable, Equatable, Sendable {
+    package let itemID: String
+    package let variantID: String
+
+    package init(itemID: String, variantID: String) {
+        self.itemID = itemID
+        self.variantID = variantID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case itemID = "item_id"
+        case variantID = "variant_id"
     }
 }
 
 package enum FixtureRPC: String, Sendable {
     case startResolution = "start_resolution"
     case listCandidates = "list_candidates"
+    case getPlaybackSource = "get_playback_source"
     case create
     case watch
     case getTask = "get_task"
@@ -73,7 +95,11 @@ package actor FixtureMetricsStore {
         try persist()
     }
 
-    package func record(_ rpc: FixtureRPC, for scenario: FixtureScenario) throws -> UInt64 {
+    package func record(
+        _ rpc: FixtureRPC,
+        for scenario: FixtureScenario,
+        playbackSourceRequest: FixturePlaybackSourceRequest? = nil
+    ) throws -> UInt64 {
         guard var values = document.scenarios[scenario.rawValue] else {
             throw FixtureMetricsError.invalidScenario
         }
@@ -90,6 +116,8 @@ package actor FixtureMetricsStore {
         }
 
         switch rpc {
+        case .startResolution:
+            values.startResolutionCount = increment(values.startResolutionCount)
         case .create:
             values.createCount = increment(values.createCount)
         case .watch:
@@ -103,7 +131,12 @@ package actor FixtureMetricsStore {
             values.outputCount = increment(values.outputCount)
         case .cancel:
             values.cancelCount = increment(values.cancelCount)
-        case .startResolution, .listCandidates:
+        case .getPlaybackSource:
+            values.playbackSourceRequestCount = increment(values.playbackSourceRequestCount)
+            if let playbackSourceRequest, values.playbackSourceRequests.count < 8 {
+                values.playbackSourceRequests.append(playbackSourceRequest)
+            }
+        case .listCandidates:
             break
         }
 
@@ -158,12 +191,14 @@ package actor FixtureMetricsStore {
 
     private func count(for rpc: FixtureRPC, in values: FixtureScenarioMetrics) -> UInt64 {
         switch rpc {
+        case .startResolution: values.startResolutionCount
         case .create: values.createCount
         case .watch: values.watchCount
         case .getTask: values.getTaskCount
         case .output: values.outputCount
         case .cancel: values.cancelCount
-        case .startResolution, .listCandidates: 0
+        case .getPlaybackSource: values.playbackSourceRequestCount
+        case .listCandidates: 0
         }
     }
 

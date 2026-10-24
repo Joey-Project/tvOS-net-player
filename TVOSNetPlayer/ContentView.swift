@@ -12,6 +12,7 @@ struct ContentView: View {
     @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @ObservedObject var bilibiliLoginModel: BilibiliLoginViewModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var pendingDeleteItem: CacheLibraryItem?
     @State private var isLoginQRPresented = false
     @State private var isResolverSettingsPresented = false
@@ -28,6 +29,9 @@ struct ContentView: View {
         case cacheLoadMoreButton
         case bilibiliField
         case bilibiliSubmitButton
+        case bilibiliContinueButton
+        case bilibiliRetryRestoreButton
+        case bilibiliForgetButton
         case bilibiliCandidateLoadMoreButton
         case bilibiliTaskResultsLoadMoreButton
         case bilibiliTaskResultsRetryButton
@@ -64,6 +68,9 @@ struct ContentView: View {
             }
             .padding(.horizontal, 72)
             .padding(.vertical, 58)
+        }
+        .task(id: cacheModel.serverAddressText) {
+            await bilibiliModel.restoreSavedTask(serverAddressText: cacheModel.serverAddressText)
         }
         .onAppear {
             if !isUITesting {
@@ -105,6 +112,11 @@ struct ContentView: View {
         .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
             Task {
                 await refreshPlaybackProgressStatus()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .inactive || phase == .background {
+                model.checkpointPlayback()
             }
         }
         .confirmationDialog(
@@ -514,6 +526,8 @@ struct ContentView: View {
                 BilibiliFetchNoticeRow(notice: notice)
             }
 
+            bilibiliResumptionControls
+
             if shouldShowStandaloneBilibiliNoticeAction {
                 bilibiliReResolveButton
             }
@@ -775,6 +789,65 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var bilibiliResumptionControls: some View {
+        if bilibiliModel.hasSavedTask || bilibiliModel.resumptionMessage != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                if bilibiliModel.isRestoringTask {
+                    ProgressView("Restoring saved task")
+                        .controlSize(.small)
+                }
+                if let message = bilibiliModel.resumptionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("bilibili-resumption-message")
+                }
+
+                HStack(spacing: 12) {
+                    if bilibiliModel.canContinueSavedPlayback {
+                        Button {
+                            Task {
+                                await continueSavedPlayback()
+                            }
+                        } label: {
+                            Label("Continue", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .focused($focusedControl, equals: .bilibiliContinueButton)
+                        .accessibilityIdentifier("bilibili-resumption-continue")
+                    }
+
+                    if bilibiliModel.hasSavedTask {
+                        Button {
+                            Task {
+                                await bilibiliModel.retrySavedTask(
+                                    serverAddressText: cacheModel.serverAddressText
+                                )
+                            }
+                        } label: {
+                            Label("Retry Restore", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(bilibiliModel.isRestoringTask || !cacheModel.hasServerAddress)
+                        .focused($focusedControl, equals: .bilibiliRetryRestoreButton)
+                        .accessibilityIdentifier("bilibili-resumption-retry")
+
+                        Button {
+                            bilibiliModel.forgetSavedTask()
+                        } label: {
+                            Label("Forget", systemImage: "trash")
+                        }
+                        .buttonStyle(.bordered)
+                        .focused($focusedControl, equals: .bilibiliForgetButton)
+                        .accessibilityIdentifier("bilibili-resumption-forget")
+                    }
+                }
+            }
+            .accessibilityIdentifier("bilibili-resumption")
+        }
+    }
+
     private var shouldShowStandaloneBilibiliNoticeAction: Bool {
         bilibiliModel.fetchNotice?.actionTitle == "Re-resolve"
             && bilibiliModel.canReResolve
@@ -979,6 +1052,7 @@ struct ContentView: View {
                     Text("Enter a local or remote stream URL")
                         .foregroundStyle(.secondary)
                 }
+                .accessibilityIdentifier("player-empty-state")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1160,6 +1234,37 @@ struct ContentView: View {
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
+    }
+
+    private func continueSavedPlayback() async {
+        let address = cacheModel.serverAddressText
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let endpoint = CacheServerEndpoint.normalized(from: address),
+            let prepared = await bilibiliModel.prepareSavedPlayback(serverAddressText: address)
+        else {
+            return
+        }
+
+        guard !Task.isCancelled,
+            cacheModel.serverAddressText == address,
+            CacheServerEndpoint.normalized(from: cacheModel.serverAddressText) == endpoint,
+            prepared.checkpoint.identity.task.matches(endpoint: endpoint),
+            model.manualInteractionSequence == manualInteractionSequence
+        else {
+            return
+        }
+
+        cacheModel.clearPlaybackStatus()
+        let didStartPlayback = model.loadTransient(
+            streamURLText: prepared.url.absoluteString,
+            progressContext: prepared.progressContext,
+            resumeCheckpoint: prepared.checkpoint,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        bilibiliModel.finishPreparedResumption(prepared, didStartPlayback: didStartPlayback)
         if didStartPlayback {
             await refreshPlaybackProgressStatus()
         }

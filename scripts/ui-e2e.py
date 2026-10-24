@@ -60,6 +60,7 @@ EXPECTED_UI_CASES = (
     "testAutomaticTaskWatchRecoversWithoutResubmission",
     "testManualTaskWatchReconnectPreservesPlayback",
     "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
+    "testRelaunchRestoresTaskAndExplicitPlaybackPosition",
 )
 EXPECTED_CASES_BY_PLATFORM = {
     "macos": EXPECTED_UI_CASES + ("testConnectBrowseAndControlRealPlayback",),
@@ -69,6 +70,13 @@ EXPECTED_TASK_IDS = {
     "automatic": "ui-e2e-automatic",
     "manual": "ui-e2e-manual",
     "silent": "ui-e2e-silent",
+    "resumption": "ui-e2e-resumption",
+}
+EXPECTED_PLAYBACK_SOURCES = {
+    "resumption": {
+        "item_id": "ui-e2e-resumption-library-item",
+        "variant_id": "ui-e2e-resumption-mp4",
+    },
 }
 
 
@@ -814,7 +822,7 @@ def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
     if not isinstance(scenarios, dict):
         raise UIE2EError("Task fixture metrics are missing scenario counters.")
     validated: dict[str, object] = {}
-    for scenario in ("automatic", "manual", "silent"):
+    for scenario in EXPECTED_TASK_IDS:
         counters = scenarios.get(scenario)
         if not isinstance(counters, dict):
             raise UIE2EError(f"Task fixture metrics are missing the {scenario} scenario.")
@@ -822,6 +830,9 @@ def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
             raise UIE2EError(f"Task fixture {scenario} scenario returned an unexpected task ID.")
         if type(counters.get("create_count")) is not int or counters.get("create_count") != 1:
             raise UIE2EError(f"Task fixture {scenario} scenario must create exactly one task.")
+        start_resolution_count = counters.get("start_resolution_count")
+        if type(start_resolution_count) is not int or start_resolution_count != 1:
+            raise UIE2EError(f"Task fixture {scenario} scenario must start exactly one resolution.")
         for key in ("watch_count", "get_task_count", "output_count"):
             value = counters.get(key)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -829,7 +840,21 @@ def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
         cancel_count = counters.get("cancel_count")
         if type(cancel_count) is not int or cancel_count != 0:
             raise UIE2EError(f"Task fixture {scenario} scenario must not cancel server work.")
+        source_count = counters.get("playback_source_request_count")
+        expected_source = EXPECTED_PLAYBACK_SOURCES.get(scenario)
+        expected_source_count = 2 if expected_source is not None else 0
+        if type(source_count) is not int or source_count != expected_source_count:
+            raise UIE2EError(
+                f"Task fixture {scenario} scenario must make exactly {expected_source_count} playback source request(s)."
+            )
+        source_requests = counters.get("playback_source_requests")
+        expected_requests = [expected_source, expected_source] if expected_source is not None else []
+        if source_requests != expected_requests:
+            raise UIE2EError(f"Task fixture {scenario} scenario requested an unexpected playback source.")
         validated[scenario] = dict(counters)
+    unexpected_scenarios = set(scenarios) - set(EXPECTED_TASK_IDS)
+    if unexpected_scenarios:
+        raise UIE2EError("Task fixture metrics contain an unexpected scenario.")
     manual = scenarios["manual"]
     if manual.get("manual_resume_read_before_watch") is not True:
         raise UIE2EError(

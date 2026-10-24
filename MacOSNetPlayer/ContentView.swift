@@ -14,6 +14,7 @@ struct ContentView: View {
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @ObservedObject var diagnosticsModel: CacheServerDiagnosticsViewModel
     @ObservedObject var bilibiliLoginModel: BilibiliLoginViewModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
     @State private var isAutoDiscoveryConnecting = false
@@ -28,6 +29,9 @@ struct ContentView: View {
             detailPane
         }
         .frame(minWidth: 900, minHeight: 560)
+        .task(id: cacheModel.serverAddressText) {
+            await bilibiliModel.restoreSavedTask(serverAddressText: cacheModel.serverAddressText)
+        }
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onAppear {
             if !isUITesting {
@@ -70,6 +74,11 @@ struct ContentView: View {
         .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
             Task {
                 await refreshPlaybackProgressStatus()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .inactive || phase == .background {
+                model.checkpointPlayback()
             }
         }
         .confirmationDialog(
@@ -543,6 +552,8 @@ struct ContentView: View {
                     BilibiliFetchNoticeRow(notice: notice)
                 }
 
+                bilibiliResumptionControls
+
                 if shouldShowStandaloneBilibiliNoticeAction {
                     bilibiliReResolveButton
                 }
@@ -804,6 +815,60 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var bilibiliResumptionControls: some View {
+        if bilibiliModel.hasSavedTask || bilibiliModel.resumptionMessage != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                if bilibiliModel.isRestoringTask {
+                    ProgressView("Restoring saved task")
+                        .controlSize(.small)
+                }
+                if let message = bilibiliModel.resumptionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("bilibili-resumption-message")
+                }
+
+                HStack(spacing: 10) {
+                    if bilibiliModel.canContinueSavedPlayback {
+                        Button {
+                            Task {
+                                await continueSavedPlayback()
+                            }
+                        } label: {
+                            Label("Continue", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("bilibili-resumption-continue")
+                    }
+
+                    if bilibiliModel.hasSavedTask {
+                        Button {
+                            Task {
+                                await bilibiliModel.retrySavedTask(
+                                    serverAddressText: cacheModel.serverAddressText
+                                )
+                            }
+                        } label: {
+                            Label("Retry Restore", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(bilibiliModel.isRestoringTask || !cacheModel.hasServerAddress)
+                        .accessibilityIdentifier("bilibili-resumption-retry")
+
+                        Button {
+                            bilibiliModel.forgetSavedTask()
+                        } label: {
+                            Label("Forget", systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("bilibili-resumption-forget")
+                    }
+                }
+            }
+            .accessibilityIdentifier("bilibili-resumption")
+        }
+    }
+
     private var bilibiliPlaybackPolicyControls: some View {
         HStack(spacing: 12) {
             Picker("Transcode", selection: $bilibiliModel.playbackTranscodingPreference) {
@@ -1015,6 +1080,7 @@ struct ContentView: View {
             } else {
                 ContentUnavailableView("No Stream Loaded", systemImage: "play.rectangle")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("player-empty-state")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1224,6 +1290,37 @@ struct ContentView: View {
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
+    }
+
+    private func continueSavedPlayback() async {
+        let address = cacheModel.serverAddressText
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let endpoint = CacheServerEndpoint.normalized(from: address),
+            let prepared = await bilibiliModel.prepareSavedPlayback(serverAddressText: address)
+        else {
+            return
+        }
+
+        guard !Task.isCancelled,
+            cacheModel.serverAddressText == address,
+            CacheServerEndpoint.normalized(from: cacheModel.serverAddressText) == endpoint,
+            prepared.checkpoint.identity.task.matches(endpoint: endpoint),
+            model.manualInteractionSequence == manualInteractionSequence
+        else {
+            return
+        }
+
+        cacheModel.clearPlaybackStatus()
+        let didStartPlayback = model.loadTransient(
+            streamURLText: prepared.url.absoluteString,
+            progressContext: prepared.progressContext,
+            resumeCheckpoint: prepared.checkpoint,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        bilibiliModel.finishPreparedResumption(prepared, didStartPlayback: didStartPlayback)
         if didStartPlayback {
             await refreshPlaybackProgressStatus()
         }
