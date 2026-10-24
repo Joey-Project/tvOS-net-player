@@ -367,9 +367,19 @@ final class UIPlaybackTests: XCTestCase {
         )
 
         let pause = app.buttons["playback-toggle"]
+        let clearLandmark = app.buttons["bilibili-clear"]
         XCTAssertTrue(
-            focusDown(until: pause, limit: 100),
-            "Remote focus could not reach Pause. " + taskWatchFocusDescription(target: pause)
+            focusDown(until: clearLandmark, limit: 8),
+            "Remote focus could not reach the left-column Clear landmark. "
+                + taskWatchFocusDescription(target: clearLandmark)
+        )
+        XCTAssertTrue(
+            moveFocus(until: pause, direction: .right, limit: 8),
+            "Remote focus could not move right from Clear to Pause. " + taskWatchFocusDescription(target: pause)
+        )
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { pause.exists && pause.hasFocus && pause.isHittable && pause.isEnabled },
+            "Pause did not become focused, hittable, and enabled. " + taskWatchFocusDescription(target: pause)
         )
         remote.press(.select)
         let savedCheckpoint = try pausedCheckpointBaseline(state: playbackState, timeline: timeline)
@@ -412,11 +422,22 @@ final class UIPlaybackTests: XCTestCase {
             "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
         )
         let continueButton = app.buttons["bilibili-resumption-continue"]
-        XCTAssertTrue(
-            focusDown(until: continueButton, limit: 100),
-            "Remote focus could not reach Continue. " + taskWatchFocusDescription(target: continueButton)
-        )
-        XCTAssertTrue(continueButton.isEnabled)
+        let retryRestoreButton = app.buttons["bilibili-resumption-retry"]
+        let forgetButton = app.buttons["bilibili-resumption-forget"]
+        guard
+            focusContinueFromResumptionRow(
+                continueButton: continueButton,
+                retryRestoreButton: retryRestoreButton,
+                forgetButton: forgetButton,
+                limit: 100
+            )
+        else {
+            XCTFail(
+                "Remote focus could not reach enabled, hittable Continue from the resumption row. "
+                    + taskWatchFocusDescription(target: continueButton)
+            )
+            return
+        }
         remote.press(.select)
 
         XCTAssertTrue(
@@ -608,6 +629,31 @@ final class UIPlaybackTests: XCTestCase {
 
     private func focusDown(until element: XCUIElement, limit: Int) -> Bool {
         moveFocus(until: element, direction: .down, limit: limit)
+    }
+
+    private func focusContinueFromResumptionRow(
+        continueButton: XCUIElement,
+        retryRestoreButton: XCUIElement,
+        forgetButton: XCUIElement,
+        limit: Int
+    ) -> Bool {
+        let rowControls = [continueButton, retryRestoreButton, forgetButton]
+        var presses = 0
+
+        while presses < limit && !rowControls.contains(where: { $0.exists && $0.hasFocus }) {
+            XCUIRemote.shared.press(.down)
+            presses += 1
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        }
+        guard rowControls.contains(where: { $0.exists && $0.hasFocus }) else { return false }
+
+        while presses < limit && !(continueButton.exists && continueButton.hasFocus) {
+            XCUIRemote.shared.press(.left)
+            presses += 1
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        }
+
+        return continueButton.exists && continueButton.hasFocus && continueButton.isHittable && continueButton.isEnabled
     }
 
     private func moveFocus(
