@@ -540,6 +540,11 @@ final class UIPlaybackTests: XCTestCase {
         app.terminate()
         app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
         app.launch()
+        app.activate()
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { app.state == .runningForeground },
+            "The player did not become foreground after relaunch. State: \(app.state)"
+        )
 
         let emptyPlayer = identifiedElement("player-empty-state")
         XCTAssertTrue(emptyPlayer.waitForExistence(timeout: 20))
@@ -565,7 +570,9 @@ final class UIPlaybackTests: XCTestCase {
         let continueButton = app.buttons["bilibili-resumption-continue"]
         XCTAssertTrue(
             waitUntil(timeout: 75) { continueButton.exists && continueButton.isEnabled },
-            "The validated saved checkpoint did not expose Continue. "
+            "The validated saved checkpoint did not expose Continue. Continue: "
+                + accessibilityDescription(continueButton)
+                + "; resumption message: "
                 + accessibilityDescription(identifiedElement("bilibili-resumption-message"))
         )
         clickVisible(continueButton, scrollingIn: controls)

@@ -476,18 +476,33 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(serverAddressIsEmpty(addressField))
         remote.press(.select)
         addressField.typeText(serverAddress)
+        addressField.typeText("\n")
+
+        let keyboard = app.keyboards.firstMatch
         if app.keyboards.firstMatch.exists {
             remote.press(.menu)
         }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { !keyboard.exists },
+            "The address keyboard did not dismiss after submission."
+        )
 
         let refresh = app.buttons["cache-server-refresh"]
+        let libraryStatus = app.staticTexts["cache-library-status"]
+        XCTAssertTrue(
+            waitUntil(timeout: 60) { refresh.exists && refresh.isEnabled },
+            "Refresh did not become enabled after address submission. Status: \(accessibilityDescription(libraryStatus))"
+        )
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { addressField.hasFocus || refresh.hasFocus },
+            "Submission did not return focus to the address controls. " + connectionFocusDescription()
+        )
         XCTAssertTrue(
             focusDown(until: refresh, limit: 3),
-            "Remote focus could not reach Connect. " + connectionFocusDescription()
+            "The refresh control below the address field did not receive remote focus. "
+                + connectionFocusDescription()
         )
         remote.press(.select)
-        let libraryStatus = app.staticTexts["cache-library-status"]
         XCTAssertTrue(
             waitUntil(timeout: 45) { status(libraryStatus, contains: "Loaded 0 cached item(s)") },
             "The production Connect flow did not persist the fixture endpoint. "

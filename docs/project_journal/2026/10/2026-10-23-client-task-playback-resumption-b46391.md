@@ -47,6 +47,7 @@ superseded_by:
 ## Validation And Delivery
 - Add deterministic storage/player and task-recovery tests covering restart, endpoint replacement, retention expiry, result identity, eviction, stale callbacks and completed content.
 - Extend both native XCUITest suites with a real terminate/relaunch/explicit-continue case. Keep isolated UI preferences only on an explicit test relaunch; preserve all existing cases and strict fixture metrics proving one original task creation and no recovery resubmission.
+- Keep resumption accessibility identifiers on individual controls rather than their container, so Continue, Retry and Forget remain independently discoverable. Native UI setup must explicitly establish foreground state and use the production address-submission/focus path before navigation; keep visibility, enabled-state and exact-source assertions.
 - Require complete local tests/lint/format/builds, actual current-head GitHub ordinary/native UI CI, GitHub Codex review, every conversation resolved and genuine applicable human approval before merge.
 - Use credential-free local fixtures. Set and verify system output mute before playback and leave it muted; muted playback does not validate audible audio.
 

@@ -844,7 +844,6 @@ struct ContentView: View {
                     }
                 }
             }
-            .accessibilityIdentifier("bilibili-resumption")
         }
     }
 
