@@ -209,7 +209,7 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
 
             XCTAssertEqual(model.currentTask?.id, FixtureScenario.silent.taskID)
             XCTAssertEqual(model.currentTask?.message, "Silent task reconciliation complete")
-            XCTAssertEqual(model.statusMessage, "Silent task reconciliation complete")
+            XCTAssertEqual(model.statusMessage, "Silent task reconciliation fixture is cached for LAN playback.")
             XCTAssertEqual(model.currentTask?.progress, 1)
             XCTAssertEqual(model.currentTask?.outputSummary?.revision, 2)
             XCTAssertNil(model.watchErrorMessage)
