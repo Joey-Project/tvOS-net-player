@@ -400,8 +400,7 @@ public final class PlayerViewModel: ObservableObject {
                 checkpoint: matchingCheckpoint
             )
         } else if matchingCheckpoint != nil {
-            validationMessage = "Could not restore the saved playback position. Try again."
-            statusMessage = validationMessage ?? "Could not restore playback."
+            tearDownFailedPlaybackResume(player: nextPlayer, controller: nextController)
         } else {
             statusMessage = "Playing \(url.absoluteString)"
             if autoplay {
@@ -410,6 +409,7 @@ public final class PlayerViewModel: ObservableObject {
             queueCurrentPlaybackProgressReport(intent: .started)
             startPlaybackProgressReporting()
         }
+        guard player === nextPlayer else { return }
         observePlaybackEnd(for: nextPlayer.currentItem)
         observePlaybackResume(for: nextPlayer)
         observePlaybackTimeJumps(for: nextPlayer.currentItem)
@@ -877,8 +877,28 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func failPlaybackResume(requestID: UUID) {
-        guard pendingPlaybackResume?.id == requestID else { return }
+        guard let request = pendingPlaybackResume, request.id == requestID else { return }
+        guard isCurrentPlaybackResume(request) else {
+            cancelPendingPlaybackResume()
+            return
+        }
+        tearDownFailedPlaybackResume(player: request.player, controller: request.controller)
+    }
+
+    private func tearDownFailedPlaybackResume(
+        player expectedPlayer: AVPlayer,
+        controller: any PlayerPlaybackControlling
+    ) {
+        guard player === expectedPlayer else { return }
         cancelPendingPlaybackResume()
+        stopPlaybackProgressReporting()
+        controller.pause()
+        expectedPlayer.pause()
+        player = nil
+        playbackController = nil
+        loadedURL = nil
+        playbackProgressContext = nil
+        resumePositionUnrestoredItem = nil
         validationMessage = "Could not restore the saved playback position. Try again."
         statusMessage = validationMessage ?? "Could not restore playback."
     }

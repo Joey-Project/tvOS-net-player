@@ -89,6 +89,43 @@ final class PlayerViewModelTests: XCTestCase {
         return (model, try XCTUnwrap(playbackController), store, client)
     }
 
+    @MainActor
+    private func assertFailedResumeIsUnloaded(
+        _ model: PlayerViewModel,
+        controller: PlaybackControlSpy,
+        store: ClientResumptionStore,
+        client: FakePlaybackProgressClient,
+        checkpoint: ClientPlaybackCheckpoint,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let message = "Could not restore the saved playback position. Try again."
+        XCTAssertEqual(model.validationMessage, message, file: file, line: line)
+        XCTAssertEqual(model.statusMessage, message, file: file, line: line)
+        XCTAssertNil(model.player, file: file, line: line)
+        XCTAssertNil(model.loadedURL, file: file, line: line)
+        XCTAssertFalse(model.canUsePlaybackControls, file: file, line: line)
+        XCTAssertEqual(model.playbackState, .paused, file: file, line: line)
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 0, file: file, line: line)
+        XCTAssertEqual(controller.playCallCount, 0, file: file, line: line)
+        XCTAssertEqual(controller.timeControlStatus, .paused, file: file, line: line)
+
+        model.checkpointPlayback()
+        let report = await model.reportCurrentPlaybackProgress()
+        await model.flushPlaybackProgressReports()
+        let reports = await client.reportsSnapshot()
+
+        XCTAssertNil(report, file: file, line: line)
+        XCTAssertTrue(reports.isEmpty, file: file, line: line)
+        XCTAssertEqual(store.record?.playback, checkpoint, file: file, line: line)
+        XCTAssertEqual(
+            ClientResumptionStore(defaults: defaults).record?.playback,
+            checkpoint,
+            file: file,
+            line: line
+        )
+    }
+
     private func makePlaybackIdentity(
         taskID: String = "task-7",
         resultID: String? = "result-2",
@@ -1512,6 +1549,9 @@ final class PlayerViewModelTests: XCTestCase {
         await model.flushPlaybackProgressReports()
 
         XCTAssertEqual(model.validationMessage, "Could not restore the saved playback position. Try again.")
+        XCTAssertNil(model.player)
+        XCTAssertNil(model.loadedURL)
+        XCTAssertFalse(model.canUsePlaybackControls)
         XCTAssertEqual(controller.playCallCount, 0)
         XCTAssertEqual(store.record?.playback, checkpoint)
     }
@@ -1537,8 +1577,82 @@ final class PlayerViewModelTests: XCTestCase {
         await model.flushPlaybackProgressReports()
 
         XCTAssertEqual(model.validationMessage, "Could not restore the saved playback position. Try again.")
+        XCTAssertNil(model.player)
+        XCTAssertNil(model.loadedURL)
+        XCTAssertFalse(model.canUsePlaybackControls)
         XCTAssertEqual(controller.playCallCount, 0)
         XCTAssertEqual(store.record?.playback, checkpoint)
+    }
+
+    @MainActor
+    func testResumeReadinessFailureUnloadsPlayerAndPreservesCheckpoint() async throws {
+        for initialReadiness in [AVPlayerItem.Status.failed, .unknown] {
+            let identity = makePlaybackIdentity(taskID: "task-readiness-\(initialReadiness.rawValue)")
+            let checkpoint = ClientPlaybackCheckpoint(
+                identity: identity,
+                positionSeconds: 47.5,
+                durationSeconds: 100
+            )
+            let (model, controller, store, client) = try makeResumableFixture(
+                identity: identity,
+                checkpoint: checkpoint,
+                readiness: initialReadiness,
+                autoplay: true
+            )
+
+            if initialReadiness == .unknown {
+                let staleReadiness = controller.lastReadinessObserver
+                controller.setReadiness(.failed)
+                staleReadiness?(.readyToPlay)
+            }
+
+            XCTAssertTrue(controller.seekTargets.isEmpty)
+            await assertFailedResumeIsUnloaded(
+                model, controller: controller, store: store, client: client, checkpoint: checkpoint
+            )
+        }
+    }
+
+    @MainActor
+    func testResumeReadinessTimeoutUnloadsPlayerAndPreservesCheckpoint() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 47.5, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            readiness: .unknown,
+            autoplay: true,
+            readinessTimeout: .milliseconds(20)
+        )
+        let staleReadiness = controller.lastReadinessObserver
+
+        for _ in 0..<100 {
+            if model.validationMessage != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        staleReadiness?(.readyToPlay)
+
+        XCTAssertTrue(controller.seekTargets.isEmpty)
+        await assertFailedResumeIsUnloaded(
+            model, controller: controller, store: store, client: client, checkpoint: checkpoint
+        )
+    }
+
+    @MainActor
+    func testFailedResumeSeekUnloadsPlayerAndPreservesCheckpoint() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 52, durationSeconds: 100)
+        let (model, controller, store, client) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            autoplay: true
+        )
+
+        controller.completeNextSeek(finished: false, position: .zero)
+
+        await assertFailedResumeIsUnloaded(
+            model, controller: controller, store: store, client: client, checkpoint: checkpoint
+        )
     }
 
     @MainActor
@@ -1625,7 +1739,7 @@ final class PlayerViewModelTests: XCTestCase {
             durationSeconds: 100,
             completed: false
         )
-        let (model, controller, store, _) = try makeResumableFixture(
+        let (model, controller, store, client) = try makeResumableFixture(
             identity: identity,
             checkpoint: checkpoint,
             autoplay: true,
@@ -1639,10 +1753,10 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(model.validationMessage, "Could not restore the saved playback position. Try again.")
 
         controller.completeNextSeek(finished: true, position: CMTime(seconds: 52, preferredTimescale: 600))
-        await model.flushPlaybackProgressReports()
 
-        XCTAssertEqual(controller.playCallCount, 0)
-        XCTAssertEqual(store.record?.playback, checkpoint)
+        await assertFailedResumeIsUnloaded(
+            model, controller: controller, store: store, client: client, checkpoint: checkpoint
+        )
     }
 
     @MainActor

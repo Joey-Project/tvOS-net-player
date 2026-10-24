@@ -5531,13 +5531,199 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         return await condition()
     }
 
+    func testSavedTaskRestoreRejectsChangedLiveServerIDBeforeFetchingTask() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "original-server",
+            taskID: "colliding-saved-task"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(
+            task: taskIdentity,
+            libraryItemID: "saved-library",
+            variantID: "h264"
+        )
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(playbackIdentity)
+        let savedRecord = store.record
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [
+                taskIdentity.taskID: [
+                    .success(
+                        .playableFixture(
+                            id: taskIdentity.taskID,
+                            state: "TASK_STATE_COMPLETED",
+                            libraryItemID: "saved-library",
+                            playbackSourceItemID: "saved-library"
+                        ))
+                ]
+            ]
+        )
+        await client.setServerID("replacement-server")
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.canContinueSavedPlayback)
+        XCTAssertFalse(model.canPlay)
+        XCTAssertFalse(model.isWatching)
+        XCTAssertFalse(model.isRestoringTask)
+        XCTAssertTrue(model.hasSavedTask)
+        XCTAssertEqual(store.record, savedRecord)
+        XCTAssertTrue(model.resumptionMessage?.contains("server identity changed") == true)
+        let serverInfoCount = await client.serverInfoRequestCountSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let sources = await client.playbackSourceRequestsSnapshot()
+        let results = await client.taskResultRequestsSnapshot()
+        let resolved = await client.resolvedRequestsSnapshot()
+        let created = await client.createdRequestsSnapshot()
+        let cancelled = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(serverInfoCount, 1)
+        XCTAssertTrue(taskIDs.isEmpty)
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(resolved.isEmpty)
+        XCTAssertTrue(created.isEmpty)
+        XCTAssertTrue(cancelled.isEmpty)
+    }
+
+    func testSavedPlaybackRevalidationRejectsChangedLiveServerIDBeforeFetchingTaskOrSource() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "revalidation-server-change"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(
+            task: taskIdentity,
+            libraryItemID: "saved-library",
+            variantID: "h264"
+        )
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(playbackIdentity)
+        let task = CacheTask.playableFixture(
+            id: taskIdentity.taskID,
+            state: "TASK_STATE_COMPLETED",
+            libraryItemID: "saved-library",
+            playbackSourceItemID: "saved-library"
+        )
+        let source = try XCTUnwrap(task.playbackSource)
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [taskIdentity.taskID: [.success(task), .success(task)]],
+            playbackSourceResponses: ["saved-library\u{1F}h264": source]
+        )
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        XCTAssertTrue(model.canContinueSavedPlayback)
+        let savedRecord = store.record
+        let initialTaskIDs = await client.getTaskIDsSnapshot()
+        let initialSources = await client.playbackSourceRequestsSnapshot()
+        XCTAssertEqual(initialTaskIDs, [taskIdentity.taskID])
+        XCTAssertEqual(initialSources.count, 1)
+
+        await client.setServerID("replacement-server")
+        let prepared = await model.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+
+        XCTAssertNil(prepared)
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.canContinueSavedPlayback)
+        XCTAssertFalse(model.canPlay)
+        XCTAssertFalse(model.isWatching)
+        XCTAssertFalse(model.isRestoringTask)
+        XCTAssertTrue(model.hasSavedTask)
+        XCTAssertEqual(store.record, savedRecord)
+        XCTAssertTrue(model.resumptionMessage?.contains("server identity changed") == true)
+        let serverInfoCount = await client.serverInfoRequestCountSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let sources = await client.playbackSourceRequestsSnapshot()
+        let results = await client.taskResultRequestsSnapshot()
+        let resolved = await client.resolvedRequestsSnapshot()
+        let created = await client.createdRequestsSnapshot()
+        let cancelled = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(serverInfoCount, 2)
+        XCTAssertEqual(taskIDs, initialTaskIDs)
+        XCTAssertEqual(sources.count, initialSources.count)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(resolved.isEmpty)
+        XCTAssertTrue(created.isEmpty)
+        XCTAssertTrue(cancelled.isEmpty)
+    }
+
+    func testSavedTaskRestoreAndPlaybackRevalidationAcceptTrimmedLiveServerID() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "trimmed-server-identity"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(
+            task: taskIdentity,
+            libraryItemID: "saved-library",
+            variantID: "h264"
+        )
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(playbackIdentity)
+        let task = CacheTask.playableFixture(
+            id: taskIdentity.taskID,
+            state: "TASK_STATE_COMPLETED",
+            libraryItemID: "saved-library",
+            playbackSourceItemID: "saved-library"
+        )
+        let source = try XCTUnwrap(task.playbackSource)
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [taskIdentity.taskID: [.success(task), .success(task)]],
+            playbackSourceResponses: ["saved-library\u{1F}h264": source]
+        )
+        await client.setServerID(" \nfake-cache-server\t ")
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        XCTAssertTrue(model.canContinueSavedPlayback)
+        let prepared = await model.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+
+        XCTAssertNotNil(prepared)
+        XCTAssertEqual(prepared?.checkpoint.identity, playbackIdentity)
+        XCTAssertEqual(prepared?.progressContext.resumptionIdentity, playbackIdentity)
+        XCTAssertEqual(prepared?.url, source.explicitHTTPURL)
+        XCTAssertEqual(store.record?.task, taskIdentity)
+        XCTAssertTrue(model.canContinueSavedPlayback)
+        XCTAssertFalse(model.isWatching)
+        XCTAssertNil(model.resumptionMessage)
+        let serverInfoCount = await client.serverInfoRequestCountSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let sources = await client.playbackSourceRequestsSnapshot()
+        let resolved = await client.resolvedRequestsSnapshot()
+        let created = await client.createdRequestsSnapshot()
+        let cancelled = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(serverInfoCount, 2)
+        XCTAssertEqual(taskIDs, [taskIdentity.taskID, taskIdentity.taskID])
+        XCTAssertEqual(sources.count, 2)
+        XCTAssertTrue(sources.allSatisfy { $0.itemID == "saved-library" && $0.variantID == "h264" })
+        XCTAssertTrue(resolved.isEmpty)
+        XCTAssertTrue(created.isEmpty)
+        XCTAssertTrue(cancelled.isEmpty)
+    }
+
     func testConcurrentRestoreForSameIdentityMakesOneRequest() async throws {
         let (defaults, store, suiteName) = try makeResumptionStore()
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
         let taskIdentity = ClientResumptionTaskIdentity(
             endpoint: endpoint,
-            serverID: "persisted-label",
+            serverID: "fake-cache-server",
             taskID: "restore-single-flight"
         )
         store.rememberTask(taskIdentity)
@@ -6548,6 +6734,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private let supportsBilibiliExecutionV2: Bool
     private let supportsTaskOutputV2: Bool
     private let mediaBaseURIs: [String]
+    private var serverID = "fake-cache-server"
     private var suspendsResolveResponses: Bool
     private var suspendsCreateResponses: Bool
     private var suspendsTaskResultResponses = false
@@ -6657,6 +6844,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         }
     }
 
+    func setServerID(_ serverID: String) {
+        self.serverID = serverID
+    }
+
     func getServerInfo() async throws -> CacheServerSummary {
         serverInfoRequestCount += 1
         let ready = serverInfoRequestWaiters.filter { $0.count <= serverInfoRequestCount }
@@ -6682,7 +6873,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             capabilities.append(CacheServerCapability.taskOutputV2)
         }
         return CacheServerSummary(
-            id: "fake-cache-server",
+            id: serverID,
             name: "Fake cache server",
             version: "test",
             mediaBaseURIs: mediaBaseURIs,

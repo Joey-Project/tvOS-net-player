@@ -1323,6 +1323,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             guard isSavedRestoreCurrent(record.task, generation: generation, sequence: sequence) else {
                 return
             }
+            let liveServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard liveServerID == record.task.serverID else {
+                throw SavedTaskResumptionIssue.serverIdentityChanged
+            }
             let task = try await Self.withCancellableOperationTimeout(operationTimeout) {
                 try await client.getTask(id: record.task.taskID)
             }
@@ -1337,7 +1341,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             activeEndpoint = record.task.endpoint
-            activeServerID = record.task.serverID
+            activeServerID = liveServerID
             mediaBaseURIs = serverInfo.mediaBaseURIs
             restoredTaskIdentity = record.task
             resumptionStore?.rememberTask(record.task)
@@ -1524,6 +1528,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return nil
             }
 
+            let liveServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard liveServerID == record.task.serverID else {
+                throw SavedTaskResumptionIssue.serverIdentityChanged
+            }
             let task = try await Self.withCancellableOperationTimeout(operationTimeout) {
                 try await client.getTask(id: record.task.taskID)
             }
@@ -1575,6 +1583,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     operation: operation
                 )
             else {
+                return nil
+            }
+            if let issue = error as? SavedTaskResumptionIssue, case .serverIdentityChanged = issue {
+                invalidateSavedRestore(message: SavedTaskResumptionIssue.message(for: issue))
+                statusMessage = "The saved Bilibili task is unavailable on this cache server."
                 return nil
             }
             if let currentTask,
@@ -5178,6 +5191,7 @@ private extension String {
 }
 
 private enum SavedTaskResumptionIssue: Error {
+    case serverIdentityChanged
     case taskIdentityChanged
     case notBilibiliTask
     case playbackUnavailable
@@ -5193,6 +5207,9 @@ private enum SavedTaskResumptionIssue: Error {
             return "The saved playback source could not be verified. Retry the saved task, or forget it."
         }
         switch issue {
+        case .serverIdentityChanged:
+            return
+                "The cache server identity changed. The saved task is unavailable here. Retry it on the original server, or forget the saved record."
         case .taskIdentityChanged:
             return
                 "The cache server did not return the exact saved task. The saved record is retained for retry or forget."
