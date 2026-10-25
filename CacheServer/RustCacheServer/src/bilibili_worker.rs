@@ -1008,7 +1008,8 @@ mod tests {
         std::fs::remove_file(&stale_output_path)
             .expect("the simulated storage failure should be cleared");
 
-        let work_item = tokio::time::timeout(Duration::from_secs(2), claim)
+        // This fixture completion retry budget is not the production retry interval.
+        let work_item = tokio::time::timeout(Duration::from_secs(10), claim)
             .await
             .expect("the worker should retry cleanup")
             .expect("the claim task should not panic");

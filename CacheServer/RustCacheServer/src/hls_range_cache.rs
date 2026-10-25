@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, watch};
 
 pub(crate) const RANGE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const RANGE_FOREGROUND_CHUNK_BYTES: u64 = 64 * 1024;
 pub(crate) const RANGE_STARTUP_CHUNK_BYTES: u64 = 512 * 1024;
 pub(crate) const RANGE_MIN_CHUNK_BYTES: u64 = 512 * 1024;
 pub(crate) const RANGE_MAX_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -300,6 +301,14 @@ impl HlsRangeCache {
             state.active,
             state.reservations.values().map(HashMap::len).sum(),
         )
+    }
+
+    pub(crate) fn active_flight_count(&self, key: &RangeResourceKey) -> usize {
+        self.lock_state()
+            .flights
+            .keys()
+            .filter(|flight| &flight.resource == key)
+            .count()
     }
 
     pub(crate) fn enter(

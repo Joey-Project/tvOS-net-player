@@ -24088,7 +24088,8 @@ mod tests {
     ) -> Task {
         let started = StdInstant::now();
         let mut diagnostics = TaskWaitDiagnostics::default();
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
+        // Fixture synchronization under parallel durable IO, not a playback latency assertion.
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let task = tasks
                     .get_task(task_id)

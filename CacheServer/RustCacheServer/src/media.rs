@@ -36,13 +36,17 @@ use crate::{
     },
     hls_cache::{HlsCacheFillControl, OpenedPrewarmedHlsResource},
     hls_media_refresh::is_expired_range_error,
-    hls_range_cache::{HlsRangeError, HlsRangePriority, HlsReadyRange},
+    hls_range_cache::{
+        HlsRangeError, HlsRangePriority, HlsReadyRange, RANGE_FOREGROUND_CHUNK_BYTES,
+        RANGE_MAX_CHUNK_BYTES,
+    },
     library::OpenedMediaFile,
     playback_policy::WeakNetworkPreference,
 };
 
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
-const HLS_MEDIA_STREAM_CHUNK_BYTES: u64 = 256 * 1024;
+const HLS_MEDIA_STREAM_CHUNK_BYTES: u64 = RANGE_MAX_CHUNK_BYTES;
+const HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES: u64 = RANGE_FOREGROUND_CHUNK_BYTES;
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 static HLS_MEDIA_404_DIAGNOSTIC_BUDGET: AtomicUsize = AtomicUsize::new(32);
 
@@ -903,18 +907,17 @@ async fn foreground_hls_range_response(
         return hls_cached_range_response(resource, status, start..end, content_range, None);
     }
 
-    let first_end = start.saturating_add(HLS_MEDIA_STREAM_CHUNK_BYTES).min(end);
     let first = if start == 0
-        && first_end == 1
+        && end - start == 1
         && let Some(probe) = initial_probe.take()
     {
         Some(probe)
     } else {
-        match read_or_fill_hls_range(
+        match read_hls_media_stream_chunk(
             state,
             &policy_recorder.session_id,
             &resource,
-            start..first_end,
+            start..end,
             &control,
         )
         .await
@@ -950,7 +953,10 @@ async fn foreground_hls_range_response(
     };
     let (first_bytes, first_was_fetched) = first.expect("nonempty response has a first chunk");
     let first_was_fetched = first_was_fetched || probe_was_fetched;
-    if u64::try_from(first_bytes.len()).ok() != Some(first_end - start) {
+    if first_bytes.is_empty()
+        || first_bytes.len() as u64 > HLS_MEDIA_STREAM_CHUNK_BYTES
+        || first_bytes.len() as u64 > end - start
+    {
         policy_recorder.record_upstream_failure(variant_id);
         return text_response(
             StatusCode::BAD_GATEWAY,
@@ -966,7 +972,7 @@ async fn foreground_hls_range_response(
         resource: resource.clone(),
         session_id: policy_recorder.session_id.clone(),
         control,
-        offset: first_end,
+        offset: start + first_bytes.len() as u64,
         end,
         total_length,
         first_bytes: Some(first_bytes),
@@ -1104,6 +1110,66 @@ where
         ));
     }
     Ok((Bytes::from(bytes), true, ready.total_length))
+}
+
+fn check_hls_media_stream_control<F>(control: &F) -> Result<(), HlsRangeError>
+where
+    F: Fn() -> HlsCacheFillControl,
+{
+    match control() {
+        HlsCacheFillControl::Continue => Ok(()),
+        HlsCacheFillControl::Cancel => Err(HlsRangeError::Cancelled),
+        HlsCacheFillControl::Preempt => Err(HlsRangeError::Preempted),
+    }
+}
+
+async fn read_hls_media_stream_chunk<F>(
+    state: &MediaState,
+    session_id: &str,
+    resource: &HlsMediaResource,
+    requested: StdRange<u64>,
+    control: &F,
+) -> Result<(Bytes, bool, u64), HlsRangeError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
+    check_hls_media_stream_control(control)?;
+    let delivery_end = requested
+        .start
+        .saturating_add(HLS_MEDIA_STREAM_CHUNK_BYTES)
+        .min(requested.end);
+    let delivery_bound = delivery_end - requested.start;
+    let cached_prefix = state
+        .state
+        .hls_cache
+        .read_resource_range_prefix(session_id, resource, requested.start..delivery_end)
+        .await?;
+    check_hls_media_stream_control(control)?;
+    if let Some(bytes) = cached_prefix {
+        if bytes.is_empty() || bytes.len() as u64 > delivery_bound {
+            return Err(HlsRangeError::InvalidResponse(
+                "HLS range cache returned an invalid verified prefix length".to_owned(),
+            ));
+        }
+        return Ok((
+            Bytes::from(bytes),
+            false,
+            resource.request.size.unwrap_or(delivery_end),
+        ));
+    }
+
+    let fetch_end = requested
+        .start
+        .saturating_add(HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES)
+        .min(requested.end);
+    read_or_fill_hls_range(
+        state,
+        session_id,
+        resource,
+        requested.start..fetch_end,
+        control,
+    )
+    .await
 }
 
 async fn ensure_hls_range_with_media_refresh<F>(
@@ -1302,6 +1368,15 @@ where
                 };
             }
 
+            if (state.first_bytes.is_some() || state.offset < state.end)
+                && let Err(error) = check_hls_media_stream_control(&state.control)
+            {
+                state.observation.fail();
+                return Some((
+                    Err(Box::new(std::io::Error::other(error.to_string()))),
+                    state,
+                ));
+            }
             if let Some(bytes) = state.first_bytes.take() {
                 state.observation.observe(&bytes, state.first_was_fetched);
                 return Some((Ok(bytes), state));
@@ -1311,12 +1386,8 @@ where
                 return None;
             }
 
-            let next_end = state
-                .offset
-                .saturating_add(HLS_MEDIA_STREAM_CHUNK_BYTES)
-                .min(state.end);
-            let requested = state.offset..next_end;
-            match read_or_fill_hls_range(
+            let requested = state.offset..state.end;
+            match read_hls_media_stream_chunk(
                 &state.media_state,
                 &state.session_id,
                 &state.resource,
@@ -1326,7 +1397,10 @@ where
             .await
             {
                 Ok((bytes, fetched, _)) => {
-                    if u64::try_from(bytes.len()).ok() != Some(next_end - state.offset) {
+                    if bytes.is_empty()
+                        || bytes.len() as u64 > HLS_MEDIA_STREAM_CHUNK_BYTES
+                        || bytes.len() as u64 > state.end - state.offset
+                    {
                         state
                             .policy_recorder
                             .record_upstream_failure(&state.variant_id);
@@ -1338,7 +1412,7 @@ where
                             state,
                         ));
                     }
-                    state.offset = next_end;
+                    state.offset += bytes.len() as u64;
                     state.observation.observe(&bytes, fetched);
                     return Some((Ok(bytes), state));
                 }
@@ -3182,6 +3256,52 @@ mod tests {
         resource_path: PathBuf,
     }
 
+    #[derive(Default)]
+    struct ServerTasks {
+        tasks: Vec<JoinHandle<()>>,
+    }
+
+    impl ServerTasks {
+        fn push(&mut self, task: JoinHandle<()>) {
+            self.tasks.push(task);
+        }
+
+        fn len(&self) -> usize {
+            self.tasks.len()
+        }
+
+        async fn abort_at(&mut self, index: usize) {
+            let task = self.tasks.remove(index);
+            task.abort();
+            let joined = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("owned test task should stop after abort");
+            if let Err(error) = joined {
+                assert!(error.is_cancelled(), "owned test task panicked: {error}");
+            }
+        }
+
+        async fn abort_and_join(mut self) {
+            while let Some(task) = self.tasks.pop() {
+                task.abort();
+                let joined = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .expect("owned test task should stop after abort");
+                if let Err(error) = joined {
+                    assert!(error.is_cancelled(), "owned test task panicked: {error}");
+                }
+            }
+        }
+    }
+
+    impl Drop for ServerTasks {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
     #[test]
     fn cdn_ranking_keeps_refreshed_candidate_urls_and_is_variant_scoped() {
         let history = CdnHistory::default();
@@ -4912,6 +5032,492 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_segment_delivers_first_post_startup_payload_from_bounded_origin_range() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed_ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gated_parent_requests = Arc::new(AtomicUsize::new(0));
+        let (release, release_rx) = watch::channel(false);
+        let (upstream_url, upstream_task) = start_hls_foreground_payload_upstream(
+            Arc::clone(&requests),
+            Arc::clone(&completed_ranges),
+            Arc::clone(&gated_parent_requests),
+            release_rx,
+        )
+        .await;
+        let mut tasks = ServerTasks::default();
+        tasks.push(upstream_task);
+        let data = foreground_payload_fake_mp4();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("bounded LAN client should build");
+
+        for (session_id, declared_size) in [
+            ("known-size", Some(data.len() as u64)),
+            ("unknown-size", None),
+        ] {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let root_path = temp.path().canonicalize().unwrap();
+            let state = AppState::new(CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            });
+            let mut session = hls_session(session_id, &upstream_url);
+            session.variant.video.request.size = declared_size;
+            session.variant.video.request.bandwidth = Some(0);
+            let resource = session.variant.video.clone();
+            insert_authorized_hls_session(&state, session);
+
+            state
+                .hls_cache
+                .ensure_resource_range(
+                    &state.hls_upstream_client,
+                    session_id,
+                    &resource,
+                    0..1,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .expect("trusted startup bytes should enter the durable range manifest");
+            assert!(
+                state
+                    .hls_cache
+                    .open_prewarmed_resource(session_id, &resource.id)
+                    .is_none(),
+                "startup proof must not use the prewarm sidecar path"
+            );
+            assert!(
+                state
+                    .hls_cache
+                    .cached_resource(session_id, &resource.id)
+                    .is_none(),
+                "startup proof must remain a partial range-cache resource"
+            );
+            let startup_end = crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES;
+            assert_eq!(
+                Some(data[..startup_end as usize].to_vec()),
+                state
+                    .hls_cache
+                    .read_resource_range(session_id, &resource, 0..startup_end)
+                    .await
+                    .expect("durable startup prefix should be readable")
+            );
+            assert!(
+                requests
+                    .lock()
+                    .expect("request log should be readable")
+                    .iter()
+                    .any(|range| range == &format!("bytes=0-{}", startup_end - 1))
+            );
+            let completed_before = completed_ranges
+                .lock()
+                .expect("completed range log should be readable")
+                .len();
+            let requests_before = requests
+                .lock()
+                .expect("request log should be readable")
+                .len();
+            let gated_before = gated_parent_requests.load(Ordering::SeqCst);
+
+            let background_cache = state.hls_cache.clone();
+            let background_client = state.hls_upstream_client.clone();
+            let background_resource = resource.clone();
+            let background_session_id = session_id.to_owned();
+            let background_task_index = tasks.len();
+            tasks.push(tokio::spawn(async move {
+                let _ = background_cache
+                    .fill_missing_resource_ranges(
+                        &background_client,
+                        &background_session_id,
+                        &background_resource,
+                        HlsRangePriority::Background,
+                        &|| HlsCacheFillControl::Continue,
+                    )
+                    .await;
+            }));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while gated_parent_requests.load(Ordering::SeqCst) <= gated_before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("large background parent range should remain gated");
+            assert!(gated_parent_requests.load(Ordering::SeqCst) > gated_before);
+
+            let start = startup_end;
+            let end = start + HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("LAN listener should bind");
+            let address = listener.local_addr().unwrap();
+            let router = Router::new()
+                .route(
+                    "/hls/{session_id}/segments/{segment_id}",
+                    get(hls_segment_get),
+                )
+                .with_state(MediaState::new(state.clone()));
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("LAN server should run");
+            }));
+
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                client
+                    .get(format!(
+                        "http://{address}/hls/{session_id}/segments/video.m4s"
+                    ))
+                    .header(RANGE, format!("bytes={start}-{}", end - 1))
+                    .send(),
+            )
+            .await
+            .expect("LAN response headers should arrive before the deadline")
+            .expect("LAN response should be successful");
+            assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+            let expected_content_range = format!("bytes {start}-{}/{}", end - 1, data.len());
+            assert_eq!(
+                Some(expected_content_range.as_str()),
+                response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+            );
+            assert_eq!(
+                Some(end - start),
+                response.content_length(),
+                "LAN Content-Length must describe the exact requested bytes"
+            );
+
+            let expected = &data[start as usize..end as usize];
+            let mut stream = response.bytes_stream();
+            let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("first LAN payload should arrive before the body deadline")
+                .expect("LAN body should contain the requested range")
+                .expect("LAN body stream should remain valid");
+            assert!(!first.is_empty(), "first LAN payload must contain bytes");
+            assert!(first.len() <= expected.len());
+            assert_eq!(&expected[..first.len()], &first[..]);
+            let mut received = first.to_vec();
+            loop {
+                let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("LAN body should finish before the deadline");
+                let Some(next) = next else { break };
+                received.extend_from_slice(&next.expect("LAN body stream should remain valid"));
+            }
+            assert_eq!(expected, &received[..]);
+            assert_eq!(
+                Some(expected.to_vec()),
+                state
+                    .hls_cache
+                    .read_resource_range(session_id, &resource, start..end)
+                    .await
+                    .expect("delivered foreground range should remain readable from cache"),
+                "the exact LAN payload should be durable in the range manifest"
+            );
+            assert!(gated_parent_requests.load(Ordering::SeqCst) > 0);
+
+            let post_startup_completed = {
+                let completed = completed_ranges
+                    .lock()
+                    .expect("completed range log should be readable");
+                completed[completed_before..].to_vec()
+            };
+            assert_eq!(1, post_startup_completed.len());
+            assert!(post_startup_completed.iter().all(|range| {
+                parse_test_range(range, data.len()).is_some_and(|(range_start, range_end)| {
+                    range_start >= startup_end as usize
+                        && range_end - range_start < HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES as usize
+                })
+            }));
+            {
+                let recorded = requests.lock().expect("request log should be readable");
+                assert!(recorded.iter().any(|range| {
+                    parse_test_range(range, data.len()) == Some((start as usize, end as usize - 1))
+                }));
+                let post_startup_requests = &recorded[requests_before..];
+                let stalled_parent = post_startup_requests
+                    .iter()
+                    .find(|range| {
+                        parse_test_range(range, data.len()).is_some_and(
+                            |(range_start, range_end)| {
+                                range_start >= startup_end as usize
+                                    && range_end - range_start + 1
+                                        > HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES as usize
+                            },
+                        )
+                    })
+                    .expect("a large post-startup background parent should remain outstanding");
+                assert!(!post_startup_completed.contains(stalled_parent));
+            }
+            tasks.abort_at(background_task_index).await;
+        }
+
+        let _ = release.send(true);
+        tasks.abort_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn hls_segment_delivers_warm_startup_prefix_once_then_fetches_bounded_miss() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upstream_url, upstream_task) =
+            start_hls_counted_range_upstream(Arc::clone(&requests)).await;
+        let mut tasks = ServerTasks::default();
+        tasks.push(upstream_task);
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let data = large_fake_mp4();
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(data.len() as u64);
+        let resource = session.variant.video.clone();
+        insert_authorized_hls_session(&state, session);
+        state
+            .hls_cache
+            .ensure_resource_range(
+                &state.hls_upstream_client,
+                "session-1",
+                &resource,
+                0..1,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("startup extent should be durably cached");
+
+        let startup_end = crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES;
+        let media_state = MediaState::new(state.clone());
+        let cancelled = super::read_hls_media_stream_chunk(
+            &media_state,
+            "session-1",
+            &resource,
+            0..startup_end,
+            &|| HlsCacheFillControl::Cancel,
+        )
+        .await;
+        assert!(matches!(cancelled, Err(HlsRangeError::Cancelled)));
+        let control_checks = AtomicUsize::new(0);
+        let cancelled_after_read = super::read_hls_media_stream_chunk(
+            &media_state,
+            "session-1",
+            &resource,
+            0..startup_end,
+            &|| {
+                if control_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    HlsCacheFillControl::Continue
+                } else {
+                    HlsCacheFillControl::Cancel
+                }
+            },
+        )
+        .await;
+        assert!(matches!(
+            cancelled_after_read,
+            Err(HlsRangeError::Cancelled)
+        ));
+        assert_eq!(2, control_checks.load(Ordering::SeqCst));
+        let start = 123;
+        let end = startup_end + HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes={start}-{}", end - 1)).unwrap(),
+        );
+        let response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        let expected_content_range = format!("bytes {start}-{}/{}", end - 1, data.len());
+        assert_eq!(
+            Some(expected_content_range.as_str()),
+            response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(Some(end - start), response_content_length(&response));
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream
+            .try_next()
+            .await
+            .expect("warm cache body chunk should be valid")
+            .expect("warm startup extent should produce a body chunk");
+        assert_eq!(
+            usize::try_from(startup_end - start).unwrap(),
+            first.len(),
+            "the warm startup extent should be delivered as one verified cache chunk"
+        );
+        assert_eq!(
+            &data[start as usize..startup_end as usize],
+            &first[..],
+            "the HTTP subrange should clip the warm cache prefix"
+        );
+        let second = stream
+            .try_next()
+            .await
+            .expect("bounded miss body chunk should be valid")
+            .expect("the uncached suffix should be fetched");
+        assert_eq!(HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES as usize, second.len());
+        assert_eq!(&data[startup_end as usize..end as usize], &second[..]);
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert_eq!(
+            Some(data[start as usize..end as usize].to_vec()),
+            state
+                .hls_cache
+                .read_resource_range("session-1", &resource, start..end)
+                .await
+                .expect("delivered range should remain durable")
+        );
+        assert_eq!(
+            vec![format!("bytes={}-{}", startup_end, end - 1)],
+            requests
+                .lock()
+                .expect("request log should be readable")
+                .iter()
+                .filter(|range| range.starts_with(&format!("bytes={startup_end}-")))
+                .cloned()
+                .collect::<Vec<_>>(),
+            "only the bounded uncached suffix should reach the origin"
+        );
+        let mut cancelled_headers = HeaderMap::new();
+        cancelled_headers.insert(RANGE, HeaderValue::from_static("bytes=0-524287"));
+        let cancelled_response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            cancelled_headers,
+        )
+        .await;
+        assert_eq!(StatusCode::PARTIAL_CONTENT, cancelled_response.status());
+        state.remove_hls_playback_session("session-1");
+        let mut cancelled_stream = cancelled_response.into_body().into_data_stream();
+        assert!(
+            cancelled_stream
+                .try_next()
+                .await
+                .expect_err("retired session must not emit its prepared warm prefix")
+                .to_string()
+                .contains("cancel")
+        );
+        tasks.abort_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn hls_segment_does_not_emit_or_publish_truncated_small_range() {
+        let (upstream_url, upstream_task) = start_hls_truncated_tail_upstream().await;
+        let mut tasks = ServerTasks::default();
+        tasks.push(upstream_task);
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let data = large_fake_mp4();
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(data.len() as u64);
+        session.variant.video.request.bandwidth = Some(0);
+        let resource = session.variant.video.clone();
+        insert_authorized_hls_session(&state, session);
+        state
+            .hls_cache
+            .ensure_resource_range(
+                &state.hls_upstream_client,
+                "session-1",
+                &resource,
+                0..1,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("trusted startup bytes should enter the durable range manifest");
+        assert!(
+            state
+                .hls_cache
+                .open_prewarmed_resource("session-1", &resource.id)
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource("session-1", &resource.id)
+                .is_none()
+        );
+        let start = crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES;
+        assert_eq!(
+            Some(data[..start as usize].to_vec()),
+            state
+                .hls_cache
+                .read_resource_range("session-1", &resource, 0..start)
+                .await
+                .expect("durable startup prefix should remain readable")
+        );
+        let end = start + HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("LAN listener should bind");
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route(
+                "/hls/{session_id}/segments/{segment_id}",
+                get(hls_segment_get),
+            )
+            .with_state(MediaState::new(state.clone()));
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("LAN server should run");
+        }));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("bounded LAN client should build");
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("http://{address}/hls/session-1/segments/video.m4s"))
+                .header(RANGE, format!("bytes={start}-{}", end - 1))
+                .send(),
+        )
+        .await
+        .expect("LAN error headers should arrive before the deadline")
+        .expect("LAN error response should arrive");
+
+        assert_eq!(StatusCode::BAD_GATEWAY, response.status());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), response.bytes())
+                .await
+                .expect("LAN error body should finish before the deadline")
+                .expect("LAN error body should be readable")
+                .is_empty()
+        );
+        assert_eq!(
+            None,
+            state
+                .hls_cache
+                .read_resource_range("session-1", &resource, start..end)
+                .await
+                .expect("truncated response should not poison the cache")
+        );
+        tasks.abort_and_join().await;
+    }
+
+    #[tokio::test]
     async fn foreground_read_joins_inflight_background_range() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream_url, _upstream_task) =
@@ -6204,6 +6810,81 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_foreground_payload_upstream(
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        completed_ranges: Arc<std::sync::Mutex<Vec<String>>>,
+        gated_parent_requests: Arc<AtomicUsize>,
+        release: watch::Receiver<bool>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(move |headers: HeaderMap| {
+                        let requests = Arc::clone(&requests);
+                        let completed_ranges = Arc::clone(&completed_ranges);
+                        let gated_parent_requests = Arc::clone(&gated_parent_requests);
+                        let mut release = release.clone();
+                        async move {
+                            if headers.get("referer")
+                                != Some(&HeaderValue::from_static("https://www.bilibili.com"))
+                            {
+                                return empty_response(StatusCode::FORBIDDEN);
+                            }
+                            let Some(range_header) =
+                                headers.get(RANGE).and_then(|value| value.to_str().ok())
+                            else {
+                                return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+                            };
+                            let data = foreground_payload_fake_mp4();
+                            let Some((start, end)) = parse_test_range(range_header, data.len())
+                            else {
+                                return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+                            };
+                            requests
+                                .lock()
+                                .expect("request log should be writable")
+                                .push(range_header.to_owned());
+                            let range_length = end - start + 1;
+                            if start >= crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES as usize
+                                && range_length > RANGE_FOREGROUND_CHUNK_BYTES as usize
+                            {
+                                gated_parent_requests.fetch_add(1, Ordering::SeqCst);
+                                if !*release.borrow() {
+                                    let _ = release.wait_for(|released| *released).await;
+                                }
+                            }
+                            completed_ranges
+                                .lock()
+                                .expect("completed range log should be writable")
+                                .push(range_header.to_owned());
+                            let body = data[start..=end].to_vec();
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(CONTENT_TYPE, "video/mp4")
+                                .header(
+                                    CONTENT_RANGE,
+                                    format!("bytes {start}-{end}/{}", data.len()),
+                                )
+                                .header(CONTENT_LENGTH, body.len().to_string())
+                                .body(Body::from(body))
+                                .expect("foreground range response should build")
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_truncated_tail_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -6601,6 +7282,16 @@ mod tests {
             *b"mdat",
             &vec![0x55; usize::try_from(HLS_INITIALIZATION_SCAN_BYTES).unwrap() + 64],
         ));
+        bytes
+    }
+
+    fn foreground_payload_fake_mp4() -> Vec<u8> {
+        let mut bytes = large_fake_mp4();
+        let target_length = (crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES * 3) as usize;
+        let free_box_length = target_length - bytes.len();
+        assert!(free_box_length >= 8);
+        bytes.extend(mp4_box(*b"free", &vec![0; free_box_length - 8]));
+        assert_eq!(target_length, bytes.len());
         bytes
     }
 
