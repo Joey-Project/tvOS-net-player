@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-09
 updated: 2026-11-09
 branch: wip/stable-local-signing
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/88
 supersedes: []
 superseded_by:
 ---
