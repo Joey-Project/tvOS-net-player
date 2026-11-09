@@ -5,6 +5,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
 };
 
 use crate::{
@@ -40,11 +41,12 @@ use crate::{
         HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
     },
     hls_range_cache::{
-        HlsRangeCache, HlsRangeError, HlsRangePriority, HlsRangeResourceStatus, HlsReadyRange,
-        HlsSessionRemovalGuard, PersistedRangeExtent, PersistedRangeManifest, PersistedRangeOrigin,
-        RANGE_FOREGROUND_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS,
-        RANGE_MAX_MANIFEST_BYTES, RANGE_MAX_SIZE, RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES,
-        RangeChunkKey, RangeResourceKey, SessionPublicationMode,
+        HlsRangeCache, HlsRangeError, HlsRangePreparation, HlsRangePriority, HlsRangeReadiness,
+        HlsRangeResourceStatus, HlsReadyRange, HlsSessionRemovalGuard, PersistedRangeExtent,
+        PersistedRangeManifest, PersistedRangeOrigin, RANGE_FOREGROUND_CHUNK_BYTES,
+        RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS, RANGE_MAX_MANIFEST_BYTES, RANGE_MAX_SIZE,
+        RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES, RangeChunkKey, RangeResourceKey,
+        SessionPublicationMode,
     },
     library::{OpenedMediaFile, open_read_no_follow},
     mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
@@ -86,6 +88,8 @@ type RangeChunkFetch = (
     Duration,
     PersistedRangeManifest,
 );
+type HlsRangeCompletion =
+    Pin<Box<dyn Future<Output = Result<HlsRangePreparation, HlsRangeError>> + Send>>;
 
 struct RangeExtentCommitInput<'a> {
     expected: &'a PersistedRangeManifest,
@@ -131,6 +135,63 @@ pub(crate) struct HlsCacheStore {
     remove_session_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     range_hash_bytes_read: Arc<AtomicU64>,
+}
+
+pub(crate) struct HlsRangeEnsure {
+    readiness: watch::Receiver<Option<HlsRangeReadiness>>,
+    completion: Option<HlsRangeCompletion>,
+    completed: Option<Result<HlsRangePreparation, HlsRangeError>>,
+}
+
+impl HlsRangeEnsure {
+    pub(crate) async fn wait_for_headers(
+        &mut self,
+    ) -> Result<Option<HlsRangeReadiness>, HlsRangeError> {
+        loop {
+            if let Some(readiness) = self.readiness.borrow().clone() {
+                return Ok(Some(readiness));
+            }
+            if let Some(Ok(_)) = self.completed.as_ref() {
+                return Ok(None);
+            }
+            if let Some(Err(_)) = self.completed.as_ref() {
+                return match self.completed.take().expect("failure was present") {
+                    Err(error) => Err(error),
+                    Ok(_) => unreachable!("completion state changed"),
+                };
+            }
+            let completion = self.completion.as_mut().expect("completion is pending");
+            tokio::select! {
+                result = completion => {
+                    let readiness = self.readiness.borrow().clone();
+                    self.completion = None;
+                    self.completed = Some(result);
+                    if let Some(readiness) = readiness {
+                        return Ok(Some(readiness));
+                    }
+                    return match self.completed.take().expect("completion was stored") {
+                        Ok(preparation) => {
+                            self.completed = Some(Ok(preparation));
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    };
+                }
+                changed = self.readiness.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<HlsRangePreparation, HlsRangeError> {
+        if let Some(result) = self.completed.take() {
+            return result;
+        }
+        self.completion.take().expect("completion is pending").await
+    }
 }
 
 pub(crate) struct HlsCacheSessionDirectoryScan {
@@ -326,6 +387,40 @@ impl HlsCacheStore {
     {
         self.ensure_range_inner(client, session_id, resource, requested, priority, control)
             .await
+    }
+
+    pub(crate) fn observe_resource_range<F>(
+        &self,
+        client: reqwest::Client,
+        session_id: String,
+        resource: HlsMediaResource,
+        requested: Range<u64>,
+        priority: HlsRangePriority,
+        control: F,
+    ) -> HlsRangeEnsure
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync + 'static,
+    {
+        let (sender, readiness) = watch::channel(None);
+        let store = self.clone();
+        let completion = Box::pin(async move {
+            store
+                .ensure_range_inner_observed(
+                    &client,
+                    &session_id,
+                    &resource,
+                    requested,
+                    priority,
+                    &control,
+                    Some(sender),
+                )
+                .await
+        });
+        HlsRangeEnsure {
+            readiness,
+            completion: Some(completion),
+            completed: None,
+        }
     }
 
     pub(crate) async fn read_resource_range(
@@ -4021,6 +4116,33 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        let requested_snapshot = requested.clone();
+        let preparation = self
+            .ensure_range_inner_observed(
+                client, session_id, resource, requested, priority, control, None,
+            )
+            .await?;
+        Ok(HlsReadyRange {
+            requested: requested_snapshot,
+            total_length: preparation.total_length,
+            strong_etag: preparation.strong_etag,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_range_inner_observed<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        requested: Range<u64>,
+        priority: HlsRangePriority,
+        control: &F,
+        readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
+    ) -> Result<HlsRangePreparation, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
         let _active = self.range_cache.enter(session_id, priority)?;
         if requested.start >= requested.end {
             return Err(HlsRangeError::InvalidResponse(
@@ -4028,13 +4150,23 @@ impl HlsCacheStore {
             ));
         }
         if let Some(ready) = self.completed_range_ready(session_id, resource, requested.clone())? {
-            return Ok(ready);
+            return Ok(HlsRangePreparation {
+                prepared_span: None,
+                total_length: ready.total_length,
+                strong_etag: ready.strong_etag,
+            });
         }
         let mut loaded = match self
             .ensure_range_state_after_initial_miss(session_id, resource, requested.clone())
             .await?
         {
-            RangeEnsureState::Completed(ready) => return Ok(ready),
+            RangeEnsureState::Completed(ready) => {
+                return Ok(HlsRangePreparation {
+                    prepared_span: None,
+                    total_length: ready.total_length,
+                    strong_etag: ready.strong_etag,
+                });
+            }
             RangeEnsureState::Partial(loaded) => *loaded,
         };
         let key = self.range_resource_key(session_id, resource)?;
@@ -4077,7 +4209,12 @@ impl HlsCacheStore {
                 .await;
             if let Err(error) = result {
                 return self
-                    .completed_range_after_identity_error(session_id, resource, requested, error);
+                    .completed_range_after_identity_error(session_id, resource, requested, error)
+                    .map(|ready| HlsRangePreparation {
+                        prepared_span: None,
+                        total_length: ready.total_length,
+                        strong_etag: ready.strong_etag,
+                    });
             }
         }
         loaded = self
@@ -4101,11 +4238,21 @@ impl HlsCacheStore {
                 })
                 .collect()
         };
+        let prepared_span = readiness
+            .as_ref()
+            .and_then(|_| chunks.first().map(|(_, range)| range.clone()));
+        let chunks = if readiness.is_some() {
+            chunks.into_iter().take(1).collect::<Vec<_>>()
+        } else {
+            chunks
+        };
         let result = futures_util::stream::iter(chunks)
-            .map(|(index, chunk)| {
+            .enumerate()
+            .map(|(position, (index, chunk))| {
                 let key = key.clone();
+                let readiness = readiness.clone().filter(|_| position == 0);
                 async move {
-                    self.ensure_range_span(
+                    self.ensure_range_span_observed(
                         client,
                         session_id,
                         resource,
@@ -4115,6 +4262,7 @@ impl HlsCacheStore {
                         priority,
                         control,
                         &|_| {},
+                        readiness,
                     )
                     .await
                 }
@@ -4124,20 +4272,28 @@ impl HlsCacheStore {
             .await;
         if let Err(error) = result {
             return self
-                .completed_range_after_identity_error(session_id, resource, requested, error);
+                .completed_range_after_identity_error(session_id, resource, requested, error)
+                .map(|ready| HlsRangePreparation {
+                    prepared_span: None,
+                    total_length: ready.total_length,
+                    strong_etag: ready.strong_etag,
+                });
         }
         if let Some(ready) = self.completed_range_ready(session_id, resource, requested.clone())? {
-            return Ok(ready);
+            return Ok(HlsRangePreparation {
+                prepared_span,
+                total_length: ready.total_length,
+                strong_etag: ready.strong_etag,
+            });
         }
         let loaded = self
             .load_range_manifest_serialized(session_id, resource)
             .await?
             .ok_or_else(|| identity_error_at("ensure-checkpoint-missing"))?;
-        let strong_etag = loaded.manifest.strong_etag.clone();
-        Ok(HlsReadyRange {
-            requested,
+        Ok(HlsRangePreparation {
+            prepared_span,
             total_length: total,
-            strong_etag,
+            strong_etag: loaded.manifest.strong_etag,
         })
     }
 
@@ -4447,6 +4603,39 @@ impl HlsCacheStore {
         F: Fn() -> HlsCacheFillControl + Send + Sync,
         P: Fn(u64) + Send + Sync,
     {
+        self.ensure_range_span_observed(
+            client,
+            session_id,
+            resource,
+            resource_key,
+            range,
+            chunk_index,
+            priority,
+            control,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_range_span_observed<F, P>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        resource_key: &RangeResourceKey,
+        range: Range<u64>,
+        chunk_index: u64,
+        priority: HlsRangePriority,
+        control: &F,
+        progress: &P,
+        readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
+    ) -> Result<(), HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(u64) + Send + Sync,
+    {
         let loaded = self
             .load_range_manifest_serialized(session_id, resource)
             .await?
@@ -4526,7 +4715,7 @@ impl HlsCacheStore {
                 }
                 let committed = self
                     .fetch_and_commit_range_extent(session_id, resource, range.clone(), || {
-                        self.fetch_range_chunk(
+                        self.fetch_range_chunk_observed(
                             client,
                             session_id,
                             resource,
@@ -4534,6 +4723,8 @@ impl HlsCacheStore {
                             chunk_index,
                             priority,
                             control,
+                            flight.readiness_sender(),
+                            readiness.clone(),
                         )
                     })
                     .await;
@@ -4601,8 +4792,23 @@ impl HlsCacheStore {
                 }
                 return Ok(());
             }
+            let mut flight_readiness = flight.readiness();
+            if readiness.is_some()
+                && let Some(outcome) = flight_readiness.borrow_and_update().clone()
+                && let Some(sender) = readiness.as_ref()
+            {
+                sender.send_replace(Some(outcome));
+            }
             tokio::select! {
                 () = flight.notified() => {}
+                changed = flight_readiness.changed(), if readiness.is_some() => {
+                    if changed.is_ok()
+                        && let Some(outcome) = flight_readiness.borrow().clone()
+                        && let Some(sender) = readiness.as_ref()
+                    {
+                        sender.send_replace(Some(outcome));
+                    }
+                }
                 () = tokio::time::sleep(Duration::from_millis(50)) => {
                     self.range_cache.check_priority_control(&chunk_key, priority, control)?;
                 }
@@ -4704,6 +4910,7 @@ impl HlsCacheStore {
     }
 
     // Candidate ranking depends on both chunk index and key while control remains caller-owned.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_range_chunk<F>(
         &self,
@@ -4714,6 +4921,36 @@ impl HlsCacheStore {
         chunk_index: u64,
         priority: HlsRangePriority,
         control: &F,
+    ) -> Result<RangeChunkFetch, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        self.fetch_range_chunk_observed(
+            client,
+            session_id,
+            resource,
+            chunk_key,
+            chunk_index,
+            priority,
+            control,
+            watch::channel(None).0,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_range_chunk_observed<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        chunk_key: &RangeChunkKey,
+        chunk_index: u64,
+        priority: HlsRangePriority,
+        control: &F,
+        flight_readiness: watch::Sender<Option<HlsRangeReadiness>>,
+        readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
     ) -> Result<RangeChunkFetch, HlsRangeError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
@@ -4890,6 +5127,134 @@ impl HlsCacheStore {
                 ));
             }
             let length = chunk_key.range.end - chunk_key.range.start;
+            if response
+                .content_length()
+                .is_some_and(|declared| declared != length)
+            {
+                self.record_cdn_observation(
+                    resource,
+                    &final_url,
+                    passive_cache_observation(
+                        CdnObservationOutcome::IntegrityMismatch,
+                        0,
+                        None,
+                        None,
+                        Some(false),
+                    ),
+                );
+                return Err(HlsRangeError::InvalidResponse(
+                    "upstream range Content-Length mismatch".to_owned(),
+                ));
+            }
+            let response_etag = strong_etag(&headers);
+            let observed_origin = media_url_origin(&final_url)
+                .ok_or_else(|| HlsRangeError::InvalidResponse("invalid CDN origin".to_owned()))?;
+            let observed_binding = loaded
+                .manifest
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == observed_origin);
+            let baseline_etag = observed_binding.and_then(|binding| binding.strong_etag.clone());
+            let validator_changed =
+                observed_binding.is_some_and(|binding| binding.strong_etag != response_etag);
+            let origin_unvalidated = observed_binding.is_none();
+            let must_revalidate = loaded.manifest.prefix_sha256.is_some()
+                && (origin_unvalidated || validator_changed);
+            if must_revalidate {
+                if validator_changed
+                    && ETAG_MISMATCH_DIAGNOSTIC_USED
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    let mut probe = self
+                        .diagnose_etag_mismatch_prefix(
+                            client,
+                            resource,
+                            &url,
+                            &observed_origin,
+                            chunk_key,
+                            &loaded.manifest,
+                            baseline_etag.as_deref().unwrap_or_default(),
+                            priority,
+                            control,
+                        )
+                        .await;
+                    probe.response_etag_syntax_valid = etag_header_syntax_valid(&headers);
+                    eprintln!(
+                        "HLS range ETag mismatch probe: same_origin={} total_matches={} prefix_hash_matches={} baseline_etag_matches={} response_etag_syntax_valid={} prefix_etag_syntax_valid={}",
+                        probe.same_origin,
+                        probe.total_matches,
+                        probe.prefix_hash_matches,
+                        probe.baseline_etag_matches,
+                        probe.response_etag_syntax_valid,
+                        probe.prefix_etag_syntax_valid,
+                    );
+                }
+                match self
+                    .verify_candidate_prefix(
+                        client,
+                        session_id,
+                        resource,
+                        &url,
+                        Some(&observed_origin),
+                        chunk_key,
+                        &loaded.manifest,
+                        priority,
+                        control,
+                    )
+                    .await
+                {
+                    Ok((verified_origin, _)) if verified_origin == observed_origin => {
+                        loaded = self
+                            .publish_validated_origin(
+                                session_id,
+                                resource,
+                                loaded,
+                                observed_origin.clone(),
+                                response_etag.clone(),
+                            )
+                            .await?;
+                    }
+                    Ok(_) => {
+                        last_error = Some(HlsRangeError::InvalidResponse(
+                            "candidate origin changed during content revalidation".to_owned(),
+                        ));
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Fallback(error)) => {
+                        self.record_cdn_observation(
+                            resource,
+                            &final_url,
+                            passive_cache_observation(
+                                range_outcome_for_error(&error),
+                                0,
+                                Some(started.elapsed()),
+                                None,
+                                Some(false),
+                            ),
+                        );
+                        if matches!(error, HlsRangeError::RangeUnsupported) {
+                            range_unsupported_seen = true;
+                        }
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Mismatch(error)) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Abort(error)) => return Err(error),
+                }
+            }
+            let outcome = HlsRangeReadiness {
+                accepted: chunk_key.range.clone(),
+                total_length: chunk_key.total_length,
+                strong_etag: response_etag.clone(),
+            };
+            flight_readiness.send_replace(Some(outcome.clone()));
+            if let Some(sender) = readiness.as_ref() {
+                sender.send_replace(Some(outcome));
+            }
             let body = match self
                 .read_range_body(response, length, chunk_key, priority, control)
                 .await
@@ -4914,110 +5279,6 @@ impl HlsCacheStore {
                     continue;
                 }
             };
-            let response_etag = strong_etag(&headers);
-            let observed_origin = media_url_origin(&final_url)
-                .ok_or_else(|| HlsRangeError::InvalidResponse("invalid CDN origin".to_owned()))?;
-            let observed_binding = loaded
-                .manifest
-                .validated_origins
-                .iter()
-                .find(|binding| binding.origin == observed_origin);
-            let baseline_etag = observed_binding.and_then(|binding| binding.strong_etag.clone());
-            let validator_changed =
-                observed_binding.is_some_and(|binding| binding.strong_etag != response_etag);
-            let origin_unvalidated = observed_binding.is_none();
-            let must_revalidate = loaded.manifest.prefix_sha256.is_some()
-                && (origin_unvalidated || validator_changed);
-            if validator_changed {
-                let baseline_etag = baseline_etag.as_deref().unwrap_or_default();
-                if ETAG_MISMATCH_DIAGNOSTIC_USED
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let mut probe = self
-                        .diagnose_etag_mismatch_prefix(
-                            client,
-                            resource,
-                            &url,
-                            &observed_origin,
-                            chunk_key,
-                            &loaded.manifest,
-                            baseline_etag,
-                            priority,
-                            control,
-                        )
-                        .await;
-                    probe.response_etag_syntax_valid = etag_header_syntax_valid(&headers);
-                    eprintln!(
-                        "HLS range ETag mismatch probe: same_origin={} total_matches={} prefix_hash_matches={} baseline_etag_matches={} response_etag_syntax_valid={} prefix_etag_syntax_valid={}",
-                        probe.same_origin,
-                        probe.total_matches,
-                        probe.prefix_hash_matches,
-                        probe.baseline_etag_matches,
-                        probe.response_etag_syntax_valid,
-                        probe.prefix_etag_syntax_valid,
-                    );
-                }
-            }
-            if must_revalidate {
-                match self
-                    .verify_candidate_prefix(
-                        client,
-                        session_id,
-                        resource,
-                        &url,
-                        Some(&observed_origin),
-                        chunk_key,
-                        &loaded.manifest,
-                        priority,
-                        control,
-                    )
-                    .await
-                {
-                    Ok((verified_origin, _prefix_etag)) if verified_origin == observed_origin => {
-                        loaded = self
-                            .publish_validated_origin(
-                                session_id,
-                                resource,
-                                loaded,
-                                observed_origin.clone(),
-                                response_etag.clone(),
-                            )
-                            .await?;
-                    }
-                    Ok((_, _)) => {
-                        last_error = Some(HlsRangeError::InvalidResponse(
-                            "candidate origin changed during content revalidation".to_owned(),
-                        ));
-                        continue;
-                    }
-                    Err(CandidateVerificationError::Fallback(error)) => {
-                        self.record_cdn_observation(
-                            resource,
-                            &final_url,
-                            passive_cache_observation(
-                                range_outcome_for_error(&error),
-                                length,
-                                Some(started.elapsed()),
-                                None,
-                                Some(false),
-                            ),
-                        );
-                        if matches!(error, HlsRangeError::RangeUnsupported) {
-                            range_unsupported_seen = true;
-                        }
-                        last_error = Some(error);
-                        continue;
-                    }
-                    Err(CandidateVerificationError::Mismatch(error)) => {
-                        last_error = Some(error);
-                        continue;
-                    }
-                    Err(CandidateVerificationError::Abort(error)) => {
-                        return Err(error);
-                    }
-                }
-            }
             let last_modified = headers
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|value| value.to_str().ok())
@@ -11854,6 +12115,8 @@ mod tests {
             .await
             .expect("completed cache should avoid another upstream request");
         assert_eq!(body.len() as u64, ready.total_length);
+        assert_eq!(0..1, ready.requested);
+        assert_eq!(None, ready.strong_etag);
         assert_eq!(
             body,
             fs::read(&cached.path).expect("completed MP4 should remain")

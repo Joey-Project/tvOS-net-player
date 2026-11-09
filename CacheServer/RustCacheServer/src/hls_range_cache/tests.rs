@@ -119,16 +119,23 @@ async fn serve_range(
     if state.truncate_once.as_ref() == Some(&requested)
         && !state.truncated.swap(true, Ordering::SeqCst)
     {
-        return response(
-            StatusCode::PARTIAL_CONTENT,
-            Some(format!(
-                "bytes {}-{}/{}",
-                requested.start,
-                requested.end - 1,
-                state.bytes.len()
-            )),
-            state.bytes[requested.start..requested.end - 1].to_vec(),
-        );
+        let partial = state.bytes[requested.start..requested.end - 1].to_vec();
+        let body = futures_util::stream::once(async move {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(partial))
+        });
+        return Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(
+                CONTENT_RANGE,
+                format!(
+                    "bytes {}-{}/{}",
+                    requested.start,
+                    requested.end - 1,
+                    state.bytes.len()
+                ),
+            )
+            .body(Body::from_stream(body))
+            .expect("truncated range response should be valid");
     }
     if state.stalled_body_once.as_ref() == Some(&requested)
         && !state.stalled_body.swap(true, Ordering::SeqCst)
@@ -487,6 +494,401 @@ async fn unknown_size_probe_is_not_checkpointed_and_only_missing_tail_is_filled(
     })
     .await
     .expect("unknown-size probe test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn observed_headers_precede_body_and_late_joiner_receives_existing_readiness() {
+    timeout(TEST_DEADLINE, async {
+        let total = (RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES) as usize;
+        let bytes = patterned_bytes(total);
+        let missing = RANGE_STARTUP_CHUNK_BYTES as usize..total;
+        let (url, state, server) =
+            start_range_server_with_behavior(bytes.clone(), None, None, Some(missing.clone()))
+                .await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path()).with_range_parallelism(1);
+        let resource = resource(url, Some(total as u64));
+        let client = reqwest::Client::new();
+        let session_id = "observed-header-late-joiner";
+        seed_startup_range(&store, &client, session_id, &resource).await;
+
+        let mut owner = store.observe_resource_range(
+            client.clone(),
+            session_id.to_owned(),
+            resource.clone(),
+            missing.start as u64..missing.end as u64,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        let accepted = timeout(TEST_DEADLINE, owner.wait_for_headers())
+            .await
+            .expect("accepted origin headers should arrive before body completion")
+            .expect("valid range headers should be accepted")
+            .expect("a missing span should publish readiness");
+        assert_eq!(missing.start as u64..missing.end as u64, accepted.accepted);
+        assert_eq!(total as u64, accepted.total_length);
+        timeout(TEST_DEADLINE, state.body_entered.notified())
+            .await
+            .expect("origin body should be held after accepted headers");
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES,
+            store
+                .range_durable_bytes(session_id, &resource)
+                .expect("durable count should remain readable"),
+            "headers readiness must not publish the withheld extent"
+        );
+
+        let mut joiner = store.observe_resource_range(
+            client,
+            session_id.to_owned(),
+            resource.clone(),
+            missing.start as u64..missing.end as u64,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        let joined = timeout(TEST_DEADLINE, joiner.wait_for_headers())
+            .await
+            .expect("late joiner should see the existing watch value")
+            .expect("late joiner should observe accepted headers")
+            .expect("shared flight should retain readiness");
+        assert_eq!(accepted, joined);
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES,
+            store
+                .range_durable_bytes(session_id, &resource)
+                .expect("durable count should remain readable")
+        );
+
+        state.release_body.notify_one();
+        let owner_preparation = timeout(TEST_DEADLINE, owner.finish())
+            .await
+            .expect("owner fill should finish after releasing origin body")
+            .expect("owner span should publish atomically");
+        let joiner_preparation = timeout(TEST_DEADLINE, joiner.finish())
+            .await
+            .expect("joiner should observe flight completion")
+            .expect("joiner should see the durable span");
+        assert_eq!(
+            Some(missing.start as u64..missing.end as u64),
+            owner_preparation.prepared_span
+        );
+        assert_eq!(
+            Some(missing.start as u64..missing.end as u64),
+            joiner_preparation.prepared_span
+        );
+        assert_eq!(
+            bytes[missing.clone()],
+            store
+                .read_resource_range(
+                    session_id,
+                    &resource,
+                    RANGE_STARTUP_CHUNK_BYTES..total as u64
+                )
+                .await
+                .expect("published range should read")
+                .expect("exact response span should be durable")
+        );
+        stop_server(server).await;
+    })
+    .await
+    .expect("observed header/late joiner test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn cold_startup_identity_does_not_publish_before_512k_body_proof() {
+    timeout(TEST_DEADLINE, async {
+        let total = (RANGE_STARTUP_CHUNK_BYTES * 2) as usize;
+        let startup = 0..RANGE_STARTUP_CHUNK_BYTES as usize;
+        let (url, state, server) = start_range_server_with_behavior(
+            patterned_bytes(total),
+            None,
+            None,
+            Some(startup.clone()),
+        )
+        .await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path());
+        let resource = resource(url, Some(total as u64));
+        let mut ensure = store.observe_resource_range(
+            reqwest::Client::new(),
+            "cold-startup-identity".to_owned(),
+            resource.clone(),
+            0..1,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        {
+            let waiting = ensure.wait_for_headers();
+            tokio::pin!(waiting);
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("cold startup must not report ready before identity proof: {result:?}"),
+                () = state.body_entered.notified() => {}
+            }
+        }
+        assert_eq!(
+            0,
+            store
+                .range_durable_bytes("cold-startup-identity", &resource)
+                .expect("cold cache should have no durable bytes before the proof body")
+        );
+        state.release_body.notify_one();
+        assert_eq!(
+            None,
+            ensure
+                .wait_for_headers()
+                .await
+                .expect("startup proof should complete successfully")
+        );
+        let preparation = ensure.finish().await.expect("startup range should become durable");
+        assert_eq!(None, preparation.prepared_span);
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES,
+            store
+                .range_durable_bytes("cold-startup-identity", &resource)
+                .expect("startup body proof should be atomically published")
+        );
+        stop_server(server).await;
+    })
+    .await
+    .expect("cold identity proof test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn observed_range_that_is_already_durable_does_not_fetch_upstream() {
+    timeout(TEST_DEADLINE, async {
+        let total = (RANGE_STARTUP_CHUNK_BYTES * 2) as usize;
+        let (url, state, server) = start_range_server(patterned_bytes(total), None).await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path());
+        let resource = resource(url, Some(total as u64));
+        let client = reqwest::Client::new();
+        seed_startup_range(&store, &client, "observed-cache-hit", &resource).await;
+
+        let mut ensure = store.observe_resource_range(
+            client,
+            "observed-cache-hit".to_owned(),
+            resource,
+            23..91,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        assert_eq!(
+            None,
+            ensure
+                .wait_for_headers()
+                .await
+                .expect("durable range should complete without origin headers")
+        );
+        let preparation = ensure
+            .finish()
+            .await
+            .expect("durable range preparation should complete");
+        assert_eq!(None, preparation.prepared_span);
+        assert_eq!(total as u64, preparation.total_length);
+        assert_eq!(
+            vec![0..RANGE_STARTUP_CHUNK_BYTES as usize],
+            state
+                .requests
+                .lock()
+                .expect("request list should not poison")
+                .clone(),
+            "a fully cached requested range must stay upstream-free"
+        );
+        stop_server(server).await;
+    })
+    .await
+    .expect("durable observed range test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn accepted_headers_can_be_followed_by_truncation_without_publication() {
+    timeout(TEST_DEADLINE, async {
+        let total = (RANGE_STARTUP_CHUNK_BYTES * 2) as usize;
+        let bytes = patterned_bytes(total);
+        let missing = RANGE_STARTUP_CHUNK_BYTES as usize
+            ..(RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES) as usize;
+        let (url, state, server) =
+            start_range_server_with_behavior(bytes, None, Some(missing.clone()), None).await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path());
+        let resource = resource(url, Some(total as u64));
+        let client = reqwest::Client::new();
+        let session_id = "observed-truncated-body";
+        seed_startup_range(&store, &client, session_id, &resource).await;
+
+        let mut ensure = store.observe_resource_range(
+            client,
+            session_id.to_owned(),
+            resource.clone(),
+            missing.start as u64..missing.end as u64,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        let readiness = ensure
+            .wait_for_headers()
+            .await
+            .expect("valid headers should pass the readiness gate")
+            .expect("missing span should publish header outcome");
+        assert_eq!(missing.start as u64..missing.end as u64, readiness.accepted);
+        let error = ensure
+            .finish()
+            .await
+            .expect_err("truncated body must fail after accepted headers");
+        assert!(matches!(
+            error,
+            HlsRangeError::InvalidResponse(_) | HlsRangeError::Network(_)
+        ));
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES,
+            store
+                .range_durable_bytes(session_id, &resource)
+                .expect("prior startup prefix should remain durable")
+        );
+        assert_eq!(
+            None,
+            store
+                .read_resource_range(
+                    session_id,
+                    &resource,
+                    missing.start as u64..missing.end as u64
+                )
+                .await
+                .expect("truncated response must not create a readable extent")
+        );
+        assert!(state.truncated.load(Ordering::SeqCst));
+        stop_server(server).await;
+    })
+    .await
+    .expect("accepted-header truncation test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn rejected_upstream_status_never_publishes_readiness() {
+    timeout(TEST_DEADLINE, async {
+        let total = (RANGE_STARTUP_CHUNK_BYTES * 2) as usize;
+        let requested = RANGE_STARTUP_CHUNK_BYTES as usize
+            ..(RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES) as usize;
+        let (url, state, server) =
+            start_range_server(patterned_bytes(total), Some(requested.clone())).await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path());
+        let resource = resource(url, Some(total as u64));
+        let client = reqwest::Client::new();
+        let session_id = "observed-upstream-503";
+        seed_startup_range(&store, &client, session_id, &resource).await;
+
+        let mut ensure = store.observe_resource_range(
+            client,
+            session_id.to_owned(),
+            resource.clone(),
+            requested.start as u64..requested.end as u64,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        let error = ensure
+            .wait_for_headers()
+            .await
+            .expect_err("all rejected candidates should fail before readiness");
+        assert!(matches!(error, HlsRangeError::UpstreamStatus(_)));
+        assert_eq!(
+            RANGE_STARTUP_CHUNK_BYTES,
+            store
+                .range_durable_bytes(session_id, &resource)
+                .expect("startup prefix should remain durable")
+        );
+        assert_eq!(
+            vec![0..RANGE_STARTUP_CHUNK_BYTES as usize, requested],
+            state
+                .requests
+                .lock()
+                .expect("request log should be readable")
+                .clone()
+        );
+        stop_server(server).await;
+    })
+    .await
+    .expect("rejected status readiness test should finish within its deadline");
+}
+
+#[tokio::test]
+async fn observed_missing_span_is_found_beyond_eight_mib_delivery_prefix() {
+    timeout(Duration::from_secs(20), async {
+        let warm_through = RANGE_STARTUP_CHUNK_BYTES + RANGE_MAX_CHUNK_BYTES + 512 * 1024;
+        let missing = warm_through..warm_through + RANGE_FOREGROUND_CHUNK_BYTES;
+        let total = missing.end + RANGE_FOREGROUND_CHUNK_BYTES;
+        let bytes = patterned_bytes(total as usize);
+        let (url, state, server) = start_range_server_with_behavior(
+            bytes.clone(),
+            None,
+            None,
+            Some(missing.start as usize..missing.end as usize),
+        )
+        .await;
+        let temp = tempfile::tempdir().expect("cache root should be created");
+        let store = test_store(temp.path()).with_range_budget(32 * 1024 * 1024);
+        let resource = resource(url.clone(), Some(total));
+        let client = reqwest::Client::new();
+        let session_id = "observed-gap-after-eight-mib";
+        seed_startup_range(&store, &client, session_id, &resource).await;
+        let expected = store
+            .range_manifest_snapshot(session_id, &resource)
+            .expect("startup manifest should validate")
+            .expect("startup manifest should exist");
+        store
+            .commit_range_extent(
+                session_id,
+                &resource,
+                &expected,
+                RANGE_STARTUP_CHUNK_BYTES..warm_through,
+                &bytes[RANGE_STARTUP_CHUNK_BYTES as usize..warm_through as usize],
+                &url,
+                None,
+                None,
+            )
+            .await
+            .expect("warm prefix extending beyond delivery window should publish");
+
+        let mut ensure = store.observe_resource_range(
+            client,
+            session_id.to_owned(),
+            resource.clone(),
+            0..total,
+            HlsRangePriority::Foreground,
+            || HlsCacheFillControl::Continue,
+        );
+        let readiness = timeout(TEST_DEADLINE, ensure.wait_for_headers())
+            .await
+            .expect("first missing origin headers should arrive")
+            .expect("valid first missing range should be accepted")
+            .expect("missing range should produce readiness");
+        assert_eq!(missing, readiness.accepted);
+        timeout(TEST_DEADLINE, state.body_entered.notified())
+            .await
+            .expect("first missing span body should remain gated");
+        assert_eq!(
+            warm_through,
+            store.range_durable_bytes(session_id, &resource).unwrap()
+        );
+        state.release_body.notify_one();
+        let preparation = ensure
+            .finish()
+            .await
+            .expect("first missing span should publish");
+        assert_eq!(Some(missing.clone()), preparation.prepared_span);
+        assert_eq!(total, preparation.total_length);
+        assert_eq!(
+            bytes[missing.start as usize..missing.end as usize],
+            store
+                .read_resource_range(session_id, &resource, missing.clone())
+                .await
+                .expect("prepared gap should read")
+                .expect("prepared gap should be durable")
+        );
+        stop_server(server).await;
+    })
+    .await
+    .expect("large warm-prefix readiness test should finish within its deadline");
 }
 
 #[tokio::test]

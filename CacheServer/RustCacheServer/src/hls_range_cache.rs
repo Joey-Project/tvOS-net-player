@@ -75,6 +75,20 @@ pub(crate) struct HlsReadyRange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsRangeReadiness {
+    pub(crate) accepted: Range<u64>,
+    pub(crate) total_length: u64,
+    pub(crate) strong_etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsRangePreparation {
+    pub(crate) prepared_span: Option<Range<u64>>,
+    pub(crate) total_length: u64,
+    pub(crate) strong_etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HlsRangeResourceStatus {
     Partial {
         total_length: u64,
@@ -184,6 +198,7 @@ struct RangeState {
 
 struct FlightState {
     completion: watch::Sender<bool>,
+    readiness: watch::Sender<Option<HlsRangeReadiness>>,
     foreground_interest: usize,
 }
 
@@ -353,38 +368,45 @@ impl HlsRangeCache {
         {
             return Err(HlsRangeError::SessionRemoving);
         }
-        let (completion, receiver, owner) = match state.flights.get_mut(&key) {
-            Some(flight) => {
-                if priority == HlsRangePriority::Foreground {
-                    flight.foreground_interest += 1;
+        let (completion, receiver, readiness, readiness_receiver, owner) =
+            match state.flights.get_mut(&key) {
+                Some(flight) => {
+                    if priority == HlsRangePriority::Foreground {
+                        flight.foreground_interest += 1;
+                    }
+                    (
+                        flight.completion.clone(),
+                        flight.completion.subscribe(),
+                        flight.readiness.clone(),
+                        flight.readiness.subscribe(),
+                        false,
+                    )
                 }
-                (
-                    flight.completion.clone(),
-                    flight.completion.subscribe(),
-                    false,
-                )
-            }
-            None => {
-                let (completion, receiver) = watch::channel(false);
-                state.flights.insert(
-                    key.clone(),
-                    FlightState {
-                        completion: completion.clone(),
-                        foreground_interest: if priority == HlsRangePriority::Foreground {
-                            1
-                        } else {
-                            0
+                None => {
+                    let (completion, receiver) = watch::channel(false);
+                    let (readiness, readiness_receiver) = watch::channel(None);
+                    state.flights.insert(
+                        key.clone(),
+                        FlightState {
+                            completion: completion.clone(),
+                            readiness: readiness.clone(),
+                            foreground_interest: if priority == HlsRangePriority::Foreground {
+                                1
+                            } else {
+                                0
+                            },
                         },
-                    },
-                );
-                (completion, receiver, true)
-            }
-        };
+                    );
+                    (completion, receiver, readiness, readiness_receiver, true)
+                }
+            };
         Ok(RangeFlight {
             cache: Arc::clone(self),
             key,
             completion,
             receiver,
+            readiness,
+            readiness_receiver,
             owner,
             foreground_interest: !owner && priority == HlsRangePriority::Foreground,
         })
@@ -712,6 +734,8 @@ pub(crate) struct RangeFlight {
     key: RangeChunkKey,
     completion: watch::Sender<bool>,
     receiver: watch::Receiver<bool>,
+    readiness: watch::Sender<Option<HlsRangeReadiness>>,
+    readiness_receiver: watch::Receiver<Option<HlsRangeReadiness>>,
     owner: bool,
     foreground_interest: bool,
 }
@@ -726,6 +750,14 @@ impl RangeFlight {
         if !*receiver.borrow() {
             let _ = receiver.changed().await;
         }
+    }
+
+    pub(crate) fn readiness(&self) -> watch::Receiver<Option<HlsRangeReadiness>> {
+        self.readiness_receiver.clone()
+    }
+
+    pub(crate) fn readiness_sender(&self) -> watch::Sender<Option<HlsRangeReadiness>> {
+        self.readiness.clone()
     }
 }
 
