@@ -6,12 +6,234 @@ use std::{
 };
 
 const MAX_TIMING_BOX_PAYLOAD_LENGTH: u64 = 16 * 1024 * 1024;
+const MAX_SIDX_PREFIX_BYTES: usize = 1024 * 1024;
+const MAX_SIDX_REFERENCES: usize = 16_384;
+
+pub(crate) const MAX_SIDX_TRAILER_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Mp4SegmentRange {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) duration_millis: u64,
+}
+
+pub(crate) struct Mp4SidxIndex {
+    pub(crate) trailing_offset: u64,
+    pub(crate) trailing_length: u64,
+    ranges: Vec<Mp4SegmentRange>,
+    first_reference_offset: u64,
+    total_length: u64,
+}
+
+pub(crate) fn mp4_sidx_index(
+    prefix: &[u8],
+    initialization_length: u64,
+    total_length: u64,
+) -> Option<Mp4SidxIndex> {
+    if prefix.len() > MAX_SIDX_PREFIX_BYTES
+        || total_length <= initialization_length
+        || initialization_length > u64::try_from(prefix.len()).ok()?
+    {
+        return None;
+    }
+
+    let initialization_length = usize::try_from(initialization_length).ok()?;
+    let mut offset = 0_usize;
+    while offset < initialization_length {
+        let (kind, _, _, next_offset) = read_slice_box(prefix, offset)?;
+        if kind == *b"sidx" || next_offset > initialization_length {
+            return None;
+        }
+        offset = next_offset;
+    }
+    if offset != initialization_length {
+        return None;
+    }
+
+    let mut offset = initialization_length;
+    let mut parsed = None;
+    while offset < prefix.len() {
+        let (kind, payload_start, payload_end, next_offset) = read_slice_box(prefix, offset)?;
+        if kind == *b"sidx" {
+            if parsed.is_some() {
+                return None;
+            }
+            parsed = Some(parse_sidx(
+                &prefix[payload_start..payload_end],
+                u64::try_from(offset).ok()?,
+                u64::try_from(next_offset).ok()?,
+                initialization_length as u64,
+                total_length,
+            )?);
+        } else if matches!(&kind, b"moof" | b"mdat") && parsed.is_none() {
+            return None;
+        }
+        if let Some(index) = parsed.as_ref()
+            && u64::try_from(next_offset).ok()? > index.first_reference_offset
+        {
+            return None;
+        }
+        offset = next_offset;
+        if let Some(index) = parsed.as_ref()
+            && u64::try_from(offset).ok()? >= index.first_reference_offset
+        {
+            break;
+        }
+    }
+
+    let mut index = parsed?;
+    let references_end = index
+        .ranges
+        .last()?
+        .offset
+        .checked_add(index.ranges.last()?.length)?;
+    if references_end > total_length {
+        return None;
+    }
+    let trailing_length = total_length.checked_sub(references_end)?;
+    if trailing_length > MAX_SIDX_TRAILER_BYTES {
+        return None;
+    }
+    index.trailing_offset = references_end;
+    index.trailing_length = trailing_length;
+    Some(index)
+}
+
+pub(crate) fn mp4_sidx_segment_ranges(
+    index: Mp4SidxIndex,
+    trailer: &[u8],
+) -> Option<Vec<Mp4SegmentRange>> {
+    if u64::try_from(trailer.len()).ok()? != index.trailing_length {
+        return None;
+    }
+    if index.trailing_length == 0 {
+        if !trailer.is_empty()
+            || index
+                .ranges
+                .last()?
+                .offset
+                .checked_add(index.ranges.last()?.length)?
+                != index.total_length
+        {
+            return None;
+        }
+        return Some(index.ranges);
+    }
+
+    if !is_valid_terminal_mfra_bytes(trailer)? {
+        return None;
+    }
+    let mut ranges = index.ranges;
+    let last = ranges.last_mut()?;
+    let end = last.offset.checked_add(last.length)?;
+    if end != index.trailing_offset {
+        return None;
+    }
+    last.length = index.total_length.checked_sub(last.offset)?;
+    Some(ranges)
+}
+
+fn parse_sidx(
+    payload: &[u8],
+    box_offset: u64,
+    box_end: u64,
+    initialization_length: u64,
+    total_length: u64,
+) -> Option<Mp4SidxIndex> {
+    let version = *payload.first()?;
+    if !matches!(version, 0 | 1) || full_box_flags(payload)? != 0 {
+        return None;
+    }
+    let timescale = u64::from(read_u32(payload, 8)?);
+    if timescale == 0 {
+        return None;
+    }
+    let (earliest, first_offset, mut cursor) = if version == 0 {
+        (
+            u64::from(read_u32(payload, 12)?),
+            u64::from(read_u32(payload, 16)?),
+            20_usize,
+        )
+    } else {
+        (read_u64(payload, 12)?, read_u64(payload, 20)?, 28_usize)
+    };
+    if payload.get(cursor..cursor.checked_add(2)?)? != [0, 0] {
+        return None;
+    }
+    cursor = cursor.checked_add(2)?;
+    let reference_count = usize::from(read_u16(payload, cursor)?);
+    cursor = cursor.checked_add(2)?;
+    if !(2..=MAX_SIDX_REFERENCES).contains(&reference_count)
+        || cursor.checked_add(reference_count.checked_mul(12)?)? != payload.len()
+    {
+        return None;
+    }
+
+    let first_reference_offset = box_end.checked_add(first_offset)?;
+    if first_reference_offset < initialization_length || first_reference_offset > total_length {
+        return None;
+    }
+    let mut reference_offset = first_reference_offset;
+    let mut cumulative_duration = 0_u64;
+    let mut ranges = Vec::with_capacity(reference_count);
+    for _ in 0..reference_count {
+        let size_and_type = read_u32(payload, cursor)?;
+        cursor = cursor.checked_add(4)?;
+        let reference_size = u64::from(size_and_type & 0x7fff_ffff);
+        let duration = u64::from(read_u32(payload, cursor)?);
+        cursor = cursor.checked_add(4)?;
+        let sap = read_u32(payload, cursor)?;
+        cursor = cursor.checked_add(4)?;
+        let sap_type = (sap >> 28) & 0x07;
+        if size_and_type & 0x8000_0000 != 0
+            || reference_size == 0
+            || duration == 0
+            || sap & 0x8000_0000 == 0
+            || sap_type > 2
+            || sap & 0x0fff_ffff != 0
+        {
+            return None;
+        }
+        cumulative_duration = cumulative_duration.checked_add(duration)?;
+        let duration_millis = duration
+            .checked_mul(1_000)?
+            .checked_add(timescale.checked_sub(1)?)?
+            .checked_div(timescale)?;
+        if duration_millis == 0 {
+            return None;
+        }
+        let reference_end = reference_offset.checked_add(reference_size)?;
+        if reference_end > total_length {
+            return None;
+        }
+        let segment_offset = if ranges.is_empty() {
+            initialization_length
+        } else {
+            reference_offset
+        };
+        let segment_end = reference_end;
+        if segment_end <= segment_offset {
+            return None;
+        }
+        ranges.push(Mp4SegmentRange {
+            offset: segment_offset,
+            length: segment_end.checked_sub(segment_offset)?,
+            duration_millis,
+        });
+        reference_offset = reference_end;
+    }
+    earliest.checked_add(cumulative_duration)?;
+    if reference_offset > total_length || box_offset >= box_end {
+        return None;
+    }
+    Some(Mp4SidxIndex {
+        trailing_offset: reference_offset,
+        trailing_length: 0,
+        ranges,
+        first_reference_offset,
+        total_length,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +323,23 @@ fn parse_mp4_fragment_ranges(
                 pending_segment_start = None;
             }
             b"mdat" => return Ok(None),
+            b"mfra" => {
+                if pending_segment_start.is_some()
+                    || segments.len() < 2
+                    || header.end() != Some(total_length)
+                    || !is_valid_terminal_mfra(file, header)?
+                {
+                    return Ok(Some(Vec::new()));
+                }
+                let Some(last_segment) = segments.last_mut() else {
+                    return Ok(Some(Vec::new()));
+                };
+                if last_segment.offset.checked_add(last_segment.length) != Some(header.offset) {
+                    return Ok(Some(Vec::new()));
+                }
+                last_segment.length = total_length - last_segment.offset;
+                return Ok(Some(segments));
+            }
             _ => {
                 pending_segment_start.get_or_insert(header.offset);
                 let Some(next_offset) = header.end() else {
@@ -118,6 +357,92 @@ fn parse_mp4_fragment_ranges(
         return Ok(Some(Vec::new()));
     }
     Ok(Some(segments))
+}
+
+fn is_valid_terminal_mfra(file: &mut File, header: Mp4BoxHeader) -> io::Result<bool> {
+    let Some(payload) = read_box_payload_limited(file, header, MAX_TIMING_BOX_PAYLOAD_LENGTH)?
+    else {
+        return Ok(false);
+    };
+    let Some(mfra_size) = u32::try_from(header.size).ok() else {
+        return Ok(false);
+    };
+    Ok(is_valid_terminal_mfra_payload(&payload, mfra_size))
+}
+
+fn is_valid_terminal_mfra_bytes(trailer: &[u8]) -> Option<bool> {
+    if u64::try_from(trailer.len()).ok()? > MAX_SIDX_TRAILER_BYTES {
+        return None;
+    }
+    let (kind, payload_start, payload_end, next_offset) = read_slice_box(trailer, 0)?;
+    if kind != *b"mfra" || next_offset != trailer.len() {
+        return Some(false);
+    }
+    let mfra_size = u32::try_from(trailer.len()).ok()?;
+    Some(is_valid_terminal_mfra_payload(
+        &trailer[payload_start..payload_end],
+        mfra_size,
+    ))
+}
+
+fn is_valid_terminal_mfra_payload(payload: &[u8], mfra_size: u32) -> bool {
+    let mut has_tfra = false;
+    let mut has_mfro = false;
+    let valid = visit_child_boxes(payload, |kind, child_payload| {
+        if has_mfro {
+            return None;
+        }
+        match &kind {
+            b"tfra" => {
+                parse_tfra_index(child_payload)?;
+                has_tfra = true;
+                Some(())
+            }
+            b"mfro" => {
+                if !has_tfra || parse_mfro_size(child_payload)? != mfra_size {
+                    return None;
+                }
+                has_mfro = true;
+                Some(())
+            }
+            _ => None,
+        }
+    })
+    .is_some();
+    valid && has_tfra && has_mfro
+}
+
+fn parse_tfra_index(payload: &[u8]) -> Option<()> {
+    let version = *payload.first()?;
+    if !matches!(version, 0 | 1) || full_box_flags(payload)? != 0 {
+        return None;
+    }
+    if read_u32(payload, 4)? == 0 {
+        return None;
+    }
+    let length_sizes = read_u32(payload, 8)?;
+    if length_sizes >> 6 != 0 {
+        return None;
+    }
+    let entry_count = usize::try_from(read_u32(payload, 12)?).ok()?;
+    let variable_length = usize::try_from(1 + ((length_sizes >> 4) & 0x03))
+        .ok()?
+        .checked_add(usize::try_from(1 + ((length_sizes >> 2) & 0x03)).ok()?)?
+        .checked_add(usize::try_from(1 + (length_sizes & 0x03)).ok()?)?;
+    let fixed_length = if version == 0 { 8_usize } else { 16_usize };
+    let entry_length = fixed_length.checked_add(variable_length)?;
+    let entries_length = entry_count.checked_mul(entry_length)?;
+    if 16_usize.checked_add(entries_length)? != payload.len() {
+        return None;
+    }
+    Some(())
+}
+
+fn parse_mfro_size(payload: &[u8]) -> Option<u32> {
+    if payload.len() != 8 || payload[..4] != [0, 0, 0, 0] {
+        return None;
+    }
+    read_u32(payload, 4)
 }
 
 fn parse_timing_context(
@@ -623,6 +948,24 @@ fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
+fn read_u16(payload: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        payload
+            .get(offset..offset.checked_add(2)?)?
+            .try_into()
+            .ok()?,
+    ))
+}
+
+fn read_u64(payload: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(
+        payload
+            .get(offset..offset.checked_add(8)?)?
+            .try_into()
+            .ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Seek as _, SeekFrom, Write as _};
@@ -752,7 +1095,8 @@ mod tests {
     fn returns_no_index_for_single_fragment() {
         let temp = TempDir::new().expect("temp dir should be created");
         let path = temp.path().join("single-fragment.mp4");
-        let bytes = fragmented_mp4(&[(1_000, b"only-media".as_slice())]);
+        let mut bytes = fragmented_mp4(&[(1_000, b"only-media".as_slice())]);
+        bytes.extend(valid_mfra());
         std::fs::write(&path, &bytes).expect("test mp4 should be written");
         let initialization_length = init_mp4().len() as u64;
 
@@ -772,12 +1116,98 @@ mod tests {
         bytes.extend(mp4_box(*b"mdat", b"first-media"));
         bytes.extend(mp4_box(*b"moof", b"second-moof"));
         bytes.extend(mp4_box(*b"mdat", b"second-media"));
+        bytes.extend(valid_mfra());
         std::fs::write(&path, &bytes).expect("test mp4 should be written");
 
         let ranges = mp4_fragment_ranges(&path, initialization_length, bytes.len() as u64)
             .expect("fragment ranges should parse");
 
         assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn folds_valid_terminal_mfra_into_last_fragment_without_changing_timing() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("fragmented-with-mfra.mp4");
+        let initialization_length = init_mp4().len() as u64;
+        let first_fragment = [moof_box(1_000), mp4_box(*b"mdat", b"first-media")].concat();
+        let second_fragment = [moof_box(2_000), mp4_box(*b"mdat", b"second-media")].concat();
+        let mfra = valid_mfra();
+        let mut bytes = init_mp4();
+        bytes.extend(&first_fragment);
+        bytes.extend(&second_fragment);
+        bytes.extend(&mfra);
+        let total_length = bytes.len() as u64;
+        std::fs::write(&path, &bytes).expect("test mp4 should be written");
+
+        let ranges = mp4_fragment_ranges(&path, initialization_length, total_length)
+            .expect("fragment ranges should parse");
+
+        assert_eq!(
+            vec![
+                Mp4SegmentRange {
+                    offset: initialization_length,
+                    length: first_fragment.len() as u64,
+                    duration_millis: 1_000,
+                },
+                Mp4SegmentRange {
+                    offset: initialization_length + first_fragment.len() as u64,
+                    length: (second_fragment.len() + mfra.len()) as u64,
+                    duration_millis: 2_000,
+                },
+            ],
+            ranges
+        );
+        assert_eq!(
+            total_length,
+            ranges.last().unwrap().offset + ranges.last().unwrap().length
+        );
+        assert_eq!(
+            total_length - initialization_length,
+            ranges.iter().map(|r| r.length).sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_unknown_terminal_mfra_children() {
+        let mut bad_child_size = valid_mfra();
+        bad_child_size[8..12].copy_from_slice(&7_u32.to_be_bytes());
+
+        let mut truncated = valid_mfra();
+        truncated.pop();
+
+        let mut unknown_child = valid_mfra();
+        unknown_child[12..16].copy_from_slice(b"free");
+
+        let mut bad_mfra_size = valid_mfra();
+        let mfro_size_offset = bad_mfra_size.len() - 4;
+        bad_mfra_size[mfro_size_offset..].copy_from_slice(&1_u32.to_be_bytes());
+
+        let tfra = tfra_box();
+        let missing_mfro = mfra_box(&tfra, false);
+
+        for (name, trailer) in [
+            ("bad child size", bad_child_size),
+            ("truncated trailer", truncated),
+            ("unknown child", unknown_child),
+            ("mfro size mismatch", bad_mfra_size),
+            ("missing mfro", missing_mfro),
+        ] {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let path = temp.path().join("fragmented-with-invalid-mfra.mp4");
+            let mut bytes = fragmented_mp4(&[
+                (1_000, b"first-media".as_slice()),
+                (2_000, b"second-media".as_slice()),
+            ]);
+            let initialization_length = init_mp4().len() as u64;
+            bytes.extend(trailer);
+            std::fs::write(&path, &bytes).expect("test mp4 should be written");
+
+            let ranges = mp4_fragment_ranges(&path, initialization_length, bytes.len() as u64)
+                .unwrap_or_else(|error| panic!("{name}: parsing should not fail: {error}"));
+
+            assert!(ranges.is_empty(), "{name} should invalidate the index");
+        }
     }
 
     #[test]
@@ -861,6 +1291,290 @@ mod tests {
         payload.extend(u32::MAX.to_be_bytes());
 
         assert!(parse_trun_duration_units(&payload, Some(1)).is_none());
+    }
+
+    #[test]
+    fn parses_version_zero_index_with_first_offset_padding_and_sap_type_zero() {
+        let init = mp4_box(*b"ftyp", b"isom");
+        let padding = mp4_box(*b"free", b"pad");
+        let sidx = sidx_box(
+            0,
+            1_000,
+            5,
+            u64::try_from(padding.len()).unwrap(),
+            &[(7, 1_000, 0x8000_0000), (9, 2_000, 0x8000_0000)],
+        );
+        let first_offset = init.len() + sidx.len() + padding.len();
+        let first = vec![0x11; 7];
+        let second = [0x22; 9];
+        let total_length = first_offset + first.len() + second.len();
+        let mut prefix = [init.as_slice(), sidx.as_slice(), padding.as_slice()].concat();
+        prefix.extend(&first);
+
+        let index = mp4_sidx_index(
+            &prefix,
+            u64::try_from(init.len()).unwrap(),
+            u64::try_from(total_length).unwrap(),
+        )
+        .expect("flat version zero sidx should parse");
+        let ranges = mp4_sidx_segment_ranges(index, &[])
+            .expect("exact-EOF references should finalize without a trailer");
+
+        assert_eq!(2, ranges.len());
+        assert_eq!(u64::try_from(init.len()).unwrap(), ranges[0].offset);
+        assert_eq!(
+            u64::try_from(sidx.len() + padding.len() + first.len()).unwrap(),
+            ranges[0].length
+        );
+        assert_eq!(
+            u64::try_from(first_offset + first.len()).unwrap(),
+            ranges[1].offset
+        );
+        assert_eq!(u64::try_from(second.len()).unwrap(), ranges[1].length);
+        assert_eq!(
+            [1_000, 2_000],
+            [ranges[0].duration_millis, ranges[1].duration_millis]
+        );
+        assert_eq!(
+            u64::try_from(total_length - init.len()).unwrap(),
+            ranges.iter().map(|range| range.length).sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn parses_version_one_index_and_folds_only_valid_terminal_mfra() {
+        let init = mp4_box(*b"ftyp", b"isom");
+        let first = [0x31; 5];
+        let second = [0x42; 6];
+        let sidx = sidx_box(
+            1,
+            90_000,
+            u64::MAX - 300_000,
+            0,
+            &[(5, 90_000, 0x8000_0000), (6, 180_000, 0x8000_0000)],
+        );
+        let first_offset = init.len() + sidx.len();
+        let mut prefix = [init.as_slice(), sidx.as_slice()].concat();
+        prefix.extend(first);
+        let mfra = valid_mfra();
+        let total_length = first_offset + first.len() + second.len() + mfra.len();
+        let index = mp4_sidx_index(
+            &prefix,
+            u64::try_from(init.len()).unwrap(),
+            u64::try_from(total_length).unwrap(),
+        )
+        .expect("flat version one sidx should parse");
+
+        assert_eq!(
+            u64::try_from(mfra.len()).unwrap(),
+            index.trailing_length,
+            "the index should expose the exact terminal metadata range"
+        );
+        assert_eq!(
+            u64::try_from(first_offset + first.len() + second.len()).unwrap(),
+            index.trailing_offset
+        );
+        let ranges = mp4_sidx_segment_ranges(index, &mfra)
+            .expect("valid terminal mfra should fold into the final range");
+        assert_eq!(2, ranges.len());
+        assert_eq!(1_000, ranges[0].duration_millis);
+        assert_eq!(2_000, ranges[1].duration_millis);
+        assert_eq!(
+            u64::try_from(total_length - init.len()).unwrap(),
+            ranges.iter().map(|range| range.length).sum::<u64>()
+        );
+        assert_eq!(
+            u64::try_from(total_length).unwrap(),
+            ranges.last().unwrap().offset + ranges.last().unwrap().length
+        );
+    }
+
+    #[test]
+    fn accepts_only_supported_sap_types_with_zero_delta() {
+        let init = mp4_box(*b"ftyp", b"isom");
+        for sap in [0x8000_0000, 0x9000_0000, 0xa000_0000] {
+            let sidx = sidx_box(0, 1_000, 0, 0, &[(1, 1, sap), (1, 1, 0x8000_0000)]);
+            let total = init.len() + sidx.len() + 2;
+            let prefix = [init.as_slice(), sidx.as_slice()].concat();
+            let index = mp4_sidx_index(
+                &prefix,
+                u64::try_from(init.len()).unwrap(),
+                u64::try_from(total).unwrap(),
+            )
+            .expect("SAP types zero, one and two should be accepted");
+            assert!(mp4_sidx_segment_ranges(index, &[]).is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_sidx_references_without_independent_zero_delta_sap() {
+        let init = mp4_box(*b"ftyp", b"isom");
+        for (name, sap) in [
+            ("missing starts_with_SAP", 0),
+            ("unsupported SAP type", 0xb000_0000),
+            ("nonzero SAP delta", 0x8000_0001),
+        ] {
+            let sidx = sidx_box(0, 1_000, 0, 0, &[(1, 1, sap), (1, 1, 0x8000_0000)]);
+            let total = init.len() + sidx.len() + 2;
+            let prefix = [init.as_slice(), sidx.as_slice()].concat();
+            assert!(
+                mp4_sidx_index(
+                    &prefix,
+                    u64::try_from(init.len()).unwrap(),
+                    u64::try_from(total).unwrap(),
+                )
+                .is_none(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_sidx_duration_size_hierarchy_overflow_and_truncation() {
+        let cases = [
+            ("zero duration", 1_000, 0, 0_u32, 0_u64, u64::MAX, false),
+            ("zero size", 1_000, 1, 0_u32, 0_u64, u64::MAX, false),
+            ("hierarchical", 1_000, 1, 1_u32, 0_u64, u64::MAX, true),
+            (
+                "timescale overflow",
+                1_000,
+                1,
+                1_u32,
+                0_u64,
+                u64::MAX,
+                false,
+            ),
+        ];
+        for (name, timescale, duration, size, offset, earliest, hierarchical) in cases {
+            let init = mp4_box(*b"ftyp", b"isom");
+            let type_size = size | if hierarchical { 0x8000_0000 } else { 0 };
+            let sidx = sidx_box(
+                1,
+                timescale,
+                earliest,
+                offset,
+                &[(type_size, duration, 0x8000_0000), (1, 1, 0x8000_0000)],
+            );
+            let total = init.len() + sidx.len() + 2;
+            let prefix = [init.as_slice(), sidx.as_slice()].concat();
+            let parsed = mp4_sidx_index(
+                &prefix,
+                u64::try_from(init.len()).unwrap(),
+                u64::try_from(total).unwrap(),
+            );
+            assert!(parsed.is_none(), "{name} should be rejected");
+        }
+
+        let init = mp4_box(*b"ftyp", b"isom");
+        let sidx = sidx_box(
+            1,
+            1_000,
+            0,
+            u64::MAX,
+            &[(1, 1, 0x8000_0000), (1, 1, 0x8000_0000)],
+        );
+        let total = init.len() + sidx.len() + 2;
+        assert!(
+            mp4_sidx_index(
+                &[init.as_slice(), sidx.as_slice()].concat(),
+                u64::try_from(init.len()).unwrap(),
+                u64::try_from(total).unwrap(),
+            )
+            .is_none(),
+            "reference offset overflow should be rejected"
+        );
+
+        let mut truncated = [init.as_slice(), sidx.as_slice()].concat();
+        truncated.pop();
+        assert!(
+            mp4_sidx_index(
+                &truncated,
+                u64::try_from(init.len()).unwrap(),
+                u64::try_from(total).unwrap(),
+            )
+            .is_none(),
+            "truncated sidx should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_missing_terminal_mfra_and_excessive_reference_count() {
+        let init = mp4_box(*b"ftyp", b"isom");
+        let first = [0x11; 3];
+        let second = [0x22; 4];
+        let sidx = sidx_box(0, 1_000, 0, 0, &[(3, 1, 0x8000_0000), (4, 1, 0x8000_0000)]);
+        let prefix = [init.as_slice(), sidx.as_slice(), &first].concat();
+        let index_offset = u64::try_from(init.len()).unwrap();
+        let data_end = init.len() + sidx.len() + first.len() + second.len();
+
+        for (name, trailer) in [
+            ("unknown tail", mp4_box(*b"free", b"junk")),
+            ("missing mfro", mfra_box(&tfra_box(), false)),
+        ] {
+            let total = data_end + trailer.len();
+            let index = mp4_sidx_index(&prefix, index_offset, u64::try_from(total).unwrap())
+                .expect("the flat references should parse before trailer validation");
+            assert!(
+                mp4_sidx_segment_ranges(index, &trailer).is_none(),
+                "{name} should be rejected"
+            );
+        }
+
+        let references = vec![(1, 1, 0x8000_0000); MAX_SIDX_REFERENCES + 1];
+        let excessive = sidx_box(0, 1_000, 0, 0, &references);
+        let total = init.len() + excessive.len() + references.len();
+        assert!(
+            mp4_sidx_index(
+                &[init.as_slice(), excessive.as_slice()].concat(),
+                index_offset,
+                u64::try_from(total).unwrap(),
+            )
+            .is_none()
+        );
+
+        assert!(
+            mp4_sidx_index(
+                &vec![0; MAX_SIDX_PREFIX_BYTES + 1],
+                0,
+                u64::try_from(MAX_SIDX_PREFIX_BYTES + 2).unwrap(),
+            )
+            .is_none()
+        );
+
+        let small = sidx_box(0, 1_000, 0, 0, &[(1, 1, 0x8000_0000), (1, 1, 0x8000_0000)]);
+        let excessive_trailer_total =
+            init.len() + small.len() + 2 + usize::try_from(MAX_SIDX_TRAILER_BYTES).unwrap() + 1;
+        assert!(
+            mp4_sidx_index(
+                &[init.as_slice(), small.as_slice()].concat(),
+                index_offset,
+                u64::try_from(excessive_trailer_total).unwrap(),
+            )
+            .is_none()
+        );
+
+        let second_index = sidx_box(0, 1_000, 0, 0, &[(1, 1, 0x8000_0000), (1, 1, 0x8000_0000)]);
+        let first_index = sidx_box(
+            0,
+            1_000,
+            0,
+            u64::try_from(second_index.len()).unwrap(),
+            &[(1, 1, 0x8000_0000), (1, 1, 0x8000_0000)],
+        );
+        let total = init.len() + first_index.len() + second_index.len() + 2;
+        assert!(
+            mp4_sidx_index(
+                &[
+                    init.as_slice(),
+                    first_index.as_slice(),
+                    second_index.as_slice()
+                ]
+                .concat(),
+                index_offset,
+                u64::try_from(total).unwrap(),
+            )
+            .is_none()
+        );
     }
 
     fn fragmented_mp4(fragments: &[(u32, &[u8])]) -> Vec<u8> {
@@ -987,5 +1701,62 @@ mod tests {
         bytes.extend(kind);
         bytes.extend(payload);
         bytes
+    }
+
+    fn sidx_box(
+        version: u8,
+        timescale: u32,
+        earliest: u64,
+        first_offset: u64,
+        references: &[(u32, u32, u32)],
+    ) -> Vec<u8> {
+        let mut payload = vec![version, 0, 0, 0];
+        payload.extend(1_u32.to_be_bytes());
+        payload.extend(timescale.to_be_bytes());
+        match version {
+            0 => {
+                payload.extend(u32::try_from(earliest).unwrap().to_be_bytes());
+                payload.extend(u32::try_from(first_offset).unwrap().to_be_bytes());
+            }
+            1 => {
+                payload.extend(earliest.to_be_bytes());
+                payload.extend(first_offset.to_be_bytes());
+            }
+            _ => panic!("test fixture only supports sidx versions zero and one"),
+        }
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(u16::try_from(references.len()).unwrap().to_be_bytes());
+        for (size_and_type, duration, sap) in references {
+            payload.extend(size_and_type.to_be_bytes());
+            payload.extend(duration.to_be_bytes());
+            payload.extend(sap.to_be_bytes());
+        }
+        mp4_box(*b"sidx", &payload)
+    }
+
+    fn valid_mfra() -> Vec<u8> {
+        mfra_box(&tfra_box(), true)
+    }
+
+    fn tfra_box() -> Vec<u8> {
+        let mut payload = vec![0, 0, 0, 0];
+        payload.extend(1_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(1_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend([1, 1, 1]);
+        mp4_box(*b"tfra", &payload)
+    }
+
+    fn mfra_box(tfra: &[u8], include_mfro: bool) -> Vec<u8> {
+        let mfra_size = 8 + tfra.len() + if include_mfro { 16 } else { 0 };
+        let mut payload = tfra.to_vec();
+        if include_mfro {
+            let mut mfro_payload = vec![0, 0, 0, 0];
+            mfro_payload.extend(u32::try_from(mfra_size).unwrap().to_be_bytes());
+            payload.extend(mp4_box(*b"mfro", &mfro_payload));
+        }
+        mp4_box(*b"mfra", &payload)
     }
 }

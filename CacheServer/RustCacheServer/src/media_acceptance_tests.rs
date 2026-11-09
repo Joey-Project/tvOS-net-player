@@ -1,0 +1,4168 @@
+use std::{
+    collections::HashMap,
+    env,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::Stdio,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Router,
+    body::{Body, HttpBody as _},
+    extract::{Path as AxumPath, Request, State},
+    http::{
+        HeaderMap, Response, StatusCode,
+        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+    },
+    middleware::{Next, from_fn_with_state},
+    routing::get,
+};
+use futures_util::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
+    net::TcpListener,
+    process::{Child, Command},
+    task::JoinHandle,
+    time::timeout,
+};
+use tokio_util::io::ReaderStream;
+
+use crate::{
+    AppState,
+    bbdown_adapter::{
+        BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
+        BilibiliPlaybackAbrGroup, BilibiliPlaybackAbrGroupKind, BilibiliPlaybackAbrLevel,
+        BilibiliPlaybackAbrMetadata, BilibiliPlaybackVariant, BilibiliPlaybackVariantKind,
+    },
+    bilibili_playback::{BilibiliPlaybackPlanner, BilibiliPlaybackPlanningFuture},
+    bilibili_worker::BilibiliDownloadError,
+    config::CacheServerOptions,
+    generated::tvos_net_player::v1::{BilibiliPlaybackSession, PlaybackProtocol, PlaybackSource},
+    hls::{HlsPlaybackSession, mp4_initialization_length},
+    hls_cache::{HlsCacheFillControl, HlsCacheStore, HlsTranscodingExecutionConfig},
+    mp4_segments::{
+        MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, mp4_fragment_ranges, mp4_sidx_index,
+        mp4_sidx_segment_ranges,
+    },
+    playback_policy::{PlaybackPolicy, TranscodingPreference, WeakNetworkPreference},
+    transcoding::HlsTranscodingPlan,
+};
+
+const ABR_CASE_FULL_NAME: &str =
+    "media_acceptance_tests::native_progressive_adaptation_and_recovery";
+const TRANSCODE_CASE_FULL_NAME: &str = "media_acceptance_tests::native_transcoded_output_decodes";
+const MAX_REPORT_BYTES: usize = 32 * 1024;
+const MAX_PROBE_JSON_BYTES: usize = 16 * 1024;
+const MAX_CHILD_STDERR_BYTES: usize = 128 * 1024;
+const MAX_FIXTURE_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_SOURCE_FIXTURE_BYTES: u64 = 60 * 1024 * 1024;
+const MAX_SINGLE_HIGH_FIXTURE_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_SINGLE_LOW_FIXTURE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SINGLE_AUDIO_FIXTURE_BYTES: u64 = 4 * 1024 * 1024;
+const ABR_MEDIA_DURATION_SECONDS: u32 = 160;
+const TRANSCODE_MEDIA_DURATION_SECONDS: u32 = 45;
+const ABR_PROBE_DURATION_SECONDS: u64 = 130;
+const ABR_PROBE_DEADLINE_SECONDS: u64 = 175;
+const TRANSCODE_PROBE_DURATION_SECONDS: u64 = 30;
+const ABR_CASE_TIMEOUT: Duration = Duration::from_secs(225);
+const TRANSCODE_CASE_TIMEOUT: Duration = Duration::from_secs(225);
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(100);
+const DECODER_READY_TIMEOUT: Duration = Duration::from_secs(45);
+const BASELINE_WINDOW: Duration = Duration::from_secs(6);
+const BAD_HIGH_WINDOW: Duration = Duration::from_secs(45);
+const PROBE_EXIT_GRACE: Duration = Duration::from_secs(8);
+
+const PHASE_BASELINE: u8 = 0;
+const PHASE_BAD_HIGH: u8 = 1;
+const PHASE_RECOVERY: u8 = 2;
+const ABR_BASELINE_RATE_BITS_PER_SECOND: u64 = 4_000_000;
+const ABR_BAD_RATE_BITS_PER_SECOND: u64 = 1_000_000;
+const ABR_RECOVERY_RATE_BITS_PER_SECOND: u64 = 8_000_000;
+const H264_BASELINE_LEVEL_3_CODEC: &str = "avc1.42c01e";
+
+#[derive(Clone, Copy)]
+enum NativeCase {
+    ProgressiveAbr,
+    Transcoding,
+}
+
+impl NativeCase {
+    fn full_name(self) -> &'static str {
+        match self {
+            Self::ProgressiveAbr => ABR_CASE_FULL_NAME,
+            Self::Transcoding => TRANSCODE_CASE_FULL_NAME,
+        }
+    }
+
+    fn report_name(self) -> &'static str {
+        match self {
+            Self::ProgressiveAbr => "abr.json",
+            Self::Transcoding => "transcoding.json",
+        }
+    }
+
+    fn deadline(self) -> Duration {
+        match self {
+            Self::ProgressiveAbr => ABR_CASE_TIMEOUT,
+            Self::Transcoding => TRANSCODE_CASE_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct AcceptanceReport {
+    schema_version: u32,
+    status: String,
+    case_full_name: String,
+    probe: Option<Value>,
+    fixture_media: Vec<FixtureRecord>,
+    hls_playlist_preflight: Option<HlsPlaylistPreflight>,
+    requests: RequestSummary,
+    lan_ingress: LanIngressSummary,
+    lan_body_outcomes: LanBodyOutcomeSummary,
+    fault_timeline: FaultTimeline,
+    transcoding_metadata: Option<TranscodingMetadata>,
+    error: Option<String>,
+}
+
+impl AcceptanceReport {
+    fn new(case: NativeCase) -> Self {
+        Self {
+            schema_version: 1,
+            status: "failed".to_owned(),
+            case_full_name: case.full_name().to_owned(),
+            probe: None,
+            fixture_media: Vec::new(),
+            hls_playlist_preflight: None,
+            requests: RequestSummary::default(),
+            lan_ingress: LanIngressSummary::default(),
+            lan_body_outcomes: LanBodyOutcomeSummary::default(),
+            fault_timeline: FaultTimeline::default(),
+            transcoding_metadata: None,
+            error: None,
+        }
+    }
+}
+
+type ReportStore = Arc<Mutex<AcceptanceReport>>;
+
+#[derive(Clone, Default, Serialize)]
+struct RequestSummary {
+    total: u64,
+    count_by_representation: [u64; 3],
+    successful_by_representation: [u64; 3],
+    media_payload_by_phase_and_representation: [[u64; 3]; 3],
+    count_by_phase_and_representation: [[u64; 3]; 3],
+    high_fault_status_count: u64,
+    events: Vec<RequestEvent>,
+}
+
+#[derive(Clone, Serialize)]
+struct RequestEvent {
+    elapsed_ms: u64,
+    representation_code: u8,
+    phase_code: u8,
+    range_start: u64,
+    range_length: u64,
+    status_code: u16,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct LanIngressSummary {
+    count_by_phase_and_representation: [[u64; 3]; 3],
+    segment_query_present_by_phase_and_representation: [[u64; 3]; 3],
+    header_samples: Vec<LanIngressHeaderSample>,
+}
+
+#[derive(Clone, Serialize)]
+struct LanIngressHeaderSample {
+    elapsed_ms: u64,
+    representation_code: u8,
+    phase_code: u8,
+    range_start: Option<u64>,
+    range_end: Option<u64>,
+    header_status_code: u16,
+    segment_query_present: bool,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct LanBodyOutcomeSummary {
+    complete_by_representation: [u64; 3],
+    error_by_representation: [u64; 3],
+    dropped_by_representation: [u64; 3],
+    events: Vec<LanBodyOutcomeEvent>,
+}
+
+#[derive(Clone, Serialize)]
+struct LanBodyOutcomeEvent {
+    header_elapsed_ms: u64,
+    header_phase_code: u8,
+    outcome_elapsed_ms: u64,
+    representation_code: u8,
+    outcome: &'static str,
+    bytes_observed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LanBodyOutcomeContext {
+    representation_code: u8,
+    header_phase_code: u8,
+    header_elapsed_ms: u64,
+}
+
+struct LanIngressTelemetry {
+    session_id: String,
+    resource_representations: HashMap<String, u8>,
+    phase: Arc<AtomicU8>,
+    epoch: Arc<Mutex<Instant>>,
+    report: ReportStore,
+}
+
+type IngressClassification = (u8, bool, Option<(u64, u64)>);
+
+#[derive(Clone, Default, Serialize)]
+struct FaultTimeline {
+    enabled: bool,
+    baseline_start_elapsed_ms: Option<u64>,
+    decoder_ready_monotonic_seconds: Option<f64>,
+    baseline_start_monotonic_seconds: Option<f64>,
+    bad_high_start_elapsed_ms: Option<u64>,
+    bad_high_end_elapsed_ms: Option<u64>,
+    recovery_start_elapsed_ms: Option<u64>,
+    bad_high_before_monotonic_seconds: Option<f64>,
+    bad_high_after_monotonic_seconds: Option<f64>,
+    recovery_before_monotonic_seconds: Option<f64>,
+    recovery_after_monotonic_seconds: Option<f64>,
+    bad_high_status_code: Option<u16>,
+}
+
+#[derive(Clone, Serialize)]
+struct FixtureRecord {
+    representation_code: u8,
+    width: Option<u32>,
+    height: Option<u32>,
+    file_bytes: u64,
+    initialization_bytes: u64,
+    fragment_count: u64,
+    fragment_duration_ms: u64,
+    peak_bandwidth_bits_per_second: u64,
+    global_sidx_present: bool,
+    progressive_index_count: Option<u64>,
+    video_codec_code: u8,
+    video_profile_code: u8,
+    video_level: Option<i32>,
+    audio_codec_code: u8,
+}
+
+#[derive(Clone, Serialize)]
+struct HlsPlaylistPreflight {
+    high_video_fragment_count: u64,
+    high_video_target_duration_seconds: u64,
+    audio_fragment_count: u64,
+    audio_target_duration_seconds: u64,
+    high_video_peak_bandwidth_bits_per_second: u64,
+    audio_peak_bandwidth_bits_per_second: u64,
+    high_variant_peak_bandwidth_bits_per_second: u64,
+    advertised_high_bandwidth_bits_per_second: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct TranscodingMetadata {
+    executed: bool,
+    output_file_bytes: u64,
+    output_initialization_bytes: u64,
+    output_fragment_count: u64,
+    output_fragment_duration_ms: u64,
+    output_global_sidx_present: bool,
+    output_width: u32,
+    output_height: u32,
+    output_video_codec_code: u8,
+    output_audio_codec_code: u8,
+    output_audio_track_count: u64,
+}
+
+struct MediaFixture {
+    high_video: InspectedMedia,
+    low_video: Option<InspectedMedia>,
+    audio: InspectedMedia,
+}
+
+struct InspectedMedia {
+    path: PathBuf,
+    record: FixtureRecord,
+}
+
+#[derive(Deserialize)]
+struct FfprobeOutput {
+    streams: Vec<FfprobeStream>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeStream {
+    codec_type: String,
+    codec_name: Option<String>,
+    profile: Option<String>,
+    level: Option<i32>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
+}
+
+struct ProcessCapture {
+    status_code: Option<i32>,
+    success: bool,
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_tail: Vec<u8>,
+    stderr_truncated: bool,
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+struct OriginMedia {
+    path: PathBuf,
+    representation_code: u8,
+    initialization_length: u64,
+    content_type: &'static str,
+}
+
+struct OriginState {
+    media: HashMap<String, OriginMedia>,
+    case: NativeCase,
+    phase: Arc<AtomicU8>,
+    epoch: Arc<Mutex<Instant>>,
+    report: ReportStore,
+    pacers: [RepresentationPacer; 3],
+}
+
+impl LanIngressTelemetry {
+    fn new(
+        session: &HlsPlaybackSession,
+        report: ReportStore,
+        phase: Arc<AtomicU8>,
+        epoch: Arc<Mutex<Instant>>,
+    ) -> Self {
+        let mut resource_representations = HashMap::new();
+        for variant in std::iter::once(&session.variant).chain(session.alternate_variants.iter()) {
+            let representation_code = if variant.height.is_some_and(|height| height <= 180) {
+                2
+            } else {
+                1
+            };
+            resource_representations.insert(variant.video.id.clone(), representation_code);
+            if let Some(audio) = &variant.audio {
+                resource_representations.insert(audio.id.clone(), 3);
+            }
+        }
+        Self {
+            session_id: session.id.clone(),
+            resource_representations,
+            phase,
+            epoch,
+            report,
+        }
+    }
+
+    fn classify(&self, request: &Request) -> Option<IngressClassification> {
+        let mut path = request.uri().path().split('/');
+        if !path.next()?.is_empty() || path.next()? != "hls" || path.next()? != self.session_id {
+            return None;
+        }
+        if path.next()? != "segments" {
+            return None;
+        }
+        let resource_id = path.next()?;
+        if path.next().is_some() {
+            return None;
+        }
+        let representation = *self.resource_representations.get(resource_id)?;
+        let segment_query_present = request.uri().query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|entry| entry.split('=').next() == Some("segment"))
+        });
+        Some((
+            representation,
+            segment_query_present,
+            numeric_range_header(request.headers()),
+        ))
+    }
+
+    fn record(
+        &self,
+        representation_code: u8,
+        segment_query_present: bool,
+        range: Option<(u64, u64)>,
+        status_code: u16,
+    ) -> LanBodyOutcomeContext {
+        let phase_code = self.phase.load(Ordering::Acquire).min(PHASE_RECOVERY);
+        let phase_index = usize::from(phase_code);
+        let representation_index = usize::from(representation_code.saturating_sub(1).min(2));
+        let elapsed_ms = self
+            .epoch
+            .lock()
+            .map(|epoch| {
+                Instant::now()
+                    .saturating_duration_since(*epoch)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            })
+            .unwrap_or_default();
+        let Ok(mut report) = self.report.lock() else {
+            return LanBodyOutcomeContext {
+                representation_code,
+                header_phase_code: phase_code,
+                header_elapsed_ms: elapsed_ms,
+            };
+        };
+        let ingress = &mut report.lan_ingress;
+        ingress.count_by_phase_and_representation[phase_index][representation_index] = ingress
+            .count_by_phase_and_representation[phase_index][representation_index]
+            .saturating_add(1);
+        if segment_query_present {
+            ingress.segment_query_present_by_phase_and_representation[phase_index]
+                [representation_index] = ingress.segment_query_present_by_phase_and_representation
+                [phase_index][representation_index]
+                .saturating_add(1);
+        }
+        if ingress
+            .header_samples
+            .iter()
+            .filter(|sample| sample.phase_code == phase_code)
+            .count()
+            < 8
+        {
+            ingress.header_samples.push(LanIngressHeaderSample {
+                elapsed_ms,
+                representation_code,
+                phase_code,
+                range_start: range.map(|(start, _)| start),
+                range_end: range.map(|(_, end)| end),
+                header_status_code: status_code,
+                segment_query_present,
+            });
+        }
+        LanBodyOutcomeContext {
+            representation_code,
+            header_phase_code: phase_code,
+            header_elapsed_ms: elapsed_ms,
+        }
+    }
+}
+
+fn numeric_range_header(headers: &HeaderMap) -> Option<(u64, u64)> {
+    let value = headers.get(RANGE)?.to_str().ok()?.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    if end.contains('-') {
+        return None;
+    }
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+async fn record_lan_ingress(
+    State(telemetry): State<Arc<LanIngressTelemetry>>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
+    let classification = telemetry.classify(&request);
+    let is_head = request.method() == axum::http::Method::HEAD;
+    let mut response = next.run(request).await;
+    if let Some((representation_code, segment_query_present, range)) = classification {
+        let context = telemetry.record(
+            representation_code,
+            segment_query_present,
+            range,
+            response.status().as_u16(),
+        );
+        let exact_length = response.body().size_hint().exact();
+        if is_head || (response.body().is_end_stream() && exact_length == Some(0)) {
+            record_empty_lan_body_outcome(
+                context,
+                Arc::clone(&telemetry.report),
+                Arc::clone(&telemetry.epoch),
+            );
+        } else {
+            if let Some(length) = exact_length
+                && !response.headers().contains_key(CONTENT_LENGTH)
+                && let Ok(value) = length.to_string().parse()
+            {
+                response.headers_mut().insert(CONTENT_LENGTH, value);
+            }
+            response = response.map(|body| {
+                Body::from_stream(LanBodyOutcomeStream::new(
+                    body.into_data_stream(),
+                    context,
+                    Arc::clone(&telemetry.report),
+                    Arc::clone(&telemetry.epoch),
+                ))
+            });
+        }
+    }
+    response
+}
+
+fn record_empty_lan_body_outcome(
+    context: LanBodyOutcomeContext,
+    report: ReportStore,
+    epoch: Arc<Mutex<Instant>>,
+) {
+    let mut outcome =
+        LanBodyOutcomeStream::new(futures_util::stream::empty(), context, report, epoch);
+    outcome.finish("complete");
+}
+
+struct LanBodyOutcomeStream {
+    inner: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
+    context: LanBodyOutcomeContext,
+    report: ReportStore,
+    epoch: Arc<Mutex<Instant>>,
+    bytes_observed: u64,
+    finished: bool,
+}
+
+impl LanBodyOutcomeStream {
+    fn new<S>(
+        inner: S,
+        context: LanBodyOutcomeContext,
+        report: ReportStore,
+        epoch: Arc<Mutex<Instant>>,
+    ) -> Self
+    where
+        S: Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(inner),
+            context,
+            report,
+            epoch,
+            bytes_observed: 0,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let elapsed_ms = self
+            .epoch
+            .lock()
+            .map(|epoch| {
+                Instant::now()
+                    .saturating_duration_since(*epoch)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            })
+            .unwrap_or_default();
+        let Ok(mut report) = self.report.lock() else {
+            return;
+        };
+        let representation = usize::from(self.context.representation_code.saturating_sub(1).min(2));
+        let outcomes = &mut report.lan_body_outcomes;
+        match outcome {
+            "complete" => {
+                outcomes.complete_by_representation[representation] =
+                    outcomes.complete_by_representation[representation].saturating_add(1);
+            }
+            "error" => {
+                outcomes.error_by_representation[representation] =
+                    outcomes.error_by_representation[representation].saturating_add(1);
+            }
+            "dropped" => {
+                outcomes.dropped_by_representation[representation] =
+                    outcomes.dropped_by_representation[representation].saturating_add(1);
+            }
+            _ => return,
+        }
+        let event = LanBodyOutcomeEvent {
+            header_elapsed_ms: self.context.header_elapsed_ms,
+            header_phase_code: self.context.header_phase_code,
+            outcome_elapsed_ms: elapsed_ms,
+            representation_code: self.context.representation_code,
+            outcome,
+            bytes_observed: self.bytes_observed,
+        };
+        if outcomes.events.len() < 32 {
+            outcomes.events.push(event);
+        } else if outcome != "complete"
+            && let Some(complete_index) = outcomes
+                .events
+                .iter()
+                .position(|recorded| recorded.outcome == "complete")
+        {
+            outcomes.events[complete_index] = event;
+        }
+    }
+}
+
+impl Stream for LanBodyOutcomeStream {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.bytes_observed = self.bytes_observed.saturating_add(bytes.len() as u64);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish("error");
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.finish("complete");
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for LanBodyOutcomeStream {
+    fn drop(&mut self) {
+        self.finish("dropped");
+    }
+}
+
+#[derive(Clone, Default)]
+struct RepresentationPacer {
+    state: Arc<Mutex<PacingState>>,
+}
+
+#[derive(Default)]
+struct PacingState {
+    next_available_at: Option<Instant>,
+}
+
+struct ServerTask(Option<JoinHandle<()>>);
+
+struct AbortTask<T>(Option<JoinHandle<T>>);
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: u64,
+    length: u64,
+    partial: bool,
+}
+
+struct RejectNetworkPlanner;
+
+impl BilibiliPlaybackPlanner for RejectNetworkPlanner {
+    fn plan<'a>(
+        &'a self,
+        _request: crate::bilibili_playback::BilibiliPlaybackPlanningRequest,
+    ) -> BilibiliPlaybackPlanningFuture<'a> {
+        Box::pin(async {
+            Err(BilibiliDownloadError::Failed(
+                "native media acceptance never invokes an upstream planner".to_owned(),
+            ))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an explicitly selected macOS AVPlayer probe and local FFmpeg tools"]
+async fn native_progressive_adaptation_and_recovery() {
+    run_native_case(NativeCase::ProgressiveAbr).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an explicitly selected macOS AVPlayer probe and local FFmpeg tools"]
+async fn native_transcoded_output_decodes() {
+    run_native_case(NativeCase::Transcoding).await;
+}
+
+async fn run_native_case(case: NativeCase) {
+    let report = Arc::new(Mutex::new(AcceptanceReport::new(case)));
+    let report_path = env::var_os("LAN_MEDIA_ACCEPTANCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .map(|directory| directory.join(case.report_name()));
+
+    let outcome = match report_path.as_ref() {
+        Some(path) => {
+            match tokio::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("."))).await {
+                Ok(()) => match timeout(case.deadline(), run_case(case, Arc::clone(&report))).await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        Err("native acceptance case exceeded its finite case deadline".to_owned())
+                    }
+                },
+                Err(_) => Err("acceptance artifact directory could not be created".to_owned()),
+            }
+        }
+        None => Err("LAN_MEDIA_ACCEPTANCE_ARTIFACTS is required".to_owned()),
+    };
+
+    if let Ok(mut report) = report.lock() {
+        if outcome.is_ok() {
+            report.status = "passed".to_owned();
+            report.error = None;
+        } else {
+            report.status = "failed".to_owned();
+            report.error = outcome.as_ref().err().map(|error| bounded_error(error));
+        }
+    }
+
+    let write_result = match report_path {
+        Some(path) => write_report(&path, &report).await,
+        None => Err("acceptance report path is unavailable".to_owned()),
+    };
+    assert!(
+        outcome.is_ok() && write_result.is_ok(),
+        "{} failed: {}; report: {}",
+        case.full_name(),
+        outcome
+            .err()
+            .unwrap_or_else(|| write_result.err().unwrap_or_default()),
+        case.report_name()
+    );
+}
+
+async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
+    let probe_path = required_executable("LAN_MEDIA_ACCEPTANCE_PROBE_BINARY")?;
+    let ffmpeg = find_executable("ffmpeg")?;
+    let ffprobe = find_executable("ffprobe")?;
+    let temporary = tempfile::Builder::new()
+        .prefix("lan-media-acceptance-")
+        .tempdir()
+        .map_err(|_| "temporary acceptance directory could not be created".to_owned())?;
+    let temporary_root = temporary
+        .path()
+        .canonicalize()
+        .map_err(|_| "temporary acceptance directory could not be canonicalized".to_owned())?;
+    let directories = create_case_directories(&temporary_root).await?;
+
+    let fixture_duration = match case {
+        NativeCase::ProgressiveAbr => ABR_MEDIA_DURATION_SECONDS,
+        NativeCase::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
+    };
+    let fixture = generate_and_inspect_fixture(
+        case,
+        &ffmpeg,
+        &ffprobe,
+        &directories.fixtures,
+        fixture_duration,
+        &report,
+    )
+    .await?;
+    enforce_fixture_budget(&fixture)?;
+
+    let origin_listener = bind_loopback_listener().await?;
+    let origin_address = origin_listener
+        .local_addr()
+        .map_err(|_| "local fixture origin address is unavailable".to_owned())?;
+    let origin = make_origin_state(case, &fixture, origin_address, Arc::clone(&report))?;
+    let origin_router = Router::new()
+        .route("/{file_name}", get(origin_get).head(origin_head))
+        .with_state(Arc::clone(&origin));
+    let origin_task = ServerTask(Some(tokio::spawn(async move {
+        let _ = axum::serve(origin_listener, origin_router).await;
+    })));
+
+    let media_listener = bind_loopback_listener().await?;
+    let media_address = media_listener
+        .local_addr()
+        .map_err(|_| "local media listener address is unavailable".to_owned())?;
+    let mut state = create_app_state(
+        &temporary_root,
+        directories,
+        media_address,
+        &ffmpeg,
+        matches!(case, NativeCase::Transcoding),
+    )?;
+    state.hls_upstream_client = local_only_http_client()?;
+
+    let task_creation = state
+        .tasks
+        .create_bilibili_playback_task("native-media-acceptance", None, None)
+        .map_err(|_| "credential-free local playback task could not be created".to_owned())?;
+    let task_id = task_creation.task.id;
+    let policy = PlaybackPolicy {
+        transcoding_preference: TranscodingPreference::Auto,
+        weak_network_preference: WeakNetworkPreference::AvPlayerManaged,
+        ..PlaybackPolicy::default()
+    };
+    let source_variants = create_source_variants(case, &fixture, origin_address)?;
+    let selected = source_variants
+        .first()
+        .ok_or_else(|| "local fixture has no selected video representation".to_owned())?;
+    let abr = make_abr_metadata(case, &fixture)?;
+    let mut session = HlsPlaybackSession::from_playback_entry_with_policy(
+        &task_id,
+        "Local native media acceptance",
+        selected,
+        &abr,
+        &source_variants,
+        policy,
+    )
+    .map_err(|_| "production HLS playback session construction failed".to_owned())?;
+    let mut playlist_video_fragments = fixture.high_video.record.fragment_count;
+    let mut playlist_video_peak = fixture.high_video.record.peak_bandwidth_bits_per_second;
+    if matches!(case, NativeCase::Transcoding) {
+        session.transcoding =
+            HlsTranscodingPlan::for_variant_with_policy(&state.options, selected, policy);
+        if session.transcoding.state != crate::transcoding::HlsTranscodingPlanState::Ready {
+            return Err(
+                "production transcoding planner did not select a real transcode".to_owned(),
+            );
+        }
+    }
+
+    let media_base = format!("http://{media_address}");
+    let master_url = format!("{media_base}/hls/{task_id}/master.m3u8");
+    ensure_loopback_url(&master_url)?;
+    publish_playable_session(&state, &session, &task_id, &master_url)?;
+
+    if matches!(case, NativeCase::Transcoding) {
+        let execution = HlsTranscodingExecutionConfig {
+            ffmpeg_path: ffmpeg.clone(),
+            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_job_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let completion = timeout(
+            FFMPEG_TIMEOUT + Duration::from_secs(45),
+            state
+                .hls_cache
+                .cache_session_resources_completion_with_control(
+                    &state.hls_upstream_client,
+                    &session,
+                    || HlsCacheFillControl::Continue,
+                    |_| {},
+                    Some(execution),
+                ),
+        )
+        .await
+        .map_err(|_| "production HLS cache fill and transcode exceeded its deadline".to_owned())?
+        .map_err(|_| "production HLS cache fill or transcode failed".to_owned())?;
+        let cached = state
+            .hls_cache
+            .cached_resource(&task_id, &completion.session.variant.video.id)
+            .ok_or_else(|| "production transcode output was not durably cached".to_owned())?;
+        let output = inspect_mp4(&cached.path, 1, ffprobe.as_path(), false).await?;
+        let probe_metadata = ffprobe_media(&ffprobe, &cached.path).await?;
+        let output_streams = probe_metadata.streams;
+        let video = output_streams
+            .iter()
+            .find(|stream| stream.codec_type == "video")
+            .ok_or_else(|| "production transcode output has no video track".to_owned())?;
+        let audio_tracks = output_streams
+            .iter()
+            .filter(|stream| stream.codec_type == "audio")
+            .count() as u64;
+        let audio = output_streams
+            .iter()
+            .find(|stream| stream.codec_type == "audio")
+            .ok_or_else(|| "production transcode output has no AAC track".to_owned())?;
+        if video.codec_name.as_deref() != Some("h264")
+            || audio.codec_name.as_deref() != Some("aac")
+            || video.width != Some(640)
+            || video.height != Some(360)
+        {
+            return Err(
+                "production transcoded MP4 metadata did not match H.264/AAC 640x360".to_owned(),
+            );
+        }
+        if cached.total_length > MAX_FIXTURE_BYTES {
+            return Err("production transcoded media exceeded the 96 MiB bound".to_owned());
+        }
+        playlist_video_fragments = output.record.fragment_count;
+        playlist_video_peak = output.record.peak_bandwidth_bits_per_second;
+        if let Ok(mut data) = report.lock() {
+            data.transcoding_metadata = Some(TranscodingMetadata {
+                executed: true,
+                output_file_bytes: cached.total_length,
+                output_initialization_bytes: output.record.initialization_bytes,
+                output_fragment_count: output.record.fragment_count,
+                output_fragment_duration_ms: output.record.fragment_duration_ms,
+                output_global_sidx_present: output.record.global_sidx_present,
+                output_width: video.width.unwrap_or_default(),
+                output_height: video.height.unwrap_or_default(),
+                output_video_codec_code: 1,
+                output_audio_codec_code: 1,
+                output_audio_track_count: audio_tracks,
+            });
+        }
+        session = completion.session;
+        state.register_hls_playback_session(session.clone());
+    }
+
+    let telemetry = Arc::new(LanIngressTelemetry::new(
+        &session,
+        Arc::clone(&report),
+        Arc::clone(&origin.phase),
+        Arc::clone(&origin.epoch),
+    ));
+    let media_router = crate::media_router(state).layer(from_fn_with_state(
+        Arc::clone(&telemetry),
+        record_lan_ingress,
+    ));
+    let media_task = ServerTask(Some(tokio::spawn(async move {
+        let _ = axum::serve(media_listener, media_router).await;
+    })));
+    let local_client = local_only_http_client()?;
+    let playlist_preflight = validate_master_playlist(
+        &local_client,
+        &master_url,
+        case,
+        playlist_video_fragments,
+        fixture.audio.record.fragment_count,
+        playlist_video_peak,
+        fixture.audio.record.peak_bandwidth_bits_per_second,
+    )
+    .await?;
+    if let Ok(mut data) = report.lock() {
+        data.hls_playlist_preflight = Some(playlist_preflight);
+    }
+
+    origin.reset_probe_epoch();
+    if matches!(case, NativeCase::ProgressiveAbr)
+        && let Ok(mut data) = report.lock()
+    {
+        data.fault_timeline = FaultTimeline {
+            enabled: true,
+            bad_high_status_code: Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            ..FaultTimeline::default()
+        };
+    }
+
+    let probe_duration = match case {
+        NativeCase::ProgressiveAbr => ABR_PROBE_DURATION_SECONDS,
+        NativeCase::Transcoding => TRANSCODE_PROBE_DURATION_SECONDS,
+    };
+    let probe_deadline = match case {
+        NativeCase::ProgressiveAbr => ABR_PROBE_DEADLINE_SECONDS,
+        NativeCase::Transcoding => probe_duration + 15,
+    };
+    let expected_sizes = match case {
+        NativeCase::ProgressiveAbr => "640x360,320x180,640x360",
+        NativeCase::Transcoding => "640x360",
+    };
+    let ready_marker_path = if matches!(case, NativeCase::ProgressiveAbr) {
+        let path = temporary_root.join("decoder-ready.json");
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(
+                    "decoder readiness marker already existed in the private fixture root"
+                        .to_owned(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err("decoder readiness marker path could not be checked safely".to_owned());
+            }
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let mut probe = AbortTask(Some(tokio::spawn(run_native_probe(
+        probe_path,
+        master_url,
+        probe_duration,
+        probe_deadline,
+        expected_sizes.to_owned(),
+        ready_marker_path.clone(),
+    ))));
+
+    if matches!(case, NativeCase::ProgressiveAbr) {
+        let timeline = run_abr_fault_timeline(
+            &origin,
+            &mut probe,
+            ready_marker_path
+                .as_deref()
+                .expect("ABR marker path is present"),
+            &report,
+        )
+        .await;
+        if let Err(error) = timeline {
+            probe.abort();
+            return Err(error);
+        }
+    }
+
+    let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
+    let process = timeout(probe_timeout, probe.join()).await;
+    let process = match process {
+        Ok(result) => result?,
+        Err(_) => {
+            probe.abort();
+            return Err("native probe exceeded its declared deadline".to_owned());
+        }
+    };
+    let probe_value = parse_probe_result(process?, &report)?;
+    validate_probe_result(case, probe_duration, &probe_value, &report)?;
+    if matches!(case, NativeCase::ProgressiveAbr) {
+        validate_abr_request_trace(&report)?;
+        validate_abr_sample_timeline(&probe_value, &report)?;
+    }
+
+    media_task.stop().await;
+    origin_task.stop().await;
+    Ok(())
+}
+
+struct CaseDirectories {
+    credentials: PathBuf,
+    tasks: PathBuf,
+    cache: PathBuf,
+    library: PathBuf,
+    fixtures: PathBuf,
+}
+
+async fn create_case_directories(root: &Path) -> Result<CaseDirectories, String> {
+    let directories = CaseDirectories {
+        credentials: root.join("credentials"),
+        tasks: root.join("tasks"),
+        cache: root.join("cache"),
+        library: root.join("library"),
+        fixtures: root.join("fixtures"),
+    };
+    for path in [
+        &directories.credentials,
+        &directories.tasks,
+        &directories.cache,
+        &directories.library,
+        &directories.fixtures,
+    ] {
+        tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|_| "a fresh case-local media directory could not be created".to_owned())?;
+    }
+    Ok(directories)
+}
+
+fn create_app_state(
+    temporary_root: &Path,
+    directories: CaseDirectories,
+    media_address: SocketAddr,
+    ffmpeg: &Path,
+    transcoding_enabled: bool,
+) -> Result<AppState, String> {
+    let credentials_path = directories.credentials.join("credentials.json");
+    let options = CacheServerOptions {
+        root_path: directories.library,
+        task_state_path: directories.tasks.join("tasks.json"),
+        grpc_listen_url: "http://127.0.0.1:1".to_owned(),
+        media_listen_url: format!("http://{media_address}"),
+        bonjour_enabled: false,
+        lan_transcoding_enabled: transcoding_enabled,
+        lan_transcoding_ffmpeg_path: ffmpeg.to_path_buf(),
+        lan_transcoding_max_concurrent_jobs: 1,
+        bilibili_worker_enabled: false,
+        allow_bilibili_login_sessions: false,
+        bbdown_credential_path: Some(credentials_path),
+        bbdown_credential_profile: None,
+        hls_cache_max_bytes: MAX_FIXTURE_BYTES,
+        bbdown_cdn_probe: false,
+        bbdown_cdn_parallelism: 1,
+        ..CacheServerOptions::default()
+    };
+    if !options.root_path.starts_with(temporary_root) {
+        return Err("library path escaped its temporary test root".to_owned());
+    }
+    let state = AppState::new_with_playback_planner_and_hls_cache(
+        options,
+        Arc::new(RejectNetworkPlanner),
+        HlsCacheStore::new(temporary_root.join("cache")),
+    );
+    Ok(state)
+}
+
+fn local_only_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(3))
+        .read_timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|_| "local-only HTTP client could not be created".to_owned())
+}
+
+fn publish_playable_session(
+    state: &AppState,
+    session: &HlsPlaybackSession,
+    task_id: &str,
+    master_url: &str,
+) -> Result<(), String> {
+    ensure_loopback_url(master_url)?;
+    state.hls_cache.save_session(session).map_err(|_| {
+        "local HLS session could not be persisted in the temporary cache".to_owned()
+    })?;
+    state.register_hls_playback_session(session.clone());
+    let playback_source = PlaybackSource {
+        item_id: task_id.to_owned(),
+        variant_id: session.variant.id.clone(),
+        protocol: PlaybackProtocol::Hls.into(),
+        uri: master_url.to_owned(),
+        expires_at: None,
+    };
+    let playback_session = BilibiliPlaybackSession {
+        id: task_id.to_owned(),
+        title: session.title.clone(),
+        content_id: "native-media-acceptance".to_owned(),
+        selected_variant_id: session.variant.id.clone(),
+        ..BilibiliPlaybackSession::default()
+    };
+    state
+        .tasks
+        .complete_playback_playable(
+            task_id,
+            session.title.clone(),
+            playback_source,
+            playback_session,
+        )
+        .map_err(|_| {
+            "local playback task could not pass production publication checks".to_owned()
+        })?;
+    Ok(())
+}
+
+fn create_source_variants(
+    case: NativeCase,
+    fixture: &MediaFixture,
+    origin_address: SocketAddr,
+) -> Result<Vec<BilibiliPlaybackVariant>, String> {
+    let high_url = origin_url(origin_address, "high.mp4")?;
+    let audio_url = origin_url(origin_address, "audio.mp4")?;
+    let abr_group_id = "native-acceptance-video-levels";
+    let duration = match case {
+        NativeCase::ProgressiveAbr => ABR_MEDIA_DURATION_SECONDS,
+        NativeCase::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
+    };
+    let high_video_bandwidth = fixture.high_video.record.peak_bandwidth_bits_per_second;
+    let high = make_variant(VariantSpec {
+        id: "high",
+        width: 640,
+        height: 360,
+        bandwidth: aggregate_peak_bandwidth(
+            high_video_bandwidth,
+            fixture.audio.record.peak_bandwidth_bits_per_second,
+        )?,
+        request_bandwidth: 2_000_000,
+        duration,
+        video_url: &high_url,
+        audio_url: &audio_url,
+        video_codec: if matches!(case, NativeCase::Transcoding) {
+            "mp4v.20.9"
+        } else {
+            H264_BASELINE_LEVEL_3_CODEC
+        },
+        level: matches!(case, NativeCase::ProgressiveAbr).then(|| BilibiliPlaybackAbrLevel {
+            group_id: abr_group_id.to_owned(),
+            level_index: 1,
+            level_count: 2,
+            switchable: true,
+        }),
+    });
+    let Some(low_media) = fixture.low_video.as_ref() else {
+        return Ok(vec![high]);
+    };
+    let low_url = origin_url(origin_address, "low.mp4")?;
+    let low_video_bandwidth = low_media.record.peak_bandwidth_bits_per_second;
+    let low = make_variant(VariantSpec {
+        id: "low",
+        width: 320,
+        height: 180,
+        bandwidth: aggregate_peak_bandwidth(
+            low_video_bandwidth,
+            fixture.audio.record.peak_bandwidth_bits_per_second,
+        )?,
+        request_bandwidth: 500_000,
+        duration,
+        video_url: &low_url,
+        audio_url: &audio_url,
+        video_codec: H264_BASELINE_LEVEL_3_CODEC,
+        level: Some(BilibiliPlaybackAbrLevel {
+            group_id: abr_group_id.to_owned(),
+            level_index: 0,
+            level_count: 2,
+            switchable: true,
+        }),
+    });
+    let _ = low_media;
+    Ok(vec![high, low])
+}
+
+fn make_abr_metadata(
+    case: NativeCase,
+    fixture: &MediaFixture,
+) -> Result<BilibiliPlaybackAbrMetadata, String> {
+    match case {
+        NativeCase::ProgressiveAbr => {
+            let audio_peak = fixture.audio.record.peak_bandwidth_bits_per_second;
+            let low_peak = aggregate_peak_bandwidth(
+                fixture
+                    .low_video
+                    .as_ref()
+                    .ok_or_else(|| "low ABR fixture was missing".to_owned())?
+                    .record
+                    .peak_bandwidth_bits_per_second,
+                audio_peak,
+            )?;
+            let high_peak = aggregate_peak_bandwidth(
+                fixture.high_video.record.peak_bandwidth_bits_per_second,
+                audio_peak,
+            )?;
+            Ok(BilibiliPlaybackAbrMetadata {
+                groups: vec![BilibiliPlaybackAbrGroup {
+                    id: "native-acceptance-video-levels".to_owned(),
+                    kind: BilibiliPlaybackAbrGroupKind::DashVideo,
+                    variant_ids: vec!["high".to_owned(), "low".to_owned()],
+                    level_count: 2,
+                    min_bandwidth: Some(low_peak),
+                    max_bandwidth: Some(high_peak),
+                }],
+            })
+        }
+        NativeCase::Transcoding => Ok(BilibiliPlaybackAbrMetadata { groups: Vec::new() }),
+    }
+}
+
+struct VariantSpec<'a> {
+    id: &'a str,
+    width: u32,
+    height: u32,
+    bandwidth: u64,
+    request_bandwidth: u64,
+    duration: u32,
+    video_url: &'a str,
+    audio_url: &'a str,
+    video_codec: &'a str,
+    level: Option<BilibiliPlaybackAbrLevel>,
+}
+
+fn make_variant(spec: VariantSpec<'_>) -> BilibiliPlaybackVariant {
+    let video_kind = BilibiliMediaRequestKind::Video;
+    let audio_kind = BilibiliMediaRequestKind::Audio;
+    BilibiliPlaybackVariant {
+        id: spec.id.to_owned(),
+        kind: BilibiliPlaybackVariantKind::Dash,
+        content_id: "native-media-acceptance".to_owned(),
+        bandwidth: Some(spec.bandwidth),
+        codecs: vec![spec.video_codec.to_owned(), "mp4a.40.2".to_owned()],
+        mime_types: vec!["video/mp4".to_owned(), "audio/mp4".to_owned()],
+        width: Some(spec.width),
+        height: Some(spec.height),
+        frame_rate: Some("30".to_owned()),
+        duration_seconds: Some(spec.duration),
+        abr: spec.level,
+        video: Some(make_request(
+            video_kind,
+            spec.video_url,
+            spec.video_codec,
+            Some(spec.width),
+            Some(spec.height),
+            Some(spec.request_bandwidth),
+            spec.duration,
+        )),
+        audio: Some(make_request(
+            audio_kind,
+            spec.audio_url,
+            "mp4a.40.2",
+            None,
+            None,
+            Some(128_000),
+            spec.duration,
+        )),
+        flv_segments: Vec::new(),
+    }
+}
+
+fn make_request(
+    kind: BilibiliMediaRequestKind,
+    url: &str,
+    codec: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    bandwidth: Option<u64>,
+    duration: u32,
+) -> BilibiliMediaRequest {
+    BilibiliMediaRequest {
+        kind,
+        stream_id: None,
+        url: url.to_owned(),
+        backup_urls: Vec::new(),
+        headers: Vec::new(),
+        mime_type: Some(match kind {
+            BilibiliMediaRequestKind::Audio => "audio/mp4".to_owned(),
+            _ => "video/mp4".to_owned(),
+        }),
+        codecs: Some(codec.to_owned()),
+        bandwidth,
+        width,
+        height,
+        frame_rate: Some("30".to_owned()),
+        size: None,
+        duration_seconds: Some(duration),
+        cache_key: BilibiliMediaCacheKey {
+            content_id: "native-media-acceptance".to_owned(),
+            media_kind: kind,
+            stream_id: None,
+            codecs: Some(codec.to_owned()),
+            source_hash: match kind {
+                BilibiliMediaRequestKind::Video => format!(
+                    "local-fixture-video-{}x{}-{}",
+                    width.unwrap_or_default(),
+                    height.unwrap_or_default(),
+                    bandwidth.unwrap_or_default(),
+                ),
+                BilibiliMediaRequestKind::Audio => "local-fixture-audio".to_owned(),
+                BilibiliMediaRequestKind::FlvSegment => "local-fixture-segment".to_owned(),
+            },
+        },
+    }
+}
+
+async fn generate_and_inspect_fixture(
+    case: NativeCase,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    directory: &Path,
+    duration: u32,
+    report: &ReportStore,
+) -> Result<MediaFixture, String> {
+    let mut command = Command::new(ffmpeg);
+    let video_input = format!("testsrc2=size=640x360:rate=30:duration={duration}");
+    let audio_input = format!("sine=frequency=440:sample_rate=48000:duration={duration}");
+    let mut arguments = vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-y".to_owned(),
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        video_input,
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        audio_input,
+    ];
+
+    match case {
+        NativeCase::ProgressiveAbr => {
+            push_video_output(
+                &mut arguments,
+                "high.mp4",
+                "640:360",
+                duration,
+                "libx264",
+                "2000k",
+                MAX_SINGLE_HIGH_FIXTURE_BYTES,
+            );
+            push_video_output(
+                &mut arguments,
+                "low.mp4",
+                "320:180",
+                duration,
+                "libx264",
+                "500k",
+                MAX_SINGLE_LOW_FIXTURE_BYTES,
+            );
+        }
+        NativeCase::Transcoding => {
+            push_video_output(
+                &mut arguments,
+                "high.mp4",
+                "640:360",
+                duration,
+                "mpeg4",
+                "1200k",
+                MAX_SINGLE_HIGH_FIXTURE_BYTES,
+            );
+        }
+    }
+    push_audio_output(
+        &mut arguments,
+        "audio.mp4",
+        duration,
+        MAX_SINGLE_AUDIO_FIXTURE_BYTES,
+    );
+    command.current_dir(directory).args(arguments);
+    let generated = run_process(command, FFMPEG_TIMEOUT, 1024).await?;
+    if !generated.success {
+        return Err(format!(
+            "FFmpeg fixture generation failed with exit code {}",
+            generated
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        ));
+    }
+
+    let high_path = directory.join("high.mp4");
+    let high = inspect_fixture(
+        &high_path,
+        1,
+        Some((640, 360)),
+        if matches!(case, NativeCase::Transcoding) {
+            2
+        } else {
+            1
+        },
+        0,
+        source_h264_sidx_guard_applies(case).then_some(("Constrained Baseline", 30)),
+        ffprobe,
+    )
+    .await?;
+    let low = if matches!(case, NativeCase::ProgressiveAbr) {
+        Some(
+            inspect_fixture(
+                &directory.join("low.mp4"),
+                2,
+                Some((320, 180)),
+                1,
+                0,
+                Some(("Constrained Baseline", 30)),
+                ffprobe,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let audio = inspect_fixture(&directory.join("audio.mp4"), 3, None, 0, 1, None, ffprobe).await?;
+    if let Ok(mut data) = report.lock() {
+        data.fixture_media.clear();
+        data.fixture_media.push(high.record.clone());
+        if let Some(low) = low.as_ref() {
+            data.fixture_media.push(low.record.clone());
+        }
+        data.fixture_media.push(audio.record.clone());
+    }
+    Ok(MediaFixture {
+        high_video: high,
+        low_video: low,
+        audio,
+    })
+}
+
+fn push_video_output(
+    arguments: &mut Vec<String>,
+    output_name: &str,
+    size: &str,
+    duration: u32,
+    codec: &str,
+    bitrate: &str,
+    maximum_bytes: u64,
+) {
+    arguments.extend([
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-vf".to_owned(),
+        format!("scale={size}"),
+        "-c:v".to_owned(),
+        codec.to_owned(),
+        "-preset".to_owned(),
+        "ultrafast".to_owned(),
+        "-pix_fmt".to_owned(),
+        "yuv420p".to_owned(),
+    ]);
+    if codec == "libx264" {
+        arguments.extend([
+            "-profile:v".to_owned(),
+            "baseline".to_owned(),
+            "-level:v".to_owned(),
+            "3.0".to_owned(),
+        ]);
+    }
+    arguments.extend([
+        "-b:v".to_owned(),
+        bitrate.to_owned(),
+        "-maxrate".to_owned(),
+        bitrate.to_owned(),
+        "-bufsize".to_owned(),
+        if codec == "mpeg4" { "2400k" } else { "5000k" }.to_owned(),
+        "-g".to_owned(),
+        "60".to_owned(),
+        "-keyint_min".to_owned(),
+        "60".to_owned(),
+        "-sc_threshold".to_owned(),
+        "0".to_owned(),
+        "-force_key_frames".to_owned(),
+        "expr:gte(t,n_forced*2)".to_owned(),
+        "-an".to_owned(),
+        "-movflags".to_owned(),
+        "+dash+frag_keyframe+empty_moov+default_base_moof+global_sidx".to_owned(),
+        "-frag_duration".to_owned(),
+        "2000000".to_owned(),
+        "-t".to_owned(),
+        duration.to_string(),
+        "-fs".to_owned(),
+        maximum_bytes.to_string(),
+        "-f".to_owned(),
+        "mp4".to_owned(),
+        output_name.to_owned(),
+    ]);
+}
+
+fn push_audio_output(
+    arguments: &mut Vec<String>,
+    output_name: &str,
+    duration: u32,
+    maximum_bytes: u64,
+) {
+    arguments.extend([
+        "-map".to_owned(),
+        "1:a:0".to_owned(),
+        "-vn".to_owned(),
+        "-c:a".to_owned(),
+        "aac".to_owned(),
+        "-b:a".to_owned(),
+        "128k".to_owned(),
+        "-ar".to_owned(),
+        "48000".to_owned(),
+        "-movflags".to_owned(),
+        "+dash+frag_keyframe+empty_moov+default_base_moof+global_sidx".to_owned(),
+        "-frag_duration".to_owned(),
+        "2000000".to_owned(),
+        "-t".to_owned(),
+        duration.to_string(),
+        "-fs".to_owned(),
+        maximum_bytes.to_string(),
+        "-f".to_owned(),
+        "mp4".to_owned(),
+        output_name.to_owned(),
+    ]);
+}
+
+async fn inspect_fixture(
+    path: &Path,
+    representation_code: u8,
+    expected_dimensions: Option<(u32, u32)>,
+    expected_video_codec_code: u8,
+    expected_audio_codec_code: u8,
+    expected_video_profile: Option<(&str, i32)>,
+    ffprobe: &Path,
+) -> Result<InspectedMedia, String> {
+    let mut inspected = inspect_mp4(
+        path,
+        representation_code,
+        ffprobe,
+        expected_video_codec_code != 2,
+    )
+    .await?;
+    let metadata = ffprobe_media(ffprobe, path).await?;
+    let duration = metadata
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(|duration| duration.parse::<f64>().ok());
+    if !duration.is_some_and(|duration| duration.is_finite() && duration > 0.0) {
+        return Err("FFmpeg fixture duration metadata was missing or invalid".to_owned());
+    }
+    let video = metadata
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video");
+    let audio = metadata
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "audio");
+    if expected_dimensions.is_some_and(|dimensions| {
+        video.and_then(|stream| stream.width.zip(stream.height)) != Some(dimensions)
+    }) {
+        return Err(
+            "FFmpeg fixture dimensions did not match the requested representation".to_owned(),
+        );
+    }
+    let video_codec_code = video
+        .and_then(|stream| stream.codec_name.as_deref())
+        .map(video_codec_code)
+        .unwrap_or_default();
+    let audio_codec_code = audio
+        .and_then(|stream| stream.codec_name.as_deref())
+        .map(audio_codec_code)
+        .unwrap_or_default();
+    if video_codec_code != expected_video_codec_code
+        || audio_codec_code != expected_audio_codec_code
+    {
+        return Err(
+            "FFmpeg fixture codec metadata did not match the expected video/audio tracks"
+                .to_owned(),
+        );
+    }
+    let profile = video.and_then(|stream| stream.profile.as_deref());
+    let level = video.and_then(|stream| stream.level);
+    if expected_video_profile.is_some_and(|(expected_profile, expected_level)| {
+        !h264_baseline_level_3_is_coherent(
+            H264_BASELINE_LEVEL_3_CODEC,
+            profile,
+            level,
+            expected_profile,
+            expected_level,
+        )
+    }) {
+        return Err("generated H.264 fixture profile or level was not Baseline 3.0".to_owned());
+    }
+    inspected.record.video_profile_code = profile.map(video_profile_code).unwrap_or_default();
+    inspected.record.video_level = level;
+    Ok(inspected)
+}
+
+async fn inspect_mp4(
+    path: &Path,
+    representation_code: u8,
+    ffprobe: &Path,
+    require_global_sidx: bool,
+) -> Result<InspectedMedia, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| "generated media file is missing".to_owned())?;
+    let total_length = metadata.len();
+    if total_length == 0 || total_length > MAX_FIXTURE_BYTES {
+        return Err("generated media file was empty or exceeded the 96 MiB bound".to_owned());
+    }
+    let initialization_length = tokio::task::spawn_blocking({
+        let path = path.to_path_buf();
+        move || {
+            let mut file = File::open(path)?;
+            let mut prefix = vec![0; usize::try_from(total_length.min(1024 * 1024)).unwrap_or(0)];
+            file.read_exact(&mut prefix)?;
+            mp4_initialization_length(&prefix)
+                .ok_or_else(|| std::io::Error::other("MP4 initialization was not parseable"))
+        }
+    })
+    .await
+    .map_err(|_| "MP4 initialization parser task failed".to_owned())?
+    .map_err(|_| "MP4 initialization could not be parsed".to_owned())?;
+    let ranges = tokio::task::spawn_blocking({
+        let path = path.to_path_buf();
+        move || mp4_fragment_ranges(&path, initialization_length, total_length)
+    })
+    .await
+    .map_err(|_| "MP4 fragment parser task failed".to_owned())?
+    .map_err(|_| "MP4 fragment ranges could not be parsed".to_owned())?;
+    validate_fragment_ranges(initialization_length, total_length, &ranges)?;
+    let peak_bandwidth = peak_bandwidth_bits_per_second(&ranges)
+        .ok_or_else(|| "generated media fragment peak bandwidth was invalid".to_owned())?;
+    let has_sidx = tokio::task::spawn_blocking({
+        let path = path.to_path_buf();
+        move || top_level_box_present(&path, *b"sidx")
+    })
+    .await
+    .map_err(|_| "MP4 global index parser task failed".to_owned())?
+    .map_err(|_| "MP4 top-level boxes could not be scanned".to_owned())?;
+    if require_global_sidx && !has_sidx {
+        return Err("FFmpeg fixture did not contain a global top-level sidx box".to_owned());
+    }
+    let progressive_index_count = if require_global_sidx {
+        let path = path.to_path_buf();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                inspect_progressive_index_reference_count(
+                    &path,
+                    initialization_length,
+                    total_length,
+                )
+            })
+            .await
+            .map_err(|_| "production SIDX inspection task failed".to_owned())??,
+        )
+    } else {
+        None
+    };
+    let parsed = ffprobe_media(ffprobe, path).await?;
+    let video = parsed
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video");
+    let duration_ms = ranges.iter().fold(0_u64, |sum, range| {
+        sum.saturating_add(range.duration_millis)
+    });
+    Ok(InspectedMedia {
+        path: path.to_path_buf(),
+        record: FixtureRecord {
+            representation_code,
+            width: video.and_then(|stream| stream.width),
+            height: video.and_then(|stream| stream.height),
+            file_bytes: total_length,
+            initialization_bytes: initialization_length,
+            fragment_count: ranges.len() as u64,
+            fragment_duration_ms: duration_ms,
+            peak_bandwidth_bits_per_second: peak_bandwidth,
+            global_sidx_present: has_sidx,
+            progressive_index_count,
+            video_codec_code: video
+                .and_then(|stream| stream.codec_name.as_deref())
+                .map(video_codec_code)
+                .unwrap_or_default(),
+            video_profile_code: video
+                .and_then(|stream| stream.profile.as_deref())
+                .map(video_profile_code)
+                .unwrap_or_default(),
+            video_level: video.and_then(|stream| stream.level),
+            audio_codec_code: parsed
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type == "audio")
+                .and_then(|stream| stream.codec_name.as_deref())
+                .map(audio_codec_code)
+                .unwrap_or_default(),
+        },
+    })
+}
+
+fn inspect_progressive_index_reference_count(
+    path: &Path,
+    initialization_length: u64,
+    total_length: u64,
+) -> Result<u64, String> {
+    let prefix_length = usize::try_from(total_length.min(1024 * 1024))
+        .map_err(|_| "SIDX prefix length was not representable".to_owned())?;
+    let mut file =
+        File::open(path).map_err(|_| "generated SIDX media could not be opened".to_owned())?;
+    let mut prefix = vec![0; prefix_length];
+    file.read_exact(&mut prefix)
+        .map_err(|_| "generated SIDX prefix could not be read within its bound".to_owned())?;
+    let index = mp4_sidx_index(&prefix, initialization_length, total_length)
+        .ok_or_else(|| "production SIDX parser rejected generated indexed media".to_owned())?;
+    if index.trailing_length > MAX_SIDX_TRAILER_BYTES {
+        return Err("generated SIDX trailer exceeded the production parser bound".to_owned());
+    }
+    let trailer_length = usize::try_from(index.trailing_length)
+        .map_err(|_| "SIDX trailer length was not representable".to_owned())?;
+    let mut trailer = vec![0; trailer_length];
+    file.seek(SeekFrom::Start(index.trailing_offset))
+        .and_then(|_| file.read_exact(&mut trailer))
+        .map_err(|_| "generated SIDX trailer could not be read within its bound".to_owned())?;
+    let ranges = mp4_sidx_segment_ranges(index, &trailer)
+        .ok_or_else(|| "production SIDX range validation rejected generated media".to_owned())?;
+    if ranges.len() < 2 {
+        return Err("generated SIDX index contained fewer than two references".to_owned());
+    }
+    u64::try_from(ranges.len()).map_err(|_| "SIDX reference count was not representable".to_owned())
+}
+
+fn validate_fragment_ranges(
+    initialization_length: u64,
+    total_length: u64,
+    ranges: &[Mp4SegmentRange],
+) -> Result<(), String> {
+    if ranges.len() < 2 {
+        return Err("FFmpeg media did not contain at least two parsed MP4 fragments".to_owned());
+    }
+    let mut expected_offset = initialization_length;
+    for range in ranges {
+        if range.offset != expected_offset || range.length == 0 {
+            return Err("parsed MP4 byte ranges were not contiguous".to_owned());
+        }
+        expected_offset = expected_offset
+            .checked_add(range.length)
+            .ok_or_else(|| "parsed MP4 range length overflowed".to_owned())?;
+    }
+    if expected_offset != total_length {
+        return Err("parsed MP4 byte ranges did not cover the media file tail".to_owned());
+    }
+    Ok(())
+}
+
+fn top_level_box_present(path: &Path, target: [u8; 4]) -> std::io::Result<bool> {
+    let mut file = File::open(path)?;
+    let total_length = file.metadata()?.len();
+    let mut offset = 0_u64;
+    while offset.saturating_add(8) <= total_length {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; 16];
+        file.read_exact(&mut header[..8])?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap_or_default());
+        let kind: [u8; 4] = header[4..8].try_into().unwrap_or_default();
+        let (header_size, box_size) = match size32 {
+            0 => return Ok(kind == target),
+            1 => {
+                if offset.saturating_add(16) > total_length {
+                    return Ok(false);
+                }
+                file.read_exact(&mut header[8..16])?;
+                (
+                    16_u64,
+                    u64::from_be_bytes(header[8..16].try_into().unwrap_or_default()),
+                )
+            }
+            size => (8_u64, u64::from(size)),
+        };
+        if kind == target {
+            return Ok(true);
+        }
+        if box_size < header_size || offset.saturating_add(box_size) > total_length {
+            return Ok(false);
+        }
+        offset += box_size;
+    }
+    Ok(false)
+}
+
+async fn ffprobe_media(ffprobe: &Path, path: &Path) -> Result<FfprobeOutput, String> {
+    let mut command = Command::new(ffprobe);
+    command.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name,profile,level,width,height",
+        "-of",
+        "json",
+    ]);
+    command.arg(path);
+    let output = run_process(command, Duration::from_secs(15), 32 * 1024).await?;
+    if !output.success || output.stdout_truncated {
+        return Err("ffprobe metadata inspection failed or exceeded its 32 KiB bound".to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "ffprobe returned invalid bounded metadata JSON".to_owned())
+}
+
+fn video_codec_code(codec: &str) -> u8 {
+    match codec {
+        "h264" => 1,
+        "mpeg4" => 2,
+        _ => 0,
+    }
+}
+
+fn video_profile_code(profile: &str) -> u8 {
+    match profile {
+        "Constrained Baseline" => 1,
+        "Baseline" => 2,
+        "Main" => 3,
+        "High" => 4,
+        _ => 0,
+    }
+}
+
+fn h264_baseline_level_3_is_coherent(
+    advertised_codec: &str,
+    ffprobe_profile: Option<&str>,
+    ffprobe_level: Option<i32>,
+    expected_profile: &str,
+    expected_level: i32,
+) -> bool {
+    advertised_codec == H264_BASELINE_LEVEL_3_CODEC
+        && ffprobe_profile == Some(expected_profile)
+        && ffprobe_level == Some(expected_level)
+}
+
+fn source_h264_sidx_guard_applies(case: NativeCase) -> bool {
+    matches!(case, NativeCase::ProgressiveAbr)
+}
+
+fn peak_bandwidth_bits_per_second(ranges: &[Mp4SegmentRange]) -> Option<u64> {
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.iter().try_fold(0_u64, |peak, range| {
+        if range.length == 0 || range.duration_millis == 0 {
+            return None;
+        }
+        let numerator = range
+            .length
+            .checked_mul(8)?
+            .checked_mul(1_000)?
+            .checked_add(range.duration_millis.checked_sub(1)?)?;
+        Some(peak.max(numerator / range.duration_millis))
+    })
+}
+
+fn aggregate_peak_bandwidth(video_peak: u64, audio_peak: u64) -> Result<u64, String> {
+    video_peak
+        .checked_add(audio_peak)
+        .filter(|peak| *peak > 0)
+        .ok_or_else(|| "video and shared-audio peak bandwidth overflowed".to_owned())
+}
+
+fn master_bandwidth_covers_peak(advertised: u64, measured_peak: u64) -> bool {
+    advertised > 0 && measured_peak > 0 && advertised >= measured_peak
+}
+
+fn audio_codec_code(codec: &str) -> u8 {
+    if codec == "aac" { 1 } else { 0 }
+}
+
+fn enforce_fixture_budget(fixture: &MediaFixture) -> Result<(), String> {
+    let total = fixture
+        .high_video
+        .record
+        .file_bytes
+        .saturating_add(
+            fixture
+                .low_video
+                .as_ref()
+                .map(|media| media.record.file_bytes)
+                .unwrap_or_default(),
+        )
+        .saturating_add(fixture.audio.record.file_bytes);
+    if total > MAX_SOURCE_FIXTURE_BYTES {
+        return Err("generated source fixtures exceeded the 60 MiB aggregate bound".to_owned());
+    }
+    Ok(())
+}
+
+fn make_origin_state(
+    case: NativeCase,
+    fixture: &MediaFixture,
+    address: SocketAddr,
+    report: ReportStore,
+) -> Result<Arc<OriginState>, String> {
+    let mut media = HashMap::new();
+    media.insert(
+        "high.mp4".to_owned(),
+        OriginMedia {
+            path: fixture.high_video.path.clone(),
+            representation_code: 1,
+            initialization_length: fixture.high_video.record.initialization_bytes,
+            content_type: "video/mp4",
+        },
+    );
+    if let Some(low) = fixture.low_video.as_ref() {
+        media.insert(
+            "low.mp4".to_owned(),
+            OriginMedia {
+                path: low.path.clone(),
+                representation_code: 2,
+                initialization_length: low.record.initialization_bytes,
+                content_type: "video/mp4",
+            },
+        );
+    }
+    media.insert(
+        "audio.mp4".to_owned(),
+        OriginMedia {
+            path: fixture.audio.path.clone(),
+            representation_code: 3,
+            initialization_length: fixture.audio.record.initialization_bytes,
+            content_type: "audio/mp4",
+        },
+    );
+    if !is_strict_loopback(address) {
+        return Err("fixture origin was not bound to IPv4 loopback".to_owned());
+    }
+    if let Ok(mut data) = report.lock() {
+        data.fault_timeline.enabled = matches!(case, NativeCase::ProgressiveAbr);
+        if matches!(case, NativeCase::ProgressiveAbr) {
+            data.fault_timeline.bad_high_status_code = Some(503);
+        }
+    }
+    Ok(Arc::new(OriginState {
+        media,
+        case,
+        phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+        epoch: Arc::new(Mutex::new(Instant::now())),
+        report,
+        pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+    }))
+}
+
+async fn origin_get(
+    State(origin): State<Arc<OriginState>>,
+    AxumPath(file_name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    origin_response(origin, file_name, headers, false).await
+}
+
+async fn origin_head(
+    State(origin): State<Arc<OriginState>>,
+    AxumPath(file_name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    origin_response(origin, file_name, headers, true).await
+}
+
+async fn origin_response(
+    origin: Arc<OriginState>,
+    file_name: String,
+    headers: HeaderMap,
+    head_only: bool,
+) -> Response<Body> {
+    let Some(media) = origin.media.get(&file_name) else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    let total_length = match tokio::fs::metadata(&media.path).await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let range = match parse_byte_range(headers.get(RANGE), total_length) {
+        Ok(range) => range,
+        Err(()) => {
+            let mut response = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+            response.headers_mut().insert(
+                CONTENT_RANGE,
+                format!("bytes */{total_length}")
+                    .parse()
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("bytes */0")),
+            );
+            return response;
+        }
+    };
+    let phase_code = origin.phase.load(Ordering::Acquire).min(PHASE_RECOVERY);
+    let fault_applied = media.representation_code == 1 && phase_code == PHASE_BAD_HIGH;
+    let status = if fault_applied {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if range.partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let touches_media_payload =
+        range.start.saturating_add(range.length) > media.initialization_length;
+    record_origin_request(
+        &origin,
+        media.representation_code,
+        phase_code,
+        range,
+        status,
+        !fault_applied && touches_media_payload,
+    );
+    if fault_applied {
+        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_TYPE, media.content_type)
+        .header(CONTENT_LENGTH, range.length.to_string())
+        .header("cache-control", "no-store");
+    if range.partial {
+        let end = range.start.saturating_add(range.length).saturating_sub(1);
+        builder = builder.header(
+            CONTENT_RANGE,
+            format!("bytes {}-{end}/{total_length}", range.start),
+        );
+    }
+    if head_only {
+        return builder
+            .body(Body::empty())
+            .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+    let mut file = match tokio::fs::File::open(&media.path).await {
+        Ok(file) => file,
+        Err(_) => return empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    if file.seek(SeekFrom::Start(range.start)).await.is_err() {
+        return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let stream = ReaderStream::new(file.take(range.length));
+    let body = if pacing_rate_bits_per_second(origin.case, phase_code, media.representation_code)
+        .is_some()
+    {
+        let pacer = origin.pacers[usize::from(media.representation_code - 1)].clone();
+        let origin_for_stream = Arc::clone(&origin);
+        let representation_code = media.representation_code;
+        let stream = stream.then(move |chunk| {
+            let origin = Arc::clone(&origin_for_stream);
+            let pacer = pacer.clone();
+            async move {
+                if let Ok(bytes) = &chunk {
+                    pacer
+                        .pace_chunk(&origin, representation_code, bytes.len())
+                        .await;
+                }
+                chunk
+            }
+        });
+        Body::from_stream(stream)
+    } else {
+        Body::from_stream(stream)
+    };
+    builder
+        .body(body)
+        .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn pacing_rate_bits_per_second(
+    case: NativeCase,
+    phase_code: u8,
+    representation_code: u8,
+) -> Option<u64> {
+    if !matches!(case, NativeCase::ProgressiveAbr) || !matches!(representation_code, 1 | 2) {
+        return None;
+    }
+    Some(match phase_code.min(PHASE_RECOVERY) {
+        PHASE_BASELINE => ABR_BASELINE_RATE_BITS_PER_SECOND,
+        PHASE_BAD_HIGH => ABR_BAD_RATE_BITS_PER_SECOND,
+        _ => ABR_RECOVERY_RATE_BITS_PER_SECOND,
+    })
+}
+
+fn chunk_transmission_duration(bytes: usize, bits_per_second: u64) -> Duration {
+    let numerator = (bytes as u128).saturating_mul(8_000_000_000);
+    let nanoseconds = numerator.div_ceil(u128::from(bits_per_second.max(1)));
+    Duration::from_nanos(nanoseconds.min(u128::from(u64::MAX)) as u64)
+}
+
+impl PacingState {
+    fn wait_time(&self, now: Instant) -> Duration {
+        self.next_available_at
+            .map(|available_at| available_at.saturating_duration_since(now))
+            .unwrap_or_default()
+    }
+
+    fn try_reserve(&mut self, now: Instant, bytes: usize, bits_per_second: u64) -> bool {
+        if self
+            .next_available_at
+            .is_some_and(|available_at| available_at > now)
+        {
+            return false;
+        }
+        self.next_available_at = Some(
+            now.checked_add(chunk_transmission_duration(bytes, bits_per_second))
+                .unwrap_or(now),
+        );
+        true
+    }
+}
+
+impl RepresentationPacer {
+    async fn pace_chunk(&self, origin: &OriginState, representation_code: u8, bytes: usize) {
+        loop {
+            let wait = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.wait_time(Instant::now())
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            let now = Instant::now();
+            let reserved = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let phase_code = origin.phase.load(Ordering::Acquire).min(PHASE_RECOVERY);
+                let Some(rate) =
+                    pacing_rate_bits_per_second(origin.case, phase_code, representation_code)
+                else {
+                    return;
+                };
+                state.try_reserve(now, bytes, rate)
+            };
+            if reserved {
+                return;
+            }
+        }
+    }
+}
+
+fn parse_byte_range(value: Option<&axum::http::HeaderValue>, size: u64) -> Result<ByteRange, ()> {
+    let Some(value) = value else {
+        return Ok(ByteRange {
+            start: 0,
+            length: size,
+            partial: false,
+        });
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let (start, end) = if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?.min(size);
+        (
+            size.checked_sub(suffix).ok_or(())?,
+            size.checked_sub(1).ok_or(())?,
+        )
+    } else {
+        let start = start.parse::<u64>().map_err(|_| ())?;
+        let end = if end.is_empty() {
+            size.checked_sub(1).ok_or(())?
+        } else {
+            end.parse::<u64>()
+                .map_err(|_| ())?
+                .min(size.saturating_sub(1))
+        };
+        (start, end)
+    };
+    if start >= size || end < start {
+        return Err(());
+    }
+    Ok(ByteRange {
+        start,
+        length: end
+            .checked_sub(start)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(())?,
+        partial: true,
+    })
+}
+
+fn empty_response(status: StatusCode) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn record_origin_request(
+    origin: &OriginState,
+    representation_code: u8,
+    phase_code: u8,
+    range: ByteRange,
+    status: StatusCode,
+    media_payload: bool,
+) {
+    let Ok(epoch) = origin.epoch.lock() else {
+        return;
+    };
+    let elapsed_ms = Instant::now()
+        .saturating_duration_since(*epoch)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    drop(epoch);
+    let Ok(mut report) = origin.report.lock() else {
+        return;
+    };
+    let rep = usize::from(representation_code.saturating_sub(1).min(2));
+    let phase = usize::from(phase_code.min(2));
+    report.requests.total = report.requests.total.saturating_add(1);
+    report.requests.count_by_representation[rep] =
+        report.requests.count_by_representation[rep].saturating_add(1);
+    report.requests.count_by_phase_and_representation[phase][rep] =
+        report.requests.count_by_phase_and_representation[phase][rep].saturating_add(1);
+    if status.is_success() {
+        report.requests.successful_by_representation[rep] =
+            report.requests.successful_by_representation[rep].saturating_add(1);
+        if media_payload {
+            report.requests.media_payload_by_phase_and_representation[phase][rep] =
+                report.requests.media_payload_by_phase_and_representation[phase][rep]
+                    .saturating_add(1);
+        }
+    }
+    if representation_code == 1
+        && phase_code == PHASE_BAD_HIGH
+        && status == StatusCode::SERVICE_UNAVAILABLE
+    {
+        report.requests.high_fault_status_count =
+            report.requests.high_fault_status_count.saturating_add(1);
+    }
+    if report.requests.events.len() < 32 {
+        report.requests.events.push(RequestEvent {
+            elapsed_ms,
+            representation_code,
+            phase_code,
+            range_start: range.start,
+            range_length: range.length,
+            status_code: status.as_u16(),
+        });
+    }
+}
+
+impl OriginState {
+    fn reset_probe_epoch(&self) {
+        if let Ok(mut epoch) = self.epoch.lock() {
+            *epoch = Instant::now();
+        }
+    }
+
+    fn set_phase(&self, phase: u8) -> Result<(), String> {
+        let elapsed_ms = self
+            .epoch
+            .lock()
+            .map(|epoch| {
+                Instant::now()
+                    .saturating_duration_since(*epoch)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            })
+            .unwrap_or_default();
+        let before_monotonic = match phase {
+            PHASE_BAD_HIGH | PHASE_RECOVERY => Some(monotonic_clock_seconds()?),
+            _ => None,
+        };
+        self.phase.store(phase, Ordering::Release);
+        let after_monotonic = match phase {
+            PHASE_BAD_HIGH | PHASE_RECOVERY => Some(monotonic_clock_seconds()?),
+            _ => None,
+        };
+        if let Ok(mut report) = self.report.lock() {
+            match phase {
+                PHASE_BAD_HIGH => {
+                    report.fault_timeline.bad_high_start_elapsed_ms = Some(elapsed_ms);
+                    report.fault_timeline.bad_high_before_monotonic_seconds = before_monotonic;
+                    report.fault_timeline.bad_high_after_monotonic_seconds = after_monotonic;
+                }
+                PHASE_RECOVERY => {
+                    report.fault_timeline.bad_high_end_elapsed_ms = Some(elapsed_ms);
+                    report.fault_timeline.recovery_start_elapsed_ms = Some(elapsed_ms);
+                    report.fault_timeline.recovery_before_monotonic_seconds = before_monotonic;
+                    report.fault_timeline.recovery_after_monotonic_seconds = after_monotonic;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn run_abr_fault_timeline(
+    origin: &Arc<OriginState>,
+    probe: &mut AbortTask<Result<ProcessCapture, String>>,
+    marker_path: &Path,
+    report: &ReportStore,
+) -> Result<(), String> {
+    let ready_marker = wait_for_decoder_ready_marker(marker_path, probe).await?;
+    let baseline_start = monotonic_clock_seconds()?;
+    if ready_marker.observed_monotonic_seconds > baseline_start {
+        return Err("decoder readiness marker timestamp was after the baseline clock".to_owned());
+    }
+    let baseline_elapsed_ms = origin
+        .epoch
+        .lock()
+        .map_err(|_| "origin probe epoch lock was poisoned".to_owned())?
+        .elapsed()
+        .as_millis();
+    let baseline_elapsed_ms = u64::try_from(baseline_elapsed_ms).unwrap_or(u64::MAX);
+    let high_payloads = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?
+        .requests
+        .media_payload_by_phase_and_representation[0][0];
+    if high_payloads == 0 {
+        return Err("decoder readiness marker lacked a healthy high media payload".to_owned());
+    }
+    {
+        let mut report_data = report
+            .lock()
+            .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+        report_data.fault_timeline.decoder_ready_monotonic_seconds =
+            Some(ready_marker.observed_monotonic_seconds);
+        report_data.fault_timeline.baseline_start_monotonic_seconds = Some(baseline_start);
+        report_data.fault_timeline.baseline_start_elapsed_ms = Some(baseline_elapsed_ms);
+    }
+    wait_while_probe_runs(origin, probe, BASELINE_WINDOW).await?;
+    origin.set_phase(PHASE_BAD_HIGH)?;
+    wait_while_probe_runs(origin, probe, BAD_HIGH_WINDOW).await?;
+    origin.set_phase(PHASE_RECOVERY)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DecoderReadyMarker {
+    schema_version: u32,
+    expected_width: u32,
+    expected_height: u32,
+    distinct_frame_count: u32,
+    observed_monotonic_seconds: f64,
+}
+
+async fn wait_for_decoder_ready_marker(
+    path: &Path,
+    probe: &AbortTask<Result<ProcessCapture, String>>,
+) -> Result<DecoderReadyMarker, String> {
+    let started = Instant::now();
+    loop {
+        if probe.is_finished() {
+            return Err("native probe exited before decoder readiness was marked".to_owned());
+        }
+        if let Some(marker) = read_decoder_ready_marker(path)? {
+            if marker.schema_version != 1
+                || marker.expected_width != 640
+                || marker.expected_height != 360
+                || marker.distinct_frame_count != 3
+                || !marker.observed_monotonic_seconds.is_finite()
+                || marker.observed_monotonic_seconds <= 0.0
+            {
+                return Err(
+                    "decoder readiness marker fields did not match the fixture contract".to_owned(),
+                );
+            }
+            return Ok(marker);
+        }
+        if started.elapsed() >= DECODER_READY_TIMEOUT {
+            return Err(
+                "native probe did not publish decoder readiness within 45 seconds".to_owned(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn read_decoder_ready_marker(path: &Path) -> Result<Option<DecoderReadyMarker>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(
+                "decoder readiness marker could not be opened without following links".to_owned(),
+            );
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "decoder readiness marker metadata could not be read".to_owned())?;
+    if !metadata.is_file()
+        || metadata.len() > 2 * 1024
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err("decoder readiness marker was not a bounded private regular file".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(2 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "decoder readiness marker could not be read within its bound".to_owned())?;
+    if bytes.len() > 2 * 1024 {
+        return Err("decoder readiness marker exceeded its 2 KiB read bound".to_owned());
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn wait_while_probe_runs(
+    origin: &OriginState,
+    probe: &AbortTask<Result<ProcessCapture, String>>,
+    duration: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    loop {
+        if probe.is_finished() {
+            return Err("native probe ended before the planned recovery phase".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = origin;
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+}
+
+async fn run_native_probe(
+    probe_path: PathBuf,
+    master_url: String,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: String,
+    ready_marker_path: Option<PathBuf>,
+) -> Result<ProcessCapture, String> {
+    ensure_loopback_url(&master_url)?;
+    let mut command = Command::new(probe_path);
+    command.args([
+        "--url".to_owned(),
+        master_url,
+        "--duration".to_owned(),
+        duration.to_string(),
+        "--deadline".to_owned(),
+        deadline.to_string(),
+        "--expect-video-sizes".to_owned(),
+        expected_sizes,
+    ]);
+    if let Some(path) = ready_marker_path {
+        command.args([
+            "--ready-marker".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--controls-after-video-size-expectations".to_owned(),
+        ]);
+    }
+    run_process(
+        command,
+        Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
+        MAX_PROBE_JSON_BYTES,
+    )
+    .await
+}
+
+fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
+    if process.stdout_truncated || process.stdout.len() > MAX_PROBE_JSON_BYTES {
+        return Err("native probe JSON exceeded its 16 KiB bound".to_owned());
+    }
+    let mut value: Value = serde_json::from_slice(&process.stdout)
+        .map_err(|_| "native probe did not return bounded JSON".to_owned())?;
+    redact_probe_json(&mut value);
+    if let Ok(mut data) = report.lock() {
+        data.probe = Some(value.clone());
+    }
+    if !process.success {
+        return Err(format!(
+            "native probe exited with status {}; bounded_stderr_bytes={}; stderr_truncated={}",
+            process
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            process.stderr_tail.len(),
+            process.stderr_truncated
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_probe_result(
+    case: NativeCase,
+    requested_duration: u64,
+    probe: &Value,
+    report: &ReportStore,
+) -> Result<(), String> {
+    if let Ok(mut data) = report.lock() {
+        data.probe = Some(probe.clone());
+    }
+    if probe.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err("native probe did not complete all AVPlayer acceptance checks".to_owned());
+    }
+    let asset_duration = probe
+        .get("item_duration_seconds")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "native probe did not report numeric asset duration".to_owned())?;
+    if asset_duration < requested_duration as f64 {
+        return Err("native HLS asset duration was shorter than the probe duration".to_owned());
+    }
+    if !all_probe_controls_completed(probe) {
+        return Err("native probe did not complete every playback control".to_owned());
+    }
+    if matches!(case, NativeCase::Transcoding)
+        && (probe.get("audio_track_present").and_then(Value::as_bool) != Some(true)
+            || probe
+                .get("enabled_audio_track_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                == 0)
+    {
+        return Err("native playback did not provide AVPlayer audio-track evidence".to_owned());
+    }
+    let expected = match case {
+        NativeCase::ProgressiveAbr => &[(640, 360), (320, 180), (640, 360)][..],
+        NativeCase::Transcoding => &[(640, 360)][..],
+    };
+    validate_video_size_expectations(probe, expected)
+}
+
+fn validate_video_size_expectations(probe: &Value, expected: &[(u32, u32)]) -> Result<(), String> {
+    let contract = probe
+        .get("video_size_expectations")
+        .ok_or_else(|| "native probe omitted ordered decoded-size expectations".to_owned())?;
+    if contract.get("enabled").and_then(Value::as_bool) != Some(true)
+        || contract.get("complete").and_then(Value::as_bool) != Some(true)
+        || contract.get("semantics").and_then(Value::as_str)
+            != Some("ordered_decoded_size_subsequence")
+        || contract
+            .get("minimum_distinct_display_timestamps_per_size")
+            .and_then(Value::as_u64)
+            != Some(3)
+    {
+        return Err("native probe ordered decoded-size contract was incomplete".to_owned());
+    }
+    let entries = contract
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native probe size expectation entries were missing".to_owned())?;
+    if entries.len() != expected.len() {
+        return Err("native probe returned the wrong number of decoded-size entries".to_owned());
+    }
+    for (entry, (width, height)) in entries.iter().zip(expected) {
+        if entry.get("expected_width").and_then(Value::as_u64) != Some(u64::from(*width))
+            || entry.get("expected_height").and_then(Value::as_u64) != Some(u64::from(*height))
+            || entry.get("matched").and_then(Value::as_bool) != Some(true)
+            || entry
+                .get("distinct_frame_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                < 3
+            || entry
+                .get("required_distinct_frame_count")
+                .and_then(Value::as_u64)
+                != Some(3)
+            || entry
+                .get("samples")
+                .and_then(Value::as_array)
+                .is_none_or(|samples| {
+                    samples.len() != 3
+                        || samples.iter().take(3).any(|sample| {
+                            sample
+                                .get("observed_elapsed_seconds")
+                                .and_then(Value::as_f64)
+                                .is_none_or(|elapsed| !elapsed.is_finite() || elapsed < 0.0)
+                                || sample
+                                    .get("observed_monotonic_seconds")
+                                    .and_then(Value::as_f64)
+                                    .is_none_or(|timestamp| {
+                                        !timestamp.is_finite() || timestamp <= 0.0
+                                    })
+                        })
+                        || samples
+                            .iter()
+                            .take(3)
+                            .filter_map(|sample| {
+                                sample
+                                    .get("observed_monotonic_seconds")
+                                    .and_then(Value::as_f64)
+                            })
+                            .collect::<Vec<_>>()
+                            .windows(2)
+                            .any(|pair| pair[0] > pair[1])
+                })
+        {
+            return Err(format!(
+                "native decoded pixels did not match expected size {width}x{height}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn all_probe_controls_completed(probe: &Value) -> bool {
+    let Some(steps) = probe.get("steps").and_then(Value::as_array) else {
+        return false;
+    };
+    let required = [
+        "play",
+        "pause",
+        "resume",
+        "seek_forward",
+        "seek_forward_play",
+        "seek_back",
+        "seek_back_play",
+        "rate_1_25",
+        "duration_remainder",
+    ];
+    required.iter().all(|name| {
+        steps.iter().any(|step| {
+            step.get("name").and_then(Value::as_str) == Some(name)
+                && step.get("status").and_then(Value::as_str) == Some("completed")
+        })
+    })
+}
+
+fn validate_abr_request_trace(report: &ReportStore) -> Result<(), String> {
+    let data = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+    let requests = &data.requests;
+    if requests.media_payload_by_phase_and_representation[0][0] == 0
+        || requests.count_by_phase_and_representation[1][0] == 0
+        || requests.high_fault_status_count == 0
+        || requests.count_by_phase_and_representation[1][1] == 0
+        || requests.successful_by_representation[1] == 0
+        || requests.media_payload_by_phase_and_representation[2][0] == 0
+    {
+        return Err(
+            "origin trace did not prove healthy high, bad-high with healthy low, and recovered high requests"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_abr_sample_timeline(probe: &Value, report: &ReportStore) -> Result<(), String> {
+    let timeline = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?
+        .fault_timeline
+        .clone();
+    let decoder_ready = required_clock_bound(
+        timeline.decoder_ready_monotonic_seconds,
+        "decoder-ready marker clock was not recorded",
+    )?;
+    let baseline_start = required_clock_bound(
+        timeline.baseline_start_monotonic_seconds,
+        "post-decoder healthy-baseline clock was not recorded",
+    )?;
+    let bad_high_before = required_clock_bound(
+        timeline.bad_high_before_monotonic_seconds,
+        "bad-high pre-transition clock bound was not recorded",
+    )?;
+    let bad_high_after = required_clock_bound(
+        timeline.bad_high_after_monotonic_seconds,
+        "bad-high post-transition clock bound was not recorded",
+    )?;
+    let recovery_before = required_clock_bound(
+        timeline.recovery_before_monotonic_seconds,
+        "recovery pre-transition clock bound was not recorded",
+    )?;
+    let recovery_after = required_clock_bound(
+        timeline.recovery_after_monotonic_seconds,
+        "recovery post-transition clock bound was not recorded",
+    )?;
+    if decoder_ready > baseline_start
+        || baseline_start + BASELINE_WINDOW.as_secs_f64() > bad_high_before
+    {
+        return Err(
+            "healthy high baseline did not start after decoder readiness and last six seconds"
+                .to_owned(),
+        );
+    }
+    let entries = probe["video_size_expectations"]["entries"]
+        .as_array()
+        .ok_or_else(|| "decoded-size sample entries were missing".to_owned())?;
+    let samples = |index: usize| -> Result<Vec<f64>, String> {
+        entries[index]["samples"]
+            .as_array()
+            .filter(|samples| samples.len() == 3)
+            .ok_or_else(|| "decoded-size monotonic samples were missing".to_owned())?
+            .iter()
+            .map(|sample| {
+                sample["observed_monotonic_seconds"]
+                    .as_f64()
+                    .filter(|timestamp| timestamp.is_finite() && *timestamp > 0.0)
+                    .ok_or_else(|| "decoded-size monotonic sample was not numeric".to_owned())
+            })
+            .collect()
+    };
+    let initial_high = samples(0)?;
+    let low = samples(1)?;
+    let recovered_high = samples(2)?;
+    validate_abr_sample_timestamps(
+        &initial_high,
+        &low,
+        &recovered_high,
+        bad_high_before,
+        bad_high_after,
+        recovery_before,
+        recovery_after,
+    )
+}
+
+fn required_clock_bound(value: Option<f64>, error: &str) -> Result<f64, String> {
+    value
+        .filter(|timestamp| timestamp.is_finite() && *timestamp > 0.0)
+        .ok_or_else(|| error.to_owned())
+}
+
+fn monotonic_clock_seconds() -> Result<f64, String> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC is shared across processes on this host.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0
+        || timestamp.tv_sec < 0
+        || !(0..1_000_000_000).contains(&timestamp.tv_nsec)
+    {
+        return Err("native monotonic clock could not be read".to_owned());
+    }
+    let seconds = timestamp.tv_sec as f64 + timestamp.tv_nsec as f64 / 1_000_000_000.0;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("native monotonic clock returned an invalid timestamp".to_owned());
+    }
+    Ok(seconds)
+}
+
+fn validate_abr_sample_timestamps(
+    initial_high: &[f64],
+    low: &[f64],
+    recovered_high: &[f64],
+    bad_high_before: f64,
+    bad_high_after: f64,
+    recovery_before: f64,
+    recovery_after: f64,
+) -> Result<(), String> {
+    let timestamps_are_valid = |values: &[f64]| {
+        values.len() == 3
+            && values.iter().all(|value| value.is_finite() && *value > 0.0)
+            && values.windows(2).all(|pair| pair[0] <= pair[1])
+    };
+    if !([initial_high, low, recovered_high]
+        .into_iter()
+        .all(timestamps_are_valid)
+        && [
+            bad_high_before,
+            bad_high_after,
+            recovery_before,
+            recovery_after,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value > 0.0)
+        && bad_high_before <= bad_high_after
+        && bad_high_after <= recovery_before
+        && recovery_before <= recovery_after)
+    {
+        return Err("decoded-size monotonic timestamps or fault bounds were invalid".to_owned());
+    }
+    if initial_high
+        .iter()
+        .copied()
+        .any(|timestamp| timestamp >= bad_high_before)
+    {
+        return Err(
+            "initial high decoded frames were not observed before the bad-high gate".to_owned(),
+        );
+    }
+    if low
+        .iter()
+        .copied()
+        .any(|timestamp| timestamp < bad_high_after || timestamp >= recovery_before)
+    {
+        return Err("low decoded frames were not observed inside the bad-high interval".to_owned());
+    }
+    if recovered_high
+        .iter()
+        .copied()
+        .any(|timestamp| timestamp < recovery_after)
+    {
+        return Err("final high decoded frames were not observed after high recovery".to_owned());
+    }
+    Ok(())
+}
+
+fn redact_probe_json(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                let key_lower = key.to_ascii_lowercase();
+                if ["url", "path", "cookie", "token", "header"]
+                    .iter()
+                    .any(|marker| key_lower.contains(marker))
+                {
+                    *value = Value::String("[redacted]".to_owned());
+                } else {
+                    redact_probe_json(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_probe_json(value);
+            }
+        }
+        Value::String(string)
+            if string.starts_with("http://") || string.starts_with("https://") =>
+        {
+            *string = "[redacted]".to_owned();
+        }
+        _ => {}
+    }
+}
+
+async fn validate_master_playlist(
+    client: &reqwest::Client,
+    url: &str,
+    case: NativeCase,
+    expected_video_fragments: u64,
+    expected_audio_fragments: u64,
+    expected_video_peak_bandwidth: u64,
+    expected_audio_peak_bandwidth: u64,
+) -> Result<HlsPlaylistPreflight, String> {
+    ensure_loopback_url(url)?;
+    let master =
+        url::Url::parse(url).map_err(|_| "production HLS master URL was invalid".to_owned())?;
+    let body = fetch_playlist(client, &master).await?;
+    if !body.starts_with("#EXTM3U") || !body.contains("#EXT-X-STREAM-INF:") {
+        return Err("production media route returned an invalid HLS master playlist".to_owned());
+    }
+    if matches!(case, NativeCase::ProgressiveAbr)
+        && (!body.contains("RESOLUTION=640x360") || !body.contains("RESOLUTION=320x180"))
+    {
+        return Err(
+            "production master playlist did not advertise both real ABR representations".to_owned(),
+        );
+    }
+    let SelectedHlsPlaylists {
+        video_uri,
+        audio_uri,
+        bandwidth: advertised_bandwidth,
+    } = selected_high_playlist_uris(&body)?;
+    if source_h264_sidx_guard_applies(case) && audio_uri.is_none() {
+        return Err("ABR source master omitted its separate audio playlist".to_owned());
+    }
+    let expected_variant_peak = if matches!(case, NativeCase::Transcoding) {
+        expected_video_peak_bandwidth
+    } else {
+        aggregate_peak_bandwidth(expected_video_peak_bandwidth, expected_audio_peak_bandwidth)?
+    };
+    if !master_bandwidth_covers_peak(advertised_bandwidth, expected_variant_peak) {
+        return Err(
+            "production HLS master bandwidth was below the parsed fragment peak".to_owned(),
+        );
+    }
+    let video_url = resolve_same_origin_playlist(&master, &video_uri)?;
+    let (video_fragment_count, video_target_duration_seconds) =
+        fetch_and_validate_media_playlist(client, &video_url, expected_video_fragments).await?;
+    let (audio_fragment_count, audio_target_duration_seconds, external_audio_peak) =
+        if let Some(audio_uri) = audio_uri {
+            let audio_url = resolve_same_origin_playlist(&master, &audio_uri)?;
+            let (count, target) =
+                fetch_and_validate_media_playlist(client, &audio_url, expected_audio_fragments)
+                    .await?;
+            (count, target, expected_audio_peak_bandwidth)
+        } else {
+            (0, 0, 0)
+        };
+    Ok(HlsPlaylistPreflight {
+        high_video_fragment_count: video_fragment_count,
+        high_video_target_duration_seconds: video_target_duration_seconds,
+        audio_fragment_count,
+        audio_target_duration_seconds,
+        high_video_peak_bandwidth_bits_per_second: expected_video_peak_bandwidth,
+        audio_peak_bandwidth_bits_per_second: external_audio_peak,
+        high_variant_peak_bandwidth_bits_per_second: expected_variant_peak,
+        advertised_high_bandwidth_bits_per_second: advertised_bandwidth,
+    })
+}
+
+async fn fetch_playlist(client: &reqwest::Client, url: &url::Url) -> Result<String, String> {
+    ensure_loopback_url(url.as_str())?;
+    let mut response = timeout(Duration::from_secs(5), client.get(url.clone()).send())
+        .await
+        .map_err(|_| "production HLS playlist request timed out".to_owned())?
+        .map_err(|_| "production HLS playlist request failed".to_owned())?;
+    if response.status() != StatusCode::OK {
+        return Err("production media router did not serve the selected HLS playlist".to_owned());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > 64 * 1024)
+    {
+        return Err("production HLS playlist exceeded its response bound".to_owned());
+    }
+    let bytes = timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = response.chunk().await.map_err(|_| ())?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                return Err(());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok::<_, ()>(bytes)
+    })
+    .await
+    .map_err(|_| "production HLS playlist body timed out".to_owned())?
+    .map_err(|_| "production HLS playlist body exceeded its response bound".to_owned())?;
+    String::from_utf8(bytes).map_err(|_| "production HLS playlist was not valid UTF-8".to_owned())
+}
+
+struct SelectedHlsPlaylists {
+    video_uri: String,
+    audio_uri: Option<String>,
+    bandwidth: u64,
+}
+
+fn selected_high_playlist_uris(master: &str) -> Result<SelectedHlsPlaylists, String> {
+    let lines = master.lines().map(str::trim).collect::<Vec<_>>();
+    let mut selected: Option<SelectedHlsPlaylists> = None;
+    for (index, line) in lines.iter().enumerate() {
+        let Some(attributes) = line.strip_prefix("#EXT-X-STREAM-INF:") else {
+            continue;
+        };
+        let attributes = parse_hls_attributes(attributes)
+            .ok_or_else(|| "production HLS master attributes were invalid".to_owned())?;
+        if attributes.get("RESOLUTION").map(String::as_str) != Some("640x360") {
+            continue;
+        }
+        let bandwidth = attributes
+            .get("BANDWIDTH")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "selected high HLS variant bandwidth was invalid".to_owned())?;
+        let video_uri = lines[index + 1..]
+            .iter()
+            .find(|entry| !entry.is_empty() && !entry.starts_with('#'))
+            .ok_or_else(|| "production HLS master omitted the selected video URI".to_owned())?;
+        let audio_group = attributes.get("AUDIO");
+        let mut audio_uris = Vec::new();
+        for line in &lines {
+            let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA:") else {
+                continue;
+            };
+            let attributes = parse_hls_attributes(attributes)
+                .ok_or_else(|| "production HLS rendition attributes were invalid".to_owned())?;
+            if attributes.get("TYPE").map(String::as_str) == Some("AUDIO")
+                && audio_group.is_some()
+                && attributes.get("GROUP-ID") == audio_group
+                && let Some(uri) = attributes.get("URI")
+            {
+                audio_uris.push(uri.clone());
+            }
+        }
+        if (audio_group.is_some() && audio_uris.len() != 1) || selected.is_some() {
+            return Err(
+                "production HLS master did not identify one high video/audio pair".to_owned(),
+            );
+        }
+        selected = Some(SelectedHlsPlaylists {
+            video_uri: (*video_uri).to_owned(),
+            audio_uri: audio_uris.pop(),
+            bandwidth,
+        });
+    }
+    selected
+        .ok_or_else(|| "production HLS master omitted the selected high representation".to_owned())
+}
+
+fn parse_hls_attributes(value: &str) -> Option<HashMap<String, String>> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (index, character) in value.char_indices() {
+        if character == '"' {
+            quoted = !quoted;
+        } else if character == ',' && !quoted {
+            entries.push(&value[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    if quoted {
+        return None;
+    }
+    entries.push(&value[start..]);
+    let mut attributes = HashMap::new();
+    for entry in entries {
+        let (key, raw_value) = entry.split_once('=')?;
+        let key = key.trim();
+        let raw_value = raw_value.trim();
+        if key.is_empty() || raw_value.is_empty() || attributes.contains_key(key) {
+            return None;
+        }
+        let value = if raw_value.starts_with('"') && raw_value.ends_with('"') {
+            raw_value.get(1..raw_value.len().checked_sub(1)?)?
+        } else if raw_value.contains('"') {
+            return None;
+        } else {
+            raw_value
+        };
+        attributes.insert(key.to_owned(), value.to_owned());
+    }
+    Some(attributes)
+}
+
+fn resolve_same_origin_playlist(master: &url::Url, uri: &str) -> Result<url::Url, String> {
+    let resolved = master
+        .join(uri)
+        .map_err(|_| "selected HLS playlist URI could not be resolved".to_owned())?;
+    if resolved.origin() != master.origin()
+        || resolved.username() != ""
+        || resolved.password().is_some()
+        || resolved.fragment().is_some()
+        || !resolved.path().starts_with('/')
+    {
+        return Err("selected HLS playlist URI was not same-origin".to_owned());
+    }
+    ensure_loopback_url(resolved.as_str())?;
+    Ok(resolved)
+}
+
+async fn fetch_and_validate_media_playlist(
+    client: &reqwest::Client,
+    url: &url::Url,
+    expected_fragments: u64,
+) -> Result<(u64, u64), String> {
+    let body = fetch_playlist(client, url).await?;
+    let target_duration = validate_media_playlist_body(url, &body, expected_fragments)?;
+    Ok((expected_fragments, target_duration))
+}
+
+fn validate_media_playlist_body(
+    playlist_url: &url::Url,
+    body: &str,
+    expected_fragments: u64,
+) -> Result<u64, String> {
+    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+    if lines.first().copied() != Some("#EXTM3U") {
+        return Err("selected production media playlist was invalid".to_owned());
+    }
+    let target_durations = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("#EXT-X-TARGETDURATION:"))
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "selected production target duration was invalid".to_owned())?;
+    if target_durations.len() != 1 || target_durations[0] == 0 {
+        return Err("selected production media playlist omitted its target duration".to_owned());
+    }
+    let map_lines = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("#EXT-X-MAP:"))
+        .collect::<Vec<_>>();
+    let map_attributes = map_lines
+        .first()
+        .and_then(|line| parse_hls_attributes(line));
+    let map_uri = map_attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get("URI"));
+    let map_range = map_attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get("BYTERANGE"))
+        .and_then(|range| parse_hls_byte_range(range));
+    let map_resource = map_uri
+        .zip(map_range)
+        .and_then(|(uri, _range)| resolve_playlist_resource(playlist_url, uri, None, None).ok());
+    if map_lines.len() != 1 || map_resource.is_none() {
+        return Err(
+            "selected production media playlist omitted a valid initialization map".to_owned(),
+        );
+    }
+    let map_resource = map_resource.expect("validated map resource is present");
+    let mut fragment_count = 0_u64;
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(duration) = lines[index].strip_prefix("#EXTINF:") else {
+            index += 1;
+            continue;
+        };
+        let (duration, _) = duration
+            .split_once(',')
+            .ok_or_else(|| "selected production segment duration was malformed".to_owned())?;
+        let duration = duration
+            .parse::<f64>()
+            .map_err(|_| "selected production segment duration was invalid".to_owned())?;
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err("selected production segment duration was invalid".to_owned());
+        }
+        let range = lines
+            .get(index + 1)
+            .and_then(|line| line.strip_prefix("#EXT-X-BYTERANGE:"))
+            .ok_or_else(|| "selected production segment omitted its byte range".to_owned())?;
+        let Some(byte_range) = parse_hls_byte_range(range) else {
+            return Err(
+                "selected production media playlist declared an invalid byte range".to_owned(),
+            );
+        };
+        let segment_uri = lines.get(index + 2).copied().unwrap_or_default();
+        if segment_uri.is_empty()
+            || segment_uri.starts_with('#')
+            || resolve_playlist_resource(
+                playlist_url,
+                segment_uri,
+                Some(map_resource.path()),
+                Some(byte_range),
+            )
+            .is_err()
+        {
+            return Err("selected production segment byte range or URI was invalid".to_owned());
+        }
+        fragment_count = fragment_count.saturating_add(1);
+        index += 3;
+    }
+    if fragment_count < 2 || fragment_count != expected_fragments {
+        return Err(
+            "selected production playlist fragment count did not match its source".to_owned(),
+        );
+    }
+    if lines
+        .iter()
+        .filter(|line| line.starts_with("#EXT-X-BYTERANGE:"))
+        .count()
+        != usize::try_from(fragment_count).unwrap_or(usize::MAX)
+        || lines
+            .iter()
+            .filter(|line| **line == "#EXT-X-ENDLIST")
+            .count()
+            != 1
+    {
+        return Err("selected production media playlist was incomplete".to_owned());
+    }
+    Ok(target_durations[0])
+}
+
+fn valid_hls_byte_range(value: &str) -> bool {
+    parse_hls_byte_range(value).is_some()
+}
+
+fn parse_hls_byte_range(value: &str) -> Option<(u64, u64)> {
+    let (length, offset) = value.split_once('@').unwrap_or((value, "0"));
+    let length = length.parse::<u64>().ok().filter(|length| *length > 0)?;
+    let offset = offset.parse::<u64>().ok()?;
+    Some((offset, length))
+}
+
+fn resolve_playlist_resource(
+    playlist_url: &url::Url,
+    uri: &str,
+    authorized_path: Option<&str>,
+    expected_range: Option<(u64, u64)>,
+) -> Result<url::Url, String> {
+    let resolved = playlist_url
+        .join(uri)
+        .map_err(|_| "selected HLS resource URI could not be resolved".to_owned())?;
+    if resolved.origin() != playlist_url.origin()
+        || resolved.username() != ""
+        || resolved.password().is_some()
+        || resolved.fragment().is_some()
+        || !resolved.path().starts_with('/')
+        || authorized_path.is_some_and(|path| path != resolved.path())
+    {
+        return Err("selected HLS resource URI was not authorized".to_owned());
+    }
+    if let Some(query) = resolved.query() {
+        let expected = expected_range
+            .map(|(offset, length)| format!("segment={offset}-{length}"))
+            .ok_or_else(|| "initialization resource URI contained a query".to_owned())?;
+        let mut pairs = resolved.query_pairs();
+        let matches_expected = pairs
+            .next()
+            .is_some_and(|(name, value)| format!("{name}={value}") == expected);
+        if !matches_expected || pairs.next().is_some() || query.is_empty() {
+            return Err("selected HLS segment query did not match its byte range".to_owned());
+        }
+    }
+    ensure_loopback_url(resolved.as_str())?;
+    Ok(resolved)
+}
+
+async fn run_process(
+    mut command: Command,
+    deadline: Duration,
+    max_stdout_bytes: usize,
+) -> Result<ProcessCapture, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "required local acceptance child process could not be started".to_owned())?;
+    capture_child(&mut child, deadline, max_stdout_bytes).await
+}
+
+async fn capture_child(
+    child: &mut Child,
+    deadline: Duration,
+    max_stdout_bytes: usize,
+) -> Result<ProcessCapture, String> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "acceptance child stdout pipe was unavailable".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "acceptance child stderr pipe was unavailable".to_owned())?;
+    let stdout_task = tokio::spawn(capture_stream(stdout, max_stdout_bytes, false));
+    let stderr_task = tokio::spawn(capture_stream(stderr, MAX_CHILD_STDERR_BYTES, true));
+    let wait_result = timeout(deadline, child.wait()).await;
+    let timed_out = wait_result.is_err();
+    let status = match wait_result {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let _ = child.start_kill();
+            timeout(Duration::from_secs(3), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }
+    };
+    let stdout = finish_capture_task(stdout_task).await?;
+    let stderr = finish_capture_task(stderr_task).await?;
+    if timed_out {
+        return Err("acceptance child process exceeded its finite deadline".to_owned());
+    }
+    if status.is_none() {
+        return Err("acceptance child process could not be reaped".to_owned());
+    }
+    Ok(ProcessCapture {
+        status_code: status.as_ref().and_then(|status| status.code()),
+        success: status.as_ref().is_some_and(|status| status.success()),
+        stdout: stdout.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_tail: stderr.bytes,
+        stderr_truncated: stderr.truncated,
+    })
+}
+
+async fn capture_stream<R>(
+    mut reader: R,
+    maximum_bytes: usize,
+    keep_tail: bool,
+) -> std::io::Result<CapturedStream>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(CapturedStream {
+                bytes: captured,
+                truncated,
+            });
+        }
+        let chunk = &buffer[..read];
+        if keep_tail {
+            if chunk.len() >= maximum_bytes {
+                captured.clear();
+                captured.extend_from_slice(&chunk[chunk.len() - maximum_bytes..]);
+                truncated = true;
+                continue;
+            }
+            let overflow = captured
+                .len()
+                .saturating_add(chunk.len())
+                .saturating_sub(maximum_bytes);
+            if overflow > 0 {
+                captured.drain(..overflow);
+                truncated = true;
+            }
+            captured.extend_from_slice(chunk);
+        } else if captured.len() < maximum_bytes {
+            let copied = (maximum_bytes - captured.len()).min(chunk.len());
+            captured.extend_from_slice(&chunk[..copied]);
+            truncated |= copied < chunk.len();
+        } else {
+            truncated = true;
+        }
+    }
+}
+
+async fn finish_capture_task(
+    task: JoinHandle<std::io::Result<CapturedStream>>,
+) -> Result<CapturedStream, String> {
+    timeout(Duration::from_secs(3), task)
+        .await
+        .map_err(|_| "acceptance child output reader exceeded its deadline".to_owned())?
+        .map_err(|_| "acceptance child output reader task failed".to_owned())?
+        .map_err(|_| "acceptance child output stream failed".to_owned())
+}
+
+fn required_executable(name: &str) -> Result<PathBuf, String> {
+    let path = env::var_os(name)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{name} is required"))?;
+    if !path.is_absolute() {
+        return Err(format!("{name} must name an absolute executable path"));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|_| format!("{name} did not resolve to an existing executable"))?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| format!("{name} executable metadata could not be read"))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{name} is not an executable file"));
+    }
+    Ok(path)
+}
+
+fn find_executable(name: &str) -> Result<PathBuf, String> {
+    let path =
+        env::var_os("PATH").ok_or_else(|| "PATH is required to locate FFmpeg tools".to_owned())?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(name);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return candidate
+                .canonicalize()
+                .map_err(|_| format!("{name} executable path could not be resolved"));
+        }
+    }
+    Err(format!("required local tool {name} was not found on PATH"))
+}
+
+async fn bind_loopback_listener() -> Result<TcpListener, String> {
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .map_err(|_| "local IPv4 loopback listener could not be bound".to_owned())
+}
+
+fn origin_url(address: SocketAddr, file_name: &str) -> Result<String, String> {
+    if !is_strict_loopback(address) || !matches!(file_name, "high.mp4" | "low.mp4" | "audio.mp4") {
+        return Err("fixture source URL did not use the strict local allowlist".to_owned());
+    }
+    let url = format!("http://{address}/{file_name}");
+    ensure_loopback_url(&url)?;
+    Ok(url)
+}
+
+fn ensure_loopback_url(value: &str) -> Result<(), String> {
+    let parsed =
+        url::Url::parse(value).map_err(|_| "acceptance source URL was invalid".to_owned())?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.username() != ""
+        || parsed.password().is_some()
+    {
+        return Err("acceptance source URL was not strict IPv4 loopback HTTP".to_owned());
+    }
+    Ok(())
+}
+
+fn is_strict_loopback(address: SocketAddr) -> bool {
+    address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+async fn write_report(path: &Path, report: &ReportStore) -> Result<(), String> {
+    let mut snapshot = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?
+        .clone();
+    let mut bytes = serde_json::to_vec(&snapshot)
+        .map_err(|_| "acceptance report could not be encoded as JSON".to_owned())?;
+    if bytes.len() > MAX_REPORT_BYTES {
+        snapshot.requests.events.truncate(8);
+        snapshot.probe = None;
+        snapshot.error = Some("report payload reduced to enforce the 32 KiB limit".to_owned());
+        bytes = serde_json::to_vec(&snapshot)
+            .map_err(|_| "bounded acceptance report could not be encoded".to_owned())?;
+    }
+    if bytes.len() > MAX_REPORT_BYTES {
+        return Err("acceptance report exceeded its 32 KiB bound".to_owned());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|_| "acceptance report directory could not be created".to_owned())?;
+    let temporary = path.with_extension("json.tmp");
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|_| "bounded acceptance report could not be written".to_owned())?;
+    tokio::fs::rename(&temporary, path)
+        .await
+        .map_err(|_| "bounded acceptance report could not be installed".to_owned())
+}
+
+fn bounded_error(error: &str) -> String {
+    let mut value = error.chars().take(900).collect::<String>();
+    if error.chars().count() > 900 {
+        value.push_str("...");
+    }
+    value
+}
+
+impl ServerTask {
+    async fn stop(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ServerTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl<T> AbortTask<T> {
+    fn is_finished(&self) -> bool {
+        self.0.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn abort(&mut self) {
+        if let Some(task) = self.0.as_ref() {
+            task.abort();
+        }
+    }
+
+    async fn join(&mut self) -> Result<T, String> {
+        let task = self
+            .0
+            .take()
+            .ok_or_else(|| "native probe task was already joined".to_owned())?;
+        task.await
+            .map_err(|_| "native probe task ended before returning a result".to_owned())
+    }
+}
+
+impl<T> Drop for AbortTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod origin_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn phase_rates_apply_only_to_progressive_video_representations() {
+        for representation_code in [1, 2] {
+            assert_eq!(
+                pacing_rate_bits_per_second(
+                    NativeCase::ProgressiveAbr,
+                    PHASE_BASELINE,
+                    representation_code,
+                ),
+                Some(ABR_BASELINE_RATE_BITS_PER_SECOND),
+            );
+            assert_eq!(
+                pacing_rate_bits_per_second(
+                    NativeCase::ProgressiveAbr,
+                    PHASE_BAD_HIGH,
+                    representation_code,
+                ),
+                Some(ABR_BAD_RATE_BITS_PER_SECOND),
+            );
+            assert_eq!(
+                pacing_rate_bits_per_second(
+                    NativeCase::ProgressiveAbr,
+                    PHASE_RECOVERY,
+                    representation_code,
+                ),
+                Some(ABR_RECOVERY_RATE_BITS_PER_SECOND),
+            );
+        }
+        assert_eq!(
+            pacing_rate_bits_per_second(NativeCase::Transcoding, PHASE_BASELINE, 1),
+            None,
+        );
+        assert_eq!(
+            pacing_rate_bits_per_second(NativeCase::ProgressiveAbr, PHASE_BASELINE, 3),
+            None,
+        );
+    }
+
+    #[test]
+    fn chunk_duration_accounts_for_bytes_at_the_selected_bit_rate() {
+        assert_eq!(
+            chunk_transmission_duration(524_288, ABR_BASELINE_RATE_BITS_PER_SECOND),
+            Duration::from_micros(1_048_576),
+        );
+        assert_eq!(
+            chunk_transmission_duration(4_000, ABR_BASELINE_RATE_BITS_PER_SECOND),
+            Duration::from_millis(8),
+        );
+        assert_eq!(
+            chunk_transmission_duration(0, ABR_BASELINE_RATE_BITS_PER_SECOND),
+            Duration::ZERO,
+        );
+    }
+
+    #[test]
+    fn abr_timeline_uses_shared_clock_independent_of_process_elapsed_origins() {
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        {
+            let mut report = report.lock().unwrap();
+            report.fault_timeline.bad_high_before_monotonic_seconds = Some(100.0);
+            report.fault_timeline.bad_high_after_monotonic_seconds = Some(101.0);
+            report.fault_timeline.recovery_before_monotonic_seconds = Some(200.0);
+            report.fault_timeline.recovery_after_monotonic_seconds = Some(201.0);
+            report.fault_timeline.bad_high_start_elapsed_ms = Some(5_000);
+            report.fault_timeline.recovery_start_elapsed_ms = Some(15_000);
+            report.fault_timeline.decoder_ready_monotonic_seconds = Some(90.0);
+            report.fault_timeline.baseline_start_monotonic_seconds = Some(94.0);
+        }
+        let make_samples = |values: [f64; 3], elapsed_origin: f64| {
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, timestamp)| {
+                    serde_json::json!({
+                        "observed_monotonic_seconds": timestamp,
+                        "observed_elapsed_seconds": elapsed_origin + index as f64,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let probe = serde_json::json!({
+            "video_size_expectations": {
+                "entries": [
+                    {"samples": make_samples([90.0, 95.0, 99.0], 50_000.0)},
+                    {"samples": make_samples([101.0, 150.0, 199.0], 0.5)},
+                    {"samples": make_samples([201.0, 202.0, 203.0], 8.0)},
+                ]
+            }
+        });
+
+        assert!(validate_abr_sample_timeline(&probe, &report).is_ok());
+    }
+
+    #[test]
+    fn abr_timeline_requires_exact_finite_ordered_samples_inside_strict_bounds() {
+        let validate = |initial, low, recovered| {
+            validate_abr_sample_timestamps(initial, low, recovered, 100.0, 101.0, 200.0, 201.0)
+        };
+        assert!(
+            validate(
+                &[90.0, 95.0, 99.0],
+                &[101.0, 150.0, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                &[90.0, 100.0, 99.0],
+                &[101.0, 150.0, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &[90.0, 95.0, 99.0],
+                &[100.0, 150.0, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &[90.0, 95.0, 99.0],
+                &[101.0, 200.0, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &[90.0, 95.0, 99.0],
+                &[101.0, f64::NAN, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &[90.0, 95.0],
+                &[101.0, 150.0, 199.0],
+                &[201.0, 202.0, 203.0]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_abr_sample_timestamps(
+                &[90.0, 95.0, 99.0],
+                &[101.0, 150.0, 199.0],
+                &[201.0, 202.0, 203.0],
+                100.0,
+                201.0,
+                200.0,
+                202.0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_monotonic_clock_returns_finite_positive_seconds() {
+        let timestamps = [
+            monotonic_clock_seconds().unwrap(),
+            monotonic_clock_seconds().unwrap(),
+        ];
+        assert!(
+            timestamps
+                .iter()
+                .all(|timestamp| timestamp.is_finite() && *timestamp > 0.0)
+        );
+        assert!(timestamps[0] <= timestamps[1]);
+    }
+
+    #[test]
+    fn shared_pacer_serializes_chunks_without_reserving_waiting_bytes() {
+        let first_request = RepresentationPacer::default();
+        let concurrent_request = first_request.clone();
+        let start = Instant::now();
+        let chunk_bytes = 4_000;
+        let chunk_duration = Duration::from_millis(8);
+
+        assert!(first_request.state.lock().unwrap().try_reserve(
+            start,
+            chunk_bytes,
+            ABR_BASELINE_RATE_BITS_PER_SECOND
+        ));
+
+        let mut state = concurrent_request.state.lock().unwrap();
+        assert_eq!(state.wait_time(start), chunk_duration);
+        assert!(!state.try_reserve(start, chunk_bytes, ABR_BASELINE_RATE_BITS_PER_SECOND,));
+        let available_at = start + chunk_duration;
+        assert_eq!(state.next_available_at, Some(available_at));
+        assert_eq!(
+            state.wait_time(start + Duration::from_millis(2)),
+            Duration::from_millis(6),
+        );
+        assert_eq!(state.next_available_at, Some(available_at));
+        assert!(state.try_reserve(available_at, chunk_bytes, ABR_BASELINE_RATE_BITS_PER_SECOND,));
+        assert_eq!(state.next_available_at, Some(available_at + chunk_duration));
+    }
+}
+
+#[cfg(test)]
+mod protocol_contract_tests {
+    use super::*;
+
+    #[test]
+    fn h264_advertisement_matches_constrained_baseline_level_3_metadata() {
+        assert!(h264_baseline_level_3_is_coherent(
+            "avc1.42c01e",
+            Some("Constrained Baseline"),
+            Some(30),
+            "Constrained Baseline",
+            30,
+        ));
+        assert!(!h264_baseline_level_3_is_coherent(
+            "avc1.640028",
+            Some("Constrained Baseline"),
+            Some(30),
+            "Constrained Baseline",
+            30,
+        ));
+        assert!(!h264_baseline_level_3_is_coherent(
+            "avc1.42c01e",
+            Some("High"),
+            Some(30),
+            "Constrained Baseline",
+            30,
+        ));
+        assert!(!h264_baseline_level_3_is_coherent(
+            "avc1.42c01e",
+            Some("Constrained Baseline"),
+            Some(40),
+            "Constrained Baseline",
+            30,
+        ));
+    }
+
+    #[test]
+    fn selected_high_variant_resolves_only_its_same_group_audio_playlist() {
+        let master = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-high\",NAME=\"Default\",URI=\"segments/audio-high.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-low\",NAME=\"Default\",URI=\"segments/audio-low.m3u8\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=640x360,CODECS=\"avc1.42c01e,mp4a.40.2\",AUDIO=\"audio-high\"\n",
+            "segments/high.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=320x180,CODECS=\"avc1.42c01e,mp4a.40.2\",AUDIO=\"audio-low\"\n",
+            "segments/low.m3u8\n",
+        );
+        let SelectedHlsPlaylists {
+            video_uri,
+            audio_uri,
+            bandwidth,
+        } = selected_high_playlist_uris(master).unwrap();
+        let base = url::Url::parse("http://127.0.0.1:4321/session/master.m3u8").unwrap();
+        assert_eq!(video_uri, "segments/high.m3u8");
+        assert_eq!(audio_uri.as_deref(), Some("segments/audio-high.m3u8"));
+        assert_eq!(bandwidth, 2_000_000);
+        assert_eq!(
+            resolve_same_origin_playlist(&base, &video_uri)
+                .unwrap()
+                .path(),
+            "/session/segments/high.m3u8",
+        );
+        assert!(resolve_same_origin_playlist(&base, "http://example.com/audio.m3u8").is_err());
+    }
+
+    #[test]
+    fn transcoding_master_guard_accepts_muxed_output_without_external_audio_group() {
+        let master = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2128000,RESOLUTION=640x360,CODECS=\"avc1.640028,mp4a.40.2\"\n",
+            "transcoded.m3u8\n",
+        );
+        assert!(master.starts_with("#EXTM3U\n") && master.contains("#EXT-X-STREAM-INF:"));
+        assert!(!source_h264_sidx_guard_applies(NativeCase::Transcoding));
+        let SelectedHlsPlaylists {
+            video_uri,
+            audio_uri,
+            bandwidth,
+        } = selected_high_playlist_uris(master).unwrap();
+        assert_eq!(video_uri, "transcoded.m3u8");
+        assert_eq!(audio_uri, None);
+        assert_eq!(bandwidth, 2_128_000);
+        assert!(master_bandwidth_covers_peak(bandwidth, 2_000_001));
+    }
+
+    #[test]
+    fn fragment_peak_bandwidth_uses_checked_rounding_and_rejects_invalid_ranges() {
+        let ranges = [
+            Mp4SegmentRange {
+                offset: 0,
+                length: 125_000,
+                duration_millis: 1_000,
+            },
+            Mp4SegmentRange {
+                offset: 125_000,
+                length: 100_001,
+                duration_millis: 1_000,
+            },
+        ];
+        assert_eq!(peak_bandwidth_bits_per_second(&ranges), Some(1_000_000));
+        assert_eq!(peak_bandwidth_bits_per_second(&[]), None);
+        assert_eq!(
+            peak_bandwidth_bits_per_second(&[Mp4SegmentRange {
+                offset: 0,
+                length: 1,
+                duration_millis: 0,
+            }]),
+            None,
+        );
+        assert_eq!(
+            peak_bandwidth_bits_per_second(&[Mp4SegmentRange {
+                offset: 0,
+                length: u64::MAX,
+                duration_millis: 1,
+            }]),
+            None,
+        );
+    }
+
+    #[test]
+    fn aggregate_peak_bandwidth_includes_audio_and_checks_overflow() {
+        assert_eq!(
+            aggregate_peak_bandwidth(2_000_000, 128_000).unwrap(),
+            2_128_000
+        );
+        assert!(aggregate_peak_bandwidth(u64::MAX, 1).is_err());
+        assert!(!master_bandwidth_covers_peak(2_000_000, 2_128_000));
+    }
+
+    #[test]
+    fn same_codec_fixture_rungs_have_distinct_video_keys_and_shared_audio_key() {
+        let high = make_request(
+            BilibiliMediaRequestKind::Video,
+            "http://127.0.0.1/high.mp4",
+            "avc1.42c01e",
+            Some(640),
+            Some(360),
+            Some(2_000_000),
+            160,
+        );
+        let low = make_request(
+            BilibiliMediaRequestKind::Video,
+            "http://127.0.0.1/low.mp4",
+            "avc1.42c01e",
+            Some(320),
+            Some(180),
+            Some(500_000),
+            160,
+        );
+        let high_audio = make_request(
+            BilibiliMediaRequestKind::Audio,
+            "http://127.0.0.1/audio.mp4",
+            "mp4a.40.2",
+            None,
+            None,
+            Some(128_000),
+            160,
+        );
+        let low_audio = make_request(
+            BilibiliMediaRequestKind::Audio,
+            "http://127.0.0.1/audio.mp4",
+            "mp4a.40.2",
+            None,
+            None,
+            Some(128_000),
+            160,
+        );
+        assert_eq!(high.cache_key.content_id, low.cache_key.content_id);
+        assert_eq!(high.cache_key.codecs, low.cache_key.codecs);
+        assert_ne!(high.cache_key, low.cache_key);
+        assert_eq!(high_audio.cache_key, low_audio.cache_key);
+    }
+
+    #[test]
+    fn production_media_playlist_requires_matching_multiple_ranges_and_map() {
+        let playlist_url = url::Url::parse("http://127.0.0.1/hls/session/video.m3u8").unwrap();
+        let playlist = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"100@0\"\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@100\nvideo.m4s\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@300\nvideo.m4s\n",
+            "#EXT-X-ENDLIST\n",
+        );
+        assert_eq!(
+            validate_media_playlist_body(&playlist_url, playlist, 2).unwrap(),
+            2
+        );
+        assert!(validate_media_playlist_body(&playlist_url, playlist, 3).is_err());
+        assert!(validate_media_playlist_body(&playlist_url, playlist, 1).is_err());
+        assert!(
+            validate_media_playlist_body(
+                &playlist_url,
+                &playlist.replace("#EXT-X-MAP:", "#EXT-X-MAP-INVALID:"),
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_media_playlist_body(
+                &playlist_url,
+                &playlist.replace("#EXT-X-ENDLIST\n", ""),
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_media_playlist_accepts_only_matching_segment_queries() {
+        let playlist_url = url::Url::parse("http://127.0.0.1/hls/session/video.m3u8").unwrap();
+        assert!(valid_hls_byte_range("200@100"));
+        assert!(!valid_hls_byte_range("0@100"));
+        let prefix = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"100@0\"\n#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@100\n";
+        let suffix = concat!(
+            "\n#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@300\n",
+            "video.m4s?segment=300-200\n#EXT-X-ENDLIST\n",
+        );
+        for uri in ["video.m4s", "video.m4s?segment=100-200"] {
+            let playlist = format!("{prefix}{uri}{suffix}");
+            assert!(validate_media_playlist_body(&playlist_url, &playlist, 2).is_ok());
+        }
+        for uri in [
+            "video.m4s?segment=101-200",
+            "video.m4s?segment=100-200&extra=1",
+            "other.m4s?segment=100-200",
+            "http://example.com/video.m4s?segment=100-200",
+            "video.m4s?segment=100-200#fragment",
+        ] {
+            let playlist = format!("{prefix}{uri}{suffix}");
+            assert!(validate_media_playlist_body(&playlist_url, &playlist, 2).is_err());
+        }
+        let map_with_query = concat!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MAP:URI=\"video.m4s?segment=0-100\",BYTERANGE=\"100@0\"\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@100\n",
+            "video.m4s?segment=100-200\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@300\n",
+            "video.m4s?segment=300-200\n#EXT-X-ENDLIST\n",
+        );
+        assert!(validate_media_playlist_body(&playlist_url, map_with_query, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lan_ingress_tests {
+    use super::*;
+
+    fn telemetry() -> Arc<LanIngressTelemetry> {
+        Arc::new(LanIngressTelemetry {
+            session_id: "session-test".to_owned(),
+            resource_representations: HashMap::from([
+                ("video.m4s".to_owned(), 1),
+                ("low-video.m4s".to_owned(), 2),
+                ("audio.m4s".to_owned(), 3),
+            ]),
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::new(Mutex::new(AcceptanceReport::new(
+                NativeCase::ProgressiveAbr,
+            ))),
+        })
+    }
+
+    #[test]
+    fn ingress_classification_is_known_id_only_and_range_is_numeric() {
+        let telemetry = telemetry();
+        let request = Request::builder()
+            .uri("/hls/session-test/segments/low-video.m4s?segment=40-12")
+            .header(RANGE, "bytes=9-20")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(telemetry.classify(&request), Some((2, true, Some((9, 20)))));
+
+        let unknown = Request::builder()
+            .uri("/hls/session-test/segments/unknown.m4s?probe=private")
+            .header(RANGE, "bytes=9-20")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(telemetry.classify(&unknown), None);
+
+        for value in [
+            "bytes=9-20,30-40",
+            "bytes=9-",
+            "bytes=secret-20",
+            "bytes=-20",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, value.parse().unwrap());
+            assert_eq!(numeric_range_header(&headers), None);
+        }
+    }
+
+    #[test]
+    fn ingress_header_samples_are_capped_per_phase() {
+        let telemetry = telemetry();
+        for _ in 0..12 {
+            telemetry.record(1, true, Some((0, 99)), StatusCode::PARTIAL_CONTENT.as_u16());
+        }
+        let report = telemetry.report.lock().unwrap();
+        assert_eq!(
+            report.lan_ingress.count_by_phase_and_representation[0][0],
+            12
+        );
+        assert_eq!(
+            report
+                .lan_ingress
+                .segment_query_present_by_phase_and_representation[0][0],
+            12
+        );
+        assert_eq!(report.lan_ingress.header_samples.len(), 8);
+        assert!(
+            report
+                .lan_ingress
+                .header_samples
+                .iter()
+                .all(|sample| { sample.range_start == Some(0) && sample.range_end == Some(99) })
+        );
+    }
+
+    #[tokio::test]
+    async fn body_outcomes_distinguish_eof_error_and_drop() {
+        let telemetry = telemetry();
+        let context =
+            telemetry.record(1, false, Some((0, 3)), StatusCode::PARTIAL_CONTENT.as_u16());
+        let mut complete = LanBodyOutcomeStream::new(
+            futures_util::stream::iter([
+                Ok::<_, axum::Error>(axum::body::Bytes::from_static(b"ab")),
+                Ok(axum::body::Bytes::from_static(b"cd")),
+            ]),
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        );
+        assert_eq!(
+            b"ab".as_slice(),
+            complete.next().await.unwrap().unwrap().as_ref()
+        );
+        assert_eq!(
+            b"cd".as_slice(),
+            complete.next().await.unwrap().unwrap().as_ref()
+        );
+        assert!(complete.next().await.is_none());
+
+        let context =
+            telemetry.record(2, false, Some((0, 3)), StatusCode::PARTIAL_CONTENT.as_u16());
+        let error = axum::Error::new(std::io::Error::other("fixture body failure"));
+        let mut errored = LanBodyOutcomeStream::new(
+            futures_util::stream::iter([Err::<axum::body::Bytes, _>(error)]),
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        );
+        assert!(errored.next().await.unwrap().is_err());
+
+        let context =
+            telemetry.record(3, false, Some((0, 3)), StatusCode::PARTIAL_CONTENT.as_u16());
+        let dropped = LanBodyOutcomeStream::new(
+            futures_util::stream::pending::<Result<axum::body::Bytes, axum::Error>>(),
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        );
+        drop(dropped);
+
+        let report = telemetry.report.lock().unwrap();
+        let outcomes = &report.lan_body_outcomes;
+        assert_eq!(outcomes.complete_by_representation, [1, 0, 0]);
+        assert_eq!(outcomes.error_by_representation, [0, 1, 0]);
+        assert_eq!(outcomes.dropped_by_representation, [0, 0, 1]);
+        assert_eq!(outcomes.events.len(), 3);
+        assert_eq!(outcomes.events[0].outcome, "complete");
+        assert_eq!(outcomes.events[0].bytes_observed, 4);
+        assert_eq!(outcomes.events[1].outcome, "error");
+        assert_eq!(outcomes.events[2].outcome, "dropped");
+        assert!(outcomes.events.iter().all(|event| {
+            event.outcome_elapsed_ms >= event.header_elapsed_ms
+                && event.header_phase_code == PHASE_BASELINE
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_error_body_preserves_end_stream_and_exact_zero_size_hint() {
+        let telemetry = telemetry();
+        let context = telemetry.record(1, false, None, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        let response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(CONTENT_LENGTH), None);
+
+        let original_end_stream = response.body().is_end_stream();
+        let original_size_hint = response.body().size_hint().exact();
+        assert!(original_end_stream);
+        assert_eq!(original_size_hint, Some(0));
+        record_empty_lan_body_outcome(
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        );
+        assert!(response.body().is_end_stream());
+        assert_eq!(response.body().size_hint().exact(), Some(0));
+        assert_eq!(response.headers().get(CONTENT_LENGTH), None);
+
+        let report = telemetry.report.lock().unwrap();
+        assert_eq!(
+            report.lan_body_outcomes.complete_by_representation,
+            [1, 0, 0]
+        );
+        assert_eq!(report.lan_body_outcomes.events[0].bytes_observed, 0);
+        assert_eq!(report.lan_body_outcomes.events[0].outcome, "complete");
+    }
+
+    #[tokio::test]
+    async fn body_outcome_event_cap_reserves_rare_error_and_drop_samples() {
+        let telemetry = telemetry();
+        for _ in 0..40 {
+            let context = telemetry.record(1, false, None, StatusCode::PARTIAL_CONTENT.as_u16());
+            let mut complete = LanBodyOutcomeStream::new(
+                futures_util::stream::once(async {
+                    Ok::<_, axum::Error>(axum::body::Bytes::from_static(b"healthy"))
+                }),
+                context,
+                Arc::clone(&telemetry.report),
+                Arc::clone(&telemetry.epoch),
+            );
+            while complete.next().await.is_some() {}
+        }
+        let context = telemetry.record(2, false, None, StatusCode::BAD_GATEWAY.as_u16());
+        let error = axum::Error::new(std::io::Error::other("fixture body failure"));
+        let mut errored = LanBodyOutcomeStream::new(
+            futures_util::stream::iter([Err::<axum::body::Bytes, _>(error)]),
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        );
+        assert!(errored.next().await.unwrap().is_err());
+
+        let context = telemetry.record(3, false, None, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        drop(LanBodyOutcomeStream::new(
+            futures_util::stream::pending::<Result<axum::body::Bytes, axum::Error>>(),
+            context,
+            Arc::clone(&telemetry.report),
+            Arc::clone(&telemetry.epoch),
+        ));
+
+        let report = telemetry.report.lock().unwrap();
+        let outcomes = &report.lan_body_outcomes;
+        assert_eq!(outcomes.events.len(), 32);
+        assert_eq!(outcomes.complete_by_representation, [40, 0, 0]);
+        assert_eq!(outcomes.error_by_representation, [0, 1, 0]);
+        assert_eq!(outcomes.dropped_by_representation, [0, 0, 1]);
+        assert!(outcomes.events.iter().any(|event| event.outcome == "error"));
+        assert!(
+            outcomes
+                .events
+                .iter()
+                .any(|event| event.outcome == "dropped")
+        );
+        assert_eq!(
+            outcomes
+                .events
+                .iter()
+                .filter(|event| event.outcome == "complete")
+                .count(),
+            30
+        );
+    }
+}

@@ -76,7 +76,7 @@ just test-lan-playback
 - Probe：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/probe-lan-playback`
 - Rust library-test 程序：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/media-acceptance-tests`
 
-本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试默认也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。显式设置 `CACHE_SERVER_BINARY` 时，UI 测试保留该 fixture binary 选择，不静默替换；这属于隔离 XCUITest 配置，不建立固定产物的 operator/原生媒体验收结论。固定 server 准备失败或没有返回路径时会立即失败，不回退到旧 Cargo 产物。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；后续原生媒体验收可复用该入口，本 PR 不提供或宣称通过新的 ABR 验收。
+本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试默认也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。显式设置 `CACHE_SERVER_BINARY` 时，UI 测试保留该 fixture binary 选择，不静默替换；这属于隔离 XCUITest 配置，不建立固定产物的 operator/原生媒体验收结论。固定 server 准备失败或没有返回路径时会立即失败，不回退到旧 Cargo 产物。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；构建或签名成功本身不代表原生 ABR 验收通过。
 
 `python3 scripts/local_build.py run probe -- --self-test` 会在持有构建锁期间执行固定副本，`run media-tests -- <test arguments>` 同理。媒体、缓存和测试状态仍需每轮隔离。构建不会自动重启日常 App 或 server；更新后需退出并从固定位置重新启动，已运行的旧进程不会自动切换版本。
 
@@ -198,6 +198,16 @@ LAN_PLAYBACK_DURATION_SECONDS=60 \
 LAN_PLAYBACK_DEADLINE_SECONDS=120 \
 just test-lan-playback
 ```
+
+### 受控原生媒体验收
+
+```bash
+just test-media-network
+```
+
+此入口使用无凭据的本地媒体夹具、生产 Rust HTTP/HLS 路由和原生 AVPlayer，分别验证自动高→低→高的实际解码帧，以及生产转码输出的解码、音轨和暂停/续播/跳转/倍速控制。ABR 输入为 160 秒，probe 为 130 秒，高档上游故障保持 45 秒；每个画质阶段至少需要三个不同显示时间戳，并与真实故障区间对齐。播放前必须验证系统静音，结束后保持静音；音轨存在不等于可听音频验收。
+
+本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。测试报告和资源均有时间与容量上限。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
 ## LAN Cache Server
 

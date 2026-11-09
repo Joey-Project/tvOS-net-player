@@ -415,15 +415,11 @@ impl HlsPlaybackSession {
                 continue;
             };
             let group_id = audio_group_id(index);
-            let name = if index == 0 {
-                "Default".to_owned()
-            } else {
-                format!("Variant {index}")
-            };
+            let name = "Default";
             playlist.push_str(&format!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/{}\"\n",
                 escape_quoted(&group_id),
-                escape_quoted(&name),
+                escape_quoted(name),
                 escape_quoted(&audio_playlist_id)
             ));
         }
@@ -841,7 +837,7 @@ fn split_media_playlist_for_resource(
 ) -> String {
     let target_duration = segments
         .iter()
-        .map(|segment| segment.duration_millis.div_ceil(1_000))
+        .map(|segment| target_duration_seconds(segment.duration_millis))
         .max()
         .unwrap_or(1)
         .max(1);
@@ -860,6 +856,12 @@ fn split_media_playlist_for_resource(
     }
     playlist.push_str("#EXT-X-ENDLIST\n");
     playlist
+}
+
+fn target_duration_seconds(duration_millis: u64) -> u64 {
+    let seconds = duration_millis / 1_000;
+    let remainder = duration_millis % 1_000;
+    (seconds + if remainder >= 500 { 1 } else { 0 }).max(1)
 }
 
 fn format_duration_millis(duration_millis: u64) -> String {
@@ -1783,6 +1785,60 @@ mod tests {
     }
 
     #[test]
+    fn target_duration_rounds_milliseconds_to_nearest_second() {
+        assert_eq!(2, target_duration_seconds(2_005));
+        assert_eq!(2, target_duration_seconds(2_499));
+        assert_eq!(3, target_duration_seconds(2_500));
+        assert_eq!(1, target_duration_seconds(499));
+        assert_eq!(1, target_duration_seconds(0));
+
+        let large_duration = u64::MAX;
+        let expected = large_duration / 1_000 + if large_duration % 1_000 >= 500 { 1 } else { 0 };
+        assert_eq!(expected, target_duration_seconds(large_duration));
+    }
+
+    #[test]
+    fn audio_and_video_playlists_match_near_second_boundary() {
+        let session =
+            HlsPlaybackSession::from_selected_variant("session-1", "Episode", &dash_variant())
+                .unwrap();
+        let video_segments = [
+            HlsMediaSegment {
+                byte_range_offset: 128,
+                byte_range_length: 1_000,
+                duration_millis: 2_000,
+            },
+            HlsMediaSegment {
+                byte_range_offset: 1_128,
+                byte_range_length: 1_000,
+                duration_millis: 2_000,
+            },
+        ];
+        let audio_segments = [
+            HlsMediaSegment {
+                duration_millis: 2_005,
+                ..video_segments[0]
+            },
+            HlsMediaSegment {
+                duration_millis: 2_005,
+                ..video_segments[1]
+            },
+        ];
+
+        let video = session
+            .media_playlist_with_segments("video.m3u8", 128, 2_128, &video_segments)
+            .expect("video playlist should be created");
+        let audio = session
+            .media_playlist_with_segments("audio.m3u8", 128, 2_128, &audio_segments)
+            .expect("audio playlist should be created");
+
+        assert!(video.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(audio.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(video.contains("#EXTINF:2.000,\n#EXT-X-BYTERANGE:1000@128\nvideo.m4s"));
+        assert!(audio.contains("#EXTINF:2.005,\n#EXT-X-BYTERANGE:1000@128\naudio.m4s"));
+    }
+
+    #[test]
     fn media_playlist_falls_back_when_cached_fragment_ranges_are_non_contiguous() {
         let session =
             HlsPlaybackSession::from_selected_variant("session-1", "Episode", &dash_variant())
@@ -1847,6 +1903,26 @@ mod tests {
 
         assert!(master.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
         assert!(!master.contains("mp4a.40.2,mp4a.40.2"));
+        assert_eq!(1, master.matches("#EXT-X-MEDIA:TYPE=AUDIO").count());
+        assert!(master.contains(
+            "GROUP-ID=\"audio\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/audio.m3u8\""
+        ));
+    }
+
+    #[test]
+    fn master_playlist_keeps_muxed_variant_without_external_audio_rendition() {
+        let mut muxed = dash_variant();
+        muxed.audio = None;
+        muxed.codecs.push("mp4a.40.2".to_owned());
+        let session =
+            HlsPlaybackSession::from_selected_variant("session-1", "Episode", &muxed).unwrap();
+
+        let master = session.master_playlist();
+
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("#EXT-X-MEDIA:TYPE=AUDIO"));
+        assert!(!master.contains(",AUDIO="));
+        assert!(master.contains("segments/video.m3u8\n"));
     }
 
     #[test]
@@ -1885,9 +1961,13 @@ mod tests {
         );
         let master = session.master_playlist();
         assert_eq!(2, master.matches("#EXT-X-STREAM-INF").count());
-        assert!(master.contains("URI=\"segments/audio.m3u8\""));
-        assert!(master.contains("URI=\"segments/v1-audio.m3u8\""));
-        assert!(master.contains("GROUP-ID=\"audio-v1\",NAME=\"Variant 1\",DEFAULT=YES"));
+        assert!(master.contains(
+            "GROUP-ID=\"audio\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/audio.m3u8\""
+        ));
+        assert!(master.contains(
+            "GROUP-ID=\"audio-v1\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/v1-audio.m3u8\""
+        ));
+        assert!(master.contains("AUDIO=\"audio\""));
         assert!(master.contains("AUDIO=\"audio-v1\""));
         assert!(master.contains("RESOLUTION=1280x720"));
         assert!(master.contains("segments/video.m3u8\n"));
@@ -1982,29 +2062,59 @@ mod tests {
         let mut selected = dash_variant();
         selected.id = "h264-1080p".to_owned();
         selected.bandwidth = Some(1_000_000);
-        selected.abr = Some(abr_level("dash-video", 1, 2, true));
+        selected.abr = Some(abr_level("dash-video", 2, 3, true));
         let mut alternate = dash_variant();
         alternate.id = "h264-720p".to_owned();
         alternate.bandwidth = Some(600_000);
         alternate.width = Some(1280);
         alternate.height = Some(720);
-        alternate.abr = Some(abr_level("dash-video", 0, 2, true));
+        alternate.abr = Some(abr_level("dash-video", 1, 3, true));
         alternate.video.as_mut().unwrap().url =
             "https://media.example.test/720p-video.m4s".to_owned();
         alternate.audio.as_mut().unwrap().url =
             "https://media.example.test/720p-audio.m4s".to_owned();
+        let mut lower_alternate = dash_variant();
+        lower_alternate.id = "h264-480p".to_owned();
+        lower_alternate.bandwidth = Some(300_000);
+        lower_alternate.width = Some(854);
+        lower_alternate.height = Some(480);
+        lower_alternate.abr = Some(abr_level("dash-video", 0, 3, true));
+        lower_alternate.video.as_mut().unwrap().url =
+            "https://media.example.test/480p-video.m4s".to_owned();
+        lower_alternate.audio.as_mut().unwrap().url =
+            "https://media.example.test/480p-audio.m4s".to_owned();
 
         let session = HlsPlaybackSession::from_playback_entry(
             "session-1",
             "Episode",
             &selected,
             &AdapterAbrMetadata { groups: Vec::new() },
-            &[selected.clone(), alternate],
+            &[selected.clone(), alternate, lower_alternate],
         )
         .unwrap();
 
         let master =
-            session.master_playlist_with_variant_filter(|variant| variant.id != "h264-1080p");
+            session.master_playlist_with_variant_filter(|variant| variant.id != "h264-720p");
+
+        assert_eq!(2, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(master.contains("BANDWIDTH=1000000"));
+        assert!(master.contains("BANDWIDTH=300000"));
+        assert!(master.contains("RESOLUTION=854x480"));
+        assert!(master.contains(
+            "GROUP-ID=\"audio\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/audio.m3u8\""
+        ));
+        assert!(master.contains(
+            "GROUP-ID=\"audio-v1\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/v2-audio.m3u8\""
+        ));
+        assert!(master.contains("AUDIO=\"audio\""));
+        assert!(master.contains("AUDIO=\"audio-v1\""));
+        assert!(master.contains("segments/video.m3u8\n"));
+        assert!(master.contains("segments/v2-video.m3u8\n"));
+        assert!(!master.contains("segments/v1-video.m3u8\n"));
+
+        // Keep the original selected-rung removal case and its resource mapping.
+        let master =
+            session.master_playlist_with_variant_filter(|variant| variant.id == "h264-720p");
 
         assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
         assert!(master.contains("BANDWIDTH=600000"));
@@ -2012,6 +2122,7 @@ mod tests {
         assert!(master.contains("URI=\"segments/v1-audio.m3u8\""));
         assert!(master.contains("segments/v1-video.m3u8\n"));
         assert!(!master.contains("segments/video.m3u8\n"));
+        assert!(!master.contains("segments/v2-video.m3u8\n"));
     }
 
     #[test]

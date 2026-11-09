@@ -56,6 +56,9 @@ test-macos:
 test-lan-playback:
     bash scripts/test-lan-playback.sh
 
+test-media-network:
+    env -u CI -u LOCAL_BUILD_MODE python3 scripts/media-network-e2e.py
+
 test-tvos:
     scripts/test-tvos-simulator.sh
 

@@ -1,5 +1,5 @@
 use std::{
-    io::SeekFrom,
+    io::{Read, Seek, SeekFrom},
     ops::Range as StdRange,
     sync::{
         Arc,
@@ -23,7 +23,7 @@ use axum::{
 use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
-    time::Instant,
+    time::{Instant, timeout},
 };
 use tokio_util::io::ReaderStream;
 
@@ -34,13 +34,18 @@ use crate::{
         HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, mp4_initialization_length,
         should_forward_media_request_header,
     },
-    hls_cache::{HlsCacheFillControl, HlsRangeEnsure, OpenedPrewarmedHlsResource},
+    hls_cache::{
+        HlsCacheFillControl, HlsRangeEnsure, HlsStartupProbeEvidence, OpenedPrewarmedHlsResource,
+    },
     hls_media_refresh::is_expired_range_error,
     hls_range_cache::{
         HlsRangeError, HlsRangePriority, HlsReadyRange, RANGE_FOREGROUND_CHUNK_BYTES,
         RANGE_MAX_CHUNK_BYTES,
     },
     library::OpenedMediaFile,
+    mp4_segments::{
+        MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, mp4_sidx_index, mp4_sidx_segment_ranges,
+    },
     playback_policy::WeakNetworkPreference,
 };
 
@@ -445,7 +450,13 @@ async fn hls_segment_response(
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
-                segments: Vec::new(),
+                segments: load_prewarmed_mp4_sidx_segments(
+                    &state,
+                    &session_id,
+                    &resource,
+                    &prewarmed,
+                )
+                .await,
             }
         } else {
             let Ok(initialization) =
@@ -1406,7 +1417,15 @@ fn hls_range_error_response(error: HlsRangeError) -> Response<Body> {
         }
         HlsRangeError::UpstreamStatus(status) => {
             eprintln!("HLS foreground range upstream returned {status}");
-            empty_response(StatusCode::BAD_GATEWAY)
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                response
+            } else {
+                empty_response(StatusCode::BAD_GATEWAY)
+            }
         }
         HlsRangeError::RangeUnsupported => text_response(
             StatusCode::BAD_GATEWAY,
@@ -2495,6 +2514,10 @@ struct Mp4InitializationProbe {
     initialization: Mp4Initialization,
     response_time: Duration,
     prefix_bytes: u64,
+    exact_prefix: bool,
+    status: StatusCode,
+    headers: HeaderMap,
+    probe_body: Vec<u8>,
     final_url: String,
 }
 
@@ -2565,12 +2588,12 @@ async fn probe_hls_mp4_initialization_candidates(
     for url in urls {
         match load_hls_mp4_initialization_from_url(state, resource, &url).await {
             Ok(probe) => {
-                if let Some(observation_url) =
-                    observation_candidate_url(&resource.request, &probe.final_url)
-                {
+                let observation_url =
+                    observation_candidate_url(&resource.request, &probe.final_url);
+                if let Some(observation_url) = observation_url.as_deref() {
                     state.state.cdn_history.record_request(
                         &resource.request,
-                        &observation_url,
+                        observation_url,
                         CdnObservation {
                             source: CdnObservationSource::Playback,
                             outcome: CdnObservationOutcome::Partial,
@@ -2580,6 +2603,30 @@ async fn probe_hls_mp4_initialization_candidates(
                             range_supported: Some(true),
                         },
                     );
+                }
+                if probe.exact_prefix && observation_url.is_some() {
+                    let control = hls_range_control(
+                        Arc::clone(&state.state),
+                        policy_recorder.session_id.clone(),
+                        policy_recorder.generation,
+                        resource.clone(),
+                    );
+                    let evidence = HlsStartupProbeEvidence {
+                        status: probe.status,
+                        headers: &probe.headers,
+                        final_url: &probe.final_url,
+                        bytes: &probe.probe_body,
+                    };
+                    let _ = state
+                        .state
+                        .hls_cache
+                        .seed_validated_startup_prefix(
+                            &policy_recorder.session_id,
+                            resource,
+                            &evidence,
+                            &control,
+                        )
+                        .await;
                 }
                 policy_recorder.record_upstream_success(variant_id, probe.response_time);
                 return (Ok(probe.initialization), expired_status);
@@ -2647,17 +2694,192 @@ async fn load_hls_mp4_initialization_from_url(
     if length == 0 || length >= total_length {
         return Err(Mp4InitializationProbeError::Other);
     }
+    let prefix_bytes =
+        u64::try_from(bytes.len()).map_err(|_| Mp4InitializationProbeError::Other)?;
+    let prefix_matches_resource = prefix_bytes == returned_range.length()
+        && content_length.is_none_or(|value| value == prefix_bytes)
+        && resource
+            .request
+            .size
+            .is_none_or(|expected| expected == total_length);
+    let exact_prefix =
+        prefix_matches_resource && prefix_bytes == total_length.min(HLS_INITIALIZATION_SCAN_BYTES);
+    let segments = if prefix_matches_resource {
+        load_mp4_sidx_segments(state, resource, &final_url, &bytes, length, total_length).await
+    } else {
+        Vec::new()
+    };
 
     Ok(Mp4InitializationProbe {
         initialization: Mp4Initialization {
             length,
             total_length,
-            segments: Vec::new(),
+            segments,
         },
         response_time,
-        prefix_bytes: u64::try_from(bytes.len()).map_err(|_| Mp4InitializationProbeError::Other)?,
+        prefix_bytes,
+        exact_prefix,
+        status,
+        headers,
+        probe_body: bytes,
         final_url,
     })
+}
+
+async fn load_prewarmed_mp4_sidx_segments(
+    state: &MediaState,
+    session_id: &str,
+    resource: &HlsMediaResource,
+    prewarmed: &crate::hls_cache::PrewarmedHlsResource,
+) -> Vec<HlsMediaSegment> {
+    let Some(mut opened) = state
+        .state
+        .hls_cache
+        .open_prewarmed_resource(session_id, &resource.id)
+    else {
+        return Vec::new();
+    };
+    if opened.prefix_length != prewarmed.prefix_length
+        || opened.total_length != prewarmed.total_length
+        || opened.prefix_length > opened.total_length
+        || resource
+            .request
+            .size
+            .is_some_and(|expected| expected != opened.total_length)
+    {
+        return Vec::new();
+    }
+    let Ok(scan_length) = usize::try_from(opened.prefix_length.min(HLS_INITIALIZATION_SCAN_BYTES))
+    else {
+        return Vec::new();
+    };
+    let mut prefix = Vec::with_capacity(scan_length);
+    if opened.file.seek(SeekFrom::Start(0)).is_err()
+        || (&mut opened.file)
+            .take(HLS_INITIALIZATION_SCAN_BYTES)
+            .read_to_end(&mut prefix)
+            .is_err()
+        || prefix.len() != scan_length
+        || mp4_initialization_length(&prefix) != Some(prewarmed.initialization_length)
+    {
+        return Vec::new();
+    }
+    load_mp4_sidx_segments(
+        state,
+        resource,
+        &resource.request.url,
+        &prefix,
+        prewarmed.initialization_length,
+        prewarmed.total_length,
+    )
+    .await
+}
+
+async fn load_mp4_sidx_segments(
+    state: &MediaState,
+    resource: &HlsMediaResource,
+    source_url: &str,
+    prefix: &[u8],
+    initialization_length: u64,
+    total_length: u64,
+) -> Vec<HlsMediaSegment> {
+    let Some(index) = mp4_sidx_index(prefix, initialization_length, total_length) else {
+        return Vec::new();
+    };
+    let trailer = if index.trailing_length == 0 {
+        Vec::new()
+    } else {
+        let Some(trailer_end) = index.trailing_offset.checked_add(index.trailing_length) else {
+            return Vec::new();
+        };
+        let Ok(start) = usize::try_from(index.trailing_offset) else {
+            return Vec::new();
+        };
+        let Ok(end) = usize::try_from(trailer_end) else {
+            return Vec::new();
+        };
+        if let Some(trailer) = prefix.get(start..end) {
+            trailer.to_vec()
+        } else {
+            let Some(trailer) = fetch_mp4_sidx_trailer(
+                state,
+                resource,
+                source_url,
+                index.trailing_offset,
+                index.trailing_length,
+                total_length,
+            )
+            .await
+            else {
+                return Vec::new();
+            };
+            trailer
+        }
+    };
+    mp4_sidx_segment_ranges(index, &trailer)
+        .map(|ranges| ranges.into_iter().map(hls_media_segment).collect())
+        .unwrap_or_default()
+}
+
+async fn fetch_mp4_sidx_trailer(
+    state: &MediaState,
+    resource: &HlsMediaResource,
+    source_url: &str,
+    offset: u64,
+    length: u64,
+    total_length: u64,
+) -> Option<Vec<u8>> {
+    if length == 0 || length > MAX_SIDX_TRAILER_BYTES {
+        return None;
+    }
+    let end = offset.checked_add(length)?.checked_sub(1)?;
+    if end >= total_length {
+        return None;
+    }
+    timeout(Duration::from_secs(10), async {
+        let upstream = hls_upstream_request_builder(state, resource, Method::GET, source_url)
+            .header(RANGE, format!("bytes={offset}-{end}"))
+            .send()
+            .await
+            .ok()?;
+        if upstream.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            || upstream
+                .content_length()
+                .is_some_and(|value| value != length)
+        {
+            return None;
+        }
+        let headers = upstream.headers().clone();
+        let (returned_range, returned_total) = content_range_byte_range(&headers)?;
+        if returned_range.start != offset
+            || returned_range.end != end
+            || returned_total != total_length
+        {
+            return None;
+        }
+        let max_bytes = usize::try_from(length).ok()?;
+        let mut bytes = Vec::with_capacity(max_bytes);
+        let mut stream = upstream.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            if bytes.len().checked_add(chunk.len())? > max_bytes {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        (bytes.len() == max_bytes).then_some(bytes)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn hls_media_segment(range: Mp4SegmentRange) -> HlsMediaSegment {
+    HlsMediaSegment {
+        byte_range_offset: range.offset,
+        byte_range_length: range.length,
+        duration_millis: range.duration_millis,
+    }
 }
 
 async fn read_hls_initialization_probe(upstream: reqwest::Response) -> Result<Vec<u8>, ()> {
@@ -5406,6 +5628,238 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialization_probe_seeds_startup_range_without_second_origin_request() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upstream_url, _upstream_task) =
+            start_hls_counted_large_range_upstream(Arc::clone(&requests)).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut session = hls_session("session-startup-prefix", &upstream_url);
+        session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
+        insert_authorized_hls_session(&state, session);
+
+        let playlist_response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-startup-prefix".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, playlist_response.status());
+        let _ = to_bytes(playlist_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-1023"));
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-startup-prefix".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            format!("bytes 0-1023/{}", large_fake_mp4().len()),
+            response.headers()[CONTENT_RANGE]
+                .to_str()
+                .expect("content range should be text")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&large_fake_mp4()[..1024], body.as_ref());
+        assert_eq!(
+            vec![format!("bytes=0-{}", HLS_INITIALIZATION_SCAN_BYTES - 1)],
+            requests.lock().unwrap().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_uses_global_sidx_before_full_resource_download() {
+        let (upstream_url, requests, _upstream_task) =
+            start_hls_sidx_upstream(SidxTailResponse::Valid).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut source_session = hls_session("session-1", &upstream_url);
+        source_session.variant.video.request.size = Some(indexed_fake_mp4().len() as u64);
+        insert_authorized_hls_session(&state, source_session);
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .matches("#EXTINF:")
+                .count()
+                >= 2
+        );
+        let data = indexed_fake_mp4();
+        let trailer_start = data.len() - terminal_mfra().len();
+        assert_eq!(
+            vec![
+                format!("bytes=0-{}", HLS_INITIALIZATION_SCAN_BYTES - 1),
+                format!("bytes={trailer_start}-{}", data.len() - 1),
+            ],
+            requests.lock().unwrap().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_rejects_sidx_when_declared_resource_size_mismatches() {
+        let (upstream_url, requests, _upstream_task) =
+            start_hls_sidx_upstream(SidxTailResponse::Valid).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let source_session = hls_session("session-1", &upstream_url);
+        assert_ne!(
+            source_session.variant.video.request.size,
+            Some(indexed_fake_mp4().len() as u64)
+        );
+        insert_authorized_hls_session(&state, source_session);
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            1,
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .matches("#EXTINF:")
+                .count()
+        );
+        assert_eq!(
+            vec![format!("bytes=0-{}", HLS_INITIALIZATION_SCAN_BYTES - 1)],
+            requests.lock().unwrap().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_uses_prewarmed_sidx_with_one_bounded_tail_request() {
+        let (upstream_url, requests, _upstream_task) =
+            start_hls_sidx_upstream(SidxTailResponse::Valid).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let data = indexed_fake_mp4();
+        let mut source_session = hls_session("session-1", &upstream_url);
+        source_session.variant.video.request.size = Some(data.len() as u64);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(
+                &state.hls_upstream_client,
+                &source_session,
+                || crate::hls_cache::HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("indexed resource should prewarm");
+        let prewarmed = state
+            .hls_cache
+            .prewarmed_resource("session-1", "video.m4s")
+            .expect("prewarm metadata should load");
+        assert!(prewarmed.prefix_length < prewarmed.total_length);
+        requests.lock().unwrap().clear();
+        insert_authorized_hls_session(&state, source_session);
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .matches("#EXTINF:")
+                .count()
+                >= 2
+        );
+        let trailer_start = data.len() - terminal_mfra().len();
+        assert_eq!(
+            vec![format!("bytes={trailer_start}-{}", data.len() - 1)],
+            requests.lock().unwrap().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_falls_back_for_invalid_optional_sidx_tails() {
+        for tail_response in [
+            SidxTailResponse::Ignored,
+            SidxTailResponse::Short,
+            SidxTailResponse::Oversized,
+            SidxTailResponse::OversizedChunked,
+            SidxTailResponse::ChangedTotal,
+            SidxTailResponse::Malformed,
+        ] {
+            let (upstream_url, requests, _upstream_task) =
+                start_hls_sidx_upstream(tail_response).await;
+            let temp = TempDir::new().expect("temp dir should be created");
+            let root_path = temp.path().canonicalize().unwrap();
+            let state = AppState::new(CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            });
+            let mut source_session = hls_session("session-1", &upstream_url);
+            source_session.variant.video.request.size = Some(indexed_fake_mp4().len() as u64);
+            insert_authorized_hls_session(&state, source_session);
+            let response = hls_segment_get(
+                State(MediaState::new(state)),
+                Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+                HeaderMap::new(),
+            )
+            .await;
+
+            assert_eq!(StatusCode::OK, response.status());
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                1,
+                String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .matches("#EXTINF:")
+                    .count(),
+                "{tail_response:?}"
+            );
+            assert_eq!(2, requests.lock().unwrap().len(), "{tail_response:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn hls_segment_delivers_warm_startup_prefix_once_then_fetches_bounded_miss() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream_url, upstream_task) =
@@ -5868,7 +6322,11 @@ mod tests {
                 .await
                 .expect("sanitized LAN rejection response should arrive");
             assert_eq!(
-                StatusCode::BAD_GATEWAY,
+                if matches!(behavior, HlsRangeRejection::ServiceUnavailable) {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
                 response.status(),
                 "unaccepted {:?} headers must not become LAN 206",
                 behavior
@@ -6986,6 +7444,80 @@ mod tests {
         assert_eq!(Some(28), mp4_initialization_length(&mp4));
     }
 
+    #[tokio::test]
+    async fn upstream_service_unavailable_maps_to_bounded_retry_response() {
+        let response = hls_range_error_response(HlsRangeError::UpstreamStatus(
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!("1", response.headers()[RETRY_AFTER]);
+        assert!(to_bytes(response.into_body(), 1).await.unwrap().is_empty());
+
+        let forbidden =
+            hls_range_error_response(HlsRangeError::UpstreamStatus(StatusCode::FORBIDDEN));
+        assert_eq!(StatusCode::BAD_GATEWAY, forbidden.status());
+        assert!(!forbidden.headers().contains_key(RETRY_AFTER));
+        assert!(to_bytes(forbidden.into_body(), 1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_hls_route_preserves_all_candidates_service_unavailable() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (upstream_url, _upstream_task) =
+            start_hls_unavailable_upstream(Arc::clone(&requests)).await;
+        let backup_url = upstream_url.replace("/video.m4s", "/video-backup.m4s");
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        insert_authorized_hls_session(
+            &state,
+            hls_session_with_backups(
+                "session-upstream-unavailable",
+                &upstream_url,
+                vec![backup_url],
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("LAN listener should bind");
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route(
+                "/hls/{session_id}/segments/{segment_id}",
+                get(hls_segment_get),
+            )
+            .with_state(MediaState::new(state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("LAN server should run");
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("loopback client should build")
+            .get(format!(
+                "http://{address}/hls/session-upstream-unavailable/segments/video.m4s"
+            ))
+            .header(RANGE, "bytes=0-1")
+            .send()
+            .await
+            .expect("production route response should arrive");
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!("1", response.headers()[RETRY_AFTER]);
+        assert!(response.bytes().await.unwrap().is_empty());
+        assert_eq!(2, requests.load(Ordering::Relaxed));
+        server.abort();
+        let _ = server.await;
+    }
+
     fn parse(value: &'static str, size: u64) -> Option<ByteRange> {
         parse_range(Some(&HeaderValue::from_static(value)), size).unwrap()
     }
@@ -7277,6 +7809,169 @@ mod tests {
         });
 
         (format!("http://{addr}/video.m4s"), task)
+    }
+
+    async fn start_hls_sidx_upstream(
+        tail_response: SidxTailResponse,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Arc::new(SidxUpstreamState {
+            data: indexed_fake_mp4(),
+            requests: Arc::clone(&requests),
+            tail_response,
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/video.m4s", get(upstream_sidx_get))
+                    .with_state(state),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), requests, task)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SidxTailResponse {
+        Valid,
+        Ignored,
+        Short,
+        Oversized,
+        OversizedChunked,
+        ChangedTotal,
+        Malformed,
+    }
+
+    struct SidxUpstreamState {
+        data: Vec<u8>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        tail_response: SidxTailResponse,
+    }
+
+    async fn upstream_sidx_get(
+        State(state): State<Arc<SidxUpstreamState>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return empty_response(StatusCode::FORBIDDEN);
+        }
+        let Some(range_header) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
+            return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        state.requests.lock().unwrap().push(range_header.to_owned());
+        let Some((start, end)) = parse_test_range(range_header, state.data.len()) else {
+            return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        if start == 0 {
+            let body = state.data[start..=end].to_vec();
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_TYPE, "video/mp4")
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", state.data.len()),
+                )
+                .header(CONTENT_LENGTH, body.len().to_string())
+                .body(Body::from(body))
+                .expect("indexed prefix response should build");
+        }
+
+        match state.tail_response {
+            SidxTailResponse::Ignored => Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "video/mp4")
+                .header(CONTENT_LENGTH, state.data.len().to_string())
+                .body(Body::from(state.data.clone()))
+                .expect("ignored-range response should build"),
+            SidxTailResponse::Short => {
+                let body = state.data[start..end].to_vec();
+                let body = Body::from_stream(futures_util::stream::iter([Ok::<_, Infallible>(
+                    Bytes::from(body),
+                )]));
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "video/mp4")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )
+                    .body(body)
+                    .expect("short-tail response should build")
+            }
+            SidxTailResponse::Oversized => {
+                let mut body = state.data[start..=end].to_vec();
+                body.push(0);
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "video/mp4")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )
+                    .header(CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .expect("oversized-tail response should build")
+            }
+            SidxTailResponse::ChangedTotal => Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_TYPE, "video/mp4")
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", state.data.len() + 1),
+                )
+                .header(CONTENT_LENGTH, (end - start + 1).to_string())
+                .body(Body::from(state.data[start..=end].to_vec()))
+                .expect("changed-total response should build"),
+            SidxTailResponse::OversizedChunked => {
+                let mut bytes = state.data[start..=end].to_vec();
+                bytes.push(0);
+                let body = Body::from_stream(futures_util::stream::iter([Ok::<_, Infallible>(
+                    Bytes::from(bytes),
+                )]));
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "video/mp4")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )
+                    .body(body)
+                    .expect("oversized chunked-tail response should build")
+            }
+            SidxTailResponse::Malformed => {
+                let body = vec![0; end - start + 1];
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "video/mp4")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )
+                    .header(CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .expect("malformed-tail response should build")
+            }
+            SidxTailResponse::Valid => {
+                let body = state.data[start..=end].to_vec();
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, "video/mp4")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )
+                    .header(CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .expect("valid-tail response should build")
+            }
+        }
     }
 
     async fn start_hls_counted_large_range_upstream(
@@ -7621,6 +8316,28 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_unavailable_upstream(
+        requests: Arc<AtomicUsize>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/video.m4s", get(upstream_unavailable))
+                    .route("/video-backup.m4s", get(upstream_unavailable))
+                    .with_state(requests),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn upstream_get(headers: HeaderMap) -> Response<Body> {
         upstream_media_response(headers, false)
     }
@@ -7775,6 +8492,11 @@ mod tests {
 
     async fn upstream_forbidden() -> Response<Body> {
         empty_response(StatusCode::FORBIDDEN)
+    }
+
+    async fn upstream_unavailable(State(requests): State<Arc<AtomicUsize>>) -> Response<Body> {
+        requests.fetch_add(1, Ordering::Relaxed);
+        empty_response(StatusCode::SERVICE_UNAVAILABLE)
     }
 
     async fn upstream_range_ignored() -> Response<Body> {
@@ -7939,6 +8661,48 @@ mod tests {
         bytes.extend(kind);
         bytes.extend(payload);
         bytes
+    }
+
+    fn indexed_fake_mp4() -> Vec<u8> {
+        let first_media = mp4_box(*b"mdat", &vec![0x31; 2 * 1024 * 1024]);
+        let second_media = mp4_box(*b"mdat", &vec![0x72; 3 * 1024 * 1024]);
+        let mut sidx_payload = Vec::new();
+        sidx_payload.extend([0_u8; 4]);
+        sidx_payload.extend(1_u32.to_be_bytes());
+        sidx_payload.extend(1_000_u32.to_be_bytes());
+        sidx_payload.extend(0_u32.to_be_bytes());
+        sidx_payload.extend(0_u32.to_be_bytes());
+        sidx_payload.extend([0_u8; 2]);
+        sidx_payload.extend(2_u16.to_be_bytes());
+        for (media, duration) in [(&first_media, 12_000_u32), (&second_media, 18_000_u32)] {
+            sidx_payload.extend(u32::try_from(media.len()).unwrap().to_be_bytes());
+            sidx_payload.extend(duration.to_be_bytes());
+            sidx_payload.extend(0x9000_0000_u32.to_be_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"sidx", &sidx_payload));
+        bytes.extend(first_media);
+        bytes.extend(second_media);
+        bytes.extend(terminal_mfra());
+        bytes
+    }
+
+    fn terminal_mfra() -> Vec<u8> {
+        let mut tfra_payload = vec![0_u8; 4];
+        tfra_payload.extend(1_u32.to_be_bytes());
+        tfra_payload.extend(0_u32.to_be_bytes());
+        tfra_payload.extend(0_u32.to_be_bytes());
+        let tfra = mp4_box(*b"tfra", &tfra_payload);
+        let mfro_size = 16_u32;
+        let mfra_size = 8 + u32::try_from(tfra.len()).unwrap() + mfro_size;
+        let mut mfro_payload = vec![0_u8; 4];
+        mfro_payload.extend(mfra_size.to_be_bytes());
+        let mut mfra_payload = tfra;
+        mfra_payload.extend(mp4_box(*b"mfro", &mfro_payload));
+        mp4_box(*b"mfra", &mfra_payload)
     }
 
     fn hls_session(id: &str, upstream_url: &str) -> HlsPlaybackSession {
