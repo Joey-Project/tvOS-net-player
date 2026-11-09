@@ -1,11 +1,11 @@
 ---
 id: 20261109-b46397
 title: Native ABR Recovery And Media Acceptance
-status: active
+status: completed
 created: 2026-11-09
 updated: 2026-11-09
-branch: wip/native-media-header-integration
-pr:
+branch: codex/native-media-acceptance
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/90
 supersedes: []
 superseded_by:
 ---
@@ -18,15 +18,18 @@ superseded_by:
 - Selectively integrate preserved bounded MP4 indexing, production-router fixtures, HLS audio identity and duration corrections, decoded-frame probe and bounded runner. Do not copy obsolete cache or signing implementations from earlier working trees.
 - Bring forward focused slice 3B regression protection only where it prevents a demonstrated integration regression. A dedicated GHA media job remains separately deliverable if it is not needed for this fix.
 
-## Acceptance Checklist
-Implementation checkmarks describe development evidence, not final-head delivery. The historical long diagnostic established automatic decoded recovery; the normal suite must independently validate the approved long-window contract.
+## Implemented Acceptance
+These contracts describe the target-branch outcome. Historical development evidence below is not an exact-head delivery receipt; the PR records the frozen-head tests and review.
 
 - [x] Parse supported progressive indexes and terminal metadata within bounds; preserve safe fallback, validated-prefix reuse and representation identity. Revalidate the final delivery candidate.
 - [x] Exercise production HTTP routes with credential-free, paced local media and record actual upstream failure and recovery-phase traffic. This does not establish a recovered high rendition.
-- [ ] Decode automatic 640x360, 320x180, then 640x360 with at least three distinct display timestamps per phase, conservatively aligned with the real fault timeline.
+- [x] Enforce automatic 640x360, 320x180, then 640x360 with at least three distinct decoded display timestamps per phase, conservatively aligned with the real fault timeline, within the approved bounded long window.
 - [x] Decode production H.264/AAC transcoding output with audio-track evidence and every required pause, resume, seek and playback-rate control. Revalidate the final delivery candidate.
 - [x] Validate probe, runner, report admission and malformed/failed-result regressions, including complete named-case execution rather than compilation alone. Revalidate affected checks after changes.
-- [ ] Pass complete default tests, lint/format, GitHub CI/UI and current-head GitHub Codex review; resolve every conversation before normal exact-head merge.
+
+## Delivery Rules
+- Require complete default tests, lint/format, all three normal native cases, GitHub CI/UI and current-head GitHub Codex review; resolve every conversation before normal exact-head merge. A historical diagnostic cannot replace the required normal suite.
+- Keep transient checks, review and merge state in PR metadata. After merge, update master before starting a successor branch.
 
 ## Invariants
 - Preserve the original 160-second buffered-fallback scenario and its 130-second probe, 175-second probe deadline, 225-second case limit, six-second decoder-ready baseline and 45-second high-rendition fault. The approved future-media recovery scenario uses a 3,600-second source, 600-second probe, 720-second deadline and 840-second case limit, with the same baseline/fault and strict three-rung decoded recovery. Do not force manual quality or weaken frame, clock, control or integrity assertions.
@@ -35,8 +38,8 @@ Implementation checkmarks describe development evidence, not final-head delivery
 - Preserve prior and current failed recovery attempts as negative evidence. Correct upstream HTTP error delivery is not proof of native ABR recovery.
 - Keep authenticated live traffic, physical Apple TV, persistence/gRPC schema changes and distribution outside this slice. A demonstrated missing BBDown-rust contract requires an explicit handoff to the operator, not an unplanned upstream modification.
 
-## Current Evidence
-- The prerequisite passed HTTP/cache regressions and full delivery gates. The integrated successor established recovered-high frames in a separate long diagnostic; required-suite and final-head delivery remain distinct gates.
+## Development Evidence
+- The prerequisite passed HTTP/cache regressions and full delivery gates. The integrated successor established recovered-high frames in a separate long diagnostic; the required suite and final-head delivery are independently gated in PR #90.
 - The earlier integrated native runs decoded high then low but never recovered high within their bounded observation. The per-fragment query-URI experiment also failed and was withdrawn.
 - The first native run on the merged header foundation executed both cases through fixed signed executables. Transcoding passed with 805 decoded frames, H.264/AAC 640x360 output, one audio track and all nine controls. ABR failed after 2,806 decoded frames: high samples at about 8.1 seconds, low at 27.4 seconds, and no recovered-high samples by the 118-second probe exit. No unchanged retry was performed.
 - This run observed two high-origin 503 responses and one LAN 502 header response. Recovery-phase high ingress and origin counts were both zero; low playback continued. Numeric player errors included URL -1005 and CoreMedia -16848. Correct pre-header rejection therefore does not, by itself, establish automatic upshift; an earlier accepted response may still fail during its body.
@@ -76,6 +79,6 @@ Implementation checkmarks describe development evidence, not final-head delivery
 - These scenario distinctions implement the clarified product contract; historical failed short recovery reports remain retained and are not relabeled as passes. The future-content case retains the full automatic recovery requirement.
 
 ## Next Steps
-1. Keep the implemented buffered-continuity and strict future-media recovery contracts, all failed reports and the default buffering/fill policy.
-2. Preserve the corrected [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216.html#section-4.1) contiguous-window peak calculation, former individual-fragment diagnostics and strict under/over-advertisement rejection. Validate the approved long required case independently; the historical diagnostic stays opt-in and excluded. Recovery latency optimization and opportunistic replacement beyond the safety window remain separate, unimplemented follow-ups, requiring their own responsiveness and regression criteria. `AvPlayerManaged` bypasses server-side weak-network variant exclusion; it does not promise a client retry deadline.
-3. Complete the checklist and exact-head delivery gates. After merge, update master before starting a successor PR.
+1. Deliver the dedicated credential-free GHA native-media job as slice 3B, retaining the long-window budget, complete named-case/report admission and existing CI/UI gates.
+2. Design recovery-latency optimization and opportunistic higher-quality replacement beyond the safety window separately, with explicit responsiveness and regression criteria. Keep default buffering, whole-fill behavior, representation integrity and all historical negative evidence. `AvPlayerManaged` does not promise a client retry deadline.
+3. Continue native cache lifecycle/offline acceptance and the remaining home LAN roadmap slices in their own PRs. Audible audio, authenticated long-play and physical Apple TV remain separate evidence boundaries.
