@@ -47,6 +47,45 @@ just test-ui-e2e-tvos
 
 `just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-macos` 默认使用 `generic/platform=macOS` 编译 macOS app。`just build-for-testing` 会编译 tvOS Xcode XCTest bundle，但不会启动 simulator。`just test-macos` 运行 macOS app-shell XCTest target。`just test` 运行 Swift package core/cache client tests，不需要本机安装 tvOS simulator runtime。
 
+### 固定本机签名与路径
+
+日常本机 macOS App、Rust server 和 AVPlayer probe 使用固定 Apple Development 证书指纹、Team 和各自的 code identifier。配置默认位于 `~/Library/Application Support/TVOSNetPlayer/LocalBuild/signing.json`，不提交到仓库；私钥留在 Keychain，脚本不创建证书、不导出私钥，也不修改 Keychain 授权。
+
+配置格式如下，需替换占位符。两个 SHA-1 字段必须指向同一张证书；Team 来自证书 subject 的 `OU`，不能使用证书显示名称末尾的用户标识。默认产物根目录与配置目录相同；可选 `durable_root` 必须是固定的绝对路径。
+
+```json
+{
+  "schema_version": 1,
+  "team_id": "<10-character team ID>",
+  "identity_sha1": "<40-character certificate fingerprint>",
+  "certificate_sha1": "<same certificate fingerprint>",
+  "expires_at": "YYYY-MM-DD"
+}
+```
+
+```bash
+just local-build app server probe media-tests
+just local-build-status
+just test-lan-playback
+```
+
+固定执行路径跨 Git worktree 保持不变：
+
+- App：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/Apps/MacOSNetPlayer.app`
+- Server：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/tvos-net-player-cache-server`
+- Probe：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/probe-lan-playback`
+- Rust library-test 程序：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/media-acceptance-tests`
+
+本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；后续原生媒体验收可复用该入口，本 PR 不提供或宣称通过新的 ABR 验收。
+
+`python3 scripts/local_build.py run probe -- --self-test` 会在持有构建锁期间执行固定副本，`run media-tests -- <test arguments>` 同理。媒体、缓存和测试状态仍需每轮隔离。构建不会自动重启日常 App 或 server；更新后需退出并从固定位置重新启动，已运行的旧进程不会自动切换版本。
+
+从旧路径迁移 server 时，保留原有数据目录，并显式传入原来的 `Cache:RootPath`、`Cache:TaskStatePath`、`Cache:BBDownArchivePath` 和 `Cache:BBDownCredentialPath`（如已配置）。默认状态目录与可执行文件位置有关；只换启动路径而不保留配置，可能看到一套新的空状态。构建工具不会移动任务、缓存或凭据，也不会更改所选 credential profile。
+
+缺少配置、证书不可用或签名不匹配会明确失败，不自动退回 ad-hoc。`local-build-status` 校验签名、Team、证书指纹、identifier、designated requirement、产物记录及当前 checkout 的提交/dirty 状态；dirty 标记不是未提交文件内容的完整摘要。固定签名与路径不等于公证，也不能保证所有权限都永不再次提示，参见 [Apple code requirements 说明](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
+
+GHA 不需要这份本机配置或私钥，继续使用隔离的无签名 simulator 构建和 ad-hoc macOS XCUITest 身份。非 macOS 的 Rust server 构建保留普通 Cargo 路径，不调用 Keychain。本机可显式设置 `LOCAL_BUILD_MODE=isolated` 复现纯测试构建；它不是日常启动 App/server 的默认路径。Linux 部署仍可使用 `cargo build --release --locked --package tvos-net-player-cache-server` 和 `target/release/tvos-net-player-cache-server`。
+
 如果要跑 Xcode/tvOS simulator XCTest target：
 
 ```bash
@@ -165,13 +204,15 @@ HLS 前台读取与后台整片填充分开选择传输粒度：建立原有 512
 cache server 默认只监听本机 loopback，适合本机开发：
 
 ```bash
-cargo run --package tvos-net-player-cache-server -- --Cache:RootPath /path/to/cache
+just build-cache-server
+"$HOME/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/tvos-net-player-cache-server" \
+  --Cache:RootPath /path/to/cache
 ```
 
 如果要给同一局域网内的 Apple TV 访问，需要在可信 LAN 上显式绑定：
 
 ```bash
-cargo run --package tvos-net-player-cache-server -- \
+"$HOME/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/tvos-net-player-cache-server" \
   --Cache:RootPath /path/to/cache \
   --Cache:GrpcListenUrl http://0.0.0.0:50051 \
   --Cache:MediaListenUrl http://0.0.0.0:8080
@@ -182,7 +223,7 @@ cargo run --package tvos-net-player-cache-server -- \
 当前 server 只支持 cleartext `http://` listener；认证和 TLS 是后续工作。Rust server 默认启动真实 Bilibili worker：worker 消费已提交的 task，调用 pin 到指定 commit 的 `bbdown-core`，把选中的多项结果下载到 cache root 下的 `Bilibili/`，按需 mux，并把可播放输出映射成独立的 library item ID。高频 progress 更新会通过内存状态和 watch 事件暴露，不逐次强制写盘；BBDown core 当前没有逐 chunk callback，所以真实下载中的 progress 是 coarse-grained 阶段状态。tvOS/macOS 客户端可以展示 cache root 容量，并把 completed Bilibili HLS 项标记为 offline HLS；可见 local cache/离线 HLS 库项删除默认关闭，需要显式设置 `--Cache:AllowLibraryItemDelete true` 后 server 才声明能力，客户端才显示删除入口。只在 loopback 或可信受控 LAN 上开启删除能力，例如：
 
 ```bash
-cargo run --package tvos-net-player-cache-server -- \
+"$HOME/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/tvos-net-player-cache-server" \
   --Cache:RootPath /path/to/cache \
   --Cache:GrpcListenUrl http://127.0.0.1:50051 \
   --Cache:MediaListenUrl http://127.0.0.1:8080 \
@@ -192,7 +233,7 @@ cargo run --package tvos-net-player-cache-server -- \
 默认 task state 路径是 server 可执行文件旁的 `cache-server-state/tasks.json`。本机部署建议显式指定，便于备份和排查：
 
 ```bash
-cargo run --package tvos-net-player-cache-server -- \
+"$HOME/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/tvos-net-player-cache-server" \
   --Cache:RootPath /path/to/cache \
   --Cache:TaskStatePath /path/to/server-state/tasks.json \
   --Cache:BBDownFfmpegPath /opt/homebrew/bin/ffmpeg

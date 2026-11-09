@@ -12,6 +12,12 @@ build-macos:
 build-cache-server:
     scripts/build-cache-server.sh
 
+local-build *targets:
+    python3 scripts/local_build.py build {{targets}}
+
+local-build-status:
+    python3 scripts/local_build.py status
+
 build-for-testing:
     scripts/build-for-testing.sh
 
@@ -54,7 +60,7 @@ test-tvos:
     scripts/test-tvos-simulator.sh
 
 test-ui-e2e-macos:
-    if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi && python3 scripts/ui-e2e.py --platform macos
+    if [[ "${CI:-}" == "true" || "${LOCAL_BUILD_MODE:-}" == "isolated" ]]; then if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi; python3 scripts/ui-e2e.py --platform macos; else CACHE_SERVER_BINARY="$(python3 scripts/local_build.py prepare server --print-path server)" python3 scripts/ui-e2e.py --platform macos; fi
 
 test-ui-e2e-tvos:
-    if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi && python3 scripts/ui-e2e.py --platform tvos
+    if [[ "${CI:-}" == "true" || "${LOCAL_BUILD_MODE:-}" == "isolated" ]]; then if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi; python3 scripts/ui-e2e.py --platform tvos; else CACHE_SERVER_BINARY="$(python3 scripts/local_build.py prepare server --print-path server)" python3 scripts/ui-e2e.py --platform tvos; fi
