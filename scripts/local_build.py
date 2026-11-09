@@ -120,11 +120,43 @@ def _receipt_path(root: Path) -> Path:
     return root / "receipt.json"
 
 
-def _read_receipt(root: Path) -> dict:
+def _read_receipt(root: Path, *, allow_missing: bool = False) -> dict:
+    path = _receipt_path(root)
     try:
-        return json.loads(_receipt_path(root).read_text())
-    except (OSError, json.JSONDecodeError):
-        return {"schema_version": 1, "products": {}}
+        receipt = json.loads(path.read_text())
+    except FileNotFoundError as error:
+        if allow_missing:
+            return {"schema_version": 1, "products": {}}
+        raise BuildError(f"local build receipt is missing: {path}") from error
+    except OSError as error:
+        raise BuildError(f"could not read local build receipt at {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise BuildError(f"local build receipt is malformed at {path}: {error}") from error
+    if (not isinstance(receipt, dict) or type(receipt.get("schema_version")) is not int
+            or receipt.get("schema_version") != 1
+            or not isinstance(receipt.get("products"), dict) or not receipt["products"]):
+        raise BuildError(f"local build receipt has an invalid or empty schema: {path}")
+    for target, item in receipt["products"].items():
+        if (target not in PRODUCTS or not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or not isinstance(item.get("source"), dict)
+                or not isinstance(item.get("cdhash"), str) or not item["cdhash"]):
+            raise BuildError(f"local build receipt has an invalid product entry for {target!r}: {path}")
+    return receipt
+
+
+def _validate_app_environment(root: Path) -> None:
+    expected_paths = {
+        "PROJECT_PATH": ROOT / "TVOSNetPlayer.xcodeproj",
+        "DERIVED_DATA_PATH": root / "DerivedData" / hashlib.sha256(str(ROOT).encode()).hexdigest()[:16],
+    }
+    for name, expected in expected_paths.items():
+        value = os.environ.get(name, "")
+        if value and Path(value).expanduser().resolve() != expected.resolve():
+            raise BuildError(f"{name} override is unsupported by the pinned local build; use LOCAL_BUILD_MODE=isolated with the existing custom-build wrapper")
+    scheme = os.environ.get("MACOS_SCHEME", "")
+    if scheme and scheme != "MacOSNetPlayer":
+        raise BuildError("MACOS_SCHEME override is unsupported by the pinned local build; use LOCAL_BUILD_MODE=isolated with the existing custom-build wrapper")
 
 
 def _write_receipt(root: Path, receipt: dict) -> None:
@@ -290,12 +322,21 @@ def prepared_targets(targets: set[str], *, config_file: Path | None = None):
     if unknown or not targets:
         raise BuildError(f"invalid target selection: {', '.join(sorted(unknown or targets))}")
     config = load_config(config_file)
-    verify_identity(config)
     root: Path = config["durable_root"]
+    if "app" in targets:
+        _validate_app_environment(root)
+    verify_identity(config)
     root.mkdir(parents=True, exist_ok=True)
     lock = _locked(root)
     try:
-        receipt = _read_receipt(root)
+        receipt_path = _receipt_path(root)
+        if receipt_path.exists():
+            receipt = _read_receipt(root)
+        else:
+            orphaned = [str(root / product) for product in PRODUCTS.values() if (root / product).exists()]
+            if orphaned:
+                raise BuildError(f"local build receipt is missing for existing stable product: {', '.join(orphaned)}")
+            receipt = _read_receipt(root, allow_missing=True)
         products = dict(receipt.get("products", {}))
         for target in sorted(targets):
             products[target] = _build(target, config, root, receipt)
@@ -323,7 +364,12 @@ def status() -> dict:
     lock = _locked(root)
     try:
         receipt = _read_receipt(root)
+        if not receipt["products"]:
+            raise BuildError(f"local build receipt contains no products: {_receipt_path(root)}")
         source = _source_binding()
+        for target, product in PRODUCTS.items():
+            if (root / product).exists() and target not in receipt["products"]:
+                raise BuildError(f"stable product has no receipt entry for {target}: {root / product}")
         for target, item in receipt.get("products", {}).items():
             path = Path(item["path"])
             if target not in PRODUCTS or path != root / PRODUCTS[target]:

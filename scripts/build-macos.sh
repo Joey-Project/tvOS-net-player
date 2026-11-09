@@ -2,15 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "${LOCAL_BUILD_MODE:-}" != "isolated" && "${CI:-}" != "true" ]]; then
+  exec python3 "${ROOT_DIR}/scripts/local_build.py" build app
+fi
+
 PROJECT_PATH="${PROJECT_PATH:-${ROOT_DIR}/TVOSNetPlayer.xcodeproj}"
 SCHEME="${MACOS_SCHEME:-MacOSNetPlayer}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 DESTINATION="${MACOS_DESTINATION:-generic/platform=macOS}"
 DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-${ROOT_DIR}/build/DerivedData}"
-
-if [[ "${LOCAL_BUILD_MODE:-}" != "isolated" && "${CI:-}" != "true" ]]; then
-  exec python3 "${ROOT_DIR}/scripts/local_build.py" build app
-fi
 
 xcodebuild \
   -onlyUsePackageVersionsFromResolvedFile \

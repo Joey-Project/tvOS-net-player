@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import os
@@ -263,6 +264,113 @@ class LocalBuildTests(unittest.TestCase):
                 mock.patch.object(local_build, "_source_binding", return_value=source):
             local_build.prepare_targets({"probe"}, config_file=self.config_path)
         self.assertEqual(seen_receipts[0]["products"]["probe"], published)
+
+    def test_receipt_read_rejects_missing_malformed_unreadable_and_empty(self) -> None:
+        root = self.root / "LocalBuild"
+        with self.assertRaisesRegex(local_build.BuildError, "receipt is missing"):
+            local_build._read_receipt(root)
+        path = root / "receipt.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{")
+        with self.assertRaisesRegex(local_build.BuildError, "malformed"):
+            local_build._read_receipt(root)
+        path.unlink()
+        path.write_text(json.dumps({"schema_version": 1, "products": {}}))
+        with self.assertRaisesRegex(local_build.BuildError, "invalid or empty schema"):
+            local_build._read_receipt(root)
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(local_build.BuildError, "could not read.*denied"):
+                local_build._read_receipt(root)
+
+    def test_missing_receipt_is_allowed_only_for_fresh_first_build(self) -> None:
+        target = "probe"
+        final = self.root / "LocalBuild" / local_build.PRODUCTS[target]
+        product = {"path": str(final), "identifier": local_build.IDENTIFIERS[target], "cdhash": "cd-1"}
+        with mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_build", return_value=product), \
+                mock.patch.object(local_build, "_source_binding", return_value={"repository": "/repo", "head": "abc", "dirty": False}):
+            receipt = local_build.prepare_targets({target}, config_file=self.config_path)
+        self.assertEqual(set(receipt["products"]), {target})
+
+    def test_missing_receipt_with_orphan_product_is_rejected(self) -> None:
+        config = dict(self.config)
+        root = self.root / "LocalBuild"
+        config["durable_root"] = root
+        orphan = root / local_build.PRODUCTS["probe"]
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("unreceipted")
+        with mock.patch.object(local_build, "load_config", return_value=config), \
+                mock.patch.object(local_build, "verify_identity"):
+            with self.assertRaisesRegex(local_build.BuildError, "receipt is missing for existing stable product"):
+                local_build.prepare_targets({"server"})
+
+    def test_status_accepts_a_valid_partial_receipt_when_other_products_are_absent(self) -> None:
+        config = dict(self.config)
+        config["durable_root"] = self.root / "LocalBuild"
+        path = config["durable_root"] / local_build.PRODUCTS["probe"]
+        source = {"repository": "/repo", "head": "abc", "dirty": False}
+        item = {"path": str(path), "source": source, "cdhash": "same"}
+        receipt = {"schema_version": 1, "products": {"probe": item}}
+        with mock.patch.object(local_build, "load_config", return_value=config), \
+                mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_read_receipt", return_value=receipt), \
+                mock.patch.object(local_build, "_source_binding", return_value=source), \
+                mock.patch.object(local_build, "verify_product", return_value={"cdhash": "same"}):
+            self.assertEqual(local_build.status(), receipt)
+
+    def test_status_rejects_known_stable_product_without_receipt_entry(self) -> None:
+        config = dict(self.config)
+        config["durable_root"] = self.root / "LocalBuild"
+        orphan = config["durable_root"] / local_build.PRODUCTS["server"]
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("unreceipted")
+        receipt = {"schema_version": 1, "products": {"probe": {
+            "path": str(config["durable_root"] / local_build.PRODUCTS["probe"]),
+            "source": {"repository": "/repo", "head": "abc", "dirty": False}, "cdhash": "hash",
+        }}}
+        with mock.patch.object(local_build, "load_config", return_value=config), \
+                mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_read_receipt", return_value=receipt):
+            with self.assertRaisesRegex(local_build.BuildError, "no receipt entry for server"):
+                local_build.status()
+
+    def test_status_rejects_missing_receipt(self) -> None:
+        config = dict(self.config, durable_root=self.root / "LocalBuild")
+        with mock.patch.object(local_build, "load_config", return_value=config), \
+                mock.patch.object(local_build, "verify_identity"):
+            with self.assertRaisesRegex(local_build.BuildError, "receipt is missing"):
+                local_build.status()
+
+    def test_app_environment_rejects_nondefault_overrides_before_signing(self) -> None:
+        overrides = {
+            "PROJECT_PATH": str(self.root / "Other.xcodeproj"),
+            "MACOS_SCHEME": "OtherScheme",
+            "DERIVED_DATA_PATH": str(self.root / "OtherDerivedData"),
+        }
+        for key, value in overrides.items():
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: value}, clear=True), \
+                    mock.patch.object(local_build, "verify_identity") as verify:
+                with self.assertRaisesRegex(local_build.BuildError, f"{key} override is unsupported.*LOCAL_BUILD_MODE=isolated"):
+                    local_build.prepare_targets({"app"}, config_file=self.config_path)
+                verify.assert_not_called()
+
+    def test_app_environment_accepts_defaults_empty_values_and_canonical_paths(self) -> None:
+        root = self.root / "LocalBuild"
+        app_config = dict(self.config, durable_root=root)
+        derived = root / "DerivedData" / hashlib.sha256(str(local_build.ROOT).encode()).hexdigest()[:16]
+        env = {
+            "PROJECT_PATH": str(local_build.ROOT / "." / "TVOSNetPlayer.xcodeproj"),
+            "MACOS_SCHEME": "",
+            "DERIVED_DATA_PATH": str(derived),
+        }
+        product = {"path": str(root / local_build.PRODUCTS["app"]), "identifier": local_build.IDENTIFIERS["app"], "cdhash": "app-cd"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(local_build, "load_config", return_value=app_config), \
+                mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_build", return_value=product), \
+                mock.patch.object(local_build, "_source_binding", return_value={"repository": "/repo", "head": "abc", "dirty": False}):
+            receipt = local_build.prepare_targets({"app"})
+        self.assertIn("app", receipt["products"])
 
     def test_prepared_targets_holds_lock_until_context_exit(self) -> None:
         product = {"path": str(self.root / "x"), "identifier": "x", "cdhash": "cd"}

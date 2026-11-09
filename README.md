@@ -76,15 +76,17 @@ just test-lan-playback
 - Probe：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/probe-lan-playback`
 - Rust library-test 程序：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/media-acceptance-tests`
 
-本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；后续原生媒体验收可复用该入口，本 PR 不提供或宣称通过新的 ABR 验收。
+本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试默认也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。显式设置 `CACHE_SERVER_BINARY` 时，UI 测试保留该 fixture binary 选择，不静默替换；这属于隔离 XCUITest 配置，不建立固定产物的 operator/原生媒体验收结论。固定 server 准备失败或没有返回路径时会立即失败，不回退到旧 Cargo 产物。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；后续原生媒体验收可复用该入口，本 PR 不提供或宣称通过新的 ABR 验收。
 
 `python3 scripts/local_build.py run probe -- --self-test` 会在持有构建锁期间执行固定副本，`run media-tests -- <test arguments>` 同理。媒体、缓存和测试状态仍需每轮隔离。构建不会自动重启日常 App 或 server；更新后需退出并从固定位置重新启动，已运行的旧进程不会自动切换版本。
 
 从旧路径迁移 server 时，保留原有数据目录，并显式传入原来的 `Cache:RootPath`、`Cache:TaskStatePath`、`Cache:BBDownArchivePath` 和 `Cache:BBDownCredentialPath`（如已配置）。默认状态目录与可执行文件位置有关；只换启动路径而不保留配置，可能看到一套新的空状态。构建工具不会移动任务、缓存或凭据，也不会更改所选 credential profile。
 
-缺少配置、证书不可用或签名不匹配会明确失败，不自动退回 ad-hoc。`local-build-status` 校验签名、Team、证书指纹、identifier、designated requirement、产物记录及当前 checkout 的提交/dirty 状态；dirty 标记不是未提交文件内容的完整摘要。固定签名与路径不等于公证，也不能保证所有权限都永不再次提示，参见 [Apple code requirements 说明](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
+缺少配置、证书不可用或签名不匹配会明确失败，不自动退回 ad-hoc。`local-build-status` 校验签名、Team、证书指纹、identifier、designated requirement、产物记录及当前 checkout 的提交/dirty 状态；缺失、不可读、损坏或空的 receipt，以及没有 receipt 条目的已存在产物，均不能当作验证成功。有效的部分产物记录仍可验证，无需先构建所有目标。dirty 标记不是未提交文件内容的完整摘要。固定签名与路径不等于公证，也不能保证所有权限都永不再次提示，参见 [Apple code requirements 说明](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
 
 GHA 不需要这份本机配置或私钥，继续使用隔离的无签名 simulator 构建和 ad-hoc macOS XCUITest 身份。非 macOS 的 Rust server 构建保留普通 Cargo 路径，不调用 Keychain。本机可显式设置 `LOCAL_BUILD_MODE=isolated` 复现纯测试构建；它不是日常启动 App/server 的默认路径。Linux 部署仍可使用 `cargo build --release --locked --package tvos-net-player-cache-server` 和 `target/release/tvos-net-player-cache-server`。
+
+固定 operator App 构建只支持默认 project、scheme 与中间构建目录，非默认 `PROJECT_PATH`、`MACOS_SCHEME` 或 `DERIVED_DATA_PATH` 会明确报错，不静默忽略。需要自定义这些参数时，显式使用 `LOCAL_BUILD_MODE=isolated scripts/build-macos.sh`；隔离 wrapper 保留原有覆盖能力，但该产物不是固定签名的日常 operator App。
 
 如果要跑 Xcode/tvOS simulator XCTest target：
 

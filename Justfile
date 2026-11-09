@@ -60,7 +60,7 @@ test-tvos:
     scripts/test-tvos-simulator.sh
 
 test-ui-e2e-macos:
-    if [[ "${CI:-}" == "true" || "${LOCAL_BUILD_MODE:-}" == "isolated" ]]; then if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi; python3 scripts/ui-e2e.py --platform macos; else CACHE_SERVER_BINARY="$(python3 scripts/local_build.py prepare server --print-path server)" python3 scripts/ui-e2e.py --platform macos; fi
+    bash scripts/test-ui-e2e.sh macos
 
 test-ui-e2e-tvos:
-    if [[ "${CI:-}" == "true" || "${LOCAL_BUILD_MODE:-}" == "isolated" ]]; then if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi; python3 scripts/ui-e2e.py --platform tvos; else CACHE_SERVER_BINARY="$(python3 scripts/local_build.py prepare server --print-path server)" python3 scripts/ui-e2e.py --platform tvos; fi
+    bash scripts/test-ui-e2e.sh tvos
