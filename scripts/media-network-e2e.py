@@ -8,6 +8,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import selectors
 import shutil
 import subprocess
@@ -334,20 +335,64 @@ def validate_cargo_log(path: Path, *, returncode: int = 0, timed_out: bool = Fal
     if returncode != 0:
         raise MediaNetworkError(f"Cargo test process exited {returncode}.")
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open("rb") as log:
+            raw = log.read(COMMAND_LOG_BYTES + 1)
+        if len(raw) > COMMAND_LOG_BYTES:
+            raise MediaNetworkError("Cargo test log exceeds its output bound.")
+        text = raw.decode("utf-8")
+    except MediaNetworkError:
+        raise
     except (OSError, UnicodeError) as error:
         raise MediaNetworkError("Cargo test log is missing or invalid.") from error
-    if path.stat().st_size > COMMAND_LOG_BYTES:
-        raise MediaNetworkError("Cargo test log exceeds its output bound.")
-    for name in EXPECTED_TESTS:
-        lines = [line for line in text.splitlines() if line.startswith("test ") and name in line]
-        if lines != [f"test {name} ... ok"]:
-            raise MediaNetworkError(f"Expected exactly one passing Rust test line for {name}.")
-    summaries = [line for line in text.splitlines() if line.startswith("test result:")]
+    expected = set(EXPECTED_TESTS)
+    seen: set[str] = set()
+    pending: str | None = None
+    summaries: list[int] = []
+    summary_pattern = re.compile(
+        r"test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; "
+        r"\d+ filtered out(?:; finished in \d+(?:\.\d+)?s)?"
+    )
+    for index, line in enumerate(text.splitlines()):
+        if line.startswith("test result:"):
+            if pending is not None or summary_pattern.fullmatch(line) is None:
+                raise MediaNetworkError("Cargo log contains a malformed or premature test summary.")
+            summaries.append(index)
+            continue
+        if line.startswith("test "):
+            if pending is not None:
+                raise MediaNetworkError("Cargo log contains an unterminated Rust test record.")
+            match = re.fullmatch(r"test (.+) \.\.\.(?: (.*))?", line)
+            if match is None:
+                raise MediaNetworkError("Cargo log contains a malformed Rust test header.")
+            name, status = match.groups()
+            if name not in expected:
+                raise MediaNetworkError(f"Cargo log contains an unexpected Rust test: {name}.")
+            if name in seen:
+                raise MediaNetworkError(f"Cargo log contains a duplicate Rust test: {name}.")
+            seen.add(name)
+            if status is None:
+                pending = name
+            elif status == "ok":
+                pass
+            elif status in {"FAILED", "ignored", "bench"}:
+                raise MediaNetworkError(f"Cargo test {name} did not pass: {status}.")
+            elif status.startswith(("ok ", "FAILED ", "ignored ", "bench ")):
+                raise MediaNetworkError(f"Cargo test {name} has an ambiguous inline status.")
+            else:
+                pending = name
+            continue
+        if line in {"ok", "FAILED", "ignored", "bench"}:
+            if line != "ok" or pending is None:
+                raise MediaNetworkError("Cargo log contains an orphan or non-passing test status.")
+            pending = None
+    if pending is not None:
+        raise MediaNetworkError(f"Cargo test {pending} has no passing completion status.")
+    if seen != expected:
+        raise MediaNetworkError("Cargo log did not contain exactly the three required Rust tests.")
     if len(summaries) != 1:
         raise MediaNetworkError("Cargo log must contain exactly one complete test result summary.")
-    if f"test result: ok. {len(EXPECTED_TESTS)} passed; 0 failed; 0 ignored;" not in summaries[0]:
-        raise MediaNetworkError("Cargo summary did not prove all three cases passed with no failures or ignores.")
+    if any(line.strip() for line in text.splitlines()[summaries[0] + 1:]):
+        raise MediaNetworkError("Cargo log contains data after its terminal test summary.")
 
 
 def _read_report(path: Path) -> dict[str, Any]:

@@ -346,28 +346,61 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
         self.assertEqual(media.remaining_work(4000, now=2500) - media.FINALIZE_BUDGET_SECONDS,
                          media.RUNTIME_BUDGET_SECONDS)
 
-    def test_cargo_log_requires_both_exact_tests_and_exact_counts(self) -> None:
-        lines = "\n".join(f"test {name} ... ok" for name in media.EXPECTED_TESTS)
+    def test_cargo_log_accepts_captured_nocapture_records(self) -> None:
+        captured = "\n".join((
+            "running 3 tests",
+            f"test {media.EXPECTED_TESTS[0]} ... HLS foreground range upstream returned 503 Service Unavailable",
+            "ok",
+            f"test {media.EXPECTED_TESTS[2]} ... HLS foreground range upstream returned 503 Service Unavailable",
+            "ok",
+            f"test {media.EXPECTED_TESTS[1]} ... ok",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1263 filtered out; finished in 834.52s",
+            "",
+        ))
+        mixed = "\n".join((
+            f"test {media.EXPECTED_TESTS[0]} ... ok",
+            f"test {media.EXPECTED_TESTS[2]} ... ordinary nocapture diagnostic",
+            "diagnostic continuation",
+            "ok",
+            f"test {media.EXPECTED_TESTS[1]} ... ok",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1263 filtered out",
+        ))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cargo.log"
-            path.write_text(
-                lines + "\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
-                encoding="utf-8",
-            )
-            media.validate_cargo_log(path)
-            path.write_text(
-                lines + f"\ntest {media.EXPECTED_TESTS[0]} ... ok\n"
-                "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(media.MediaNetworkError, "exactly one passing"):
+            for content in (captured, mixed):
+                path.write_text(content, encoding="utf-8")
                 media.validate_cargo_log(path)
-            path.write_text(
-                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(media.MediaNetworkError, "exactly one passing"):
-                media.validate_cargo_log(path)
+
+    def test_cargo_log_rejects_incomplete_ambiguous_and_unexpected_records(self) -> None:
+        passing = [f"test {name} ... ok" for name in media.EXPECTED_TESTS]
+        summary = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1263 filtered out"
+        cases = {
+            "duplicate required test": "\n".join(passing + [passing[0], summary]),
+            "missing required test": "\n".join(passing[:-1] + [summary]),
+            "unknown test": "\n".join(passing + ["test media_acceptance_tests::extra ... ok", summary]),
+            "diagnostic test header": "\n".join(passing + ["test HLS diagnostic ... ok", summary]),
+            "failed test": "\n".join([f"test {media.EXPECTED_TESTS[0]} ... FAILED", *passing[1:], summary]),
+            "ignored test": "\n".join([f"test {media.EXPECTED_TESTS[0]} ... ignored", *passing[1:], summary]),
+            "orphan completion": "\n".join(["ok", *passing, summary]),
+            "orphan failure": "\n".join(["FAILED", *passing, summary]),
+            "orphan ignored status": "\n".join(["ignored", *passing, summary]),
+            "unterminated header": "\n".join([f"test {media.EXPECTED_TESTS[0]} ...", *passing[1:], summary]),
+            "ambiguous completion": "\n".join([f"test {media.EXPECTED_TESTS[0]} ... ok", "ok", *passing[1:], summary]),
+            "malformed header": "\n".join(["test malformed header", *passing, summary]),
+            "duplicate summary": "\n".join([*passing, summary, summary]),
+            "nonterminal summary": "\n".join([*passing, summary, "trailing payload"]),
+            "malformed summary": "\n".join([*passing, summary + "; finished in soon",]),
+            "nonzero failed count": "\n".join([*passing, summary.replace("0 failed", "1 failed")]),
+            "nonzero ignored count": "\n".join([*passing, summary.replace("0 ignored", "1 ignored")]),
+            "zero-result fake summary": "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cargo.log"
+            for label, content in cases.items():
+                with self.subTest(case=label):
+                    path.write_text(content, encoding="utf-8")
+                    with self.assertRaises(media.MediaNetworkError):
+                        media.validate_cargo_log(path)
 
     def test_cargo_failure_and_timeout_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
