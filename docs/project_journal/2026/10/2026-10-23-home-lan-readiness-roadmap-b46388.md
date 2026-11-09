@@ -3,7 +3,7 @@ id: 20261023-b46388
 title: Home LAN Reliability And Preview Readiness
 status: active
 created: 2026-10-23
-updated: 2026-10-24
+updated: 2026-11-09
 branch:
 pr:
 supersedes: []
@@ -24,10 +24,10 @@ superseded_by:
 | [0. CI stability and diagnostics](2026-10-23-ci-stability-diagnostics-b46389.md) | completed | Add toolchain/source-bound compiled caches, bounded stage logs/JSON, all-helper regressions and redacted test-waiter diagnostics. No warm-cache speedup or timeout root cause is inferred. Preserve all test, lint and build gates. |
 | [1. Silent task-state reconciliation](2026-10-23-silent-task-reconciliation-b46390.md) | completed | Use bounded existing `GetTask` reconciliation when observation stays open but becomes silent. Healthy idle work is not a failure. Preserve task identity, cancellation/generation guards and media playback; never resubmit as a recovery side effect. |
 | [2. Client task and playback resumption](2026-10-23-client-task-playback-resumption-b46391.md) | completed | Restore the accepted task and playback position on the same client, bound to the original server and result identity. Offer an explicit Continue action rather than autoplay. Expired tasks, deleted media and a mismatched server produce an honest unavailable state, never an implicit new resolution/download. |
-| 3. Media weak-network, ABR and transcoding acceptance | pending | Land the focused [foreground Range cache prerequisite](2026-10-24-foreground-range-cache-foundation-b46393.md), then use controlled local upstream faults to validate latency, failed/truncated reads, CDN fallback, actual quality downgrade/recovery, representation isolation and decoding of existing transcoded outputs. Manifest presence or the cache prerequisite alone is not native acceptance. |
+| 3. Media weak-network, ABR and transcoding acceptance | active | The [foreground Range cache prerequisite](2026-10-24-foreground-range-cache-foundation-b46393.md) and independent [fixed local signing prerequisite](../11/2026-11-09-stable-local-signing-b46395.md) are complete. Continue native integration/local acceptance, then a dedicated credential-free GHA media job. Validate actual decoded quality downgrade/recovery and transcoding; cache/build foundations alone are not native acceptance. |
 | 4. Native cache lifecycle and offline acceptance | pending | Exercise full fill during playback, upstream unavailability, same-root server restart, existing high/low watermark eviction and deletion protection through native workflows. Only genuinely complete selected representations qualify as fully offline. |
 | 5. Native credential and settings UI regression | pending | Use credential-free fixtures for login readiness, expiry, cancellation, unavailable methods, endpoint replacement and existing settings warnings/conflicts. Keep real scanning and authenticated requests separate and opt-in. |
-| 6. Real macOS long-play acceptance | pending | Reuse the four canonical URLs and existing bounded authenticated cases, recording restricted proxy success, actual CDN paths, complete cache/offline behavior, native seeking/replay and supported window usability. Fix only demonstrated scoped failures. |
+| 6. Real macOS long-play acceptance | pending | First migrate the live integration-test executor to the pinned local certificate and stable executable path. Reuse the four canonical URLs and existing bounded authenticated cases, recording restricted proxy success, actual CDN paths, complete cache/offline behavior, native seeking/replay and supported window usability. Fix only demonstrated scoped failures. |
 | 7. Local and trusted-LAN preview delivery | pending | Provide explicit versioned app/server artifacts, startup/health checks, upgrade/rollback and backup instructions, and refresh outdated documentation. This is not public distribution, App Store submission or notarization acceptance. |
 
 ## Resumption Contract
