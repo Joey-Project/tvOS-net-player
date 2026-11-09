@@ -21,19 +21,39 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_SCRIPT = Path(__file__).with_name("ui-e2e.py")
-TOTAL_BUDGET_SECONDS = 35 * 60
+TOTAL_BUDGET_SECONDS = 50 * 60
 COMPILE_BUDGET_SECONDS = 25 * 60
-RUNTIME_BUDGET_SECONDS = 8 * 60
+RUNTIME_BUDGET_SECONDS = 24 * 60
 FINALIZE_BUDGET_SECONDS = 60
 COMMAND_LOG_BYTES = 8 * 1024 * 1024
 ARTIFACT_BYTES = 32 * 1024 * 1024
-REPORT_BYTES = 256 * 1024
+MIN_ARTIFACT_FREE_BYTES = 6 * 1024 * 1024 * 1024
+REPORT_BYTES = 32 * 1024
 EXPECTED_TESTS = (
     "media_acceptance_tests::native_progressive_adaptation_and_recovery",
     "media_acceptance_tests::native_transcoded_output_decodes",
+    "media_acceptance_tests::native_progressive_buffered_fallback_keeps_playing",
 )
-EXPECTED_ABR_SIZES = ((640, 360), (320, 180), (640, 360))
-EXPECTED_TRANSCODE_SIZES = ((640, 360),)
+EXTENDED_DIAGNOSTIC_TEST = (
+    "media_acceptance_tests::native_diagnostic_extended_adaptation_and_recovery"
+)
+EXPECTED_CASES = {
+    EXPECTED_TESTS[2]: {
+        "report": "buffered.json", "scenario": "buffered_continuity", "duration": 160,
+        "probe_duration": 130, "probe_deadline": 175, "sizes": ((640, 360), (320, 180)),
+    },
+    EXPECTED_TESTS[0]: {
+        "report": "abr.json", "scenario": "unbuffered_recovery", "duration": 3600,
+        "probe_duration": 600, "probe_deadline": 720, "diagnostic_only": False,
+        "sizes": ((640, 360), (320, 180), (640, 360)),
+    },
+    EXPECTED_TESTS[1]: {
+        "report": "transcoding.json", "scenario": "transcoded_output", "duration": 45,
+        "probe_duration": 30, "probe_deadline": 45, "sizes": ((640, 360),),
+    },
+}
+EXPECTED_ABR_SIZES = EXPECTED_CASES[EXPECTED_TESTS[0]]["sizes"]
+EXPECTED_TRANSCODE_SIZES = EXPECTED_CASES[EXPECTED_TESTS[1]]["sizes"]
 SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
     "TERM", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "SWIFT_EXEC",
@@ -79,6 +99,7 @@ def build_cargo_argv() -> list[str]:
         "cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--package",
         "tvos-net-player-cache-server", "--release", "--locked", "--lib",
         "media_acceptance_tests::", "--", "--ignored", "--nocapture", "--test-threads=1",
+        "--skip", EXTENDED_DIAGNOSTIC_TEST,
         "--color=never",
     ]
 
@@ -94,7 +115,7 @@ def build_cargo_compile_argv() -> list[str]:
 def build_signed_test_argv(binary: Path) -> list[str]:
     return [
         str(binary), "media_acceptance_tests::", "--ignored", "--nocapture",
-        "--test-threads=1", "--color=never",
+        "--test-threads=1", "--skip", EXTENDED_DIAGNOSTIC_TEST, "--color=never",
     ]
 
 
@@ -143,6 +164,11 @@ def _artifact_size(directory: Path, *, limit: int = ARTIFACT_BYTES) -> int:
             if total > limit:
                 raise MediaNetworkError(f"Artifact tree exceeded the {limit}-byte aggregate cap.")
     return total
+
+
+def _require_artifact_free_space(directory: Path) -> None:
+    if shutil.disk_usage(directory).free < MIN_ARTIFACT_FREE_BYTES:
+        raise MediaNetworkError("Artifact volume has insufficient free space for native media acceptance.")
 
 
 def resolve_work_deadline(configured: str | None, *, started_at: float, now: float | None = None) -> float:
@@ -320,8 +346,8 @@ def validate_cargo_log(path: Path, *, returncode: int = 0, timed_out: bool = Fal
     summaries = [line for line in text.splitlines() if line.startswith("test result:")]
     if len(summaries) != 1:
         raise MediaNetworkError("Cargo log must contain exactly one complete test result summary.")
-    if "test result: ok. 2 passed; 0 failed; 0 ignored;" not in summaries[0]:
-        raise MediaNetworkError("Cargo summary did not prove exactly 2 passed, 0 failed, and 0 ignored tests.")
+    if f"test result: ok. {len(EXPECTED_TESTS)} passed; 0 failed; 0 ignored;" not in summaries[0]:
+        raise MediaNetworkError("Cargo summary did not prove all three cases passed with no failures or ignores.")
 
 
 def _read_report(path: Path) -> dict[str, Any]:
@@ -353,24 +379,128 @@ def _exact_int(value: Any, expected: int | None = None) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and (expected is None or value == expected)
 
 
-def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[int, int], ...]) -> dict[str, Any]:
+def _positive_u64(value: Any) -> bool:
+    return type(value) is int and 0 < value <= 2**64 - 1
+
+
+def _observation_state(
+    value: Any, *, expected_at_or_after: float, asset_duration: float,
+    must_reach_asset_end: bool, latest_offset: float | None = 5,
+) -> tuple[float, float]:
+    if not isinstance(value, dict) or not _numeric(value.get("observed_monotonic_seconds")):
+        raise MediaNetworkError("Probe report lacks a finite passive observation timestamp.")
+    observed = float(value["observed_monotonic_seconds"])
+    if observed < expected_at_or_after or (
+        latest_offset is not None and observed > expected_at_or_after + latest_offset
+    ):
+        raise MediaNetworkError("Passive observation is outside the controller recovery window.")
+    state = value.get("player_state")
+    if not isinstance(state, dict):
+        raise MediaNetworkError("Passive observation has no player state.")
+    playhead = state.get("playhead_seconds")
+    preference = state.get("preferred_forward_buffer_duration_seconds")
+    if (not _numeric(playhead) or float(playhead) < 0
+            or float(playhead) > asset_duration + 0.25
+            or state.get("automatically_waits_to_minimize_stalling") is not True
+            or not _numeric(preference) or float(preference) != 0):
+        raise MediaNetworkError("Passive observation has a playhead outside source duration or non-default buffering preference.")
+    ranges = state.get("loaded_time_ranges")
+    if not isinstance(ranges, dict) or ranges.get("truncated") is not False:
+        raise MediaNetworkError("Passive observation loaded ranges are missing or truncated.")
+    observations = ranges.get("observations")
+    source_count, valid_count, invalid_count = (
+        ranges.get("source_count"), ranges.get("valid_count"), ranges.get("invalid_count")
+    )
+    if (not isinstance(observations, list) or not observations or len(observations) > 8
+            or not _exact_int(source_count) or not _exact_int(valid_count)
+            or not _exact_int(invalid_count, 0) or source_count != valid_count
+            or valid_count != len(observations)):
+        raise MediaNetworkError("Passive observation loaded ranges are incomplete or invalid.")
+    containing_ends: list[float] = []
+    for entry in observations:
+        if not isinstance(entry, dict):
+            raise MediaNetworkError("Passive observation contains a malformed loaded range.")
+        start, duration, end = (entry.get("start_seconds"), entry.get("duration_seconds"), entry.get("end_seconds"))
+        if (not _numeric(start) or not _numeric(duration) or not _numeric(end)
+                or min(float(start), float(duration), float(end)) < 0
+                or abs((float(start) + float(duration)) - float(end)) > 0.001
+                or float(end) > asset_duration + 0.25):
+            raise MediaNetworkError("Passive observation contains an invalid range or one beyond source duration.")
+        if float(start) <= float(playhead) <= float(end):
+            containing_ends.append(float(end))
+    if not containing_ends:
+        raise MediaNetworkError("No observed loaded range contains the playhead.")
+    range_end = max(containing_ends)
+    if must_reach_asset_end and range_end < asset_duration - 0.25:
+        raise MediaNetworkError("Steady-play end range does not cover the remaining asset within 250ms.")
+    return observed, range_end
+
+
+def _validate_progressive_origin_trace(report: dict[str, Any], expected_case: str, report_name: str) -> None:
+    requests = report.get("requests")
+    if not isinstance(requests, dict):
+        raise MediaNetworkError(f"Progressive report lacks origin request evidence: {report_name}")
+    payload = requests.get("media_payload_by_phase_and_representation")
+    counts = requests.get("count_by_phase_and_representation")
+    successful = requests.get("successful_by_representation")
+    if any(not isinstance(matrix, list) or len(matrix) != 3
+           or any(not isinstance(row, list) or len(row) != 3 for row in matrix)
+           for matrix in (payload, counts)) or not isinstance(successful, list) or len(successful) != 3:
+        raise MediaNetworkError(f"Progressive origin request evidence has invalid dimensions: {report_name}")
+    if any(not _exact_int(value) or value < 0 for matrix in (payload, counts) for row in matrix for value in row) \
+            or any(not _exact_int(value) or value < 0 for value in successful) \
+            or not _exact_int(requests.get("high_fault_status_count")):
+        raise MediaNetworkError(f"Progressive origin request evidence contains invalid counts: {report_name}")
+    if (payload[0][0] <= 0 or counts[1][0] <= 0 or requests["high_fault_status_count"] <= 0
+            or counts[1][1] <= 0 or successful[1] <= 0):
+        raise MediaNetworkError(f"Progressive origin trace lacks baseline high, faulted high, or healthy low: {report_name}")
+    if expected_case == EXPECTED_TESTS[0] and payload[2][0] <= 0:
+        raise MediaNetworkError(f"Future-case origin trace lacks recovered high traffic: {report_name}")
+
+
+def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[int, int], ...] | None = None) -> dict[str, Any]:
     if expected_case not in EXPECTED_TESTS:
         raise MediaNetworkError("Requested native report case is not in the acceptance contract.")
+    case_contract = EXPECTED_CASES[expected_case]
+    if expected_sizes is None:
+        expected_sizes = case_contract["sizes"]
     report = _read_report(path)
     if not _exact_int(report.get("schema_version"), 1) or report.get("status") != "passed":
         raise MediaNetworkError(f"Report schema/status is not a passed version-1 result: {path.name}")
+    if report.get("diagnostic_only") is not False:
+        raise MediaNetworkError(f"Report diagnostic_only value is not false for the normal suite: {path.name}")
     case = report.get("case_full_name")
     if case != expected_case:
         raise MediaNetworkError(f"Report case name does not match the requested Rust test: {path.name}")
+    if (report.get("scenario") != case_contract["scenario"]
+            or not _numeric(report.get("source_duration_seconds"))
+            or float(report["source_duration_seconds"]) != case_contract["duration"]):
+        raise MediaNetworkError(f"Report scenario or source duration does not match its named case: {path.name}")
+    preflight = report.get("hls_playlist_preflight")
+    canonical_bandwidth = (
+        preflight.get("high_variant_peak_bandwidth_bits_per_second")
+        if isinstance(preflight, dict) else None
+    )
+    advertised_bandwidth = (
+        preflight.get("advertised_high_bandwidth_bits_per_second")
+        if isinstance(preflight, dict) else None
+    )
+    if (not isinstance(preflight, dict)
+            or preflight.get("bandwidth_semantics") != "rfc8216_contiguous_duration_window"
+            or not _positive_u64(canonical_bandwidth)
+            or not _positive_u64(advertised_bandwidth)
+            or advertised_bandwidth != canonical_bandwidth):
+        raise MediaNetworkError(
+            f"HLS playlist preflight semantics or exact advertised bandwidth is invalid: {path.name}"
+        )
     probe = report.get("probe")
     if not isinstance(probe, dict) or not _exact_int(probe.get("schema_version"), 1) or probe.get("status") != "completed":
         raise MediaNetworkError(f"Probe report is missing its completed version-1 result: {path.name}")
     frames = probe.get("decoded_frame_count")
     if not isinstance(frames, int) or isinstance(frames, bool) or frames <= 0 or probe.get("audio_track_present") is not True:
         raise MediaNetworkError(f"Probe report lacks decoded frames or an audio track: {path.name}")
-    expected_duration, expected_deadline = (
-        (130, 175) if expected_case == EXPECTED_TESTS[0] else (30, 45)
-    )
+    expected_duration = case_contract["probe_duration"]
+    expected_deadline = case_contract["probe_deadline"]
     if (probe.get("requested_duration_seconds") != expected_duration
             or probe.get("overall_deadline_seconds") != expected_deadline
             or probe.get("deadline_mode") != "cooperative"):
@@ -430,10 +560,11 @@ def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[
         if monotonic_samples != sorted(monotonic_samples):
             raise MediaNetworkError(f"Probe monotonic timestamps are out of order: {path.name}")
         phase_samples.append(monotonic_samples)
-    if expected_case == EXPECTED_TESTS[0]:
+    if expected_case != EXPECTED_TESTS[1]:
+        _validate_progressive_origin_trace(report, expected_case, path.name)
         timeline = report.get("fault_timeline")
         if not isinstance(timeline, dict) or timeline.get("enabled") is not True or timeline.get("bad_high_status_code") != 503:
-            raise MediaNetworkError(f"ABR report omitted its enabled 503 fault window: {path.name}")
+            raise MediaNetworkError(f"Progressive report omitted its enabled 503 fault window: {path.name}")
         names = (
             "decoder_ready_monotonic_seconds", "baseline_start_monotonic_seconds",
             "bad_high_before_monotonic_seconds", "bad_high_after_monotonic_seconds",
@@ -441,15 +572,35 @@ def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[
         )
         bounds = [timeline.get(name) for name in names]
         if not all(_numeric(value) and value > 0 for value in bounds):
-            raise MediaNetworkError(f"ABR report has incomplete fault-window clock bounds: {path.name}")
+            raise MediaNetworkError(f"Progressive report has incomplete fault-window clock bounds: {path.name}")
         decoder_ready, baseline_start, bad_before, bad_after, recovery_before, recovery_after = map(float, bounds)
         if not (decoder_ready <= baseline_start and baseline_start + 6 <= bad_before
                 and bad_before <= bad_after <= recovery_before <= recovery_after):
-            raise MediaNetworkError(f"ABR report fault-window clock bounds are inconsistent: {path.name}")
+            raise MediaNetworkError(f"Progressive report fault-window clock bounds are inconsistent: {path.name}")
         if (any(timestamp >= bad_before for timestamp in phase_samples[0])
-                or any(timestamp < bad_after or timestamp >= recovery_before for timestamp in phase_samples[1])
-                or any(timestamp < recovery_after for timestamp in phase_samples[2])):
-            raise MediaNetworkError(f"ABR decoded-size samples do not span the high-low-high fault phases: {path.name}")
+                or any(timestamp < bad_after or timestamp >= recovery_before for timestamp in phase_samples[1])):
+            raise MediaNetworkError(f"Progressive decoded-size samples do not align with the high-low fault phases: {path.name}")
+        if expected_case == EXPECTED_TESTS[0] and any(timestamp < recovery_after for timestamp in phase_samples[2]):
+            raise MediaNetworkError(f"Future-case decoded-size samples do not prove high recovery: {path.name}")
+
+        recovery_time, recovery_end = _observation_state(
+            probe.get("recovery_observation"), expected_at_or_after=recovery_after,
+            asset_duration=float(case_contract["duration"]), must_reach_asset_end=False,
+        )
+        if expected_case == EXPECTED_TESTS[0] and recovery_end > float(case_contract["duration"]) - 20:
+            raise MediaNetworkError(f"Future-case observation does not prove 20 seconds remain beyond loaded media: {path.name}")
+        if expected_case == EXPECTED_TESTS[2]:
+            play_step = next((step for step in steps if isinstance(step, dict) and step.get("name") == "play"), None)
+            if not isinstance(play_step, dict) or not _numeric(play_step.get("elapsed_seconds")) \
+                    or float(play_step["elapsed_seconds"]) < 110:
+                raise MediaNetworkError(f"Buffered case did not retain at least 110 seconds of steady play: {path.name}")
+            steady_time, _ = _observation_state(
+                probe.get("steady_play_end_observation"), expected_at_or_after=recovery_after,
+                asset_duration=float(case_contract["duration"]), must_reach_asset_end=True,
+                latest_offset=None,
+            )
+            if steady_time < recovery_time:
+                raise MediaNetworkError(f"Buffered end observation precedes its recovery observation: {path.name}")
     return report
 
 
@@ -534,8 +685,8 @@ def _run_local_signed(
                     timeout=timeout, artifact_dir=artifact_dir, cargo_artifact_monitor=True,
                 )
                 validate_cargo_log(logs / "cargo-test.log")
-                validate_report(rust_artifacts / "abr.json", EXPECTED_TESTS[0], EXPECTED_ABR_SIZES)
-                validate_report(rust_artifacts / "transcoding.json", EXPECTED_TESTS[1], EXPECTED_TRANSCODE_SIZES)
+                for case_name, contract in EXPECTED_CASES.items():
+                    validate_report(rust_artifacts / contract["report"], case_name, contract["sizes"])
         finally:
             local_build.RUN = original_run
     except local_build.BuildError as error:
@@ -560,6 +711,7 @@ def run(
         rust_artifacts = artifact_dir / "rust"
         _new_private_dir(logs)
         _new_private_dir(rust_artifacts)
+        _require_artifact_free_space(artifact_dir)
         env = clean_environment()
         if local_config_arg is not None:
             config_path = Path(local_config_arg).expanduser()
@@ -593,8 +745,8 @@ def run(
             _run_command(build_cargo_argv(), log_path=logs / "cargo-test.log", env=test_env,
                          timeout=timeout, artifact_dir=artifact_dir, cargo_artifact_monitor=True)
             validate_cargo_log(logs / "cargo-test.log")
-            validate_report(rust_artifacts / "abr.json", EXPECTED_TESTS[0], EXPECTED_ABR_SIZES)
-            validate_report(rust_artifacts / "transcoding.json", EXPECTED_TESTS[1], EXPECTED_TRANSCODE_SIZES)
+            for case_name, contract in EXPECTED_CASES.items():
+                validate_report(rust_artifacts / contract["report"], case_name, contract["sizes"])
         else:
             _require_tools(env)
             _run_local_signed(
@@ -604,7 +756,7 @@ def run(
         _artifact_size(artifact_dir)
         remaining_work(total_deadline)
         status = "passed"
-        message = "Both native media acceptance tests and their decoded-frame reports passed validation."
+        message = "All three native media acceptance cases and their reports passed validation."
     except (MediaNetworkError, ui.UIE2EError, OSError, ValueError) as error:
         message = f"{type(error).__name__}: {error}"[:1024]
         print(f"[media-network-e2e] {message}", file=sys.stderr, flush=True)

@@ -9,6 +9,51 @@ private struct VideoSize: Equatable {
     let height: Int
 }
 
+private enum RecoveryObservationTrigger {
+    static func isFreshEmptyRegularFile(at path: String) -> Bool {
+        var pathInfo = stat()
+        guard lstat(path, &pathInfo) == 0, (pathInfo.st_mode & S_IFMT) == S_IFREG, pathInfo.st_size == 0
+        else {
+            return false
+        }
+        let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { return false }
+        defer { _ = close(descriptor) }
+        var openedInfo = stat()
+        guard fstat(descriptor, &openedInfo) == 0, (openedInfo.st_mode & S_IFMT) == S_IFREG,
+            openedInfo.st_size == 0, openedInfo.st_dev == pathInfo.st_dev,
+            openedInfo.st_ino == pathInfo.st_ino
+        else {
+            return false
+        }
+        return true
+    }
+
+    static func runSelfTest() throws -> [String] {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("probe-trigger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let empty = directory.appendingPathComponent("empty")
+        let nonempty = directory.appendingPathComponent("nonempty")
+        let link = directory.appendingPathComponent("link")
+        guard FileManager.default.createFile(atPath: empty.path, contents: Data()),
+            FileManager.default.createFile(atPath: nonempty.path, contents: Data([1]))
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoveryObservationTrigger", code: 1)
+        }
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: empty)
+        guard isFreshEmptyRegularFile(at: empty.path),
+            !isFreshEmptyRegularFile(at: nonempty.path),
+            !isFreshEmptyRegularFile(at: link.path),
+            !isFreshEmptyRegularFile(at: directory.appendingPathComponent("missing").path)
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoveryObservationTrigger", code: 2)
+        }
+        return ["recovery_trigger_accepts_only_same_identity_empty_regular_file"]
+    }
+}
+
 private enum LoadedTimeRangeDiagnostics {
     static let maximumObservations = 8
 
@@ -96,6 +141,8 @@ private struct ProbeOptions {
     let validateOnly: Bool
     let expectedVideoSizes: [VideoSize]
     let readyMarkerPath: String?
+    let recoveryObservationTriggerPath: String?
+    let minimumSteadyPlaySeconds: TimeInterval?
     let controlsAfterVideoSizeExpectations: Bool
 
     static func parse(_ arguments: [String]) throws -> ProbeOptions {
@@ -105,6 +152,8 @@ private struct ProbeOptions {
         var validateOnly = false
         var expectedVideoSizes: [VideoSize]?
         var readyMarkerPath: String?
+        var recoveryObservationTriggerPath: String?
+        var minimumSteadyPlaySeconds: TimeInterval?
         var controlsAfterVideoSizeExpectations = false
         var index = 0
 
@@ -156,6 +205,18 @@ private struct ProbeOptions {
                     throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 9)
                 }
                 readyMarkerPath = value
+            case "--recovery-observation-trigger":
+                guard recoveryObservationTriggerPath == nil, value.hasPrefix("/"), !value.isEmpty else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 11)
+                }
+                recoveryObservationTriggerPath = value
+            case "--minimum-steady-play-seconds":
+                guard minimumSteadyPlaySeconds == nil,
+                    let parsed = Double(value), parsed.isFinite, parsed >= 0
+                else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 12)
+                }
+                minimumSteadyPlaySeconds = parsed
             default:
                 throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 5)
             }
@@ -176,11 +237,21 @@ private struct ProbeOptions {
         guard readyMarkerPath == nil || expectedVideoSizes != nil else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 9)
         }
+        guard recoveryObservationTriggerPath == nil || expectedVideoSizes != nil else {
+            throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 11)
+        }
         guard
             !controlsAfterVideoSizeExpectations
                 || (expectedVideoSizes != nil && duration > 30)
         else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 10)
+        }
+        guard
+            (recoveryObservationTriggerPath == nil && minimumSteadyPlaySeconds == nil)
+                || (controlsAfterVideoSizeExpectations
+                    && (minimumSteadyPlaySeconds ?? 0) <= duration - VideoSizePhasePolicy.controlReserveSeconds)
+        else {
+            throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 12)
         }
 
         return ProbeOptions(
@@ -190,6 +261,8 @@ private struct ProbeOptions {
             validateOnly: validateOnly,
             expectedVideoSizes: expectedVideoSizes ?? [],
             readyMarkerPath: readyMarkerPath,
+            recoveryObservationTriggerPath: recoveryObservationTriggerPath,
+            minimumSteadyPlaySeconds: minimumSteadyPlaySeconds,
             controlsAfterVideoSizeExpectations: controlsAfterVideoSizeExpectations
         )
     }
@@ -307,18 +380,22 @@ private struct ProbeOptions {
         passed.append("video_size_expectations_parse_ordered_high_low_high")
         let markerOptions = try parse([
             "--url", "http://192.168.1.8/live.m3u8",
-            "--duration", "90",
-            "--deadline", "135",
+            "--duration", "130",
+            "--deadline", "175",
             "--expect-video-sizes", "640x360,320x180,640x360",
             "--ready-marker", "/tmp/ready.json",
+            "--recovery-observation-trigger", "/tmp/recovery.trigger",
+            "--minimum-steady-play-seconds", "110",
             "--controls-after-video-size-expectations",
         ])
         guard markerOptions.readyMarkerPath == "/tmp/ready.json",
+            markerOptions.recoveryObservationTriggerPath == "/tmp/recovery.trigger",
+            markerOptions.minimumSteadyPlaySeconds == 110,
             markerOptions.controlsAfterVideoSizeExpectations
         else {
             throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 5)
         }
-        passed.append("ready_marker_and_state_based_controls_options_parse")
+        passed.append("marker_and_minimum_steady_play_options_parse")
         try reject("public_ipv4", arguments: ["--url", "http://8.8.8.8/live.m3u8"], expectedCode: 6)
         try reject("public_ipv6", arguments: ["--url", "http://[2001:4860:4860::8888]/live.m3u8"], expectedCode: 6)
         try reject("userinfo", arguments: ["--url", "http://name:secret@192.168.1.8/live.m3u8"], expectedCode: 6)
@@ -379,6 +456,27 @@ private struct ProbeOptions {
             expectedCode: 9
         )
         try reject(
+            "recovery_trigger_requires_absolute_path",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--expect-video-sizes", "640x360",
+                "--recovery-observation-trigger", "trigger",
+            ],
+            expectedCode: 11
+        )
+        try reject(
+            "minimum_steady_play_must_leave_control_reserve",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--duration", "130",
+                "--deadline", "175",
+                "--expect-video-sizes", "640x360",
+                "--controls-after-video-size-expectations",
+                "--minimum-steady-play-seconds", "111",
+            ],
+            expectedCode: 12
+        )
+        try reject(
             "controls_after_expectations_require_video_sizes",
             arguments: [
                 "--url", "http://192.168.1.8/live.m3u8",
@@ -419,6 +517,7 @@ private struct ProbeOptions {
         passed.append(contentsOf: try BoundedObservations.runSelfTest())
         passed.append(contentsOf: try PlayerErrorLogDiagnostics.runSelfTest())
         passed.append(contentsOf: try LoadedTimeRangeDiagnostics.runSelfTest())
+        passed.append(contentsOf: try RecoveryObservationTrigger.runSelfTest())
         passed.append(contentsOf: try PlaybackPolicy.runSelfTest())
         passed.append(contentsOf: try PlayerSetup.runSelfTest())
         return ["schema_version": 1, "status": "complete", "passed": passed.count, "cases": passed]
@@ -580,9 +679,16 @@ private enum VideoSizePhasePolicy {
     static func shouldContinueSteadyPlay(
         expectationsComplete: Bool,
         elapsedSeconds: Double,
-        requestedDuration: Double
+        requestedDuration: Double,
+        minimumSteadyPlaySeconds: Double = 0
     ) -> Bool {
-        !expectationsComplete && elapsedSeconds < requestedDuration - controlReserveSeconds
+        let steadyEnd = min(
+            requestedDuration - controlReserveSeconds,
+            max(
+                expectationsComplete ? 0 : requestedDuration - controlReserveSeconds,
+                minimumSteadyPlaySeconds
+            ))
+        return elapsedSeconds < steadyEnd
     }
 
     static func runSelfTest() throws -> [String] {
@@ -601,11 +707,23 @@ private enum VideoSizePhasePolicy {
                 expectationsComplete: false,
                 elapsedSeconds: 70,
                 requestedDuration: 90
+            ),
+            shouldContinueSteadyPlay(
+                expectationsComplete: true,
+                elapsedSeconds: 50,
+                requestedDuration: 90,
+                minimumSteadyPlaySeconds: 60
+            ),
+            !shouldContinueSteadyPlay(
+                expectationsComplete: true,
+                elapsedSeconds: 60,
+                requestedDuration: 90,
+                minimumSteadyPlaySeconds: 60
             )
         else {
             throw ProbeFailure(phase: "self_test", domain: "VideoSizePhasePolicy", code: 1)
         }
-        return ["steady_play_ends_on_complete_rungs_or_control_reserve_deadline"]
+        return ["minimum_steady_play_preserves_control_reserve_and_completion_floor"]
     }
 }
 
@@ -1079,6 +1197,8 @@ private final class PlaybackProbe {
     private var audioTrackEvidenceSource = "not_inspected"
     private var audioEvidenceLookupError: [String: Any]?
     private var finalPlayerState: [String: Any]?
+    private var recoveryObservation: [String: Any]?
+    private var steadyPlayEndObservation: [String: Any]?
     private var finalPlayerErrorLog: [[String: Any]] = []
     private var finalPlayerErrorLogTruncated = false
     private var endedEarly = false
@@ -1161,6 +1281,7 @@ private final class PlaybackProbe {
         try startPlayback(avPlayer, phase: "play")
         if options.controlsAfterVideoSizeExpectations {
             try await steadyPlayUntilVideoSizeExpectations(playbackStart: playbackStart)
+            steadyPlayEndObservation = try playerObservation()
         } else {
             try await activePhase("play", seconds: min(8, options.duration * 0.2))
         }
@@ -1338,12 +1459,14 @@ private final class PlaybackProbe {
             expectationsComplete: videoSizeExpectations.isComplete,
             elapsedSeconds: TimeInterval(DispatchTime.now().uptimeNanoseconds - playbackStart)
                 / 1_000_000_000,
-            requestedDuration: options.duration
+            requestedDuration: options.duration,
+            minimumSteadyPlaySeconds: options.minimumSteadyPlaySeconds ?? 0
         ) {
             try checkDeadline(phase: "play")
             if endedEarly {
                 throw ProbeFailure(phase: "play", domain: "ProbePlayback", code: 1)
             }
+            try observeRecoveryTriggerIfReady()
             try sampleFrame(phase: "play")
             try await Task.sleep(for: .milliseconds(33))
         }
@@ -1582,6 +1705,8 @@ private final class PlaybackProbe {
             ],
             "steps": steps,
             "final_player_state": finalPlayerState as Any? ?? NSNull(),
+            "recovery_observation": recoveryObservation as Any? ?? NSNull(),
+            "steady_play_end_observation": steadyPlayEndObservation as Any? ?? NSNull(),
             "final_player_error_log": [
                 "events": finalPlayerErrorLog,
                 "truncated": finalPlayerErrorLogTruncated,
@@ -1595,7 +1720,28 @@ private final class PlaybackProbe {
 
     private func captureFinalPlayerState() {
         captureFinalPlayerErrorLog()
-        guard let player else { return }
+        finalPlayerState = playerStateSnapshot()
+    }
+
+    private func observeRecoveryTriggerIfReady() throws {
+        guard recoveryObservation == nil, let path = options.recoveryObservationTriggerPath,
+            RecoveryObservationTrigger.isFreshEmptyRegularFile(at: path)
+        else {
+            return
+        }
+        recoveryObservation = try playerObservation()
+    }
+
+    private func playerObservation() throws -> [String: Any]? {
+        guard let snapshot = playerStateSnapshot() else { return nil }
+        return [
+            "observed_monotonic_seconds": try monotonicClockSeconds(),
+            "player_state": snapshot,
+        ]
+    }
+
+    private func playerStateSnapshot() -> [String: Any]? {
+        guard let player else { return nil }
 
         let itemStatus: String
         switch item?.status {
@@ -1643,7 +1789,7 @@ private final class PlaybackProbe {
         let loadedTimeRanges = item.map {
             LoadedTimeRangeDiagnostics.snapshot($0.loadedTimeRanges.map(\.timeRangeValue))
         }
-        finalPlayerState = [
+        return [
             "automatically_waits_to_minimize_stalling": player.automaticallyWaitsToMinimizeStalling,
             "item_status": itemStatus,
             "time_control_status": timeControlStatus,

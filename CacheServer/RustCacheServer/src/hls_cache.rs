@@ -49,7 +49,10 @@ use crate::{
         SessionPublicationMode,
     },
     library::{OpenedMediaFile, open_read_no_follow},
-    mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
+    mp4_segments::{
+        Mp4SegmentRange, hls_peak_bandwidth_for_ranges, hls_target_duration_for_ranges,
+        mp4_fragment_ranges,
+    },
     playback_policy::PlaybackPolicy,
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
@@ -1800,17 +1803,20 @@ impl HlsCacheStore {
                 "LAN transcoding output MP4 initialization range was invalid".to_owned(),
             ));
         }
-        let segments = hls_segments_from_mp4_ranges(
-            mp4_fragment_ranges(&temp_path, initialization_length, total_length)
-                .unwrap_or_default(),
-        );
+        let ranges = mp4_fragment_ranges(&temp_path, initialization_length, total_length)
+            .unwrap_or_default();
+        let measured_bandwidth = hls_target_duration_for_ranges(&ranges)
+            .and_then(|target| hls_peak_bandwidth_for_ranges(&ranges, target))
+            .filter(|bandwidth| *bandwidth > 0);
+        let segments = hls_segments_from_mp4_ranges(ranges);
         if let Err(error) = self.reject_cache_path_symlink(&output_path) {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(error.into());
         }
         tokio::fs::rename(&temp_path, &output_path).await?;
 
-        let completed_session = transcoded_completed_session(session, total_length);
+        let completed_session =
+            transcoded_completed_session_with_bandwidth(session, total_length, measured_bandwidth);
         let metadata = PersistedHlsCachedResource {
             schema_version: HLS_CACHE_SCHEMA_VERSION,
             id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
@@ -7672,9 +7678,18 @@ fn hls_cache_error_from_transcoding(error: LanTranscodingError) -> HlsCacheError
     }
 }
 
+#[cfg(test)]
 fn transcoded_completed_session(
     session: &HlsPlaybackSession,
     output_size: u64,
+) -> HlsPlaybackSession {
+    transcoded_completed_session_with_bandwidth(session, output_size, None)
+}
+
+fn transcoded_completed_session_with_bandwidth(
+    session: &HlsPlaybackSession,
+    output_size: u64,
+    measured_bandwidth: Option<u64>,
 ) -> HlsPlaybackSession {
     let mut completed = session.clone();
     let mut hidden_lookup_variants = vec![session.variant.clone()];
@@ -7685,7 +7700,9 @@ fn transcoded_completed_session(
     let source_video = &session.variant.video.request;
     let (width, height) = transcoded_dimensions(session.variant.width, session.variant.height);
     let frame_rate = transcoded_frame_rate(source_video.frame_rate.as_deref());
-    let bandwidth = transcoded_bandwidth(had_audio);
+    let bandwidth = measured_bandwidth
+        .filter(|bandwidth| *bandwidth > 0)
+        .unwrap_or_else(|| transcoded_bandwidth(had_audio));
     let resource = HlsMediaResource {
         id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
         request: BilibiliMediaRequest {
@@ -13484,11 +13501,16 @@ mod tests {
     async fn caches_transcoded_session_and_restores_generated_manifest() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
+        std::fs::write(
+            temp.path().join("transcoded-output.mp4"),
+            multi_fragment_fake_mp4(),
+        )
+        .expect("fragmented transcode output should be written");
         let store = temp_store(&temp);
         let session = sample_transcoding_ready_session("session-transcoded", &upstream_url);
         let active_job_count = Arc::new(AtomicUsize::new(0));
         let config = HlsTranscodingExecutionConfig {
-            ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+            ffmpeg_path: write_fixed_output_fake_ffmpeg(temp.path()),
             permits: Arc::new(Semaphore::new(1)),
             active_job_count: Arc::clone(&active_job_count),
         };
@@ -13515,6 +13537,17 @@ mod tests {
             .expect("completed transcoded session should restore after restart");
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log"))
             .expect("fake ffmpeg args should be logged");
+        let published_ranges = cached
+            .segments
+            .iter()
+            .map(|segment| Mp4SegmentRange {
+                offset: segment.byte_range_offset,
+                length: segment.byte_range_length,
+                duration_millis: segment.duration_millis,
+            })
+            .collect::<Vec<_>>();
+        let measured_bandwidth = hls_target_duration_for_ranges(&published_ranges)
+            .and_then(|target| hls_peak_bandwidth_for_ranges(&published_ranges, target));
 
         assert_eq!(0, active_job_count.load(Ordering::SeqCst));
         assert_eq!(
@@ -13522,6 +13555,38 @@ mod tests {
             completion.session.variant.video.id
         );
         assert_eq!(HLS_TRANSCODED_RESOURCE_ID, reloaded.variant.video.id);
+        assert_eq!(
+            measured_bandwidth,
+            Some(completion.session.variant.bandwidth)
+        );
+        assert_eq!(
+            completion.session.variant.bandwidth,
+            completion.session.variant.video.request.bandwidth.unwrap()
+        );
+        assert_eq!(
+            Some(completion.session.variant.bandwidth),
+            completion.session.variants[0].bandwidth
+        );
+        assert_eq!(
+            Some(completion.session.variant.bandwidth),
+            completion.session.variants[0].media[0].bandwidth
+        );
+        assert_eq!(
+            completion.session.variant.bandwidth,
+            reloaded.variant.bandwidth
+        );
+        assert_eq!(
+            completion.session.variant.video.request.bandwidth,
+            reloaded.variant.video.request.bandwidth
+        );
+        assert_eq!(
+            completion.session.variants[0].bandwidth,
+            reloaded.variants[0].bandwidth
+        );
+        assert_eq!(
+            completion.session.variants[0].media[0].bandwidth,
+            reloaded.variants[0].media[0].bandwidth
+        );
         assert!(completion.session.variant.audio.is_none());
         assert_eq!(
             HlsTranscodingPlanState::NotRequired,
@@ -13529,8 +13594,11 @@ mod tests {
         );
         assert_eq!(HLS_TRANSCODED_VIDEO_CODEC, item.variants[0].video_codec);
         assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
-        assert_eq!(fake_mp4().len() as u64, cached.total_length);
-        assert_eq!(28, cached.initialization_length);
+        assert_eq!(multi_fragment_fake_mp4().len() as u64, cached.total_length);
+        assert_eq!(
+            multi_fragment_fake_mp4_initialization_length(),
+            cached.initialization_length
+        );
         assert!(
             store
                 .resource_path("session-transcoded", "video.m4s")
@@ -13620,6 +13688,51 @@ mod tests {
         assert_eq!(
             Some("60".to_owned()),
             completed_session.variants[0].frame_rate
+        );
+    }
+
+    #[test]
+    fn transcoded_completed_session_uses_measured_peak_without_clamping() {
+        let source_session =
+            sample_transcoding_ready_session("session-transcoded-measured", "https://example.test");
+        let cache_key = transcoded_cache_key(
+            &source_session,
+            &transcoded_codecs(source_session.variant.audio.is_some()),
+        );
+        let planning_cap = transcoded_bandwidth(source_session.variant.audio.is_some());
+        let measured_bandwidth = planning_cap + 123_456;
+
+        let completed = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            Some(measured_bandwidth),
+        );
+        let fallback_none = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            None,
+        );
+        let fallback_zero = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            Some(0),
+        );
+
+        assert_eq!(measured_bandwidth, completed.variant.bandwidth);
+        assert_eq!(
+            Some(measured_bandwidth),
+            completed.variant.video.request.bandwidth
+        );
+        assert_eq!(Some(measured_bandwidth), completed.variants[0].bandwidth);
+        assert_eq!(
+            Some(measured_bandwidth),
+            completed.variants[0].media[0].bandwidth
+        );
+        assert_eq!(cache_key, completed.variant.video.request.cache_key);
+        assert_eq!(planning_cap, fallback_none.variant.bandwidth);
+        assert_eq!(
+            fallback_none.variant.bandwidth,
+            fallback_zero.variant.bandwidth
         );
     }
 
@@ -16867,7 +16980,10 @@ mod tests {
         bytes.extend(mp4_box(*b"ftyp", b"isom"));
         bytes.extend(mp4_box(
             *b"moov",
-            &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+            &mp4_box(
+                *b"trak",
+                &[tkhd_box(1), mp4_box(*b"mdia", &mdhd_box(1_000))].concat(),
+            ),
         ));
         bytes.extend(moof_box(1_000));
         bytes.extend(mp4_box(*b"mdat", b"first-media"));
@@ -16899,9 +17015,19 @@ mod tests {
         (mp4_box(*b"ftyp", b"isom").len()
             + mp4_box(
                 *b"moov",
-                &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+                &mp4_box(
+                    *b"trak",
+                    &[tkhd_box(1), mp4_box(*b"mdia", &mdhd_box(1_000))].concat(),
+                ),
             )
             .len()) as u64
+    }
+
+    fn tkhd_box(track_id: u32) -> Vec<u8> {
+        let mut payload = vec![0; 12];
+        payload.extend(track_id.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        mp4_box(*b"tkhd", &payload)
     }
 
     fn mdhd_box(timescale: u32) -> Vec<u8> {
@@ -17008,26 +17134,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_copying_fake_ffmpeg(dir: &Path) -> PathBuf {
+    fn write_fixed_output_fake_ffmpeg(dir: &Path) -> PathBuf {
         write_executable(
-            dir.join("fake-ffmpeg-copy"),
+            dir.join("fake-ffmpeg-fixed-output"),
             r#"#!/bin/sh
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 args_log="$script_dir/ffmpeg-args.log"
 : > "$args_log"
 last=
-input=
-previous=
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args_log"
-  if [ "$previous" = "-i" ] && [ -z "$input" ]; then
-    input=$arg
-  fi
   last=$arg
-  previous=$arg
 done
-cp "$input" "$last"
+cp "$script_dir/transcoded-output.mp4" "$last"
 "#,
         )
     }

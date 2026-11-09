@@ -53,8 +53,10 @@ use crate::{
     hls::{HlsPlaybackSession, mp4_initialization_length},
     hls_cache::{HlsCacheFillControl, HlsCacheStore, HlsTranscodingExecutionConfig},
     mp4_segments::{
-        MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, mp4_fragment_ranges, mp4_sidx_index,
-        mp4_sidx_segment_ranges,
+        MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange,
+        hls_peak_bandwidth_for_ranges as peak_bandwidth_bits_per_second,
+        hls_target_duration_for_ranges as fixture_target_duration_seconds, mp4_fragment_ranges,
+        mp4_sidx_index, mp4_sidx_segment_ranges,
     },
     playback_policy::{PlaybackPolicy, TranscodingPreference, WeakNetworkPreference},
     transcoding::HlsTranscodingPlan,
@@ -62,6 +64,10 @@ use crate::{
 
 const ABR_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_adaptation_and_recovery";
+const EXTENDED_DIAGNOSTIC_CASE_FULL_NAME: &str =
+    "media_acceptance_tests::native_diagnostic_extended_adaptation_and_recovery";
+const BUFFERED_CASE_FULL_NAME: &str =
+    "media_acceptance_tests::native_progressive_buffered_fallback_keeps_playing";
 const TRANSCODE_CASE_FULL_NAME: &str = "media_acceptance_tests::native_transcoded_output_decodes";
 const MAX_REPORT_BYTES: usize = 32 * 1024;
 const MAX_PROBE_JSON_BYTES: usize = 16 * 1024;
@@ -71,14 +77,25 @@ const MAX_SOURCE_FIXTURE_BYTES: u64 = 60 * 1024 * 1024;
 const MAX_SINGLE_HIGH_FIXTURE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_SINGLE_LOW_FIXTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SINGLE_AUDIO_FIXTURE_BYTES: u64 = 4 * 1024 * 1024;
-const ABR_MEDIA_DURATION_SECONDS: u32 = 160;
+const MAX_LONG_SOURCE_FIXTURE_BYTES: u64 = 1280 * 1024 * 1024;
+const MAX_LONG_HIGH_FIXTURE_BYTES: u64 = 960 * 1024 * 1024;
+const MAX_LONG_LOW_FIXTURE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LONG_AUDIO_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
+const BUFFERED_MEDIA_DURATION_SECONDS: u32 = 160;
+const LONG_RECOVERY_MEDIA_DURATION_SECONDS: u32 = 3600;
 const TRANSCODE_MEDIA_DURATION_SECONDS: u32 = 45;
 const ABR_PROBE_DURATION_SECONDS: u64 = 130;
 const ABR_PROBE_DEADLINE_SECONDS: u64 = 175;
+const LONG_RECOVERY_PROBE_DURATION_SECONDS: u64 = 600;
+const LONG_RECOVERY_PROBE_DEADLINE_SECONDS: u64 = 720;
+const MINIMUM_STEADY_PLAY_SECONDS: u64 = 110;
 const TRANSCODE_PROBE_DURATION_SECONDS: u64 = 30;
 const ABR_CASE_TIMEOUT: Duration = Duration::from_secs(225);
+const LONG_RECOVERY_CASE_TIMEOUT: Duration = Duration::from_secs(840);
 const TRANSCODE_CASE_TIMEOUT: Duration = Duration::from_secs(225);
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(100);
+const LONG_RECOVERY_FFMPEG_TIMEOUT: Duration = Duration::from_secs(120);
+const LONG_RECOVERY_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const DECODER_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const BASELINE_WINDOW: Duration = Duration::from_secs(6);
 const BAD_HIGH_WINDOW: Duration = Duration::from_secs(45);
@@ -94,29 +111,92 @@ const H264_BASELINE_LEVEL_3_CODEC: &str = "avc1.42c01e";
 
 #[derive(Clone, Copy)]
 enum NativeCase {
+    BufferedContinuity,
     ProgressiveAbr,
+    ExtendedDiagnostic,
     Transcoding,
 }
 
 impl NativeCase {
     fn full_name(self) -> &'static str {
         match self {
+            Self::BufferedContinuity => BUFFERED_CASE_FULL_NAME,
             Self::ProgressiveAbr => ABR_CASE_FULL_NAME,
+            Self::ExtendedDiagnostic => EXTENDED_DIAGNOSTIC_CASE_FULL_NAME,
             Self::Transcoding => TRANSCODE_CASE_FULL_NAME,
         }
     }
 
     fn report_name(self) -> &'static str {
         match self {
+            Self::BufferedContinuity => "buffered.json",
             Self::ProgressiveAbr => "abr.json",
+            Self::ExtendedDiagnostic => "abr-extended-diagnostic.json",
             Self::Transcoding => "transcoding.json",
         }
     }
 
     fn deadline(self) -> Duration {
         match self {
-            Self::ProgressiveAbr => ABR_CASE_TIMEOUT,
+            Self::BufferedContinuity => ABR_CASE_TIMEOUT,
+            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_CASE_TIMEOUT,
             Self::Transcoding => TRANSCODE_CASE_TIMEOUT,
+        }
+    }
+
+    fn scenario(self) -> &'static str {
+        match self {
+            Self::BufferedContinuity => "buffered_continuity",
+            Self::ProgressiveAbr => "unbuffered_recovery",
+            Self::ExtendedDiagnostic => "extended_recovery_diagnostic",
+            Self::Transcoding => "transcoded_output",
+        }
+    }
+
+    fn source_duration_seconds(self) -> u32 {
+        match self {
+            Self::BufferedContinuity => BUFFERED_MEDIA_DURATION_SECONDS,
+            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_MEDIA_DURATION_SECONDS,
+            Self::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
+        }
+    }
+
+    fn uses_long_profile(self) -> bool {
+        matches!(self, Self::ProgressiveAbr | Self::ExtendedDiagnostic)
+    }
+
+    fn uses_progressive_abr(self) -> bool {
+        matches!(
+            self,
+            Self::BufferedContinuity | Self::ProgressiveAbr | Self::ExtendedDiagnostic
+        )
+    }
+
+    fn probe_duration_seconds(self) -> u64 {
+        match self {
+            Self::BufferedContinuity => ABR_PROBE_DURATION_SECONDS,
+            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_PROBE_DURATION_SECONDS,
+            Self::Transcoding => TRANSCODE_PROBE_DURATION_SECONDS,
+        }
+    }
+
+    fn probe_deadline_seconds(self) -> u64 {
+        match self {
+            Self::BufferedContinuity => ABR_PROBE_DEADLINE_SECONDS,
+            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_PROBE_DEADLINE_SECONDS,
+            Self::Transcoding => self.probe_duration_seconds() + 15,
+        }
+    }
+
+    fn is_diagnostic(self) -> bool {
+        matches!(self, Self::ExtendedDiagnostic)
+    }
+
+    fn cache_limit_bytes(self) -> u64 {
+        if self.uses_long_profile() {
+            2 * 1024 * 1024 * 1024
+        } else {
+            MAX_FIXTURE_BYTES
         }
     }
 }
@@ -126,6 +206,9 @@ struct AcceptanceReport {
     schema_version: u32,
     status: String,
     case_full_name: String,
+    scenario: String,
+    source_duration_seconds: u32,
+    diagnostic_only: bool,
     probe: Option<Value>,
     fixture_media: Vec<FixtureRecord>,
     hls_playlist_preflight: Option<HlsPlaylistPreflight>,
@@ -143,6 +226,9 @@ impl AcceptanceReport {
             schema_version: 1,
             status: "failed".to_owned(),
             case_full_name: case.full_name().to_owned(),
+            scenario: case.scenario().to_owned(),
+            source_duration_seconds: case.source_duration_seconds(),
+            diagnostic_only: case.is_diagnostic(),
             probe: None,
             fixture_media: Vec::new(),
             hls_playlist_preflight: None,
@@ -165,7 +251,10 @@ struct RequestSummary {
     successful_by_representation: [u64; 3],
     media_payload_by_phase_and_representation: [[u64; 3]; 3],
     count_by_phase_and_representation: [[u64; 3]; 3],
+    // Request-start observation at origin accounting, not response delivery completion.
+    last_request_elapsed_ms_by_phase_and_representation: [[Option<u64>; 3]; 3],
     high_fault_status_count: u64,
+    first_recovery_high_range_request: Option<RecoveryHighRangeRequest>,
     events: Vec<RequestEvent>,
 }
 
@@ -179,9 +268,20 @@ struct RequestEvent {
     status_code: u16,
 }
 
+#[derive(Clone, Serialize)]
+struct RecoveryHighRangeRequest {
+    elapsed_ms: u64,
+    monotonic_seconds: Option<f64>,
+    range_start: u64,
+    range_length: u64,
+    status_code: u16,
+}
+
 #[derive(Clone, Default, Serialize)]
 struct LanIngressSummary {
     count_by_phase_and_representation: [[u64; 3]; 3],
+    // Observed when the LAN response headers are available, not at request start or body completion.
+    last_header_elapsed_ms_by_phase_and_representation: [[Option<u64>; 3]; 3],
     segment_query_present_by_phase_and_representation: [[u64; 3]; 3],
     header_samples: Vec<LanIngressHeaderSample>,
 }
@@ -257,7 +357,9 @@ struct FixtureRecord {
     initialization_bytes: u64,
     fragment_count: u64,
     fragment_duration_ms: u64,
+    target_duration_seconds: u64,
     peak_bandwidth_bits_per_second: u64,
+    legacy_single_fragment_peak_bandwidth_bits_per_second: u64,
     global_sidx_present: bool,
     progressive_index_count: Option<u64>,
     video_codec_code: u8,
@@ -268,6 +370,7 @@ struct FixtureRecord {
 
 #[derive(Clone, Serialize)]
 struct HlsPlaylistPreflight {
+    bandwidth_semantics: &'static str,
     high_video_fragment_count: u64,
     high_video_target_duration_seconds: u64,
     audio_fragment_count: u64,
@@ -285,6 +388,9 @@ struct TranscodingMetadata {
     output_initialization_bytes: u64,
     output_fragment_count: u64,
     output_fragment_duration_ms: u64,
+    output_peak_bandwidth_bits_per_second: u64,
+    output_target_duration_seconds: u64,
+    published_variant_bandwidth_bits_per_second: u64,
     output_global_sidx_present: bool,
     output_width: u32,
     output_height: u32,
@@ -302,6 +408,28 @@ struct MediaFixture {
 struct InspectedMedia {
     path: PathBuf,
     record: FixtureRecord,
+}
+
+struct FixtureExpectation {
+    representation_code: u8,
+    dimensions: Option<(u32, u32)>,
+    video_codec_code: u8,
+    audio_codec_code: u8,
+    video_profile: Option<(&'static str, i32)>,
+}
+
+struct PlaylistExpectations {
+    video_fragments: u64,
+    audio_fragments: u64,
+    video_peak_bandwidth: u64,
+    audio_peak_bandwidth: u64,
+    video_target_duration: u64,
+    audio_target_duration: u64,
+}
+
+struct ProbeMarkerPaths {
+    ready: Option<PathBuf>,
+    recovery_observation: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +567,8 @@ impl LanIngressTelemetry {
         ingress.count_by_phase_and_representation[phase_index][representation_index] = ingress
             .count_by_phase_and_representation[phase_index][representation_index]
             .saturating_add(1);
+        ingress.last_header_elapsed_ms_by_phase_and_representation[phase_index]
+            [representation_index] = Some(elapsed_ms);
         if segment_query_present {
             ingress.segment_query_present_by_phase_and_representation[phase_index]
                 [representation_index] = ingress.segment_query_present_by_phase_and_representation
@@ -687,6 +817,18 @@ async fn native_progressive_adaptation_and_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic only; requires an explicitly selected macOS AVPlayer probe and local FFmpeg tools"]
+async fn native_diagnostic_extended_adaptation_and_recovery() {
+    run_native_case(NativeCase::ExtendedDiagnostic).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an explicitly selected macOS AVPlayer probe and local FFmpeg tools"]
+async fn native_progressive_buffered_fallback_keeps_playing() {
+    run_native_case(NativeCase::BufferedContinuity).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an explicitly selected macOS AVPlayer probe and local FFmpeg tools"]
 async fn native_transcoded_output_decodes() {
     run_native_case(NativeCase::Transcoding).await;
@@ -753,10 +895,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         .map_err(|_| "temporary acceptance directory could not be canonicalized".to_owned())?;
     let directories = create_case_directories(&temporary_root).await?;
 
-    let fixture_duration = match case {
-        NativeCase::ProgressiveAbr => ABR_MEDIA_DURATION_SECONDS,
-        NativeCase::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
-    };
+    let fixture_duration = case.source_duration_seconds();
     let fixture = generate_and_inspect_fixture(
         case,
         &ffmpeg,
@@ -766,7 +905,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         &report,
     )
     .await?;
-    enforce_fixture_budget(&fixture)?;
+    enforce_fixture_budget(case, &fixture)?;
 
     let origin_listener = bind_loopback_listener().await?;
     let origin_address = origin_listener
@@ -790,6 +929,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         media_address,
         &ffmpeg,
         matches!(case, NativeCase::Transcoding),
+        case.cache_limit_bytes(),
     )?;
     state.hls_upstream_client = local_only_http_client()?;
 
@@ -819,6 +959,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     .map_err(|_| "production HLS playback session construction failed".to_owned())?;
     let mut playlist_video_fragments = fixture.high_video.record.fragment_count;
     let mut playlist_video_peak = fixture.high_video.record.peak_bandwidth_bits_per_second;
+    let mut playlist_video_target_duration = fixture.high_video.record.target_duration_seconds;
     if matches!(case, NativeCase::Transcoding) {
         session.transcoding =
             HlsTranscodingPlan::for_variant_with_policy(&state.options, selected, policy);
@@ -859,8 +1000,16 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
             .hls_cache
             .cached_resource(&task_id, &completion.session.variant.video.id)
             .ok_or_else(|| "production transcode output was not durably cached".to_owned())?;
-        let output = inspect_mp4(&cached.path, 1, ffprobe.as_path(), false).await?;
-        let probe_metadata = ffprobe_media(&ffprobe, &cached.path).await?;
+        let output = inspect_mp4(
+            &cached.path,
+            1,
+            ffprobe.as_path(),
+            false,
+            MAX_FIXTURE_BYTES,
+            Duration::from_secs(15),
+        )
+        .await?;
+        let probe_metadata = ffprobe_media(&ffprobe, &cached.path, Duration::from_secs(15)).await?;
         let output_streams = probe_metadata.streams;
         let video = output_streams
             .iter()
@@ -888,6 +1037,8 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         }
         playlist_video_fragments = output.record.fragment_count;
         playlist_video_peak = output.record.peak_bandwidth_bits_per_second;
+        playlist_video_target_duration = output.record.target_duration_seconds;
+        let published_variant_bandwidth = completion.session.variant.bandwidth;
         if let Ok(mut data) = report.lock() {
             data.transcoding_metadata = Some(TranscodingMetadata {
                 executed: true,
@@ -895,6 +1046,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
                 output_initialization_bytes: output.record.initialization_bytes,
                 output_fragment_count: output.record.fragment_count,
                 output_fragment_duration_ms: output.record.fragment_duration_ms,
+                output_peak_bandwidth_bits_per_second: output.record.peak_bandwidth_bits_per_second,
+                output_target_duration_seconds: output.record.target_duration_seconds,
+                published_variant_bandwidth_bits_per_second: published_variant_bandwidth,
                 output_global_sidx_present: output.record.global_sidx_present,
                 output_width: video.width.unwrap_or_default(),
                 output_height: video.height.unwrap_or_default(),
@@ -925,10 +1079,15 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         &local_client,
         &master_url,
         case,
-        playlist_video_fragments,
-        fixture.audio.record.fragment_count,
-        playlist_video_peak,
-        fixture.audio.record.peak_bandwidth_bits_per_second,
+        PlaylistExpectations {
+            video_fragments: playlist_video_fragments,
+            audio_fragments: fixture.audio.record.fragment_count,
+            video_peak_bandwidth: playlist_video_peak,
+            audio_peak_bandwidth: fixture.audio.record.peak_bandwidth_bits_per_second,
+            video_target_duration: playlist_video_target_duration,
+            audio_target_duration: fixture.audio.record.target_duration_seconds,
+        },
+        case.uses_long_profile(),
     )
     .await?;
     if let Ok(mut data) = report.lock() {
@@ -936,7 +1095,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     }
 
     origin.reset_probe_epoch();
-    if matches!(case, NativeCase::ProgressiveAbr)
+    if case.uses_progressive_abr()
         && let Ok(mut data) = report.lock()
     {
         data.fault_timeline = FaultTimeline {
@@ -946,19 +1105,14 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         };
     }
 
-    let probe_duration = match case {
-        NativeCase::ProgressiveAbr => ABR_PROBE_DURATION_SECONDS,
-        NativeCase::Transcoding => TRANSCODE_PROBE_DURATION_SECONDS,
-    };
-    let probe_deadline = match case {
-        NativeCase::ProgressiveAbr => ABR_PROBE_DEADLINE_SECONDS,
-        NativeCase::Transcoding => probe_duration + 15,
-    };
+    let probe_duration = case.probe_duration_seconds();
+    let probe_deadline = case.probe_deadline_seconds();
     let expected_sizes = match case {
-        NativeCase::ProgressiveAbr => "640x360,320x180,640x360",
+        NativeCase::BufferedContinuity => "640x360,320x180",
+        NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => "640x360,320x180,640x360",
         NativeCase::Transcoding => "640x360",
     };
-    let ready_marker_path = if matches!(case, NativeCase::ProgressiveAbr) {
+    let ready_marker_path = if case.uses_progressive_abr() {
         let path = temporary_root.join("decoder-ready.json");
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
@@ -976,16 +1130,25 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     } else {
         None
     };
+    let recovery_marker_path = case
+        .uses_progressive_abr()
+        .then(|| temporary_root.join("recovery-observation.trigger"));
+    let minimum_steady_play_seconds =
+        matches!(case, NativeCase::BufferedContinuity).then_some(MINIMUM_STEADY_PLAY_SECONDS);
     let mut probe = AbortTask(Some(tokio::spawn(run_native_probe(
         probe_path,
         master_url,
         probe_duration,
         probe_deadline,
         expected_sizes.to_owned(),
-        ready_marker_path.clone(),
+        ProbeMarkerPaths {
+            ready: ready_marker_path.clone(),
+            recovery_observation: recovery_marker_path.clone(),
+        },
+        minimum_steady_play_seconds,
     ))));
 
-    if matches!(case, NativeCase::ProgressiveAbr) {
+    if case.uses_progressive_abr() {
         let timeline = run_abr_fault_timeline(
             &origin,
             &mut probe,
@@ -993,6 +1156,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
                 .as_deref()
                 .expect("ABR marker path is present"),
             &report,
+            recovery_marker_path
+                .as_deref()
+                .expect("recovery observation marker path is present"),
         )
         .await;
         if let Err(error) = timeline {
@@ -1012,9 +1178,10 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     };
     let probe_value = parse_probe_result(process?, &report)?;
     validate_probe_result(case, probe_duration, &probe_value, &report)?;
-    if matches!(case, NativeCase::ProgressiveAbr) {
-        validate_abr_request_trace(&report)?;
+    if case.uses_progressive_abr() {
+        validate_abr_request_trace(&report, case)?;
         validate_abr_sample_timeline(&probe_value, &report)?;
+        validate_recovery_observations(case, &probe_value, &report)?;
     }
 
     media_task.stop().await;
@@ -1058,6 +1225,7 @@ fn create_app_state(
     media_address: SocketAddr,
     ffmpeg: &Path,
     transcoding_enabled: bool,
+    cache_limit_bytes: u64,
 ) -> Result<AppState, String> {
     let credentials_path = directories.credentials.join("credentials.json");
     let options = CacheServerOptions {
@@ -1073,7 +1241,7 @@ fn create_app_state(
         allow_bilibili_login_sessions: false,
         bbdown_credential_path: Some(credentials_path),
         bbdown_credential_profile: None,
-        hls_cache_max_bytes: MAX_FIXTURE_BYTES,
+        hls_cache_max_bytes: cache_limit_bytes,
         bbdown_cdn_probe: false,
         bbdown_cdn_parallelism: 1,
         ..CacheServerOptions::default()
@@ -1145,18 +1313,16 @@ fn create_source_variants(
     let high_url = origin_url(origin_address, "high.mp4")?;
     let audio_url = origin_url(origin_address, "audio.mp4")?;
     let abr_group_id = "native-acceptance-video-levels";
-    let duration = match case {
-        NativeCase::ProgressiveAbr => ABR_MEDIA_DURATION_SECONDS,
-        NativeCase::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
-    };
+    let duration = case.source_duration_seconds();
     let high_video_bandwidth = fixture.high_video.record.peak_bandwidth_bits_per_second;
     let high = make_variant(VariantSpec {
         id: "high",
         width: 640,
         height: 360,
-        bandwidth: aggregate_peak_bandwidth(
+        bandwidth: expected_variant_peak_bandwidth(
             high_video_bandwidth,
             fixture.audio.record.peak_bandwidth_bits_per_second,
+            false,
         )?,
         request_bandwidth: 2_000_000,
         duration,
@@ -1167,12 +1333,14 @@ fn create_source_variants(
         } else {
             H264_BASELINE_LEVEL_3_CODEC
         },
-        level: matches!(case, NativeCase::ProgressiveAbr).then(|| BilibiliPlaybackAbrLevel {
-            group_id: abr_group_id.to_owned(),
-            level_index: 1,
-            level_count: 2,
-            switchable: true,
-        }),
+        level: case
+            .uses_progressive_abr()
+            .then(|| BilibiliPlaybackAbrLevel {
+                group_id: abr_group_id.to_owned(),
+                level_index: 1,
+                level_count: 2,
+                switchable: true,
+            }),
     });
     let Some(low_media) = fixture.low_video.as_ref() else {
         return Ok(vec![high]);
@@ -1183,9 +1351,10 @@ fn create_source_variants(
         id: "low",
         width: 320,
         height: 180,
-        bandwidth: aggregate_peak_bandwidth(
+        bandwidth: expected_variant_peak_bandwidth(
             low_video_bandwidth,
             fixture.audio.record.peak_bandwidth_bits_per_second,
+            false,
         )?,
         request_bandwidth: 500_000,
         duration,
@@ -1208,7 +1377,9 @@ fn make_abr_metadata(
     fixture: &MediaFixture,
 ) -> Result<BilibiliPlaybackAbrMetadata, String> {
     match case {
-        NativeCase::ProgressiveAbr => {
+        NativeCase::BufferedContinuity
+        | NativeCase::ProgressiveAbr
+        | NativeCase::ExtendedDiagnostic => {
             let audio_peak = fixture.audio.record.peak_bandwidth_bits_per_second;
             let low_peak = aggregate_peak_bandwidth(
                 fixture
@@ -1359,8 +1530,23 @@ async fn generate_and_inspect_fixture(
         audio_input,
     ];
 
+    let (high_limit, low_limit, audio_limit) = if case.uses_long_profile() {
+        (
+            MAX_LONG_HIGH_FIXTURE_BYTES,
+            MAX_LONG_LOW_FIXTURE_BYTES,
+            MAX_LONG_AUDIO_FIXTURE_BYTES,
+        )
+    } else {
+        (
+            MAX_SINGLE_HIGH_FIXTURE_BYTES,
+            MAX_SINGLE_LOW_FIXTURE_BYTES,
+            MAX_SINGLE_AUDIO_FIXTURE_BYTES,
+        )
+    };
     match case {
-        NativeCase::ProgressiveAbr => {
+        NativeCase::BufferedContinuity
+        | NativeCase::ProgressiveAbr
+        | NativeCase::ExtendedDiagnostic => {
             push_video_output(
                 &mut arguments,
                 "high.mp4",
@@ -1368,7 +1554,7 @@ async fn generate_and_inspect_fixture(
                 duration,
                 "libx264",
                 "2000k",
-                MAX_SINGLE_HIGH_FIXTURE_BYTES,
+                high_limit,
             );
             push_video_output(
                 &mut arguments,
@@ -1377,7 +1563,7 @@ async fn generate_and_inspect_fixture(
                 duration,
                 "libx264",
                 "500k",
-                MAX_SINGLE_LOW_FIXTURE_BYTES,
+                low_limit,
             );
         }
         NativeCase::Transcoding => {
@@ -1388,18 +1574,22 @@ async fn generate_and_inspect_fixture(
                 duration,
                 "mpeg4",
                 "1200k",
-                MAX_SINGLE_HIGH_FIXTURE_BYTES,
+                high_limit,
             );
         }
     }
-    push_audio_output(
-        &mut arguments,
-        "audio.mp4",
-        duration,
-        MAX_SINGLE_AUDIO_FIXTURE_BYTES,
-    );
+    push_audio_output(&mut arguments, "audio.mp4", duration, audio_limit);
     command.current_dir(directory).args(arguments);
-    let generated = run_process(command, FFMPEG_TIMEOUT, 1024).await?;
+    let generated = run_process(
+        command,
+        if case.uses_long_profile() {
+            LONG_RECOVERY_FFMPEG_TIMEOUT
+        } else {
+            FFMPEG_TIMEOUT
+        },
+        1024,
+    )
+    .await?;
     if !generated.success {
         return Err(format!(
             "FFmpeg fixture generation failed with exit code {}",
@@ -1413,35 +1603,57 @@ async fn generate_and_inspect_fixture(
     let high_path = directory.join("high.mp4");
     let high = inspect_fixture(
         &high_path,
-        1,
-        Some((640, 360)),
-        if matches!(case, NativeCase::Transcoding) {
-            2
-        } else {
-            1
+        FixtureExpectation {
+            representation_code: 1,
+            dimensions: Some((640, 360)),
+            video_codec_code: if matches!(case, NativeCase::Transcoding) {
+                2
+            } else {
+                1
+            },
+            audio_codec_code: 0,
+            video_profile: source_h264_sidx_guard_applies(case)
+                .then_some(("Constrained Baseline", 30)),
         },
-        0,
-        source_h264_sidx_guard_applies(case).then_some(("Constrained Baseline", 30)),
         ffprobe,
+        high_limit,
+        case.uses_long_profile(),
     )
     .await?;
-    let low = if matches!(case, NativeCase::ProgressiveAbr) {
+    let low = if case.uses_progressive_abr() {
         Some(
             inspect_fixture(
                 &directory.join("low.mp4"),
-                2,
-                Some((320, 180)),
-                1,
-                0,
-                Some(("Constrained Baseline", 30)),
+                FixtureExpectation {
+                    representation_code: 2,
+                    dimensions: Some((320, 180)),
+                    video_codec_code: 1,
+                    audio_codec_code: 0,
+                    video_profile: Some(("Constrained Baseline", 30)),
+                },
                 ffprobe,
+                low_limit,
+                case.uses_long_profile(),
             )
             .await?,
         )
     } else {
         None
     };
-    let audio = inspect_fixture(&directory.join("audio.mp4"), 3, None, 0, 1, None, ffprobe).await?;
+    let audio = inspect_fixture(
+        &directory.join("audio.mp4"),
+        FixtureExpectation {
+            representation_code: 3,
+            dimensions: None,
+            video_codec_code: 0,
+            audio_codec_code: 1,
+            video_profile: None,
+        },
+        ffprobe,
+        audio_limit,
+        case.uses_long_profile(),
+    )
+    .await?;
     if let Ok(mut data) = report.lock() {
         data.fixture_media.clear();
         data.fixture_media.push(high.record.clone());
@@ -1548,21 +1760,34 @@ fn push_audio_output(
 
 async fn inspect_fixture(
     path: &Path,
-    representation_code: u8,
-    expected_dimensions: Option<(u32, u32)>,
-    expected_video_codec_code: u8,
-    expected_audio_codec_code: u8,
-    expected_video_profile: Option<(&str, i32)>,
+    expected: FixtureExpectation,
     ffprobe: &Path,
+    maximum_bytes: u64,
+    long_profile: bool,
 ) -> Result<InspectedMedia, String> {
     let mut inspected = inspect_mp4(
         path,
-        representation_code,
+        expected.representation_code,
         ffprobe,
-        expected_video_codec_code != 2,
+        expected.video_codec_code != 2,
+        maximum_bytes,
+        if long_profile {
+            LONG_RECOVERY_FFPROBE_TIMEOUT
+        } else {
+            Duration::from_secs(15)
+        },
     )
     .await?;
-    let metadata = ffprobe_media(ffprobe, path).await?;
+    let metadata = ffprobe_media(
+        ffprobe,
+        path,
+        if long_profile {
+            LONG_RECOVERY_FFPROBE_TIMEOUT
+        } else {
+            Duration::from_secs(15)
+        },
+    )
+    .await?;
     let duration = metadata
         .format
         .as_ref()
@@ -1579,7 +1804,7 @@ async fn inspect_fixture(
         .streams
         .iter()
         .find(|stream| stream.codec_type == "audio");
-    if expected_dimensions.is_some_and(|dimensions| {
+    if expected.dimensions.is_some_and(|dimensions| {
         video.and_then(|stream| stream.width.zip(stream.height)) != Some(dimensions)
     }) {
         return Err(
@@ -1594,8 +1819,8 @@ async fn inspect_fixture(
         .and_then(|stream| stream.codec_name.as_deref())
         .map(audio_codec_code)
         .unwrap_or_default();
-    if video_codec_code != expected_video_codec_code
-        || audio_codec_code != expected_audio_codec_code
+    if video_codec_code != expected.video_codec_code
+        || audio_codec_code != expected.audio_codec_code
     {
         return Err(
             "FFmpeg fixture codec metadata did not match the expected video/audio tracks"
@@ -1604,15 +1829,18 @@ async fn inspect_fixture(
     }
     let profile = video.and_then(|stream| stream.profile.as_deref());
     let level = video.and_then(|stream| stream.level);
-    if expected_video_profile.is_some_and(|(expected_profile, expected_level)| {
-        !h264_baseline_level_3_is_coherent(
-            H264_BASELINE_LEVEL_3_CODEC,
-            profile,
-            level,
-            expected_profile,
-            expected_level,
-        )
-    }) {
+    if expected
+        .video_profile
+        .is_some_and(|(expected_profile, expected_level)| {
+            !h264_baseline_level_3_is_coherent(
+                H264_BASELINE_LEVEL_3_CODEC,
+                profile,
+                level,
+                expected_profile,
+                expected_level,
+            )
+        })
+    {
         return Err("generated H.264 fixture profile or level was not Baseline 3.0".to_owned());
     }
     inspected.record.video_profile_code = profile.map(video_profile_code).unwrap_or_default();
@@ -1625,13 +1853,15 @@ async fn inspect_mp4(
     representation_code: u8,
     ffprobe: &Path,
     require_global_sidx: bool,
+    maximum_bytes: u64,
+    ffprobe_timeout: Duration,
 ) -> Result<InspectedMedia, String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|_| "generated media file is missing".to_owned())?;
     let total_length = metadata.len();
-    if total_length == 0 || total_length > MAX_FIXTURE_BYTES {
-        return Err("generated media file was empty or exceeded the 96 MiB bound".to_owned());
+    if total_length == 0 || total_length > maximum_bytes {
+        return Err("generated media file was empty or exceeded its source/cache bound".to_owned());
     }
     let initialization_length = tokio::task::spawn_blocking({
         let path = path.to_path_buf();
@@ -1654,8 +1884,14 @@ async fn inspect_mp4(
     .map_err(|_| "MP4 fragment parser task failed".to_owned())?
     .map_err(|_| "MP4 fragment ranges could not be parsed".to_owned())?;
     validate_fragment_ranges(initialization_length, total_length, &ranges)?;
-    let peak_bandwidth = peak_bandwidth_bits_per_second(&ranges)
+    let target_duration = fixture_target_duration_seconds(&ranges)
+        .ok_or_else(|| "generated media target duration was invalid".to_owned())?;
+    let peak_bandwidth = peak_bandwidth_bits_per_second(&ranges, target_duration)
         .ok_or_else(|| "generated media fragment peak bandwidth was invalid".to_owned())?;
+    let legacy_single_fragment_peak =
+        legacy_single_fragment_peak_bandwidth_bits_per_second(&ranges).ok_or_else(|| {
+            "generated media single-fragment peak bandwidth was invalid".to_owned()
+        })?;
     let has_sidx = tokio::task::spawn_blocking({
         let path = path.to_path_buf();
         move || top_level_box_present(&path, *b"sidx")
@@ -1682,7 +1918,7 @@ async fn inspect_mp4(
     } else {
         None
     };
-    let parsed = ffprobe_media(ffprobe, path).await?;
+    let parsed = ffprobe_media(ffprobe, path, ffprobe_timeout).await?;
     let video = parsed
         .streams
         .iter()
@@ -1700,7 +1936,9 @@ async fn inspect_mp4(
             initialization_bytes: initialization_length,
             fragment_count: ranges.len() as u64,
             fragment_duration_ms: duration_ms,
+            target_duration_seconds: target_duration,
             peak_bandwidth_bits_per_second: peak_bandwidth,
+            legacy_single_fragment_peak_bandwidth_bits_per_second: legacy_single_fragment_peak,
             global_sidx_present: has_sidx,
             progressive_index_count,
             video_codec_code: video
@@ -1812,7 +2050,11 @@ fn top_level_box_present(path: &Path, target: [u8; 4]) -> std::io::Result<bool> 
     Ok(false)
 }
 
-async fn ffprobe_media(ffprobe: &Path, path: &Path) -> Result<FfprobeOutput, String> {
+async fn ffprobe_media(
+    ffprobe: &Path,
+    path: &Path,
+    timeout: Duration,
+) -> Result<FfprobeOutput, String> {
     let mut command = Command::new(ffprobe);
     command.args([
         "-v",
@@ -1823,7 +2065,7 @@ async fn ffprobe_media(ffprobe: &Path, path: &Path) -> Result<FfprobeOutput, Str
         "json",
     ]);
     command.arg(path);
-    let output = run_process(command, Duration::from_secs(15), 32 * 1024).await?;
+    let output = run_process(command, timeout, 32 * 1024).await?;
     if !output.success || output.stdout_truncated {
         return Err("ffprobe metadata inspection failed or exceeded its 32 KiB bound".to_owned());
     }
@@ -1862,10 +2104,12 @@ fn h264_baseline_level_3_is_coherent(
 }
 
 fn source_h264_sidx_guard_applies(case: NativeCase) -> bool {
-    matches!(case, NativeCase::ProgressiveAbr)
+    case.uses_progressive_abr()
 }
 
-fn peak_bandwidth_bits_per_second(ranges: &[Mp4SegmentRange]) -> Option<u64> {
+fn legacy_single_fragment_peak_bandwidth_bits_per_second(
+    ranges: &[Mp4SegmentRange],
+) -> Option<u64> {
     if ranges.is_empty() {
         return None;
     }
@@ -1889,15 +2133,27 @@ fn aggregate_peak_bandwidth(video_peak: u64, audio_peak: u64) -> Result<u64, Str
         .ok_or_else(|| "video and shared-audio peak bandwidth overflowed".to_owned())
 }
 
-fn master_bandwidth_covers_peak(advertised: u64, measured_peak: u64) -> bool {
-    advertised > 0 && measured_peak > 0 && advertised >= measured_peak
+fn expected_variant_peak_bandwidth(
+    video_peak: u64,
+    audio_peak: u64,
+    muxed_audio: bool,
+) -> Result<u64, String> {
+    if muxed_audio {
+        Ok(video_peak)
+    } else {
+        aggregate_peak_bandwidth(video_peak, audio_peak)
+    }
+}
+
+fn master_bandwidth_matches_peak(advertised: u64, measured_peak: u64) -> bool {
+    advertised > 0 && measured_peak > 0 && advertised == measured_peak
 }
 
 fn audio_codec_code(codec: &str) -> u8 {
     if codec == "aac" { 1 } else { 0 }
 }
 
-fn enforce_fixture_budget(fixture: &MediaFixture) -> Result<(), String> {
+fn enforce_fixture_budget(case: NativeCase, fixture: &MediaFixture) -> Result<(), String> {
     let total = fixture
         .high_video
         .record
@@ -1910,8 +2166,13 @@ fn enforce_fixture_budget(fixture: &MediaFixture) -> Result<(), String> {
                 .unwrap_or_default(),
         )
         .saturating_add(fixture.audio.record.file_bytes);
-    if total > MAX_SOURCE_FIXTURE_BYTES {
-        return Err("generated source fixtures exceeded the 60 MiB aggregate bound".to_owned());
+    let maximum = if case.uses_long_profile() {
+        MAX_LONG_SOURCE_FIXTURE_BYTES
+    } else {
+        MAX_SOURCE_FIXTURE_BYTES
+    };
+    if total > maximum {
+        return Err("generated source fixtures exceeded their profile aggregate bound".to_owned());
     }
     Ok(())
 }
@@ -1956,8 +2217,8 @@ fn make_origin_state(
         return Err("fixture origin was not bound to IPv4 loopback".to_owned());
     }
     if let Ok(mut data) = report.lock() {
-        data.fault_timeline.enabled = matches!(case, NativeCase::ProgressiveAbr);
-        if matches!(case, NativeCase::ProgressiveAbr) {
+        data.fault_timeline.enabled = case.uses_progressive_abr();
+        if case.uses_progressive_abr() {
             data.fault_timeline.bad_high_status_code = Some(503);
         }
     }
@@ -2094,7 +2355,7 @@ fn pacing_rate_bits_per_second(
     phase_code: u8,
     representation_code: u8,
 ) -> Option<u64> {
-    if !matches!(case, NativeCase::ProgressiveAbr) || !matches!(representation_code, 1 | 2) {
+    if !case.uses_progressive_abr() || !matches!(representation_code, 1 | 2) {
         return None;
     }
     Some(match phase_code.min(PHASE_RECOVERY) {
@@ -2245,6 +2506,9 @@ fn record_origin_request(
         report.requests.count_by_representation[rep].saturating_add(1);
     report.requests.count_by_phase_and_representation[phase][rep] =
         report.requests.count_by_phase_and_representation[phase][rep].saturating_add(1);
+    report
+        .requests
+        .last_request_elapsed_ms_by_phase_and_representation[phase][rep] = Some(elapsed_ms);
     if status.is_success() {
         report.requests.successful_by_representation[rep] =
             report.requests.successful_by_representation[rep].saturating_add(1);
@@ -2261,15 +2525,28 @@ fn record_origin_request(
         report.requests.high_fault_status_count =
             report.requests.high_fault_status_count.saturating_add(1);
     }
-    if report.requests.events.len() < 32 {
-        report.requests.events.push(RequestEvent {
+    let event = RequestEvent {
+        elapsed_ms,
+        representation_code,
+        phase_code,
+        range_start: range.start,
+        range_length: range.length,
+        status_code: status.as_u16(),
+    };
+    if representation_code == 1
+        && phase_code == PHASE_RECOVERY
+        && report.requests.first_recovery_high_range_request.is_none()
+    {
+        report.requests.first_recovery_high_range_request = Some(RecoveryHighRangeRequest {
             elapsed_ms,
-            representation_code,
-            phase_code,
+            monotonic_seconds: monotonic_clock_seconds().ok(),
             range_start: range.start,
             range_length: range.length,
             status_code: status.as_u16(),
         });
+    }
+    if report.requests.events.len() < 32 {
+        report.requests.events.push(event);
     }
 }
 
@@ -2325,6 +2602,7 @@ async fn run_abr_fault_timeline(
     probe: &mut AbortTask<Result<ProcessCapture, String>>,
     marker_path: &Path,
     report: &ReportStore,
+    recovery_observation_path: &Path,
 ) -> Result<(), String> {
     let ready_marker = wait_for_decoder_ready_marker(marker_path, probe).await?;
     let baseline_start = monotonic_clock_seconds()?;
@@ -2359,6 +2637,25 @@ async fn run_abr_fault_timeline(
     origin.set_phase(PHASE_BAD_HIGH)?;
     wait_while_probe_runs(origin, probe, BAD_HIGH_WINDOW).await?;
     origin.set_phase(PHASE_RECOVERY)?;
+    create_empty_private_marker(recovery_observation_path)?;
+    Ok(())
+}
+
+fn create_empty_private_marker(path: &Path) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| "fresh recovery observation marker could not be created".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "recovery observation marker metadata could not be read".to_owned())?;
+    if !metadata.is_file() || metadata.len() != 0 || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err("recovery observation marker was not empty, regular, and private".to_owned());
+    }
     Ok(())
 }
 
@@ -2464,7 +2761,8 @@ async fn run_native_probe(
     duration: u64,
     deadline: u64,
     expected_sizes: String,
-    ready_marker_path: Option<PathBuf>,
+    marker_paths: ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
 ) -> Result<ProcessCapture, String> {
     ensure_loopback_url(&master_url)?;
     let mut command = Command::new(probe_path);
@@ -2478,11 +2776,23 @@ async fn run_native_probe(
         "--expect-video-sizes".to_owned(),
         expected_sizes,
     ]);
-    if let Some(path) = ready_marker_path {
+    if let Some(path) = marker_paths.ready {
         command.args([
             "--ready-marker".to_owned(),
             path.to_string_lossy().into_owned(),
             "--controls-after-video-size-expectations".to_owned(),
+        ]);
+    }
+    if let Some(path) = marker_paths.recovery_observation {
+        command.args([
+            "--recovery-observation-trigger".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(seconds) = minimum_steady_play_seconds {
+        command.args([
+            "--minimum-steady-play-seconds".to_owned(),
+            seconds.to_string(),
         ]);
     }
     run_process(
@@ -2523,6 +2833,16 @@ fn validate_probe_result(
     probe: &Value,
     report: &ReportStore,
 ) -> Result<(), String> {
+    let report_data = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+    validate_report_identity(
+        case,
+        &report_data.case_full_name,
+        &report_data.scenario,
+        report_data.source_duration_seconds,
+    )?;
+    drop(report_data);
     if let Ok(mut data) = report.lock() {
         data.probe = Some(probe.clone());
     }
@@ -2532,9 +2852,13 @@ fn validate_probe_result(
     let asset_duration = probe
         .get("item_duration_seconds")
         .and_then(Value::as_f64)
-        .ok_or_else(|| "native probe did not report numeric asset duration".to_owned())?;
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| "native probe did not report finite positive asset duration".to_owned())?;
     if asset_duration < requested_duration as f64 {
         return Err("native HLS asset duration was shorter than the probe duration".to_owned());
+    }
+    if (asset_duration - f64::from(case.source_duration_seconds())).abs() > 0.25 {
+        return Err("native HLS asset duration did not match its named source profile".to_owned());
     }
     if !all_probe_controls_completed(probe) {
         return Err("native probe did not complete every playback control".to_owned());
@@ -2550,7 +2874,10 @@ fn validate_probe_result(
         return Err("native playback did not provide AVPlayer audio-track evidence".to_owned());
     }
     let expected = match case {
-        NativeCase::ProgressiveAbr => &[(640, 360), (320, 180), (640, 360)][..],
+        NativeCase::BufferedContinuity => &[(640, 360), (320, 180)][..],
+        NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => {
+            &[(640, 360), (320, 180), (640, 360)][..]
+        }
         NativeCase::Transcoding => &[(640, 360)][..],
     };
     validate_video_size_expectations(probe, expected)
@@ -2629,6 +2956,192 @@ fn validate_video_size_expectations(probe: &Value, expected: &[(u32, u32)]) -> R
     Ok(())
 }
 
+fn validate_report_identity(
+    case: NativeCase,
+    case_full_name: &str,
+    scenario: &str,
+    source_duration_seconds: u32,
+) -> Result<(), String> {
+    if case_full_name != case.full_name()
+        || scenario != case.scenario()
+        || source_duration_seconds != case.source_duration_seconds()
+    {
+        return Err("acceptance report identity did not match its named scenario".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_recovery_observations(
+    case: NativeCase,
+    probe: &Value,
+    report: &ReportStore,
+) -> Result<(), String> {
+    let report_data = report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+    validate_report_identity(
+        case,
+        &report_data.case_full_name,
+        &report_data.scenario,
+        report_data.source_duration_seconds,
+    )?;
+    let source_duration = f64::from(case.source_duration_seconds());
+    let probe_duration = probe
+        .get("item_duration_seconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "probe source duration was missing or invalid".to_owned())?;
+    if (probe_duration - source_duration).abs() > 0.25 {
+        return Err("probe source duration did not match the named case".to_owned());
+    }
+    let recovery_after = required_clock_bound(
+        report_data.fault_timeline.recovery_after_monotonic_seconds,
+        "recovery post-transition clock was not recorded",
+    )?;
+    drop(report_data);
+
+    let recovery_observation = probe
+        .get("recovery_observation")
+        .ok_or_else(|| "probe recovery observation was missing".to_owned())?;
+    let recovery_state = validate_player_observation(recovery_observation, source_duration)?;
+    if recovery_state.observed_monotonic_seconds < recovery_after
+        || recovery_state.observed_monotonic_seconds > recovery_after + 5.0
+    {
+        return Err("recovery observation was outside the controller phase window".to_owned());
+    }
+    match case {
+        NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => {
+            if recovery_state.range_end > source_duration - 20.0 {
+                return Err(
+                    "recovery observation did not prove 20 seconds of future unbuffered media"
+                        .to_owned(),
+                );
+            }
+        }
+        NativeCase::BufferedContinuity => {
+            let steady_play_elapsed = probe
+                .get("steps")
+                .and_then(Value::as_array)
+                .and_then(|steps| {
+                    steps.iter().find(|step| {
+                        step.get("name").and_then(Value::as_str) == Some("play")
+                            && step.get("status").and_then(Value::as_str) == Some("completed")
+                    })
+                })
+                .and_then(|step| step.get("elapsed_seconds"))
+                .and_then(Value::as_f64)
+                .filter(|seconds| {
+                    seconds.is_finite() && *seconds >= MINIMUM_STEADY_PLAY_SECONDS as f64
+                })
+                .ok_or_else(|| {
+                    "buffered case did not prove 110 seconds of steady playback".to_owned()
+                })?;
+            let _ = steady_play_elapsed;
+            let steady_end = probe
+                .get("steady_play_end_observation")
+                .ok_or_else(|| "steady-play end observation was missing".to_owned())?;
+            let steady_state = validate_player_observation(steady_end, source_duration)?;
+            if steady_state.observed_monotonic_seconds < recovery_state.observed_monotonic_seconds
+                || steady_state.observed_monotonic_seconds < recovery_after
+                || steady_state.range_end < source_duration - 0.25
+            {
+                return Err(
+                    "steady playback did not retain loaded coverage through the source end"
+                        .to_owned(),
+                );
+            }
+        }
+        NativeCase::Transcoding => {
+            return Err(
+                "transcoding case does not use progressive recovery observations".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+struct PlayerObservationEvidence {
+    observed_monotonic_seconds: f64,
+    range_end: f64,
+}
+
+fn validate_player_observation(
+    observation: &Value,
+    source_duration: f64,
+) -> Result<PlayerObservationEvidence, String> {
+    let observed_monotonic_seconds = observation
+        .get("observed_monotonic_seconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "passive observation timestamp was missing or invalid".to_owned())?;
+    let player_state = observation
+        .get("player_state")
+        .ok_or_else(|| "passive observation player state was missing".to_owned())?;
+    let playhead = player_state
+        .get("playhead_seconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= source_duration)
+        .ok_or_else(|| "passive observation playhead was outside the source".to_owned())?;
+    player_state
+        .get("preferred_forward_buffer_duration_seconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value == 0.0)
+        .ok_or_else(|| {
+            "passive observation did not retain default AVPlayer buffering".to_owned()
+        })?;
+    let ranges = player_state
+        .get("loaded_time_ranges")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "passive observation loaded ranges were missing".to_owned())?;
+    let observations = ranges
+        .get("observations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "passive observation loaded ranges were incomplete".to_owned())?;
+    let source_count = ranges.get("source_count").and_then(Value::as_u64);
+    let valid_count = ranges.get("valid_count").and_then(Value::as_u64);
+    let invalid_count = ranges.get("invalid_count").and_then(Value::as_u64);
+    if ranges.get("truncated").and_then(Value::as_bool) != Some(false)
+        || observations.is_empty()
+        || observations.len() > 8
+        || source_count != Some(observations.len() as u64)
+        || valid_count != source_count
+        || invalid_count != Some(0)
+    {
+        return Err("passive observation loaded ranges were truncated or invalid".to_owned());
+    }
+
+    let mut containing_range_end = None::<f64>;
+    for range in observations {
+        let start = finite_nonnegative(range.get("start_seconds"))
+            .ok_or_else(|| "loaded range start was missing or invalid".to_owned())?;
+        let duration = finite_nonnegative(range.get("duration_seconds"))
+            .ok_or_else(|| "loaded range duration was missing or invalid".to_owned())?;
+        let end = finite_nonnegative(range.get("end_seconds"))
+            .ok_or_else(|| "loaded range end was missing or invalid".to_owned())?;
+        if (start + duration - end).abs() > 0.001
+            || end > source_duration
+            || start > source_duration
+        {
+            return Err("loaded range was inconsistent or extended beyond the source".to_owned());
+        }
+        if start <= playhead && playhead <= end {
+            containing_range_end = Some(containing_range_end.unwrap_or_default().max(end));
+        }
+    }
+    let range_end = containing_range_end
+        .ok_or_else(|| "no loaded range containing the playhead was observed".to_owned())?;
+    Ok(PlayerObservationEvidence {
+        observed_monotonic_seconds,
+        range_end,
+    })
+}
+
+fn finite_nonnegative(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite() && *number >= 0.0)
+}
+
 fn all_probe_controls_completed(probe: &Value) -> bool {
     let Some(steps) = probe.get("steps").and_then(Value::as_array) else {
         return false;
@@ -2652,7 +3165,7 @@ fn all_probe_controls_completed(probe: &Value) -> bool {
     })
 }
 
-fn validate_abr_request_trace(report: &ReportStore) -> Result<(), String> {
+fn validate_abr_request_trace(report: &ReportStore, case: NativeCase) -> Result<(), String> {
     let data = report
         .lock()
         .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
@@ -2662,7 +3175,10 @@ fn validate_abr_request_trace(report: &ReportStore) -> Result<(), String> {
         || requests.high_fault_status_count == 0
         || requests.count_by_phase_and_representation[1][1] == 0
         || requests.successful_by_representation[1] == 0
-        || requests.media_payload_by_phase_and_representation[2][0] == 0
+        || (matches!(
+            case,
+            NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic
+        ) && requests.media_payload_by_phase_and_representation[2][0] == 0)
     {
         return Err(
             "origin trace did not prove healthy high, bad-high with healthy low, and recovered high requests"
@@ -2729,7 +3245,11 @@ fn validate_abr_sample_timeline(probe: &Value, report: &ReportStore) -> Result<(
     };
     let initial_high = samples(0)?;
     let low = samples(1)?;
-    let recovered_high = samples(2)?;
+    let recovered_high = match entries.len() {
+        2 => Vec::new(),
+        3 => samples(2)?,
+        _ => return Err("unexpected number of progressive decoded-size stages".to_owned()),
+    };
     validate_abr_sample_timestamps(
         &initial_high,
         &low,
@@ -2780,9 +3300,9 @@ fn validate_abr_sample_timestamps(
             && values.iter().all(|value| value.is_finite() && *value > 0.0)
             && values.windows(2).all(|pair| pair[0] <= pair[1])
     };
-    if !([initial_high, low, recovered_high]
-        .into_iter()
-        .all(timestamps_are_valid)
+    if !(timestamps_are_valid(initial_high)
+        && timestamps_are_valid(low)
+        && (recovered_high.is_empty() || timestamps_are_valid(recovered_high))
         && [
             bad_high_before,
             bad_high_after,
@@ -2813,10 +3333,11 @@ fn validate_abr_sample_timestamps(
     {
         return Err("low decoded frames were not observed inside the bad-high interval".to_owned());
     }
-    if recovered_high
-        .iter()
-        .copied()
-        .any(|timestamp| timestamp < recovery_after)
+    if !recovered_high.is_empty()
+        && recovered_high
+            .iter()
+            .copied()
+            .any(|timestamp| timestamp < recovery_after)
     {
         return Err("final high decoded frames were not observed after high recovery".to_owned());
     }
@@ -2856,19 +3377,18 @@ async fn validate_master_playlist(
     client: &reqwest::Client,
     url: &str,
     case: NativeCase,
-    expected_video_fragments: u64,
-    expected_audio_fragments: u64,
-    expected_video_peak_bandwidth: u64,
-    expected_audio_peak_bandwidth: u64,
+    expected: PlaylistExpectations,
+    long_profile: bool,
 ) -> Result<HlsPlaylistPreflight, String> {
     ensure_loopback_url(url)?;
     let master =
         url::Url::parse(url).map_err(|_| "production HLS master URL was invalid".to_owned())?;
-    let body = fetch_playlist(client, &master).await?;
+    let playlist_limit = playlist_response_limit(long_profile);
+    let body = fetch_playlist(client, &master, playlist_limit).await?;
     if !body.starts_with("#EXTM3U") || !body.contains("#EXT-X-STREAM-INF:") {
         return Err("production media route returned an invalid HLS master playlist".to_owned());
     }
-    if matches!(case, NativeCase::ProgressiveAbr)
+    if case.uses_progressive_abr()
         && (!body.contains("RESOLUTION=640x360") || !body.contains("RESOLUTION=320x180"))
     {
         return Err(
@@ -2883,42 +3403,72 @@ async fn validate_master_playlist(
     if source_h264_sidx_guard_applies(case) && audio_uri.is_none() {
         return Err("ABR source master omitted its separate audio playlist".to_owned());
     }
-    let expected_variant_peak = if matches!(case, NativeCase::Transcoding) {
-        expected_video_peak_bandwidth
-    } else {
-        aggregate_peak_bandwidth(expected_video_peak_bandwidth, expected_audio_peak_bandwidth)?
-    };
-    if !master_bandwidth_covers_peak(advertised_bandwidth, expected_variant_peak) {
-        return Err(
-            "production HLS master bandwidth was below the parsed fragment peak".to_owned(),
-        );
+    let expected_variant_peak = expected_variant_peak_bandwidth(
+        expected.video_peak_bandwidth,
+        expected.audio_peak_bandwidth,
+        audio_uri.is_none(),
+    )?;
+    if !master_bandwidth_matches_peak(advertised_bandwidth, expected_variant_peak) {
+        return Err(format!(
+            "production HLS master bandwidth mismatch: advertised={} canonical={expected_variant_peak}",
+            advertised_bandwidth
+        ));
     }
     let video_url = resolve_same_origin_playlist(&master, &video_uri)?;
-    let (video_fragment_count, video_target_duration_seconds) =
-        fetch_and_validate_media_playlist(client, &video_url, expected_video_fragments).await?;
+    let (video_fragment_count, video_target_duration_seconds) = fetch_and_validate_media_playlist(
+        client,
+        &video_url,
+        expected.video_fragments,
+        playlist_limit,
+    )
+    .await?;
+    if video_target_duration_seconds != expected.video_target_duration {
+        return Err(
+            "production video playlist target duration did not match its fixture".to_owned(),
+        );
+    }
     let (audio_fragment_count, audio_target_duration_seconds, external_audio_peak) =
         if let Some(audio_uri) = audio_uri {
             let audio_url = resolve_same_origin_playlist(&master, &audio_uri)?;
-            let (count, target) =
-                fetch_and_validate_media_playlist(client, &audio_url, expected_audio_fragments)
-                    .await?;
-            (count, target, expected_audio_peak_bandwidth)
+            let (count, target) = fetch_and_validate_media_playlist(
+                client,
+                &audio_url,
+                expected.audio_fragments,
+                playlist_limit,
+            )
+            .await?;
+            if target != expected.audio_target_duration {
+                return Err(
+                    "production audio playlist target duration did not match its fixture"
+                        .to_owned(),
+                );
+            }
+            (count, target, expected.audio_peak_bandwidth)
         } else {
             (0, 0, 0)
         };
     Ok(HlsPlaylistPreflight {
+        bandwidth_semantics: "rfc8216_contiguous_duration_window",
         high_video_fragment_count: video_fragment_count,
         high_video_target_duration_seconds: video_target_duration_seconds,
         audio_fragment_count,
         audio_target_duration_seconds,
-        high_video_peak_bandwidth_bits_per_second: expected_video_peak_bandwidth,
+        high_video_peak_bandwidth_bits_per_second: expected.video_peak_bandwidth,
         audio_peak_bandwidth_bits_per_second: external_audio_peak,
         high_variant_peak_bandwidth_bits_per_second: expected_variant_peak,
         advertised_high_bandwidth_bits_per_second: advertised_bandwidth,
     })
 }
 
-async fn fetch_playlist(client: &reqwest::Client, url: &url::Url) -> Result<String, String> {
+fn playlist_response_limit(long_profile: bool) -> usize {
+    if long_profile { 512 * 1024 } else { 64 * 1024 }
+}
+
+async fn fetch_playlist(
+    client: &reqwest::Client,
+    url: &url::Url,
+    maximum_bytes: usize,
+) -> Result<String, String> {
     ensure_loopback_url(url.as_str())?;
     let mut response = timeout(Duration::from_secs(5), client.get(url.clone()).send())
         .await
@@ -2929,7 +3479,7 @@ async fn fetch_playlist(client: &reqwest::Client, url: &url::Url) -> Result<Stri
     }
     if response
         .content_length()
-        .is_some_and(|length| length > 64 * 1024)
+        .is_some_and(|length| length > maximum_bytes as u64)
     {
         return Err("production HLS playlist exceeded its response bound".to_owned());
     }
@@ -2940,7 +3490,7 @@ async fn fetch_playlist(client: &reqwest::Client, url: &url::Url) -> Result<Stri
             let Some(chunk) = chunk else {
                 break;
             };
-            if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+            if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
                 return Err(());
             }
             bytes.extend_from_slice(&chunk);
@@ -3067,8 +3617,9 @@ async fn fetch_and_validate_media_playlist(
     client: &reqwest::Client,
     url: &url::Url,
     expected_fragments: u64,
+    maximum_bytes: usize,
 ) -> Result<(u64, u64), String> {
-    let body = fetch_playlist(client, url).await?;
+    let body = fetch_playlist(client, url, maximum_bytes).await?;
     let target_duration = validate_media_playlist_body(url, &body, expected_fragments)?;
     Ok((expected_fragments, target_duration))
 }
@@ -3491,8 +4042,237 @@ impl<T> Drop for AbortTask<T> {
 }
 
 #[cfg(test)]
+mod origin_request_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn first_recovery_high_range_survives_full_early_event_window() {
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ExtendedDiagnostic,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ExtendedDiagnostic,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+        let range = ByteRange {
+            start: 100,
+            length: 50,
+            partial: true,
+        };
+        for _ in 0..40 {
+            record_origin_request(
+                &origin,
+                1,
+                PHASE_BASELINE,
+                range,
+                StatusCode::PARTIAL_CONTENT,
+                true,
+            );
+        }
+        record_origin_request(
+            &origin,
+            1,
+            PHASE_RECOVERY,
+            range,
+            StatusCode::PARTIAL_CONTENT,
+            true,
+        );
+
+        let report = report.lock().unwrap();
+        assert_eq!(report.requests.events.len(), 32);
+        let event = report
+            .requests
+            .first_recovery_high_range_request
+            .as_ref()
+            .unwrap();
+        assert!(
+            event
+                .monotonic_seconds
+                .is_some_and(|value| value.is_finite())
+        );
+        assert_eq!(event.range_start, 100);
+        assert_eq!(event.range_length, 50);
+        assert_eq!(event.status_code, StatusCode::PARTIAL_CONTENT.as_u16());
+    }
+
+    #[test]
+    fn latest_request_times_start_missing_and_survive_event_cap() {
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ExtendedDiagnostic,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ExtendedDiagnostic,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+        let range = ByteRange {
+            start: 100,
+            length: 50,
+            partial: true,
+        };
+        {
+            let report = report.lock().unwrap();
+            assert!(
+                report
+                    .requests
+                    .last_request_elapsed_ms_by_phase_and_representation
+                    .iter()
+                    .flatten()
+                    .all(Option::is_none)
+            );
+        }
+
+        for _ in 0..40 {
+            record_origin_request(
+                &origin,
+                1,
+                PHASE_BASELINE,
+                range,
+                StatusCode::PARTIAL_CONTENT,
+                true,
+            );
+        }
+        let latest = report
+            .lock()
+            .unwrap()
+            .requests
+            .last_request_elapsed_ms_by_phase_and_representation[0][0];
+        std::thread::sleep(Duration::from_millis(2));
+        record_origin_request(
+            &origin,
+            1,
+            PHASE_BASELINE,
+            range,
+            StatusCode::PARTIAL_CONTENT,
+            true,
+        );
+
+        let report = report.lock().unwrap();
+        assert_eq!(report.requests.events.len(), 32);
+        assert!(latest.is_some());
+        assert!(
+            report
+                .requests
+                .last_request_elapsed_ms_by_phase_and_representation[0][0]
+                > latest
+        );
+    }
+
+    #[test]
+    fn latest_request_times_are_isolated_by_phase_and_representation() {
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ExtendedDiagnostic,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ExtendedDiagnostic,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+        let range = ByteRange {
+            start: 100,
+            length: 50,
+            partial: true,
+        };
+        for (phase, representation) in [
+            (PHASE_BASELINE, 1),
+            (PHASE_BAD_HIGH, 2),
+            (PHASE_RECOVERY, 3),
+        ] {
+            record_origin_request(
+                &origin,
+                representation,
+                phase,
+                range,
+                StatusCode::PARTIAL_CONTENT,
+                true,
+            );
+        }
+
+        let report = report.lock().unwrap();
+        let times = &report
+            .requests
+            .last_request_elapsed_ms_by_phase_and_representation;
+        assert!(times[0][0].is_some());
+        assert!(times[1][1].is_some());
+        assert!(times[2][2].is_some());
+        for (phase, representation) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            assert_eq!(times[phase][representation], None);
+        }
+    }
+}
+
 mod origin_pacing_tests {
     use super::*;
+
+    #[test]
+    fn long_recovery_profile_is_shared_without_conflating_case_identity() {
+        let diagnostic = NativeCase::ExtendedDiagnostic;
+        let required = NativeCase::ProgressiveAbr;
+        let buffered = NativeCase::BufferedContinuity;
+        let transcoding = NativeCase::Transcoding;
+        assert_eq!(required.full_name(), ABR_CASE_FULL_NAME);
+        assert_eq!(required.report_name(), "abr.json");
+        assert_eq!(required.scenario(), "unbuffered_recovery");
+        assert_eq!(required.source_duration_seconds(), 3600);
+        assert_eq!(required.deadline(), Duration::from_secs(840));
+        assert_eq!(required.probe_duration_seconds(), 600);
+        assert_eq!(required.probe_deadline_seconds(), 720);
+        assert!(!AcceptanceReport::new(required).diagnostic_only);
+        assert_eq!(diagnostic.full_name(), EXTENDED_DIAGNOSTIC_CASE_FULL_NAME);
+        assert_ne!(required.full_name(), diagnostic.full_name());
+        assert_eq!(diagnostic.report_name(), "abr-extended-diagnostic.json");
+        assert_eq!(diagnostic.scenario(), "extended_recovery_diagnostic");
+        assert_eq!(diagnostic.source_duration_seconds(), 3600);
+        assert_eq!(diagnostic.deadline(), Duration::from_secs(840));
+        assert_eq!(diagnostic.probe_duration_seconds(), 600);
+        assert_eq!(diagnostic.probe_deadline_seconds(), 720);
+        assert!(AcceptanceReport::new(diagnostic).diagnostic_only);
+        assert!(diagnostic.is_diagnostic());
+        assert!(!required.is_diagnostic());
+        assert!(required.uses_long_profile());
+        assert!(diagnostic.uses_long_profile());
+        assert!(!buffered.uses_long_profile());
+        assert!(!transcoding.uses_long_profile());
+        assert_eq!(diagnostic.cache_limit_bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(required.cache_limit_bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(buffered.cache_limit_bytes(), MAX_FIXTURE_BYTES);
+        assert_eq!(transcoding.cache_limit_bytes(), MAX_FIXTURE_BYTES);
+        assert_eq!(MAX_LONG_SOURCE_FIXTURE_BYTES, 1280 * 1024 * 1024);
+        assert_eq!(MAX_LONG_HIGH_FIXTURE_BYTES, 960 * 1024 * 1024);
+        assert_eq!(MAX_LONG_LOW_FIXTURE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MAX_LONG_AUDIO_FIXTURE_BYTES, 64 * 1024 * 1024);
+        assert_eq!(LONG_RECOVERY_PROBE_DURATION_SECONDS, 600);
+        const { assert!(LONG_RECOVERY_PROBE_DURATION_SECONDS <= 600) };
+        assert_eq!(LONG_RECOVERY_PROBE_DEADLINE_SECONDS, 720);
+        const { assert!(LONG_RECOVERY_PROBE_DEADLINE_SECONDS <= 900) };
+        assert_eq!(ABR_PROBE_DURATION_SECONDS, 130);
+        assert_eq!(ABR_PROBE_DEADLINE_SECONDS, 175);
+        assert_eq!(buffered.source_duration_seconds(), 160);
+        assert_eq!(buffered.deadline(), Duration::from_secs(225));
+        assert_eq!(buffered.probe_duration_seconds(), 130);
+        assert_eq!(buffered.probe_deadline_seconds(), 175);
+        assert_eq!(MINIMUM_STEADY_PLAY_SECONDS, 110);
+        assert_eq!(transcoding.source_duration_seconds(), 45);
+        assert_eq!(transcoding.deadline(), Duration::from_secs(225));
+        assert_eq!(TRANSCODE_PROBE_DURATION_SECONDS, 30);
+        assert_eq!(transcoding.probe_duration_seconds(), 30);
+        assert_eq!(transcoding.probe_deadline_seconds(), 45);
+        assert_eq!(LONG_RECOVERY_FFMPEG_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(LONG_RECOVERY_FFPROBE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(FFMPEG_TIMEOUT, Duration::from_secs(100));
+        assert_eq!(playlist_response_limit(true), 512 * 1024);
+        assert_eq!(playlist_response_limit(false), 64 * 1024);
+    }
 
     #[test]
     fn phase_rates_apply_only_to_progressive_video_representations() {
@@ -3781,38 +4561,153 @@ mod protocol_contract_tests {
         assert_eq!(video_uri, "transcoded.m3u8");
         assert_eq!(audio_uri, None);
         assert_eq!(bandwidth, 2_128_000);
-        assert!(master_bandwidth_covers_peak(bandwidth, 2_000_001));
+        assert!(!master_bandwidth_matches_peak(bandwidth, 2_000_001));
     }
 
     #[test]
-    fn fragment_peak_bandwidth_uses_checked_rounding_and_rejects_invalid_ranges() {
-        let ranges = [
+    fn rfc_peak_bandwidth_uses_contiguous_target_duration_windows() {
+        let short_tail = [
             Mp4SegmentRange {
                 offset: 0,
-                length: 125_000,
+                length: 32_000,
+                duration_millis: 2_000,
+            },
+            Mp4SegmentRange {
+                offset: 32_000,
+                length: 2_000,
+                duration_millis: 100,
+            },
+        ];
+        assert_eq!(fixture_target_duration_seconds(&short_tail), Some(2));
+        assert_eq!(
+            peak_bandwidth_bits_per_second(&short_tail, 2),
+            Some(129_524)
+        );
+        assert_eq!(
+            legacy_single_fragment_peak_bandwidth_bits_per_second(&short_tail),
+            Some(160_000),
+        );
+
+        let boundary_windows = [
+            Mp4SegmentRange {
+                offset: 0,
+                length: 1_000,
                 duration_millis: 1_000,
             },
             Mp4SegmentRange {
-                offset: 125_000,
-                length: 100_001,
+                offset: 1_000,
+                length: 500,
+                duration_millis: 500,
+            },
+            Mp4SegmentRange {
+                offset: 1_500,
+                length: 3_000,
+                duration_millis: 1_500,
+            },
+        ];
+        assert_eq!(
+            peak_bandwidth_bits_per_second(&boundary_windows, 2),
+            Some(16_000)
+        );
+
+        let three_second_boundary = [
+            Mp4SegmentRange {
+                offset: 0,
+                length: 1_000,
+                duration_millis: 1_000,
+            },
+            Mp4SegmentRange {
+                offset: 1_000,
+                length: 1_000,
+                duration_millis: 1_000,
+            },
+            Mp4SegmentRange {
+                offset: 2_000,
+                length: 1_000,
                 duration_millis: 1_000,
             },
         ];
-        assert_eq!(peak_bandwidth_bits_per_second(&ranges), Some(1_000_000));
-        assert_eq!(peak_bandwidth_bits_per_second(&[]), None);
         assert_eq!(
-            peak_bandwidth_bits_per_second(&[Mp4SegmentRange {
-                offset: 0,
-                length: 1,
-                duration_millis: 0,
-            }]),
+            peak_bandwidth_bits_per_second(&three_second_boundary, 2),
+            Some(8_000)
+        );
+        assert_eq!(
+            peak_bandwidth_bits_per_second(&three_second_boundary[..1], 2),
+            Some(8_000)
+        );
+    }
+
+    #[test]
+    fn rfc_peak_bandwidth_rejects_empty_invalid_ineligible_and_overflowing_ranges() {
+        assert_eq!(peak_bandwidth_bits_per_second(&[], 2), None);
+        assert_eq!(fixture_target_duration_seconds(&[]), None);
+        assert_eq!(
+            peak_bandwidth_bits_per_second(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: 1,
+                    duration_millis: 0
+                }],
+                2
+            ),
             None,
         );
         assert_eq!(
-            peak_bandwidth_bits_per_second(&[Mp4SegmentRange {
+            peak_bandwidth_bits_per_second(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: 0,
+                    duration_millis: 1_000
+                }],
+                2
+            ),
+            None,
+        );
+        assert_eq!(
+            peak_bandwidth_bits_per_second(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: 500,
+                    duration_millis: 500
+                }],
+                2
+            ),
+            None,
+        );
+        assert_eq!(
+            peak_bandwidth_bits_per_second(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: u64::MAX,
+                    duration_millis: 1_000
+                }],
+                2
+            ),
+            None,
+        );
+        assert_eq!(
+            peak_bandwidth_bits_per_second(
+                &[
+                    Mp4SegmentRange {
+                        offset: 0,
+                        length: u64::MAX,
+                        duration_millis: 500
+                    },
+                    Mp4SegmentRange {
+                        offset: 0,
+                        length: 1,
+                        duration_millis: 500
+                    },
+                ],
+                2,
+            ),
+            None,
+        );
+        assert_eq!(
+            legacy_single_fragment_peak_bandwidth_bits_per_second(&[Mp4SegmentRange {
                 offset: 0,
-                length: u64::MAX,
-                duration_millis: 1,
+                length: 1,
+                duration_millis: 0,
             }]),
             None,
         );
@@ -3820,12 +4715,43 @@ mod protocol_contract_tests {
 
     #[test]
     fn aggregate_peak_bandwidth_includes_audio_and_checks_overflow() {
+        let shared_audio_peak = 740_733;
+        let high_video_peak = 2_462_920;
+        let high_variant_peak =
+            aggregate_peak_bandwidth(high_video_peak, shared_audio_peak).unwrap();
+        assert_eq!(high_variant_peak, 3_203_653);
         assert_eq!(
-            aggregate_peak_bandwidth(2_000_000, 128_000).unwrap(),
-            2_128_000
+            aggregate_peak_bandwidth(2_390_920, 238_183).unwrap(),
+            2_629_103
+        );
+        assert_eq!(
+            aggregate_peak_bandwidth(500_000, shared_audio_peak).unwrap(),
+            1_240_733
         );
         assert!(aggregate_peak_bandwidth(u64::MAX, 1).is_err());
-        assert!(!master_bandwidth_covers_peak(2_000_000, 2_128_000));
+        assert!(master_bandwidth_matches_peak(
+            high_variant_peak,
+            high_variant_peak
+        ));
+        assert!(!master_bandwidth_matches_peak(
+            high_variant_peak - 1,
+            high_variant_peak
+        ));
+        assert!(!master_bandwidth_matches_peak(
+            high_variant_peak + 1,
+            high_variant_peak
+        ));
+        assert!(!master_bandwidth_matches_peak(0, high_variant_peak));
+        let separate_audio_peak =
+            expected_variant_peak_bandwidth(2_128_000, 128_000, false).unwrap();
+        assert_eq!(separate_audio_peak, 2_256_000);
+        let muxed_transcode_peak =
+            expected_variant_peak_bandwidth(2_128_000, 128_000, true).unwrap();
+        assert_eq!(muxed_transcode_peak, 2_128_000);
+        assert!(master_bandwidth_matches_peak(
+            muxed_transcode_peak,
+            muxed_transcode_peak
+        ));
     }
 
     #[test]
@@ -4164,5 +5090,223 @@ mod lan_ingress_tests {
                 .count(),
             30
         );
+    }
+
+    #[test]
+    fn latest_header_times_are_isolated_and_survive_sample_cap() {
+        let telemetry = telemetry();
+        {
+            let report = telemetry.report.lock().unwrap();
+            assert!(
+                report
+                    .lan_ingress
+                    .last_header_elapsed_ms_by_phase_and_representation
+                    .iter()
+                    .flatten()
+                    .all(Option::is_none)
+            );
+        }
+        for _ in 0..12 {
+            telemetry.record(1, false, None, StatusCode::PARTIAL_CONTENT.as_u16());
+        }
+        let latest = telemetry
+            .report
+            .lock()
+            .unwrap()
+            .lan_ingress
+            .last_header_elapsed_ms_by_phase_and_representation[0][0];
+        std::thread::sleep(Duration::from_millis(2));
+        telemetry.record(1, false, None, StatusCode::PARTIAL_CONTENT.as_u16());
+        telemetry.phase.store(PHASE_BAD_HIGH, Ordering::Release);
+        telemetry.record(2, false, None, StatusCode::PARTIAL_CONTENT.as_u16());
+        telemetry.phase.store(PHASE_RECOVERY, Ordering::Release);
+        telemetry.record(3, false, None, StatusCode::PARTIAL_CONTENT.as_u16());
+
+        let report = telemetry.report.lock().unwrap();
+        let times = &report
+            .lan_ingress
+            .last_header_elapsed_ms_by_phase_and_representation;
+        assert!(times[0][0].is_some());
+        assert!(times[0][0] > latest);
+        assert!(times[1][1].is_some());
+        assert!(times[2][2].is_some());
+        for (phase, representation) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            assert_eq!(times[phase][representation], None);
+        }
+        assert_eq!(report.lan_ingress.header_samples.len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod recovery_observation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn observation(timestamp: f64, range_end: f64) -> Value {
+        json!({
+            "observed_monotonic_seconds": timestamp,
+            "player_state": {
+                "playhead_seconds": 10.0,
+                "preferred_forward_buffer_duration_seconds": 0.0,
+                "loaded_time_ranges": {
+                    "observations": [{
+                        "start_seconds": 0.0,
+                        "duration_seconds": range_end,
+                        "end_seconds": range_end,
+                    }],
+                    "source_count": 1,
+                    "valid_count": 1,
+                    "invalid_count": 0,
+                    "truncated": false,
+                }
+            }
+        })
+    }
+
+    fn progressive_report(case: NativeCase, recovery_after: f64) -> ReportStore {
+        let mut report = AcceptanceReport::new(case);
+        report.fault_timeline.recovery_after_monotonic_seconds = Some(recovery_after);
+        Arc::new(Mutex::new(report))
+    }
+
+    #[test]
+    fn report_identity_rejects_wrong_case_scenario_and_source_duration() {
+        assert!(
+            validate_report_identity(
+                NativeCase::ProgressiveAbr,
+                ABR_CASE_FULL_NAME,
+                "unbuffered_recovery",
+                LONG_RECOVERY_MEDIA_DURATION_SECONDS,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_report_identity(
+                NativeCase::ProgressiveAbr,
+                BUFFERED_CASE_FULL_NAME,
+                "unbuffered_recovery",
+                LONG_RECOVERY_MEDIA_DURATION_SECONDS,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_report_identity(
+                NativeCase::ProgressiveAbr,
+                ABR_CASE_FULL_NAME,
+                "buffered_continuity",
+                LONG_RECOVERY_MEDIA_DURATION_SECONDS,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_report_identity(
+                NativeCase::ProgressiveAbr,
+                ABR_CASE_FULL_NAME,
+                "unbuffered_recovery",
+                BUFFERED_MEDIA_DURATION_SECONDS,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn buffered_end_coverage_accepts_a_finite_250ms_aac_tail() {
+        let evidence = validate_player_observation(&observation(20.0, 159.8), 160.0).unwrap();
+        assert!(evidence.range_end >= 160.0 - 0.25);
+        assert!(validate_player_observation(&observation(20.0, 159.75), 160.0).is_ok());
+    }
+
+    #[test]
+    fn passive_observation_rejects_playhead_or_ranges_beyond_source_duration() {
+        assert!(validate_player_observation(&observation(20.0, 160.01), 160.0).is_err());
+
+        let mut beyond_playhead = observation(20.0, 160.0);
+        beyond_playhead["player_state"]["playhead_seconds"] = json!(160.01);
+        assert!(validate_player_observation(&beyond_playhead, 160.0).is_err());
+    }
+
+    #[test]
+    fn long_recovery_requires_twenty_seconds_of_unbuffered_source() {
+        let report = progressive_report(NativeCase::ProgressiveAbr, 100.0);
+        let probe = json!({
+            "item_duration_seconds": 3600.0,
+            "recovery_observation": observation(101.0, 3580.0),
+        });
+        assert!(
+            validate_recovery_observations(NativeCase::ProgressiveAbr, &probe, &report).is_ok()
+        );
+
+        let insufficient = json!({
+            "item_duration_seconds": 3600.0,
+            "recovery_observation": observation(101.0, 3580.01),
+        });
+        assert!(
+            validate_recovery_observations(NativeCase::ProgressiveAbr, &insufficient, &report,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn buffered_admission_requires_recovery_window_and_steady_end_coverage() {
+        let report = progressive_report(NativeCase::BufferedContinuity, 100.0);
+        let probe = json!({
+            "item_duration_seconds": 160.0,
+            "steps": [{"name": "play", "status": "completed", "elapsed_seconds": 110.0}],
+            "recovery_observation": observation(101.0, 159.8),
+            "steady_play_end_observation": observation(211.0, 159.75),
+        });
+        assert!(
+            validate_recovery_observations(NativeCase::BufferedContinuity, &probe, &report,)
+                .is_ok()
+        );
+
+        let stale = json!({
+            "item_duration_seconds": 160.0,
+            "steps": [{"name": "play", "status": "completed", "elapsed_seconds": 110.0}],
+            "recovery_observation": observation(105.01, 159.8),
+            "steady_play_end_observation": observation(211.0, 159.8),
+        });
+        assert!(
+            validate_recovery_observations(NativeCase::BufferedContinuity, &stale, &report,)
+                .is_err()
+        );
+
+        let incomplete = json!({
+            "item_duration_seconds": 160.0,
+            "steps": [{"name": "play", "status": "completed", "elapsed_seconds": 109.99}],
+            "recovery_observation": observation(101.0, 159.8),
+            "steady_play_end_observation": observation(211.0, 159.8),
+        });
+        assert!(
+            validate_recovery_observations(NativeCase::BufferedContinuity, &incomplete, &report,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_marker_is_fresh_empty_regular_and_mode_600() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("recovery.trigger");
+        create_empty_private_marker(&marker).unwrap();
+        let metadata = std::fs::symlink_metadata(&marker).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(create_empty_private_marker(&marker).is_err());
+    }
+
+    #[test]
+    fn loaded_ranges_are_not_joined_across_gaps() {
+        let mut gapped = observation(211.0, 10.0);
+        gapped["player_state"]["playhead_seconds"] = json!(5.0);
+        gapped["player_state"]["loaded_time_ranges"]["observations"] = json!([
+            {"start_seconds": 0.0, "duration_seconds": 10.0, "end_seconds": 10.0},
+            {"start_seconds": 100.0, "duration_seconds": 60.0, "end_seconds": 160.0},
+        ]);
+        gapped["player_state"]["loaded_time_ranges"]["source_count"] = json!(2);
+        gapped["player_state"]["loaded_time_ranges"]["valid_count"] = json!(2);
+
+        let evidence = validate_player_observation(&gapped, 160.0).unwrap();
+        assert_eq!(evidence.range_end, 10.0);
     }
 }

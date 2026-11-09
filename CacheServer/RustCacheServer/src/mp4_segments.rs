@@ -8,6 +8,8 @@ use std::{
 const MAX_TIMING_BOX_PAYLOAD_LENGTH: u64 = 16 * 1024 * 1024;
 const MAX_SIDX_PREFIX_BYTES: usize = 1024 * 1024;
 const MAX_SIDX_REFERENCES: usize = 16_384;
+const MAX_HLS_BANDWIDTH_RANGES: usize = MAX_SIDX_REFERENCES;
+const MAX_HLS_BANDWIDTH_CANDIDATES: usize = 1_000_000;
 
 pub(crate) const MAX_SIDX_TRAILER_BYTES: u64 = 1024 * 1024;
 
@@ -16,6 +18,63 @@ pub(crate) struct Mp4SegmentRange {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) duration_millis: u64,
+}
+
+pub(crate) fn hls_target_duration_for_ranges(ranges: &[Mp4SegmentRange]) -> Option<u64> {
+    if ranges.is_empty() || ranges.len() > MAX_HLS_BANDWIDTH_RANGES {
+        return None;
+    }
+    ranges
+        .iter()
+        .try_fold(0_u64, |target, range| {
+            if range.duration_millis == 0 {
+                return None;
+            }
+            let seconds = range.duration_millis / 1_000;
+            let remainder = range.duration_millis % 1_000;
+            Some(target.max((seconds + u64::from(remainder >= 500)).max(1)))
+        })
+        .filter(|target| *target > 0)
+}
+
+pub(crate) fn hls_peak_bandwidth_for_ranges(
+    ranges: &[Mp4SegmentRange],
+    target_seconds: u64,
+) -> Option<u64> {
+    if ranges.is_empty() || ranges.len() > MAX_HLS_BANDWIDTH_RANGES || target_seconds == 0 {
+        return None;
+    }
+    let target_millis = target_seconds.checked_mul(1_000)?;
+    let minimum_window_twice = target_millis;
+    let maximum_window_twice = target_millis.checked_mul(3)?;
+    let mut peak = 0_u64;
+    let mut candidates = 0_usize;
+    for start in 0..ranges.len() {
+        let mut bytes = 0_u64;
+        let mut duration_millis = 0_u64;
+        for range in &ranges[start..] {
+            candidates = candidates.checked_add(1)?;
+            if candidates > MAX_HLS_BANDWIDTH_CANDIDATES {
+                return None;
+            }
+            if range.length == 0 || range.duration_millis == 0 {
+                return None;
+            }
+            bytes = bytes.checked_add(range.length)?;
+            duration_millis = duration_millis.checked_add(range.duration_millis)?;
+            let duration_twice = duration_millis.checked_mul(2)?;
+            if duration_twice > maximum_window_twice {
+                break;
+            }
+            if duration_twice >= minimum_window_twice {
+                let numerator = bytes.checked_mul(8)?.checked_mul(1_000)?;
+                let rounded =
+                    numerator.checked_add(duration_millis.checked_sub(1)?)? / duration_millis;
+                peak = peak.max(rounded);
+            }
+        }
+    }
+    (peak > 0).then_some(peak)
 }
 
 pub(crate) struct Mp4SidxIndex {
@@ -973,6 +1032,112 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn computes_rfc_hls_target_duration_and_peak_bandwidth() {
+        let short_tail = [
+            Mp4SegmentRange {
+                offset: 0,
+                length: 32_000,
+                duration_millis: 2_000,
+            },
+            Mp4SegmentRange {
+                offset: 32_000,
+                length: 2_000,
+                duration_millis: 100,
+            },
+        ];
+        assert_eq!(Some(2), hls_target_duration_for_ranges(&short_tail));
+        assert_eq!(Some(129_524), hls_peak_bandwidth_for_ranges(&short_tail, 2));
+
+        let boundary_windows = [
+            Mp4SegmentRange {
+                offset: 0,
+                length: 1_000,
+                duration_millis: 1_000,
+            },
+            Mp4SegmentRange {
+                offset: 1_000,
+                length: 1_000,
+                duration_millis: 1_500,
+            },
+            Mp4SegmentRange {
+                offset: 2_000,
+                length: 3_000,
+                duration_millis: 1_500,
+            },
+        ];
+        assert_eq!(
+            Some(16_000),
+            hls_peak_bandwidth_for_ranges(&boundary_windows, 2)
+        );
+    }
+
+    #[test]
+    fn hls_bandwidth_work_is_bounded_and_typical_ranges_fit() {
+        let typical = vec![
+            Mp4SegmentRange {
+                offset: 0,
+                length: 100_000,
+                duration_millis: 2_000,
+            };
+            3_600
+        ];
+        assert_eq!(Some(2), hls_target_duration_for_ranges(&typical));
+        assert!(hls_peak_bandwidth_for_ranges(&typical, 2).is_some());
+
+        let dense = vec![
+            Mp4SegmentRange {
+                offset: 0,
+                length: 1,
+                duration_millis: 1,
+            };
+            1_500
+        ];
+        assert_eq!(Some(1), hls_target_duration_for_ranges(&dense));
+        assert_eq!(None, hls_peak_bandwidth_for_ranges(&dense, 1));
+        let over_limit = vec![typical[0]; MAX_HLS_BANDWIDTH_RANGES + 1];
+        assert_eq!(None, hls_target_duration_for_ranges(&over_limit));
+    }
+
+    #[test]
+    fn hls_peak_bandwidth_rejects_invalid_and_overflowing_ranges() {
+        assert_eq!(None, hls_target_duration_for_ranges(&[]));
+        assert_eq!(None, hls_peak_bandwidth_for_ranges(&[], 2));
+        assert_eq!(
+            None,
+            hls_peak_bandwidth_for_ranges(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: 0,
+                    duration_millis: 1_000,
+                }],
+                1,
+            )
+        );
+        assert_eq!(
+            None,
+            hls_peak_bandwidth_for_ranges(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: u64::MAX,
+                    duration_millis: 1_000,
+                }],
+                1,
+            )
+        );
+        assert_eq!(
+            None,
+            hls_peak_bandwidth_for_ranges(
+                &[Mp4SegmentRange {
+                    offset: 0,
+                    length: 1,
+                    duration_millis: 1,
+                }],
+                u64::MAX,
+            )
+        );
+    }
 
     #[test]
     fn reads_fragment_ranges_from_multiple_moof_mdat_pairs() {
