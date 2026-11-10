@@ -30,6 +30,9 @@ def report_payload(
     sizes: tuple[tuple[int, int], ...], *, scenario: str = "unbuffered_recovery", duration: int = 3600,
     probe_duration: int = 600, probe_deadline: int = 720,
 ) -> dict[str, object]:
+    timeline_playhead = min(100.0, float(duration) - 0.1)
+    timeline_end = min(timeline_playhead + 20.0, float(duration))
+    timeline_offsets = (0.0, 10.0, 20.0, 30.0, 35.0) if duration == 45 else (*range(0, 101, 10), 111.5)
     entries = []
     for entry_index, (width, height) in enumerate(sizes):
         entries.append({
@@ -82,6 +85,25 @@ def report_payload(
                 "minimum_distinct_display_timestamps_per_size": 3,
                 "entries": entries,
             },
+            "playback_timeline": {
+                "sample_interval_seconds": 10,
+                "maximum_samples": 96,
+                "truncated": False,
+                "samples": [
+                    {
+                        "elapsed_seconds": float(index) + 10.0,
+                        "observed_monotonic_seconds": float(index) + 90.0,
+                        "playhead_seconds": timeline_playhead,
+                        "loaded_end_seconds": timeline_end,
+                        "buffered_ahead_seconds": timeline_end - timeline_playhead,
+                        "decoded_width": 640,
+                        "decoded_height": 360,
+                        "time_control_status": "playing",
+                        "indicated_bitrate": 1_200_000.0,
+                    }
+                    for index in timeline_offsets
+                ],
+            },
             "recovery_observation": {
                 "observed_monotonic_seconds": 202.0,
                 "player_state": {
@@ -111,6 +133,27 @@ def report_payload(
             "count_by_phase_and_representation": [[1, 0, 0], [1, 1, 0], [1, 0, 0]],
             "successful_by_representation": [1, 1, 0],
             "high_fault_status_count": 1,
+            "first_recovery_high_range_request": {
+                "elapsed_ms": 111_200,
+                "monotonic_seconds": 201.2,
+                "range_start": 0,
+                "range_length": 65_536,
+                "status_code": 206,
+                "media_window": None,
+            },
+            "first_recovery_high_media_request": {
+                "elapsed_ms": 111_500,
+                "monotonic_seconds": 201.5,
+                "range_start": 65_536,
+                "range_length": 65_536,
+                "status_code": 206,
+                "media_window": {
+                    "start_seconds": 100.0,
+                    "end_seconds": 110.0,
+                    "first_fragment_index": 1,
+                    "last_fragment_index": 1,
+                },
+            },
         },
     }
 
@@ -158,6 +201,7 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
                 mock.patch.object(media, "_mute_system_audio"),
                 mock.patch.object(media, "validate_cargo_log"),
                 mock.patch.object(media, "validate_report"),
+                mock.patch.object(media, "_validate_reports_and_derive_diagnostics", return_value={"reports": []}),
                 mock.patch.object(media, "_write_summary"),
                 mock.patch.object(media, "_artifact_size", return_value=0),
                 mock.patch.object(media, "_require_artifact_free_space") as free_space,
@@ -256,6 +300,7 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
                 mock.patch.object(media, "_run_command", side_effect=execute) as run_mock,
                 mock.patch.object(media, "validate_cargo_log"),
                 mock.patch.object(media, "validate_report"),
+                mock.patch.object(media, "_validate_reports_and_derive_diagnostics", return_value={"reports": []}),
             ):
                 for _ in range(2):
                     media._run_local_signed(
@@ -481,6 +526,19 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
             with self.assertRaisesRegex(media.MediaNetworkError, "invalid"):
                 media.validate_report(path, media.EXPECTED_TESTS[0], media.EXPECTED_ABR_SIZES)
 
+    def test_report_admission_accepts_64k_envelope_and_rejects_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "abr.json"
+            payload = report_payload(media.EXPECTED_ABR_SIZES)
+            payload["bounded_extra"] = "x" * (40 * 1024)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertLessEqual(path.stat().st_size, 64 * 1024)
+            media.validate_report(path, media.EXPECTED_TESTS[0])
+            payload["bounded_extra"] = "x" * (65 * 1024)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "oversized"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+
     def test_probe_report_requires_decoded_ordered_three_frame_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "abr.json"
@@ -498,6 +556,145 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(media.MediaNetworkError, "distinct display timestamps"):
                 media.validate_report(path, media.EXPECTED_TESTS[0], media.EXPECTED_ABR_SIZES)
+
+    def test_playback_timeline_admission_is_strict_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "abr.json"
+            payload = report_payload(media.EXPECTED_ABR_SIZES)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            media.validate_report(path, media.EXPECTED_TESTS[0])
+            mutations = (
+                (lambda t: t.update(truncated=True), "truncated"),
+                (lambda t: t.update(maximum_samples=True), "bounds"),
+                (lambda t: t["samples"].extend(dict(t["samples"][-1]) for _ in range(85)), "sample count"),
+                (lambda t: t["samples"][0].update(elapsed_seconds=float("inf")), "invalid timing"),
+                (lambda t: t["samples"][1].update(observed_monotonic_seconds=90.5), "clocks"),
+                (lambda t: t["samples"][0].update(decoded_width=None), "decoded-size pair"),
+                (lambda t: t["samples"][0].update(playhead_seconds=None), "null buffer"),
+                (lambda t: t["samples"][0].update(buffered_ahead_seconds=19.0), "buffer values"),
+                (lambda t: t["samples"][0].update(loaded_end_seconds=3601.0), "buffer values"),
+                (lambda t: t["samples"][0].update(loaded_end_seconds=99.0), "buffer values"),
+                (lambda t: t["samples"][0].update(time_control_status="unknown"), "time-control"),
+            )
+            for mutate, message in mutations:
+                malformed = json.loads(json.dumps(payload))
+                mutate(malformed["probe"]["playback_timeline"])
+                path.write_text(json.dumps(malformed, allow_nan=True), encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(media.MediaNetworkError, message):
+                    media.validate_report(path, media.EXPECTED_TESTS[0])
+
+    def test_progressive_recovery_requests_validate_media_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "abr.json"
+            payload = report_payload(media.EXPECTED_ABR_SIZES)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            media.validate_report(path, media.EXPECTED_TESTS[0])
+            payload["requests"]["first_recovery_high_range_request"]["status_code"] = 503
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            media.validate_report(path, media.EXPECTED_TESTS[0])
+            for field, key, value, message in (
+                ("first_recovery_high_range_request", "status_code", True, "invalid"),
+                ("first_recovery_high_media_request", "monotonic_seconds", float("nan"), "invalid"),
+                ("first_recovery_high_media_request", "range_length", 0, "invalid"),
+                ("first_recovery_high_media_request", "status_code", 503, "status"),
+                ("first_recovery_high_range_request", "range_start", 2**64 - 1, "invalid"),
+                ("first_recovery_high_range_request", "elapsed_ms", 2**64, "invalid"),
+            ):
+                malformed = json.loads(json.dumps(payload))
+                malformed["requests"][field][key] = value
+                path.write_text(json.dumps(malformed, allow_nan=True), encoding="utf-8")
+                with self.subTest(field=field, key=key), self.assertRaisesRegex(media.MediaNetworkError, message):
+                    media.validate_report(path, media.EXPECTED_TESTS[0])
+            malformed = json.loads(json.dumps(payload))
+            malformed["requests"]["first_recovery_high_media_request"]["range_start"] = 2**64 - 1
+            malformed["requests"]["first_recovery_high_media_request"]["range_length"] = 2
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "invalid first_recovery_high_media_request fields"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+            malformed = json.loads(json.dumps(payload))
+            malformed["requests"]["first_recovery_high_media_request"]["range_start"] = 2**64 - 1
+            malformed["requests"]["first_recovery_high_media_request"]["range_length"] = 1
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "invalid first_recovery_high_media_request fields"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+            malformed = json.loads(json.dumps(payload))
+            malformed["requests"]["first_recovery_high_media_request"]["media_window"] = None
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "no overlapping"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+            malformed = json.loads(json.dumps(payload))
+            malformed["requests"]["first_recovery_high_media_request"]["monotonic_seconds"] = 199.0
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "precedes the recovery clock bracket"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+            inside_bracket = json.loads(json.dumps(payload))
+            inside_bracket["requests"]["first_recovery_high_media_request"]["monotonic_seconds"] = 200.5
+            path.write_text(json.dumps(inside_bracket), encoding="utf-8")
+            media.validate_report(path, media.EXPECTED_TESTS[0])
+            malformed = json.loads(json.dumps(payload))
+            malformed["requests"]["first_recovery_high_media_request"]["media_window"].update(
+                end_seconds=3601.0
+            )
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "out-of-bounds"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+
+    def test_probe_duration_errors_precede_playback_timeline_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "abr.json"
+            payload = report_payload(media.EXPECTED_ABR_SIZES)
+            del payload["probe"]["overall_deadline_seconds"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(media.MediaNetworkError, "Probe duration or cooperative deadline"):
+                media.validate_report(path, media.EXPECTED_TESTS[0])
+
+    def test_recovery_diagnostics_keep_bracket_and_only_use_fresh_preceding_sample(self) -> None:
+        payload = report_payload(media.EXPECTED_ABR_SIZES)
+        diagnostic = media.recovery_latency_diagnostics(payload)
+        self.assertEqual(diagnostic["recovery_to_request_seconds"], {"lower_bound": 0.5, "upper_bound": 1.5})
+        self.assertAlmostEqual(diagnostic["first_high_decoded_vs_request_seconds"], 1.5)
+        self.assertEqual(diagnostic["request_media_window"]["first_fragment_index"], 1)
+        sample = diagnostic["nearest_preceding_timeline_sample"]
+        self.assertEqual(sample["age_seconds"], 0.0)
+        self.assertEqual(sample["requested_media_overlap_seconds"], 10.0)
+
+        stale = json.loads(json.dumps(payload))
+        stale["requests"]["first_recovery_high_media_request"]["monotonic_seconds"] = 220.0
+        stale_diagnostic = media.recovery_latency_diagnostics(stale)
+        self.assertIsNone(stale_diagnostic["nearest_preceding_timeline_sample"])
+        before_bracket = json.loads(json.dumps(payload))
+        before_bracket["requests"]["first_recovery_high_media_request"]["monotonic_seconds"] = 199.0
+        before_diagnostic = media.recovery_latency_diagnostics(before_bracket)
+        self.assertEqual(before_diagnostic["recovery_to_request_seconds"], {"lower_bound": 0.0, "upper_bound": -1.0})
+        missing = json.loads(json.dumps(payload))
+        del missing["requests"]["first_recovery_high_media_request"]
+        missing_diagnostic = media.recovery_latency_diagnostics(missing)
+        self.assertFalse(missing_diagnostic["available"])
+        self.assertIsNone(missing_diagnostic["recovery_to_request_seconds"])
+
+    def test_derived_diagnostics_fit_existing_summary_and_preserve_unavailable_cases(self) -> None:
+        abr = report_payload(media.EXPECTED_ABR_SIZES)
+        transcoded = json.loads(json.dumps(abr))
+        transcoded["case_full_name"] = media.EXPECTED_TESTS[1]
+        buffered = json.loads(json.dumps(abr))
+        buffered["case_full_name"] = media.EXPECTED_TESTS[2]
+        buffered["requests"].pop("first_recovery_high_range_request")
+        buffered["requests"].pop("first_recovery_high_media_request")
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_dir = Path(directory)
+            rust_dir = artifact_dir / "rust"
+            rust_dir.mkdir()
+            with mock.patch.object(media, "validate_report", side_effect=[buffered, abr, transcoded]):
+                diagnostics = media._validate_reports_and_derive_diagnostics(rust_dir)
+            media._write_summary(
+                artifact_dir, status="passed", message="ok", started=media.time.monotonic(),
+                recovery_diagnostics=diagnostics,
+            )
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(summary["recovery_latency_diagnostics"]["reports"]), 3)
+            self.assertLessEqual((artifact_dir / "summary.json").stat().st_size, 16 * 1024)
+            self.assertIn("no causal claim", summary["recovery_latency_diagnostics"]["interpretation"])
+            self.assertFalse(summary["recovery_latency_diagnostics"]["reports"][0]["available"])
 
     def test_abr_report_requires_fault_window_and_phase_bound_decoded_frames(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -557,6 +754,10 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
                     },
                 },
             }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            media.validate_report(path, media.EXPECTED_TESTS[2])
+            payload["requests"].pop("first_recovery_high_range_request")
+            payload["requests"].pop("first_recovery_high_media_request")
             path.write_text(json.dumps(payload), encoding="utf-8")
             media.validate_report(path, media.EXPECTED_TESTS[2])
             probe["steady_play_end_observation"]["player_state"]["loaded_time_ranges"]["observations"][0][

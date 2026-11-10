@@ -69,8 +69,8 @@ const EXTENDED_DIAGNOSTIC_CASE_FULL_NAME: &str =
 const BUFFERED_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_buffered_fallback_keeps_playing";
 const TRANSCODE_CASE_FULL_NAME: &str = "media_acceptance_tests::native_transcoded_output_decodes";
-const MAX_REPORT_BYTES: usize = 32 * 1024;
-const MAX_PROBE_JSON_BYTES: usize = 16 * 1024;
+const MAX_REPORT_BYTES: usize = 64 * 1024;
+const MAX_PROBE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHILD_STDERR_BYTES: usize = 128 * 1024;
 const MAX_FIXTURE_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_SOURCE_FIXTURE_BYTES: u64 = 60 * 1024 * 1024;
@@ -255,6 +255,7 @@ struct RequestSummary {
     last_request_elapsed_ms_by_phase_and_representation: [[Option<u64>; 3]; 3],
     high_fault_status_count: u64,
     first_recovery_high_range_request: Option<RecoveryHighRangeRequest>,
+    first_recovery_high_media_request: Option<RecoveryHighRangeRequest>,
     events: Vec<RequestEvent>,
 }
 
@@ -275,6 +276,15 @@ struct RecoveryHighRangeRequest {
     range_start: u64,
     range_length: u64,
     status_code: u16,
+    media_window: Option<MediaWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+struct MediaWindow {
+    start_seconds: f64,
+    end_seconds: f64,
+    first_fragment_index: u64,
+    last_fragment_index: u64,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -408,6 +418,7 @@ struct MediaFixture {
 struct InspectedMedia {
     path: PathBuf,
     record: FixtureRecord,
+    fragments: Vec<Mp4SegmentRange>,
 }
 
 struct FixtureExpectation {
@@ -471,6 +482,7 @@ struct OriginMedia {
     path: PathBuf,
     representation_code: u8,
     initialization_length: u64,
+    fragments: Vec<Mp4SegmentRange>,
     content_type: &'static str,
 }
 
@@ -1958,6 +1970,7 @@ async fn inspect_mp4(
                 .map(audio_codec_code)
                 .unwrap_or_default(),
         },
+        fragments: ranges,
     })
 }
 
@@ -2190,6 +2203,7 @@ fn make_origin_state(
             path: fixture.high_video.path.clone(),
             representation_code: 1,
             initialization_length: fixture.high_video.record.initialization_bytes,
+            fragments: fixture.high_video.fragments.clone(),
             content_type: "video/mp4",
         },
     );
@@ -2200,6 +2214,7 @@ fn make_origin_state(
                 path: low.path.clone(),
                 representation_code: 2,
                 initialization_length: low.record.initialization_bytes,
+                fragments: low.fragments.clone(),
                 content_type: "video/mp4",
             },
         );
@@ -2210,6 +2225,7 @@ fn make_origin_state(
             path: fixture.audio.path.clone(),
             representation_code: 3,
             initialization_length: fixture.audio.record.initialization_bytes,
+            fragments: fixture.audio.fragments.clone(),
             content_type: "audio/mp4",
         },
     );
@@ -2285,13 +2301,20 @@ async fn origin_response(
     };
     let touches_media_payload =
         range.start.saturating_add(range.length) > media.initialization_length;
+    let media_window = media_window_for_byte_range(
+        range,
+        media.initialization_length,
+        total_length,
+        &media.fragments,
+    );
     record_origin_request(
         &origin,
         media.representation_code,
         phase_code,
         range,
         status,
-        !fault_applied && touches_media_payload,
+        !head_only && !fault_applied && touches_media_payload,
+        media_window,
     );
     if fault_applied {
         return empty_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -2487,6 +2510,7 @@ fn record_origin_request(
     range: ByteRange,
     status: StatusCode,
     media_payload: bool,
+    media_window: Option<MediaWindow>,
 ) {
     let Ok(epoch) = origin.epoch.lock() else {
         return;
@@ -2543,11 +2567,68 @@ fn record_origin_request(
             range_start: range.start,
             range_length: range.length,
             status_code: status.as_u16(),
+            media_window,
+        });
+    }
+    if representation_code == 1
+        && phase_code == PHASE_RECOVERY
+        && status == StatusCode::PARTIAL_CONTENT
+        && media_payload
+        && media_window.is_some()
+        && report.requests.first_recovery_high_media_request.is_none()
+    {
+        report.requests.first_recovery_high_media_request = Some(RecoveryHighRangeRequest {
+            elapsed_ms,
+            monotonic_seconds: monotonic_clock_seconds().ok(),
+            range_start: range.start,
+            range_length: range.length,
+            status_code: status.as_u16(),
+            media_window,
         });
     }
     if report.requests.events.len() < 32 {
         report.requests.events.push(event);
     }
+}
+
+fn media_window_for_byte_range(
+    requested: ByteRange,
+    initialization_length: u64,
+    total_length: u64,
+    fragments: &[Mp4SegmentRange],
+) -> Option<MediaWindow> {
+    validate_fragment_ranges(initialization_length, total_length, fragments).ok()?;
+    let request_end = requested.start.checked_add(requested.length)?;
+    if requested.length == 0 || request_end > total_length {
+        return None;
+    }
+
+    let mut elapsed_millis = 0_u64;
+    let mut first_fragment = None;
+    let mut last_fragment = None;
+    let mut window_start_millis = 0_u64;
+    let mut window_end_millis = 0_u64;
+    for (index, fragment) in fragments.iter().enumerate() {
+        let fragment_end = fragment.offset.checked_add(fragment.length)?;
+        let fragment_index = u64::try_from(index).ok()?;
+        let fragment_start_millis = elapsed_millis;
+        elapsed_millis = elapsed_millis.checked_add(fragment.duration_millis)?;
+        if requested.start < fragment_end && fragment.offset < request_end {
+            if first_fragment.is_none() {
+                first_fragment = Some(fragment_index);
+                window_start_millis = fragment_start_millis;
+            }
+            last_fragment = Some(fragment_index);
+            window_end_millis = elapsed_millis;
+        }
+    }
+
+    Some(MediaWindow {
+        start_seconds: window_start_millis as f64 / 1000.0,
+        end_seconds: window_end_millis as f64 / 1000.0,
+        first_fragment_index: first_fragment?,
+        last_fragment_index: last_fragment?,
+    })
 }
 
 impl OriginState {
@@ -2805,7 +2886,7 @@ async fn run_native_probe(
 
 fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
     if process.stdout_truncated || process.stdout.len() > MAX_PROBE_JSON_BYTES {
-        return Err("native probe JSON exceeded its 16 KiB bound".to_owned());
+        return Err("native probe JSON exceeded its 64 KiB bound".to_owned());
     }
     let mut value: Value = serde_json::from_slice(&process.stdout)
         .map_err(|_| "native probe did not return bounded JSON".to_owned())?;
@@ -3967,12 +4048,12 @@ async fn write_report(path: &Path, report: &ReportStore) -> Result<(), String> {
     if bytes.len() > MAX_REPORT_BYTES {
         snapshot.requests.events.truncate(8);
         snapshot.probe = None;
-        snapshot.error = Some("report payload reduced to enforce the 32 KiB limit".to_owned());
+        snapshot.error = Some("report payload reduced to enforce the 64 KiB limit".to_owned());
         bytes = serde_json::to_vec(&snapshot)
             .map_err(|_| "bounded acceptance report could not be encoded".to_owned())?;
     }
     if bytes.len() > MAX_REPORT_BYTES {
-        return Err("acceptance report exceeded its 32 KiB bound".to_owned());
+        return Err("acceptance report exceeded its 64 KiB bound".to_owned());
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     tokio::fs::create_dir_all(parent)
@@ -4045,6 +4126,377 @@ impl<T> Drop for AbortTask<T> {
 mod origin_request_diagnostic_tests {
     use super::*;
 
+    fn sample_fragments() -> [Mp4SegmentRange; 3] {
+        [
+            Mp4SegmentRange {
+                offset: 100,
+                length: 100,
+                duration_millis: 1_000,
+            },
+            Mp4SegmentRange {
+                offset: 200,
+                length: 100,
+                duration_millis: 2_500,
+            },
+            Mp4SegmentRange {
+                offset: 300,
+                length: 200,
+                duration_millis: 500,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn recovery_head_probe_does_not_capture_first_media_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("high.mp4");
+        tokio::fs::write(&path, vec![0_u8; 500]).await.unwrap();
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = Arc::new(OriginState {
+            media: HashMap::from([(
+                "high.mp4".to_owned(),
+                OriginMedia {
+                    path,
+                    representation_code: 1,
+                    initialization_length: 100,
+                    fragments: sample_fragments().to_vec(),
+                    content_type: "video/mp4",
+                },
+            )]),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_RECOVERY)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        });
+        let headers = |range: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, range.parse().unwrap());
+            headers
+        };
+        let head = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            headers("bytes=150-199"),
+            true,
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            axum::body::to_bytes(head.into_body(), 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let snapshot = report.lock().unwrap();
+            assert_eq!(snapshot.requests.total, 1);
+            assert_eq!(
+                snapshot.requests.media_payload_by_phase_and_representation[2][0],
+                0
+            );
+            assert!(
+                snapshot
+                    .requests
+                    .first_recovery_high_media_request
+                    .is_none()
+            );
+            assert_eq!(
+                snapshot
+                    .requests
+                    .first_recovery_high_range_request
+                    .as_ref()
+                    .unwrap()
+                    .range_start,
+                150
+            );
+        }
+        let get = origin_response(
+            origin,
+            "high.mp4".to_owned(),
+            headers("bytes=250-299"),
+            false,
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            axum::body::to_bytes(get.into_body(), 50)
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+        let snapshot = report.lock().unwrap();
+        assert_eq!(snapshot.requests.total, 2);
+        assert_eq!(
+            snapshot.requests.media_payload_by_phase_and_representation[2][0],
+            1
+        );
+        assert_eq!(
+            snapshot
+                .requests
+                .first_recovery_high_range_request
+                .as_ref()
+                .unwrap()
+                .range_start,
+            150
+        );
+        let first_media = snapshot
+            .requests
+            .first_recovery_high_media_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_media.range_start, 250);
+        assert_eq!(first_media.media_window.unwrap().first_fragment_index, 1);
+    }
+
+    #[test]
+    fn media_window_uses_half_open_fragment_boundaries_and_parsed_durations() {
+        let fragments = sample_fragments();
+        let window = media_window_for_byte_range(
+            ByteRange {
+                start: 200,
+                length: 100,
+                partial: true,
+            },
+            100,
+            500,
+            &fragments,
+        )
+        .unwrap();
+
+        assert_eq!(window.start_seconds, 1.0);
+        assert_eq!(window.end_seconds, 3.5);
+        assert_eq!(window.first_fragment_index, 1);
+        assert_eq!(window.last_fragment_index, 1);
+
+        let initialization_and_media = media_window_for_byte_range(
+            ByteRange {
+                start: 50,
+                length: 110,
+                partial: true,
+            },
+            100,
+            500,
+            &fragments,
+        )
+        .unwrap();
+        assert_eq!(initialization_and_media.start_seconds, 0.0);
+        assert_eq!(initialization_and_media.end_seconds, 1.0);
+        assert_eq!(initialization_and_media.first_fragment_index, 0);
+        assert_eq!(initialization_and_media.last_fragment_index, 0);
+    }
+
+    #[test]
+    fn media_window_is_null_for_initialization_only_range() {
+        assert_eq!(
+            media_window_for_byte_range(
+                ByteRange {
+                    start: 0,
+                    length: 100,
+                    partial: true,
+                },
+                100,
+                500,
+                &sample_fragments(),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn media_window_spanning_fragments_uses_first_start_and_last_end() {
+        let window = media_window_for_byte_range(
+            ByteRange {
+                start: 150,
+                length: 160,
+                partial: true,
+            },
+            100,
+            500,
+            &sample_fragments(),
+        )
+        .unwrap();
+
+        assert_eq!(window.start_seconds, 0.0);
+        assert_eq!(window.end_seconds, 4.0);
+        assert_eq!(window.first_fragment_index, 0);
+        assert_eq!(window.last_fragment_index, 2);
+    }
+
+    #[test]
+    fn media_window_is_null_for_overflowing_or_truncated_mapping() {
+        let fragments = sample_fragments();
+        assert_eq!(
+            media_window_for_byte_range(
+                ByteRange {
+                    start: u64::MAX,
+                    length: 1,
+                    partial: true,
+                },
+                100,
+                500,
+                &fragments,
+            ),
+            None,
+        );
+        assert_eq!(
+            media_window_for_byte_range(
+                ByteRange {
+                    start: 150,
+                    length: 10,
+                    partial: true,
+                },
+                100,
+                501,
+                &fragments,
+            ),
+            None,
+        );
+        let overflowing_durations = [
+            Mp4SegmentRange {
+                offset: 100,
+                length: 200,
+                duration_millis: u64::MAX,
+            },
+            Mp4SegmentRange {
+                offset: 300,
+                length: 200,
+                duration_millis: 1,
+            },
+        ];
+        assert_eq!(
+            media_window_for_byte_range(
+                ByteRange {
+                    start: 150,
+                    length: 10,
+                    partial: true,
+                },
+                100,
+                500,
+                &overflowing_durations,
+            ),
+            None,
+        );
+        let overflowing_fragments = [
+            Mp4SegmentRange {
+                offset: 100,
+                length: u64::MAX,
+                duration_millis: 1,
+            },
+            Mp4SegmentRange {
+                offset: 0,
+                length: 1,
+                duration_millis: 1,
+            },
+        ];
+        assert_eq!(
+            media_window_for_byte_range(
+                ByteRange {
+                    start: 150,
+                    length: 10,
+                    partial: true,
+                },
+                100,
+                500,
+                &overflowing_fragments,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn first_recovery_range_and_first_successful_media_request_are_distinct() {
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ExtendedDiagnostic,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ExtendedDiagnostic,
+            phase: Arc::new(AtomicU8::new(PHASE_RECOVERY)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+        let init_range = ByteRange {
+            start: 0,
+            length: 100,
+            partial: true,
+        };
+        let media_range = ByteRange {
+            start: 150,
+            length: 50,
+            partial: true,
+        };
+        let media_window = media_window_for_byte_range(media_range, 100, 500, &sample_fragments());
+
+        record_origin_request(
+            &origin,
+            1,
+            PHASE_RECOVERY,
+            init_range,
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            None,
+        );
+        record_origin_request(
+            &origin,
+            1,
+            PHASE_RECOVERY,
+            media_range,
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            media_window,
+        );
+        record_origin_request(
+            &origin,
+            1,
+            PHASE_RECOVERY,
+            media_range,
+            StatusCode::PARTIAL_CONTENT,
+            true,
+            media_window,
+        );
+
+        let report = report.lock().unwrap();
+        assert_eq!(report.requests.total, 3);
+        assert_eq!(report.requests.events.len(), 3);
+        let first_range = report
+            .requests
+            .first_recovery_high_range_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_range.range_start, 0);
+        assert_eq!(first_range.media_window, None);
+        assert_eq!(
+            serde_json::to_value(first_range).unwrap()["media_window"],
+            serde_json::Value::Null
+        );
+        let first_media = report
+            .requests
+            .first_recovery_high_media_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_media.range_start, 150);
+        assert_eq!(
+            first_media.status_code,
+            StatusCode::PARTIAL_CONTENT.as_u16()
+        );
+        assert_eq!(first_media.media_window, media_window);
+        let serialized = serde_json::to_value(first_media).unwrap();
+        assert_eq!(
+            serialized["media_window"],
+            serde_json::json!({
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "first_fragment_index": 0,
+                "last_fragment_index": 0,
+            })
+        );
+    }
+
     #[test]
     fn first_recovery_high_range_survives_full_early_event_window() {
         let report = Arc::new(Mutex::new(AcceptanceReport::new(
@@ -4071,6 +4523,7 @@ mod origin_request_diagnostic_tests {
                 range,
                 StatusCode::PARTIAL_CONTENT,
                 true,
+                None,
             );
         }
         record_origin_request(
@@ -4080,6 +4533,7 @@ mod origin_request_diagnostic_tests {
             range,
             StatusCode::PARTIAL_CONTENT,
             true,
+            None,
         );
 
         let report = report.lock().unwrap();
@@ -4137,6 +4591,7 @@ mod origin_request_diagnostic_tests {
                 range,
                 StatusCode::PARTIAL_CONTENT,
                 true,
+                None,
             );
         }
         let latest = report
@@ -4152,6 +4607,7 @@ mod origin_request_diagnostic_tests {
             range,
             StatusCode::PARTIAL_CONTENT,
             true,
+            None,
         );
 
         let report = report.lock().unwrap();
@@ -4195,6 +4651,7 @@ mod origin_request_diagnostic_tests {
                 range,
                 StatusCode::PARTIAL_CONTENT,
                 true,
+                None,
             );
         }
 

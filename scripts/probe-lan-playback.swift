@@ -134,6 +134,204 @@ private enum LoadedTimeRangeDiagnostics {
     }
 }
 
+private struct PlaybackTimelineDiagnostics {
+    static let sampleIntervalSeconds = 10.0
+    static let maximumSamples = 96
+
+    private(set) var samples: [[String: Any]] = []
+    private(set) var truncated = false
+
+    private var lastElapsedSeconds: Double?
+    private var lastMonotonicSeconds: Double?
+
+    static func loadedEndSeconds(playheadSeconds: Double, ranges: [CMTimeRange]) -> Double? {
+        guard playheadSeconds.isFinite, playheadSeconds >= 0 else { return nil }
+        let intervals = ranges.compactMap { range -> (start: Double, end: Double)? in
+            let start = CMTimeGetSeconds(range.start)
+            let duration = CMTimeGetSeconds(range.duration)
+            guard
+                let interval = LoadedTimeRangeDiagnostics.observation(
+                    startSeconds: start,
+                    durationSeconds: duration
+                )
+            else {
+                return nil
+            }
+            return (interval["start_seconds"]!, interval["end_seconds"]!)
+        }.sorted { $0.start < $1.start }
+
+        let containing = intervals.filter { $0.start <= playheadSeconds && playheadSeconds <= $0.end }
+        guard var end = containing.map({ $0.end }).max() else {
+            return nil
+        }
+        for interval in intervals where interval.start > playheadSeconds {
+            guard interval.start <= end else { break }
+            end = max(end, interval.end)
+        }
+        return end
+    }
+
+    mutating func record(
+        elapsedSeconds: Double,
+        observedMonotonicSeconds: Double,
+        playheadSeconds: Double?,
+        ranges: [CMTimeRange],
+        decodedWidth: Int?,
+        decodedHeight: Int?,
+        timeControlStatus: String,
+        indicatedBitrate: Double?,
+        force: Bool = false
+    ) {
+        guard elapsedSeconds.isFinite, elapsedSeconds >= 0,
+            observedMonotonicSeconds.isFinite, observedMonotonicSeconds > 0,
+            lastElapsedSeconds.map({ elapsedSeconds >= $0 }) ?? true,
+            lastMonotonicSeconds.map({ observedMonotonicSeconds >= $0 }) ?? true,
+            lastMonotonicSeconds != observedMonotonicSeconds,
+            shouldRecord(at: elapsedSeconds, force: force)
+        else {
+            return
+        }
+        guard samples.count < Self.maximumSamples else {
+            truncated = true
+            lastElapsedSeconds = elapsedSeconds
+            lastMonotonicSeconds = observedMonotonicSeconds
+            return
+        }
+
+        let validPlayhead = playheadSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let loadedEnd = validPlayhead.flatMap { Self.loadedEndSeconds(playheadSeconds: $0, ranges: ranges) }
+        let validWidth = decodedWidth.flatMap { $0 > 0 ? $0 : nil }
+        let validHeight = decodedHeight.flatMap { $0 > 0 ? $0 : nil }
+        let validBitrate = indicatedBitrate.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        samples.append([
+            "elapsed_seconds": elapsedSeconds,
+            "observed_monotonic_seconds": observedMonotonicSeconds,
+            "playhead_seconds": validPlayhead as Any? ?? NSNull(),
+            "loaded_end_seconds": loadedEnd as Any? ?? NSNull(),
+            "buffered_ahead_seconds": validPlayhead.flatMap { playhead in
+                loadedEnd.map { max(0, $0 - playhead) }
+            } as Any? ?? NSNull(),
+            "decoded_width": validWidth as Any? ?? NSNull(),
+            "decoded_height": validHeight as Any? ?? NSNull(),
+            "time_control_status": ["paused", "waiting", "playing"].contains(timeControlStatus)
+                ? timeControlStatus
+                : "other",
+            "indicated_bitrate": validBitrate as Any? ?? NSNull(),
+        ])
+        lastElapsedSeconds = elapsedSeconds
+        lastMonotonicSeconds = observedMonotonicSeconds
+    }
+
+    func shouldRecord(at elapsedSeconds: Double, force: Bool = false) -> Bool {
+        if force { return true }
+        guard let lastElapsedSeconds else { return true }
+        return elapsedSeconds - lastElapsedSeconds >= Self.sampleIntervalSeconds
+    }
+
+    var json: [String: Any] {
+        [
+            "sample_interval_seconds": Self.sampleIntervalSeconds,
+            "maximum_samples": Self.maximumSamples,
+            "truncated": truncated,
+            "samples": samples,
+        ]
+    }
+
+    static func runSelfTest() throws -> [String] {
+        var recorder = PlaybackTimelineDiagnostics()
+        func ranges(_ pairs: [(Double, Double)]) -> [CMTimeRange] {
+            pairs.map { start, end in
+                CMTimeRange(
+                    start: CMTime(seconds: start, preferredTimescale: 600),
+                    duration: CMTime(seconds: end - start, preferredTimescale: 600)
+                )
+            }
+        }
+
+        let contiguousEnd = loadedEndSeconds(
+            playheadSeconds: 3,
+            ranges: ranges([(0, 2), (1.5, 4), (4, 5), (8, 10)]) + [
+                CMTimeRange(start: .invalid, duration: CMTime(seconds: 2, preferredTimescale: 600))
+            ]
+        )
+        guard contiguousEnd == 5,
+            loadedEndSeconds(playheadSeconds: 6, ranges: ranges([(0, 5), (8, 10)])) == nil,
+            loadedEndSeconds(playheadSeconds: .infinity, ranges: ranges([(0, 5)])) == nil
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "PlaybackTimelineDiagnostics", code: 1)
+        }
+
+        let emptyRanges: [CMTimeRange] = []
+        recorder.record(
+            elapsedSeconds: 0, observedMonotonicSeconds: 100, playheadSeconds: .nan,
+            ranges: emptyRanges, decodedWidth: nil, decodedHeight: nil, timeControlStatus: "unexpected",
+            indicatedBitrate: .infinity
+        )
+        recorder.record(
+            elapsedSeconds: 9.9, observedMonotonicSeconds: 109.9, playheadSeconds: 2,
+            ranges: emptyRanges, decodedWidth: 1920, decodedHeight: 1080,
+            timeControlStatus: "playing", indicatedBitrate: 1_000
+        )
+        guard recorder.samples.count == 1 else {
+            throw ProbeFailure(phase: "self_test", domain: "PlaybackTimelineDiagnostics", code: 2)
+        }
+        recorder.record(
+            elapsedSeconds: 10, observedMonotonicSeconds: 110, playheadSeconds: 2,
+            ranges: ranges([(0, 3), (8, 9)]), decodedWidth: 1920, decodedHeight: 1080,
+            timeControlStatus: "playing", indicatedBitrate: 1_000
+        )
+        recorder.record(
+            elapsedSeconds: 10, observedMonotonicSeconds: 110, playheadSeconds: 2,
+            ranges: emptyRanges, decodedWidth: nil, decodedHeight: nil, timeControlStatus: "paused",
+            indicatedBitrate: nil, force: true
+        )
+        let sample = recorder.samples.last ?? [:]
+        guard recorder.samples.count == 2,
+            sample["loaded_end_seconds"] as? Double == 3,
+            sample["buffered_ahead_seconds"] as? Double == 1,
+            sample["time_control_status"] as? String == "playing"
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "PlaybackTimelineDiagnostics", code: 3)
+        }
+
+        for index in 1...Self.maximumSamples {
+            recorder.record(
+                elapsedSeconds: 10 + Double(index) * 10,
+                observedMonotonicSeconds: 110 + Double(index) * 10,
+                playheadSeconds: nil, ranges: emptyRanges, decodedWidth: nil, decodedHeight: nil,
+                timeControlStatus: "paused", indicatedBitrate: nil
+            )
+        }
+        let json = recorder.json
+        let encoded = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        let decoded = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        let encodedSamples = decoded?["samples"] as? [[String: Any]]
+        let first = encodedSamples?.first
+        guard recorder.samples.count == Self.maximumSamples, recorder.truncated,
+            decoded?["sample_interval_seconds"] as? Double == 10,
+            decoded?["maximum_samples"] as? Int == Self.maximumSamples,
+            decoded?["truncated"] as? Bool == true,
+            encodedSamples?.count == Self.maximumSamples,
+            first?["elapsed_seconds"] as? Double == 0,
+            first?["observed_monotonic_seconds"] as? Double == 100,
+            first?["playhead_seconds"] is NSNull,
+            first?["loaded_end_seconds"] is NSNull,
+            first?["buffered_ahead_seconds"] is NSNull,
+            first?["decoded_width"] is NSNull,
+            first?["decoded_height"] is NSNull,
+            first?["indicated_bitrate"] is NSNull,
+            first?["time_control_status"] as? String == "other"
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "PlaybackTimelineDiagnostics", code: 4)
+        }
+        return [
+            "playback_timeline_samples_at_interval_and_bounds_storage_with_truncation",
+            "playback_timeline_rejects_nonfinite_values_and_preserves_null_json_fields",
+            "playback_timeline_buffer_end_merges_overlaps_but_not_disjoint_ranges",
+        ]
+    }
+}
+
 private struct ProbeOptions {
     let url: URL
     let duration: TimeInterval
@@ -517,6 +715,7 @@ private struct ProbeOptions {
         passed.append(contentsOf: try BoundedObservations.runSelfTest())
         passed.append(contentsOf: try PlayerErrorLogDiagnostics.runSelfTest())
         passed.append(contentsOf: try LoadedTimeRangeDiagnostics.runSelfTest())
+        passed.append(contentsOf: try PlaybackTimelineDiagnostics.runSelfTest())
         passed.append(contentsOf: try RecoveryObservationTrigger.runSelfTest())
         passed.append(contentsOf: try PlaybackPolicy.runSelfTest())
         passed.append(contentsOf: try PlayerSetup.runSelfTest())
@@ -1180,6 +1379,9 @@ private final class PlaybackProbe {
     private var item: AVPlayerItem?
     private var decodedFrames = 0
     private var uniqueDisplayTimes = Set<Int64>()
+    private var lastDecodedWidth: Int?
+    private var lastDecodedHeight: Int?
+    private var playbackTimeline = PlaybackTimelineDiagnostics()
     private var decodedVideoSizeObservations = BoundedObservations()
     private var accessLogObservations = BoundedObservations()
     private var frameSamples: [[String: Any]] = []
@@ -1533,6 +1735,7 @@ private final class PlaybackProbe {
     private func sampleFrame(phase: String) throws {
         guard item != nil else { return }
         captureAccessLog()
+        captureTimeline()
         let hostTime = CACurrentMediaTime()
         let itemTime = output.itemTime(forHostTime: hostTime)
         guard output.hasNewPixelBuffer(forItemTime: itemTime) else { return }
@@ -1550,6 +1753,8 @@ private final class PlaybackProbe {
         }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        lastDecodedWidth = width
+        lastDecodedHeight = height
         var sizeObservation: [String: Any] = ["width": width, "height": height]
         let timestampNanoseconds = displaySeconds * 1_000_000_000
         if displaySeconds.isFinite, timestampNanoseconds.isFinite,
@@ -1616,6 +1821,42 @@ private final class PlaybackProbe {
             }
             accessLogObservations.upsert(index: index, value: observation)
         }
+    }
+
+    private func captureTimeline(force: Bool = false) {
+        let elapsed = TimeInterval(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
+        guard playbackTimeline.shouldRecord(at: elapsed, force: force),
+            let observedMonotonicSeconds = try? monotonicClockSeconds(),
+            let player
+        else {
+            return
+        }
+        let events = item?.accessLog()?.events ?? []
+        let indicatedBitrate = events.reversed().first(where: {
+            $0.indicatedBitrate.isFinite && $0.indicatedBitrate >= 0
+        })?.indicatedBitrate
+        let status: String
+        switch player.timeControlStatus {
+        case .paused:
+            status = "paused"
+        case .waitingToPlayAtSpecifiedRate:
+            status = "waiting"
+        case .playing:
+            status = "playing"
+        @unknown default:
+            status = "other"
+        }
+        playbackTimeline.record(
+            elapsedSeconds: elapsed,
+            observedMonotonicSeconds: observedMonotonicSeconds,
+            playheadSeconds: CMTimeGetSeconds(player.currentTime()),
+            ranges: item?.loadedTimeRanges.map(\.timeRangeValue) ?? [],
+            decodedWidth: lastDecodedWidth,
+            decodedHeight: lastDecodedHeight,
+            timeControlStatus: status,
+            indicatedBitrate: indicatedBitrate,
+            force: force
+        )
     }
 
     private func startPlayback(_ player: AVPlayer, phase: String) throws {
@@ -1703,6 +1944,7 @@ private final class PlaybackProbe {
                 "events": accessLogObservations.observations,
                 "truncated": accessLogObservations.truncated,
             ],
+            "playback_timeline": playbackTimeline.json,
             "steps": steps,
             "final_player_state": finalPlayerState as Any? ?? NSNull(),
             "recovery_observation": recoveryObservation as Any? ?? NSNull(),
@@ -1730,6 +1972,9 @@ private final class PlaybackProbe {
             return
         }
         recoveryObservation = try playerObservation()
+        if recoveryObservation != nil {
+            captureTimeline(force: true)
+        }
     }
 
     private func playerObservation() throws -> [String: Any]? {

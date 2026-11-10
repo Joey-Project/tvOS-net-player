@@ -29,7 +29,7 @@ FINALIZE_BUDGET_SECONDS = 60
 COMMAND_LOG_BYTES = 8 * 1024 * 1024
 ARTIFACT_BYTES = 32 * 1024 * 1024
 MIN_ARTIFACT_FREE_BYTES = 6 * 1024 * 1024 * 1024
-REPORT_BYTES = 32 * 1024
+REPORT_BYTES = 64 * 1024
 EXPECTED_TESTS = (
     "media_acceptance_tests::native_progressive_adaptation_and_recovery",
     "media_acceptance_tests::native_transcoded_output_decodes",
@@ -202,15 +202,20 @@ def resolve_compile_deadline(*, started_at: float, total_deadline: float) -> flo
     )
 
 
-def _write_summary(artifact_dir: Path, *, status: str, message: str, started: float) -> None:
+def _write_summary(
+    artifact_dir: Path, *, status: str, message: str, started: float,
+    recovery_diagnostics: dict[str, Any] | None = None,
+) -> None:
     summary = {
         "schema_version": 1,
         "status": status,
         "message": " ".join(message.split())[:1024],
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
+    if recovery_diagnostics is not None:
+        summary["recovery_latency_diagnostics"] = recovery_diagnostics
     encoded = (json.dumps(summary, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    if len(encoded) > 4096 or _artifact_size(artifact_dir) + len(encoded) > ARTIFACT_BYTES:
+    if len(encoded) > 16 * 1024 or _artifact_size(artifact_dir) + len(encoded) > ARTIFACT_BYTES:
         raise MediaNetworkError("Could not retain the bounded runner summary within artifact limits.")
     (artifact_dir / "summary.json").write_bytes(encoded)
 
@@ -501,6 +506,182 @@ def _validate_progressive_origin_trace(report: dict[str, Any], expected_case: st
         raise MediaNetworkError(f"Progressive origin trace lacks baseline high, faulted high, or healthy low: {report_name}")
     if expected_case == EXPECTED_TESTS[0] and payload[2][0] <= 0:
         raise MediaNetworkError(f"Future-case origin trace lacks recovered high traffic: {report_name}")
+    source_duration = float(report["source_duration_seconds"])
+    for field in ("first_recovery_high_range_request", "first_recovery_high_media_request"):
+        request = requests.get(field)
+        required = expected_case == EXPECTED_TESTS[0]
+        if request is None and not required:
+            continue
+        if not isinstance(request, dict):
+            raise MediaNetworkError(f"Progressive report lacks {field} evidence: {report_name}")
+        if (not _exact_int(request.get("elapsed_ms")) or not 0 <= request["elapsed_ms"] <= 2**64 - 1
+                or not _numeric(request.get("monotonic_seconds"))
+                or float(request["monotonic_seconds"]) <= 0
+                or not _exact_int(request.get("range_start")) or not 0 <= request["range_start"] <= 2**64 - 1
+                or not _exact_int(request.get("range_length")) or not 0 < request["range_length"] <= 2**64 - 1
+                or request["range_start"] + request["range_length"] > 2**64 - 1
+                or not _exact_int(request.get("status_code")) or not 100 <= request["status_code"] <= 599):
+            raise MediaNetworkError(f"Progressive report has invalid {field} fields: {report_name}")
+        if field == "first_recovery_high_media_request" and request["status_code"] != 206:
+            raise MediaNetworkError(f"Progressive report has invalid {field} status: {report_name}")
+        if "media_window" not in request:
+            raise MediaNetworkError(f"Progressive report is missing {field} media-window field: {report_name}")
+        media_window = request.get("media_window")
+        if media_window is None:
+            if field == "first_recovery_high_media_request":
+                raise MediaNetworkError(f"Progressive report has no overlapping {field} media window: {report_name}")
+            continue
+        if not isinstance(media_window, dict):
+            raise MediaNetworkError(f"Progressive report has an invalid {field} media window: {report_name}")
+        start, end = media_window.get("start_seconds"), media_window.get("end_seconds")
+        first, last = media_window.get("first_fragment_index"), media_window.get("last_fragment_index")
+        if (not _numeric(start) or not _numeric(end) or float(start) < 0
+                or float(end) <= float(start) or float(end) > source_duration + 0.25
+                or not _exact_int(first) or not 0 <= first <= 2**64 - 1
+                or not _exact_int(last) or not first <= last <= 2**64 - 1):
+            raise MediaNetworkError(f"Progressive report has an out-of-bounds {field} media window: {report_name}")
+
+
+def _validate_playback_timeline(probe: dict[str, Any], source_duration: float, report_name: str) -> None:
+    timeline = probe.get("playback_timeline")
+    if not isinstance(timeline, dict):
+        raise MediaNetworkError(f"Probe report lacks its bounded playback timeline: {report_name}")
+    if (not _numeric(timeline.get("sample_interval_seconds"))
+            or float(timeline["sample_interval_seconds"]) != 10
+            or not _exact_int(timeline.get("maximum_samples"), 96)
+            or type(timeline.get("truncated")) is not bool
+            or timeline["truncated"] is not False):
+        raise MediaNetworkError(f"Probe playback timeline has invalid bounds or is truncated: {report_name}")
+    samples = timeline.get("samples")
+    if not isinstance(samples, list) or not samples or len(samples) > 96:
+        raise MediaNetworkError(f"Probe playback timeline has an invalid sample count: {report_name}")
+    previous_elapsed: float | None = None
+    previous_monotonic: float | None = None
+    deadline = float(probe["overall_deadline_seconds"])
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise MediaNetworkError(f"Probe playback timeline contains a malformed sample: {report_name}")
+        required_fields = {
+            "elapsed_seconds", "observed_monotonic_seconds", "playhead_seconds", "loaded_end_seconds",
+            "buffered_ahead_seconds", "decoded_width", "decoded_height", "time_control_status",
+            "indicated_bitrate",
+        }
+        if not required_fields.issubset(sample):
+            raise MediaNetworkError(f"Probe playback timeline sample is missing required fields: {report_name}")
+        elapsed, monotonic = sample.get("elapsed_seconds"), sample.get("observed_monotonic_seconds")
+        if (not _numeric(elapsed) or not _numeric(monotonic) or float(elapsed) < 0
+                or float(elapsed) > deadline or float(monotonic) <= 0):
+            raise MediaNetworkError(f"Probe playback timeline contains invalid timing: {report_name}")
+        elapsed, monotonic = float(elapsed), float(monotonic)
+        if previous_elapsed is not None:
+            elapsed_delta = elapsed - previous_elapsed
+            monotonic_delta = monotonic - previous_monotonic
+            if elapsed_delta <= 0 or monotonic_delta <= 0 or abs(elapsed_delta - monotonic_delta) > 2.0:
+                raise MediaNetworkError(f"Probe playback timeline clocks are out of order or incoherent: {report_name}")
+        playhead = sample.get("playhead_seconds")
+        loaded_end = sample.get("loaded_end_seconds")
+        ahead = sample.get("buffered_ahead_seconds")
+        if any(value is not None and not _numeric(value) for value in (playhead, loaded_end, ahead)):
+            raise MediaNetworkError(f"Probe playback timeline contains non-finite playback values: {report_name}")
+        if playhead is None and (loaded_end is not None or ahead is not None):
+            raise MediaNetworkError(f"Probe playback timeline has inconsistent null buffer values: {report_name}")
+        if (loaded_end is None) != (ahead is None):
+            raise MediaNetworkError(f"Probe playback timeline has inconsistent null buffer values: {report_name}")
+        if playhead is not None and (float(playhead) < 0 or float(playhead) > source_duration + 0.25):
+            raise MediaNetworkError(f"Probe playback timeline playhead exceeds source duration: {report_name}")
+        if loaded_end is not None and (
+            float(loaded_end) < float(playhead) or float(loaded_end) > source_duration + 0.25
+            or float(ahead) < 0 or abs(float(ahead) - (float(loaded_end) - float(playhead))) > 0.25
+        ):
+            raise MediaNetworkError(f"Probe playback timeline buffer values are inconsistent or out of bounds: {report_name}")
+        width, height = sample.get("decoded_width"), sample.get("decoded_height")
+        if ((width is None) != (height is None)
+                or (width is not None and (not _exact_int(width) or width <= 0
+                                           or not _exact_int(height) or height <= 0))):
+            raise MediaNetworkError(f"Probe playback timeline has an inconsistent decoded-size pair: {report_name}")
+        if sample.get("time_control_status") not in {"paused", "waiting", "playing", "other"}:
+            raise MediaNetworkError(f"Probe playback timeline has an unknown time-control status: {report_name}")
+        bitrate = sample.get("indicated_bitrate")
+        if bitrate is not None and (not _numeric(bitrate) or float(bitrate) < 0):
+            raise MediaNetworkError(f"Probe playback timeline has an invalid indicated bitrate: {report_name}")
+        previous_elapsed, previous_monotonic = elapsed, monotonic
+
+
+def recovery_latency_diagnostics(report: dict[str, Any]) -> dict[str, Any]:
+    """Derive bounded clock and media-window context without asserting causality."""
+    requests = report.get("requests")
+    probe = report.get("probe")
+    timeline = probe.get("playback_timeline") if isinstance(probe, dict) else None
+    request = requests.get("first_recovery_high_media_request") if isinstance(requests, dict) else None
+    fault = report.get("fault_timeline")
+    result: dict[str, Any] = {
+        "case_full_name": report.get("case_full_name"),
+        "available": False,
+        "recovery_to_request_seconds": None,
+        "first_high_decoded_vs_request_seconds": None,
+        "request_media_window": None,
+        "nearest_preceding_timeline_sample": None,
+    }
+    if not isinstance(request, dict) or not isinstance(fault, dict):
+        result["unavailable_reason"] = "missing recovery request or fault clock bounds"
+        return result
+    request_time = request.get("monotonic_seconds")
+    recovery_before = fault.get("recovery_before_monotonic_seconds")
+    recovery_after = fault.get("recovery_after_monotonic_seconds")
+    if not all(_numeric(value) for value in (request_time, recovery_before, recovery_after)):
+        result["unavailable_reason"] = "missing finite monotonic clock bounds"
+        return result
+    first_high_sample = None
+    if isinstance(probe, dict) and report.get("case_full_name") == EXPECTED_TESTS[0]:
+        expectations = probe.get("video_size_expectations")
+        entries = expectations.get("entries") if isinstance(expectations, dict) else None
+        if isinstance(entries, list) and entries:
+            last_entry = entries[-1]
+            samples = last_entry.get("samples") if isinstance(last_entry, dict) else None
+            if isinstance(samples, list) and samples and isinstance(samples[0], dict):
+                first_high_sample = samples[0].get("observed_monotonic_seconds")
+    result["available"] = True
+    result["recovery_to_request_seconds"] = {
+        "lower_bound": max(0.0, float(request_time) - float(recovery_after)),
+        "upper_bound": float(request_time) - float(recovery_before),
+    }
+    result["first_high_decoded_vs_request_seconds"] = (
+        float(first_high_sample) - float(request_time) if _numeric(first_high_sample) else None
+    )
+    media_window = request.get("media_window")
+    result["request_media_window"] = media_window if isinstance(media_window, dict) else None
+    if isinstance(timeline, dict) and isinstance(timeline.get("samples"), list):
+        preceding = [sample for sample in timeline["samples"]
+                     if isinstance(sample, dict) and _numeric(sample.get("observed_monotonic_seconds"))
+                     and float(sample["observed_monotonic_seconds"]) <= float(request_time)]
+        nearest = max(preceding, key=lambda sample: float(sample["observed_monotonic_seconds"]), default=None)
+        if nearest is not None and float(request_time) - float(nearest["observed_monotonic_seconds"]) <= 15:
+            result["nearest_preceding_timeline_sample"] = {
+                "age_seconds": float(request_time) - float(nearest["observed_monotonic_seconds"]),
+                "playhead_seconds": nearest.get("playhead_seconds"),
+                "loaded_end_seconds": nearest.get("loaded_end_seconds"),
+                "buffered_ahead_seconds": nearest.get("buffered_ahead_seconds"),
+                "requested_media_overlap_seconds": (
+                    max(0.0, min(float(media_window["end_seconds"]), float(nearest["loaded_end_seconds"]))
+                        - max(float(media_window["start_seconds"]), float(nearest["playhead_seconds"])))
+                    if isinstance(media_window, dict) and _numeric(nearest.get("playhead_seconds"))
+                    and _numeric(nearest.get("loaded_end_seconds")) else None
+                ),
+            }
+    return result
+
+
+def _validate_reports_and_derive_diagnostics(rust_artifacts: Path) -> dict[str, Any]:
+    reports = [
+        validate_report(rust_artifacts / contract["report"], case_name, contract["sizes"])
+        for case_name, contract in EXPECTED_CASES.items()
+    ]
+    diagnostics = {
+        "schema_version": 1,
+        "interpretation": "derived timing and media-window context; no causal claim or latency pass threshold",
+        "reports": [recovery_latency_diagnostics(report) for report in reports],
+    }
+    return diagnostics
 
 
 def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[int, int], ...] | None = None) -> dict[str, Any]:
@@ -550,6 +731,7 @@ def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[
             or probe.get("overall_deadline_seconds") != expected_deadline
             or probe.get("deadline_mode") != "cooperative"):
         raise MediaNetworkError(f"Probe duration or cooperative deadline does not match its native case: {path.name}")
+    _validate_playback_timeline(probe, float(case_contract["duration"]), path.name)
     enabled_audio = probe.get("enabled_audio_track_count")
     if not isinstance(enabled_audio, int) or isinstance(enabled_audio, bool) or enabled_audio < 1:
         raise MediaNetworkError(f"Probe report lacks enabled audio-track evidence: {path.name}")
@@ -622,6 +804,11 @@ def validate_report(path: Path, expected_case: str, expected_sizes: tuple[tuple[
         if not (decoder_ready <= baseline_start and baseline_start + 6 <= bad_before
                 and bad_before <= bad_after <= recovery_before <= recovery_after):
             raise MediaNetworkError(f"Progressive report fault-window clock bounds are inconsistent: {path.name}")
+        requests = report.get("requests")
+        for request_name in ("first_recovery_high_range_request", "first_recovery_high_media_request"):
+            request = requests.get(request_name) if isinstance(requests, dict) else None
+            if isinstance(request, dict) and float(request["monotonic_seconds"]) < recovery_before:
+                raise MediaNetworkError(f"Progressive {request_name} precedes the recovery clock bracket: {path.name}")
         if (any(timestamp >= bad_before for timestamp in phase_samples[0])
                 or any(timestamp < bad_after or timestamp >= recovery_before for timestamp in phase_samples[1])):
             raise MediaNetworkError(f"Progressive decoded-size samples do not align with the high-low fault phases: {path.name}")
@@ -677,7 +864,7 @@ def _signed_product(receipt: dict[str, Any], target: str) -> Path:
 def _run_local_signed(
     *, logs: Path, artifact_dir: Path, env: dict[str, str], config_file: Path | None,
     total_deadline: float, started: float, rust_artifacts: Path,
-) -> None:
+) -> dict[str, Any]:
     local_build = _load_local_build()
     compile_deadline = resolve_compile_deadline(started_at=started, total_deadline=total_deadline)
     invocation = 0
@@ -710,6 +897,7 @@ def _run_local_signed(
             raise local_build.BuildError(f"signed compiler exited {result.returncode}; log: {log_path.name}")
         return subprocess.CompletedProcess(list(argv), result.returncode, output, "")
 
+    diagnostics: dict[str, Any] | None = None
     try:
         original_run = local_build.RUN
         local_build.RUN = bounded_build_run
@@ -730,12 +918,14 @@ def _run_local_signed(
                     timeout=timeout, artifact_dir=artifact_dir, cargo_artifact_monitor=True,
                 )
                 validate_cargo_log(logs / "cargo-test.log")
-                for case_name, contract in EXPECTED_CASES.items():
-                    validate_report(rust_artifacts / contract["report"], case_name, contract["sizes"])
+                diagnostics = _validate_reports_and_derive_diagnostics(rust_artifacts)
         finally:
             local_build.RUN = original_run
     except local_build.BuildError as error:
         raise MediaNetworkError(f"Local signed build or verification failed: {error}") from error
+    if diagnostics is None:
+        raise MediaNetworkError("Local signed reports did not produce recovery diagnostics.")
+    return diagnostics
 
 
 def run(
@@ -750,6 +940,7 @@ def run(
     status = "failed"
     message = "Acceptance requirements were not proven."
     exit_code = 1
+    recovery_diagnostics: dict[str, Any] | None = None
     try:
         artifact_dir = _fresh_artifact_dir(artifact_dir_arg)
         logs = artifact_dir / "logs"
@@ -790,11 +981,10 @@ def run(
             _run_command(build_cargo_argv(), log_path=logs / "cargo-test.log", env=test_env,
                          timeout=timeout, artifact_dir=artifact_dir, cargo_artifact_monitor=True)
             validate_cargo_log(logs / "cargo-test.log")
-            for case_name, contract in EXPECTED_CASES.items():
-                validate_report(rust_artifacts / contract["report"], case_name, contract["sizes"])
+            recovery_diagnostics = _validate_reports_and_derive_diagnostics(rust_artifacts)
         else:
             _require_tools(env)
-            _run_local_signed(
+            recovery_diagnostics = _run_local_signed(
                 logs=logs, artifact_dir=artifact_dir, env=env, config_file=config_path,
                 total_deadline=total_deadline, started=started, rust_artifacts=rust_artifacts,
             )
@@ -812,7 +1002,10 @@ def run(
             shutil.rmtree(work_dir, ignore_errors=True)
         if artifact_dir is not None:
             try:
-                _write_summary(artifact_dir, status=status, message=message, started=started)
+                _write_summary(
+                    artifact_dir, status=status, message=message, started=started,
+                    recovery_diagnostics=recovery_diagnostics,
+                )
             except (OSError, MediaNetworkError) as error:
                 exit_code = 1
                 print(f"[media-network-e2e] summary retention failed: {type(error).__name__}", file=sys.stderr)
