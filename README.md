@@ -76,7 +76,7 @@ just test-lan-playback
 - Probe：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/probe-lan-playback`
 - Rust library-test 程序：`~/Library/Application Support/TVOSNetPlayer/LocalBuild/bin/media-acceptance-tests`
 
-本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试默认也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。显式设置 `CACHE_SERVER_BINARY` 时，UI 测试保留该 fixture binary 选择，不静默替换；这属于隔离 XCUITest 配置，不建立固定产物的 operator/原生媒体验收结论。固定 server 准备失败或没有返回路径时会立即失败，不回退到旧 Cargo 产物。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；后续原生媒体验收可复用该入口，本 PR 不提供或宣称通过新的 ABR 验收。
+本机 `just build-macos`、`just build-cache-server` 和 `just test-lan-playback` 默认走固定签名入口。本机 UI 测试默认也使用固定签名的 server，但 XCUITest App 保留隔离的测试身份。显式设置 `CACHE_SERVER_BINARY` 时，UI 测试保留该 fixture binary 选择，不静默替换；这属于隔离 XCUITest 配置，不建立固定产物的 operator/原生媒体验收结论。固定 server 准备失败或没有返回路径时会立即失败，不回退到旧 Cargo 产物。`media-tests` 只编译通用 Rust library-test 程序，再复制并签名到固定位置；构建或签名成功本身不代表原生 ABR 验收通过。
 
 `python3 scripts/local_build.py run probe -- --self-test` 会在持有构建锁期间执行固定副本，`run media-tests -- <test arguments>` 同理。媒体、缓存和测试状态仍需每轮隔离。构建不会自动重启日常 App 或 server；更新后需退出并从固定位置重新启动，已运行的旧进程不会自动切换版本。
 
@@ -199,11 +199,25 @@ LAN_PLAYBACK_DEADLINE_SECONDS=120 \
 just test-lan-playback
 ```
 
+### 受控原生媒体验收
+
+```bash
+just test-media-network
+```
+
+此入口使用无凭据的本地媒体夹具、生产 Rust HTTP/HLS 路由和原生 AVPlayer，分别验证已缓冲内容的持续播放、未来未缓冲内容的自动高→低→高解码，以及生产转码输出的解码、音轨和暂停/续播/跳转/倍速控制。持续播放输入为 160 秒、probe 为 130 秒；升档恢复采用 3,600 秒输入、600 秒 probe 和 720 秒协作式 deadline，高档上游故障保持 45 秒。每个要求的画质阶段至少需要三个不同显示时间戳，并与真实故障区间对齐。持续播放用例须证明剩余内容已缓冲；升档用例须在实际网络恢复时证明仍有未缓冲内容，且确实解码出恢复后的高档。缺少证明不能跳过或降级为通过。长测证明最终自动回升，不承诺短时间内回升；回升延迟优化单独推进。
+
+播放器保留自动前向缓冲策略，server 继续整片下载，不把缓冲限制为 20 秒。已缓冲内容可以继续使用；当前分片或约 20 秒安全窗口以外的高档替换是允许的后续优化，不代表必须丢弃已有缓冲。播放前必须验证系统静音，结束后保持静音；音轨存在不等于可听音频验收。
+
+本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
+
 ## LAN Cache Server
 
 HLS 前台读取与后台整片填充分开选择传输粒度：建立原有 512 KiB 启动身份后，前台按最多约 64 KiB 的小 Range 获取当前需要的字节，后台继续使用较大的逻辑块补齐缺口。已验证的连续缓存使用独立、有界的较大交付窗口，避免每个小请求都重新哈希整个大块；缓存未命中时不等待大窗口下载。两者共享经过验证的缓存，保留原有 ETag、跨 CDN 抽样、取消、配额和抢占规则；截断响应不会作为有效缓存交付。首次启动和跨 CDN 身份验证仍可能需要较大读取，64 KiB 不是端到端响应时间保证。小块合并保持有界，不修改 gRPC 或持久化 schema。设计与验证边界见 [foreground Range cache journal](docs/project_journal/2026/10/2026-10-24-foreground-range-cache-foundation-b46393.md)；这项基础改造不单独证明原生 ABR 降档和恢复已通过。
 
 前台 HTTP 响应还会先确认本次请求范围内首个缓存缺口的上游响应，包括已有缓存前缀、但缺失后半段的情况。通过状态、范围和必要身份校验后可以先返回 LAN 响应头，不必等待该缺口的完整响应体；内容仍须完整验证并原子写入后才能作为缓存交付。如果所有候选在响应头阶段失败，会返回经过清理的非成功响应，而不是先发成功状态再中断响应体。已接受响应头后才发生的截断或网络失败仍属于传输错误，不能改写已发出的状态。全缓存命中不访问上游，共享下载继续保留取消和资源释放约束；设计与验收边界见 [header-outcome journal](docs/project_journal/2026/11/2026-11-09-foreground-header-outcomes-b46396.md)。这不是 AVPlayer 自动恢复高码率的通过结论。
+
+已完成且具备有效片段索引的转码产物，其 master 带宽采用按实际片段窗口计算的峰值；无法测量时保留原来的估计值。实测值不改变编码上限、配额预算或缓存身份，并随完成记录保存和恢复。
 
 cache server 默认只监听本机 loopback，适合本机开发：
 

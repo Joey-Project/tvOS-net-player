@@ -33,6 +33,9 @@ pub mod task_registry;
 mod task_store;
 mod transcoding;
 
+#[cfg(all(test, target_os = "macos"))]
+mod media_acceptance_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -3610,12 +3613,17 @@ pub async fn run_media_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    axum::serve(listener, media_router(state)).await?;
+    Ok(())
+}
+
+pub(crate) fn media_router(state: AppState) -> Router {
     state.ensure_hls_runtime_startup();
     let _ = state.ensure_pending_file_cleanup_worker();
     let _ = state
         .credential_maintenance_runtime
         .ensure_running(Arc::clone(&state.options), state.bilibili_login.clone());
-    let router = Router::new()
+    Router::new()
         .route("/", get(root))
         .merge(bilibili_login_http::router())
         .route(
@@ -3634,10 +3642,7 @@ pub async fn run_media_listener(
             "/hls/{session_id}/segments/{segment_id}",
             get(hls_segment_get).head(hls_segment_head),
         )
-        .with_state(MediaState::new(state));
-
-    axum::serve(listener, router).await?;
-    Ok(())
+        .with_state(MediaState::new(state))
 }
 
 async fn run_servers<F, Fut>(

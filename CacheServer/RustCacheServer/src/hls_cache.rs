@@ -49,7 +49,10 @@ use crate::{
         SessionPublicationMode,
     },
     library::{OpenedMediaFile, open_read_no_follow},
-    mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
+    mp4_segments::{
+        Mp4SegmentRange, hls_peak_bandwidth_for_ranges, hls_target_duration_for_ranges,
+        mp4_fragment_ranges,
+    },
     playback_policy::PlaybackPolicy,
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
@@ -97,6 +100,8 @@ struct RangeExtentCommitInput<'a> {
     final_url: &'a str,
     etag: &'a Option<String>,
     last_modified: &'a Option<String>,
+    total_length: Option<u64>,
+    require_empty_startup: bool,
 }
 
 #[derive(Debug)]
@@ -281,6 +286,20 @@ pub(crate) enum HlsCacheFillControl {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsStartupPrefixSeedOutcome {
+    Published,
+    Retained,
+    Skipped,
+}
+
+pub(crate) struct HlsStartupProbeEvidence<'a> {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: &'a reqwest::header::HeaderMap,
+    pub(crate) final_url: &'a str,
+    pub(crate) bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HlsCacheFillProgress {
     pub(crate) downloaded_bytes: u64,
     pub(crate) total_bytes: Option<u64>,
@@ -387,6 +406,179 @@ impl HlsCacheStore {
     {
         self.ensure_range_inner(client, session_id, resource, requested, priority, control)
             .await
+    }
+
+    pub(crate) async fn seed_validated_startup_prefix<F>(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        evidence: &HlsStartupProbeEvidence<'_>,
+        control: &F,
+    ) -> Result<HlsStartupPrefixSeedOutcome, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        if evidence.status != StatusCode::PARTIAL_CONTENT {
+            return Err(HlsRangeError::InvalidResponse(
+                "startup probe did not return partial content".to_owned(),
+            ));
+        }
+        let (start, end, total_length) =
+            parse_content_range_header(evidence.headers).ok_or_else(|| {
+                HlsRangeError::InvalidResponse("invalid startup probe Content-Range".to_owned())
+            })?;
+        let probe_length = u64::try_from(evidence.bytes.len())
+            .map_err(|_| HlsRangeError::InvalidResponse("startup probe is too large".to_owned()))?;
+        let expected_probe_length = total_length.min(HLS_INITIALIZATION_SCAN_BYTES);
+        if total_length == 0
+            || start != 0
+            || end.checked_add(1) != Some(expected_probe_length)
+            || probe_length != expected_probe_length
+        {
+            return Err(HlsRangeError::InvalidResponse(
+                "startup probe bounds do not match its prefix".to_owned(),
+            ));
+        }
+        if let Some(value) = evidence.headers.get(reqwest::header::CONTENT_LENGTH) {
+            let declared_length = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    HlsRangeError::InvalidResponse(
+                        "invalid startup probe Content-Length".to_owned(),
+                    )
+                })?;
+            if declared_length != probe_length {
+                return Err(HlsRangeError::InvalidResponse(
+                    "startup probe Content-Length mismatch".to_owned(),
+                ));
+            }
+        }
+        if resource
+            .request
+            .size
+            .is_some_and(|expected| expected != total_length)
+        {
+            return Err(HlsRangeError::IdentityChanged);
+        }
+        let origin = media_url_origin(evidence.final_url).ok_or_else(|| {
+            HlsRangeError::InvalidResponse("invalid startup probe origin".to_owned())
+        })?;
+        let is_candidate = std::iter::once(resource.request.url.as_str())
+            .chain(resource.request.backup_urls.iter().map(String::as_str))
+            .any(|candidate| media_url_origin(candidate).as_deref() == Some(origin.as_str()));
+        if !is_candidate {
+            return Err(HlsRangeError::InvalidResponse(
+                "startup probe origin is not a resource candidate".to_owned(),
+            ));
+        }
+
+        let range = 0..total_length.min(RANGE_STARTUP_CHUNK_BYTES);
+        let prefix_len = usize::try_from(range.end)
+            .map_err(|_| HlsRangeError::InvalidResponse("startup range is too large".to_owned()))?;
+        let prefix = &evidence.bytes[..prefix_len];
+        let key = self.range_resource_key(session_id, resource)?;
+        let chunk_key = RangeChunkKey {
+            resource: key.clone(),
+            total_length,
+            range: range.clone(),
+        };
+        let _active = self
+            .range_cache
+            .enter(session_id, HlsRangePriority::Foreground)?;
+        self.range_cache.check_priority_control(
+            &chunk_key,
+            HlsRangePriority::Foreground,
+            control,
+        )?;
+        let publication_lock = self.range_publication_lock(&key);
+        {
+            let _publication = publication_lock.lock().await;
+            self.ensure_range_manifest(session_id, resource, &key)?;
+        }
+        let _reservation = self.range_cache.reserve(
+            key.clone(),
+            range.end,
+            self.range_managed_size(session_id, &resource.id)
+                .map_err(HlsRangeError::Io)?,
+            self.managed_usage_size_bytes().map_err(HlsRangeError::Io)?,
+        )?;
+
+        if self
+            .completed_range_ready(session_id, resource, range.clone())?
+            .is_some()
+        {
+            let existing = self
+                .read_durable_range(session_id, resource, range)
+                .await?
+                .ok_or_else(|| identity_error_at("startup-probe-completed-range-missing"))?;
+            return if existing.as_slice() == prefix {
+                Ok(HlsStartupPrefixSeedOutcome::Retained)
+            } else {
+                Err(identity_error_at("startup-probe-completed-content"))
+            };
+        }
+
+        let flight = self
+            .range_cache
+            .claim_chunk(chunk_key.clone(), HlsRangePriority::Foreground)?;
+        if !flight.is_owner() {
+            return Ok(HlsStartupPrefixSeedOutcome::Skipped);
+        }
+        let _permit = self
+            .range_cache
+            .acquire_chunk_permit(&chunk_key, HlsRangePriority::Foreground, control)
+            .await?;
+        let loaded = self
+            .load_range_manifest_serialized(session_id, resource)
+            .await?
+            .ok_or_else(|| identity_error_at("startup-probe-checkpoint-missing"))?;
+        self.verify_range_extents_sync(session_id, resource, &loaded.manifest)?;
+        if loaded
+            .manifest
+            .total_length
+            .is_some_and(|current| current != total_length)
+        {
+            return Err(identity_error_at("startup-probe-total-length"));
+        }
+        if !loaded.manifest.extents.is_empty()
+            || loaded.manifest.prefix_length != 0
+            || loaded.manifest.prefix_sha256.is_some()
+            || loaded.manifest.durable_bytes != 0
+            || loaded.manifest.strong_etag.is_some()
+            || loaded.manifest.validator_origin.is_some()
+            || loaded.manifest.last_modified.is_some()
+            || !loaded.manifest.validated_origins.is_empty()
+        {
+            return Ok(HlsStartupPrefixSeedOutcome::Skipped);
+        }
+        let etag = strong_etag(evidence.headers);
+        let last_modified = evidence
+            .headers
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.commit_range_extent_with_failure(
+            session_id,
+            resource,
+            range,
+            RangeExtentCommitInput {
+                expected: &loaded.manifest,
+                bytes: prefix,
+                final_url: evidence.final_url,
+                etag: &etag,
+                last_modified: &last_modified,
+                total_length: Some(total_length),
+                require_empty_startup: true,
+            },
+        )
+        .await
+        .map(|_| HlsStartupPrefixSeedOutcome::Published)
+        .map_err(|failure| match failure {
+            RangeExtentCommitFailure::StaleTargetValidator => HlsRangeError::IdentityChanged,
+            RangeExtentCommitFailure::Rejected(error) => error,
+        })
     }
 
     pub(crate) fn observe_resource_range<F>(
@@ -1611,17 +1803,20 @@ impl HlsCacheStore {
                 "LAN transcoding output MP4 initialization range was invalid".to_owned(),
             ));
         }
-        let segments = hls_segments_from_mp4_ranges(
-            mp4_fragment_ranges(&temp_path, initialization_length, total_length)
-                .unwrap_or_default(),
-        );
+        let ranges = mp4_fragment_ranges(&temp_path, initialization_length, total_length)
+            .unwrap_or_default();
+        let measured_bandwidth = hls_target_duration_for_ranges(&ranges)
+            .and_then(|target| hls_peak_bandwidth_for_ranges(&ranges, target))
+            .filter(|bandwidth| *bandwidth > 0);
+        let segments = hls_segments_from_mp4_ranges(ranges);
         if let Err(error) = self.reject_cache_path_symlink(&output_path) {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(error.into());
         }
         tokio::fs::rename(&temp_path, &output_path).await?;
 
-        let completed_session = transcoded_completed_session(session, total_length);
+        let completed_session =
+            transcoded_completed_session_with_bandwidth(session, total_length, measured_bandwidth);
         let metadata = PersistedHlsCachedResource {
             schema_version: HLS_CACHE_SCHEMA_VERSION,
             id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
@@ -2941,6 +3136,8 @@ impl HlsCacheStore {
                 final_url,
                 etag: &etag,
                 last_modified: &last_modified,
+                total_length: None,
+                require_empty_startup: false,
             },
         )
         .await
@@ -2976,6 +3173,8 @@ impl HlsCacheStore {
                         final_url,
                         etag,
                         last_modified,
+                        total_length: None,
+                        require_empty_startup: false,
                     },
                 )
                 .await
@@ -3009,6 +3208,8 @@ impl HlsCacheStore {
             final_url,
             etag,
             last_modified,
+            total_length,
+            require_empty_startup,
         } = input;
         if bytes.len() as u64 != range.end.saturating_sub(range.start) {
             return Err(HlsRangeError::InvalidResponse("range length mismatch".to_owned()).into());
@@ -3048,10 +3249,26 @@ impl HlsCacheStore {
         {
             return Err(identity_error_at("extent-origin-validator-change").into());
         }
-        let total = loaded
-            .manifest
-            .total_length
-            .ok_or(HlsRangeError::IdentityChanged)?;
+        let total = match (loaded.manifest.total_length, total_length) {
+            (Some(current), Some(reported)) if current != reported => {
+                return Err(identity_error_at("extent-publish-total-length").into());
+            }
+            (Some(current), _) => current,
+            (None, Some(reported)) if reported > 0 => reported,
+            (None, _) => return Err(HlsRangeError::IdentityChanged.into()),
+        };
+        if require_empty_startup
+            && (!loaded.manifest.extents.is_empty()
+                || loaded.manifest.prefix_length != 0
+                || loaded.manifest.prefix_sha256.is_some()
+                || loaded.manifest.durable_bytes != 0
+                || loaded.manifest.strong_etag.is_some()
+                || loaded.manifest.validator_origin.is_some()
+                || loaded.manifest.last_modified.is_some()
+                || !loaded.manifest.validated_origins.is_empty())
+        {
+            return Err(identity_error_at("startup-probe-publish-nonempty-state").into());
+        }
         if range.start >= range.end || range.end > total {
             return Err(HlsRangeError::InvalidResponse(
                 "invalid requested HLS chunk bounds".to_owned(),
@@ -3159,6 +3376,9 @@ impl HlsCacheStore {
             loaded.manifest.prefix_sha256.clone()
         };
         let mut manifest = loaded.manifest.clone();
+        if total_length.is_some() {
+            manifest.total_length = Some(total);
+        }
         manifest.generation = manifest
             .generation
             .checked_add(1)
@@ -7458,9 +7678,18 @@ fn hls_cache_error_from_transcoding(error: LanTranscodingError) -> HlsCacheError
     }
 }
 
+#[cfg(test)]
 fn transcoded_completed_session(
     session: &HlsPlaybackSession,
     output_size: u64,
+) -> HlsPlaybackSession {
+    transcoded_completed_session_with_bandwidth(session, output_size, None)
+}
+
+fn transcoded_completed_session_with_bandwidth(
+    session: &HlsPlaybackSession,
+    output_size: u64,
+    measured_bandwidth: Option<u64>,
 ) -> HlsPlaybackSession {
     let mut completed = session.clone();
     let mut hidden_lookup_variants = vec![session.variant.clone()];
@@ -7471,7 +7700,9 @@ fn transcoded_completed_session(
     let source_video = &session.variant.video.request;
     let (width, height) = transcoded_dimensions(session.variant.width, session.variant.height);
     let frame_rate = transcoded_frame_rate(source_video.frame_rate.as_deref());
-    let bandwidth = transcoded_bandwidth(had_audio);
+    let bandwidth = measured_bandwidth
+        .filter(|bandwidth| *bandwidth > 0)
+        .unwrap_or_else(|| transcoded_bandwidth(had_audio));
     let resource = HlsMediaResource {
         id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
         request: BilibiliMediaRequest {
@@ -8976,6 +9207,372 @@ mod tests {
             total_length: body.len() as u64,
             range: prefix_length..body.len() as u64,
         }
+    }
+
+    fn startup_probe_headers(probe_length: usize, total_length: u64) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes 0-{}/{total_length}",
+                probe_length.saturating_sub(1)
+            ))
+            .expect("content range should be valid"),
+        );
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&probe_length.to_string())
+                .expect("content length should be valid"),
+        );
+        headers.insert(
+            reqwest::header::ETAG,
+            HeaderValue::from_static("\"startup-v1\""),
+        );
+        headers.insert(
+            reqwest::header::LAST_MODIFIED,
+            HeaderValue::from_static("Sun, 09 Nov 2026 10:00:00 GMT"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn validated_startup_probe_publishes_prefix_and_validator_metadata() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let url = "https://cdn.example/video.m4s";
+        let total = RANGE_STARTUP_CHUNK_BYTES + 64;
+        let mut session = sample_session("startup-seed-publish", url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let body = (0..total as usize)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let probe = &body[..total.min(HLS_INITIALIZATION_SCAN_BYTES) as usize];
+        let headers = startup_probe_headers(probe.len(), total);
+        let evidence = HlsStartupProbeEvidence {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers: &headers,
+            final_url: url,
+            bytes: probe,
+        };
+
+        assert_eq!(
+            HlsStartupPrefixSeedOutcome::Published,
+            store
+                .seed_validated_startup_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    &evidence,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .expect("validated startup probe should publish"),
+        );
+        let manifest = store
+            .range_manifest_snapshot(&session.id, &session.variant.video)
+            .expect("manifest should load")
+            .expect("published manifest should exist");
+        let prefix = &body[..RANGE_STARTUP_CHUNK_BYTES as usize];
+        let origin = "https://cdn.example:443";
+        assert_eq!(Some(total), manifest.total_length);
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, manifest.prefix_length);
+        assert_eq!(Some(sha256_hex(prefix)), manifest.prefix_sha256);
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, manifest.durable_bytes);
+        assert_eq!(Some("\"startup-v1\""), manifest.strong_etag.as_deref());
+        assert_eq!(Some(origin), manifest.validator_origin.as_deref());
+        assert_eq!(
+            Some("Sun, 09 Nov 2026 10:00:00 GMT"),
+            manifest.last_modified.as_deref()
+        );
+        assert_eq!(1, manifest.extents.len());
+        assert_eq!(0, manifest.extents[0].start);
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, manifest.extents[0].end);
+        assert_eq!(sha256_hex(prefix), manifest.extents[0].sha256);
+        assert_eq!(1, manifest.validated_origins.len());
+        assert_eq!(origin, manifest.validated_origins[0].origin);
+        assert_eq!(
+            sha256_hex(prefix),
+            manifest.validated_origins[0].prefix_sha256
+        );
+        assert_eq!(
+            Some("\"startup-v1\""),
+            manifest.validated_origins[0].strong_etag.as_deref()
+        );
+        assert_eq!(
+            prefix,
+            store
+                .read_resource_range_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    0..RANGE_STARTUP_CHUNK_BYTES,
+                )
+                .await
+                .expect("published prefix should read")
+                .expect("published prefix should be present")
+                .as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_startup_probe_rejects_invalid_admission_without_publication() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let url = "https://cdn.example/video.m4s";
+        let total = 64 * 1024;
+        let mut session = sample_session("startup-seed-admission", url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let body = vec![7; total as usize + 1];
+        let probe = &body[..total as usize];
+        let control = || HlsCacheFillControl::Continue;
+
+        let cases = [
+            (StatusCode::OK, total, url, total),
+            (StatusCode::PARTIAL_CONTENT, total - 1, url, total),
+            (
+                StatusCode::PARTIAL_CONTENT,
+                total,
+                "https://other.example/video.m4s",
+                total,
+            ),
+            (StatusCode::PARTIAL_CONTENT, total + 1, url, total + 1),
+        ];
+        for (status, declared_length, final_url, reported_total) in cases {
+            let headers = startup_probe_headers(declared_length as usize, reported_total);
+            let evidence = HlsStartupProbeEvidence {
+                status,
+                headers: &headers,
+                final_url,
+                bytes: &body[..declared_length.min(body.len() as u64) as usize],
+            };
+            assert!(
+                store
+                    .seed_validated_startup_prefix(
+                        &session.id,
+                        &session.variant.video,
+                        &evidence,
+                        &control,
+                    )
+                    .await
+                    .is_err(),
+                "invalid probe admission should fail: {status} {final_url} {reported_total}"
+            );
+        }
+        let mut mismatched_length = startup_probe_headers(probe.len(), total);
+        mismatched_length.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&(total - 1).to_string())
+                .expect("content length should be valid"),
+        );
+        let mismatched_length_evidence = HlsStartupProbeEvidence {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers: &mismatched_length,
+            final_url: url,
+            bytes: probe,
+        };
+        assert!(
+            store
+                .seed_validated_startup_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    &mismatched_length_evidence,
+                    &control,
+                )
+                .await
+                .is_err(),
+            "mismatched Content-Length must be rejected"
+        );
+        let mut malformed_bounds = startup_probe_headers(probe.len(), total);
+        malformed_bounds.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes 1-{}/{total}", total - 1))
+                .expect("content range should be valid"),
+        );
+        let malformed_evidence = HlsStartupProbeEvidence {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers: &malformed_bounds,
+            final_url: url,
+            bytes: probe,
+        };
+        assert!(
+            store
+                .seed_validated_startup_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    &malformed_evidence,
+                    &control,
+                )
+                .await
+                .is_err(),
+            "nonzero startup range must be rejected"
+        );
+        assert!(
+            store
+                .range_manifest_snapshot(&session.id, &session.variant.video)
+                .expect("manifest lookup should succeed")
+                .is_none()
+        );
+        assert_eq!((0, 0), store.range_activity_counts());
+    }
+
+    #[tokio::test]
+    async fn validated_startup_probe_preserves_existing_content_and_etag() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let url = "https://cdn.example/video.m4s";
+        let body = vec![3; 128 * 1024];
+        let session = sample_session("startup-seed-existing", url);
+        let _tail = seed_range_prefix(&store, &session, url, &body, 8, "\"existing-v1\"").await;
+        let before = store
+            .range_manifest_snapshot(&session.id, &session.variant.video)
+            .expect("manifest should load")
+            .expect("existing manifest should exist");
+        let conflicting = vec![9; body.len()];
+        let headers = startup_probe_headers(conflicting.len(), body.len() as u64);
+        let evidence = HlsStartupProbeEvidence {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers: &headers,
+            final_url: url,
+            bytes: &conflicting,
+        };
+        assert_eq!(
+            HlsStartupPrefixSeedOutcome::Skipped,
+            store
+                .seed_validated_startup_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    &evidence,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .expect("existing durable state should be retained"),
+        );
+        let after = store
+            .range_manifest_snapshot(&session.id, &session.variant.video)
+            .expect("manifest should load")
+            .expect("existing manifest should remain");
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.total_length, after.total_length);
+        assert_eq!(before.prefix_length, after.prefix_length);
+        assert_eq!(before.prefix_sha256, after.prefix_sha256);
+        assert_eq!(before.extents.len(), after.extents.len());
+        assert_eq!(
+            before.validated_origins.len(),
+            after.validated_origins.len()
+        );
+        assert_eq!(before.validator_origin, after.validator_origin);
+        assert_eq!(before.strong_etag, after.strong_etag);
+        assert_eq!(Some("\"existing-v1\""), after.strong_etag.as_deref());
+    }
+
+    #[tokio::test]
+    async fn concurrent_validated_startup_seeds_publish_only_one_extent() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = Arc::new(temp_store(&temp));
+        let url = "https://cdn.example/video.m4s";
+        let total = RANGE_STARTUP_CHUNK_BYTES + 32;
+        let mut session = sample_session("startup-seed-concurrent", url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let body = Arc::new(vec![5; total as usize]);
+        let probe = &body[..total.min(HLS_INITIALIZATION_SCAN_BYTES) as usize];
+        let headers = startup_probe_headers(probe.len(), total);
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let seed = |gate: Arc<tokio::sync::Barrier>| {
+            let store = Arc::clone(&store);
+            let body = Arc::clone(&body);
+            let headers = headers.clone();
+            let session = session.clone();
+            async move {
+                gate.wait().await;
+                let evidence = HlsStartupProbeEvidence {
+                    status: StatusCode::PARTIAL_CONTENT,
+                    headers: &headers,
+                    final_url: url,
+                    bytes: &body[..total.min(HLS_INITIALIZATION_SCAN_BYTES) as usize],
+                };
+                store
+                    .seed_validated_startup_prefix(
+                        &session.id,
+                        &session.variant.video,
+                        &evidence,
+                        &|| HlsCacheFillControl::Continue,
+                    )
+                    .await
+            }
+        };
+        let first = seed(Arc::clone(&gate));
+        let second = seed(Arc::clone(&gate));
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_ok(), "first seed failed: {first:?}");
+        assert!(second.is_ok(), "second seed failed: {second:?}");
+        let manifest = store
+            .range_manifest_snapshot(&session.id, &session.variant.video)
+            .expect("manifest should load")
+            .expect("published manifest should exist");
+        assert_eq!(1, manifest.extents.len());
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, manifest.prefix_length);
+        assert_eq!(RANGE_STARTUP_CHUNK_BYTES, manifest.durable_bytes);
+        assert_eq!((0, 0), store.range_activity_counts());
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("range key should be valid");
+        assert_eq!(0, store.range_cache.active_flight_count(&key));
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_seed_leaves_no_flight_or_reservation() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let url = "https://cdn.example/video.m4s";
+        let total = 64 * 1024;
+        let session = sample_session("startup-seed-cancel", url);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let body = vec![4; total as usize];
+        let headers = startup_probe_headers(body.len(), total);
+        let evidence = HlsStartupProbeEvidence {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers: &headers,
+            final_url: url,
+            bytes: &body,
+        };
+        let checks = AtomicUsize::new(0);
+        assert!(matches!(
+            store
+                .seed_validated_startup_prefix(
+                    &session.id,
+                    &session.variant.video,
+                    &evidence,
+                    &|| {
+                        if checks.fetch_add(1, Ordering::Relaxed) == 0 {
+                            HlsCacheFillControl::Continue
+                        } else {
+                            HlsCacheFillControl::Cancel
+                        }
+                    },
+                )
+                .await,
+            Err(HlsRangeError::Cancelled)
+        ));
+        assert_eq!((0, 0), store.range_activity_counts());
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("range key should be valid");
+        assert_eq!(0, store.range_cache.active_flight_count(&key));
+        let manifest = store
+            .range_manifest_snapshot(&session.id, &session.variant.video)
+            .expect("manifest lookup should succeed")
+            .expect("admission checkpoint should remain");
+        assert!(manifest.extents.is_empty());
+        assert_eq!(0, manifest.durable_bytes);
     }
 
     #[tokio::test]
@@ -12904,11 +13501,16 @@ mod tests {
     async fn caches_transcoded_session_and_restores_generated_manifest() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
+        std::fs::write(
+            temp.path().join("transcoded-output.mp4"),
+            multi_fragment_fake_mp4(),
+        )
+        .expect("fragmented transcode output should be written");
         let store = temp_store(&temp);
         let session = sample_transcoding_ready_session("session-transcoded", &upstream_url);
         let active_job_count = Arc::new(AtomicUsize::new(0));
         let config = HlsTranscodingExecutionConfig {
-            ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+            ffmpeg_path: write_fixed_output_fake_ffmpeg(temp.path()),
             permits: Arc::new(Semaphore::new(1)),
             active_job_count: Arc::clone(&active_job_count),
         };
@@ -12935,6 +13537,17 @@ mod tests {
             .expect("completed transcoded session should restore after restart");
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log"))
             .expect("fake ffmpeg args should be logged");
+        let published_ranges = cached
+            .segments
+            .iter()
+            .map(|segment| Mp4SegmentRange {
+                offset: segment.byte_range_offset,
+                length: segment.byte_range_length,
+                duration_millis: segment.duration_millis,
+            })
+            .collect::<Vec<_>>();
+        let measured_bandwidth = hls_target_duration_for_ranges(&published_ranges)
+            .and_then(|target| hls_peak_bandwidth_for_ranges(&published_ranges, target));
 
         assert_eq!(0, active_job_count.load(Ordering::SeqCst));
         assert_eq!(
@@ -12942,6 +13555,38 @@ mod tests {
             completion.session.variant.video.id
         );
         assert_eq!(HLS_TRANSCODED_RESOURCE_ID, reloaded.variant.video.id);
+        assert_eq!(
+            measured_bandwidth,
+            Some(completion.session.variant.bandwidth)
+        );
+        assert_eq!(
+            completion.session.variant.bandwidth,
+            completion.session.variant.video.request.bandwidth.unwrap()
+        );
+        assert_eq!(
+            Some(completion.session.variant.bandwidth),
+            completion.session.variants[0].bandwidth
+        );
+        assert_eq!(
+            Some(completion.session.variant.bandwidth),
+            completion.session.variants[0].media[0].bandwidth
+        );
+        assert_eq!(
+            completion.session.variant.bandwidth,
+            reloaded.variant.bandwidth
+        );
+        assert_eq!(
+            completion.session.variant.video.request.bandwidth,
+            reloaded.variant.video.request.bandwidth
+        );
+        assert_eq!(
+            completion.session.variants[0].bandwidth,
+            reloaded.variants[0].bandwidth
+        );
+        assert_eq!(
+            completion.session.variants[0].media[0].bandwidth,
+            reloaded.variants[0].media[0].bandwidth
+        );
         assert!(completion.session.variant.audio.is_none());
         assert_eq!(
             HlsTranscodingPlanState::NotRequired,
@@ -12949,8 +13594,11 @@ mod tests {
         );
         assert_eq!(HLS_TRANSCODED_VIDEO_CODEC, item.variants[0].video_codec);
         assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
-        assert_eq!(fake_mp4().len() as u64, cached.total_length);
-        assert_eq!(28, cached.initialization_length);
+        assert_eq!(multi_fragment_fake_mp4().len() as u64, cached.total_length);
+        assert_eq!(
+            multi_fragment_fake_mp4_initialization_length(),
+            cached.initialization_length
+        );
         assert!(
             store
                 .resource_path("session-transcoded", "video.m4s")
@@ -13040,6 +13688,51 @@ mod tests {
         assert_eq!(
             Some("60".to_owned()),
             completed_session.variants[0].frame_rate
+        );
+    }
+
+    #[test]
+    fn transcoded_completed_session_uses_measured_peak_without_clamping() {
+        let source_session =
+            sample_transcoding_ready_session("session-transcoded-measured", "https://example.test");
+        let cache_key = transcoded_cache_key(
+            &source_session,
+            &transcoded_codecs(source_session.variant.audio.is_some()),
+        );
+        let planning_cap = transcoded_bandwidth(source_session.variant.audio.is_some());
+        let measured_bandwidth = planning_cap + 123_456;
+
+        let completed = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            Some(measured_bandwidth),
+        );
+        let fallback_none = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            None,
+        );
+        let fallback_zero = transcoded_completed_session_with_bandwidth(
+            &source_session,
+            fake_mp4().len() as u64,
+            Some(0),
+        );
+
+        assert_eq!(measured_bandwidth, completed.variant.bandwidth);
+        assert_eq!(
+            Some(measured_bandwidth),
+            completed.variant.video.request.bandwidth
+        );
+        assert_eq!(Some(measured_bandwidth), completed.variants[0].bandwidth);
+        assert_eq!(
+            Some(measured_bandwidth),
+            completed.variants[0].media[0].bandwidth
+        );
+        assert_eq!(cache_key, completed.variant.video.request.cache_key);
+        assert_eq!(planning_cap, fallback_none.variant.bandwidth);
+        assert_eq!(
+            fallback_none.variant.bandwidth,
+            fallback_zero.variant.bandwidth
         );
     }
 
@@ -16287,7 +16980,10 @@ mod tests {
         bytes.extend(mp4_box(*b"ftyp", b"isom"));
         bytes.extend(mp4_box(
             *b"moov",
-            &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+            &mp4_box(
+                *b"trak",
+                &[tkhd_box(1), mp4_box(*b"mdia", &mdhd_box(1_000))].concat(),
+            ),
         ));
         bytes.extend(moof_box(1_000));
         bytes.extend(mp4_box(*b"mdat", b"first-media"));
@@ -16319,9 +17015,19 @@ mod tests {
         (mp4_box(*b"ftyp", b"isom").len()
             + mp4_box(
                 *b"moov",
-                &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+                &mp4_box(
+                    *b"trak",
+                    &[tkhd_box(1), mp4_box(*b"mdia", &mdhd_box(1_000))].concat(),
+                ),
             )
             .len()) as u64
+    }
+
+    fn tkhd_box(track_id: u32) -> Vec<u8> {
+        let mut payload = vec![0; 12];
+        payload.extend(track_id.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        mp4_box(*b"tkhd", &payload)
     }
 
     fn mdhd_box(timescale: u32) -> Vec<u8> {
@@ -16428,26 +17134,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_copying_fake_ffmpeg(dir: &Path) -> PathBuf {
+    fn write_fixed_output_fake_ffmpeg(dir: &Path) -> PathBuf {
         write_executable(
-            dir.join("fake-ffmpeg-copy"),
+            dir.join("fake-ffmpeg-fixed-output"),
             r#"#!/bin/sh
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 args_log="$script_dir/ffmpeg-args.log"
 : > "$args_log"
 last=
-input=
-previous=
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args_log"
-  if [ "$previous" = "-i" ] && [ -z "$input" ]; then
-    input=$arg
-  fi
   last=$arg
-  previous=$arg
 done
-cp "$input" "$last"
+cp "$script_dir/transcoded-output.mp4" "$last"
 "#,
         )
     }
