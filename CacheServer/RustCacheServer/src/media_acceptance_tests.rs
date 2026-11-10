@@ -2313,7 +2313,7 @@ async fn origin_response(
         phase_code,
         range,
         status,
-        !fault_applied && touches_media_payload,
+        !head_only && !fault_applied && touches_media_payload,
         media_window,
     );
     if fault_applied {
@@ -2573,6 +2573,7 @@ fn record_origin_request(
     if representation_code == 1
         && phase_code == PHASE_RECOVERY
         && status == StatusCode::PARTIAL_CONTENT
+        && media_payload
         && media_window.is_some()
         && report.requests.first_recovery_high_media_request.is_none()
     {
@@ -4143,6 +4144,112 @@ mod origin_request_diagnostic_tests {
                 duration_millis: 500,
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn recovery_head_probe_does_not_capture_first_media_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("high.mp4");
+        tokio::fs::write(&path, vec![0_u8; 500]).await.unwrap();
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = Arc::new(OriginState {
+            media: HashMap::from([(
+                "high.mp4".to_owned(),
+                OriginMedia {
+                    path,
+                    representation_code: 1,
+                    initialization_length: 100,
+                    fragments: sample_fragments().to_vec(),
+                    content_type: "video/mp4",
+                },
+            )]),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_RECOVERY)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report: Arc::clone(&report),
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        });
+        let headers = |range: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, range.parse().unwrap());
+            headers
+        };
+        let head = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            headers("bytes=150-199"),
+            true,
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            axum::body::to_bytes(head.into_body(), 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let snapshot = report.lock().unwrap();
+            assert_eq!(snapshot.requests.total, 1);
+            assert_eq!(
+                snapshot.requests.media_payload_by_phase_and_representation[2][0],
+                0
+            );
+            assert!(
+                snapshot
+                    .requests
+                    .first_recovery_high_media_request
+                    .is_none()
+            );
+            assert_eq!(
+                snapshot
+                    .requests
+                    .first_recovery_high_range_request
+                    .as_ref()
+                    .unwrap()
+                    .range_start,
+                150
+            );
+        }
+        let get = origin_response(
+            origin,
+            "high.mp4".to_owned(),
+            headers("bytes=250-299"),
+            false,
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            axum::body::to_bytes(get.into_body(), 50)
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+        let snapshot = report.lock().unwrap();
+        assert_eq!(snapshot.requests.total, 2);
+        assert_eq!(
+            snapshot.requests.media_payload_by_phase_and_representation[2][0],
+            1
+        );
+        assert_eq!(
+            snapshot
+                .requests
+                .first_recovery_high_range_request
+                .as_ref()
+                .unwrap()
+                .range_start,
+            150
+        );
+        let first_media = snapshot
+            .requests
+            .first_recovery_high_media_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_media.range_start, 250);
+        assert_eq!(first_media.media_window.unwrap().first_fragment_index, 1);
     }
 
     #[test]

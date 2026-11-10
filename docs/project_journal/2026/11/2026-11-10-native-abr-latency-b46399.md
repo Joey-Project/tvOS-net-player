@@ -5,7 +5,7 @@ status: active
 created: 2026-11-10
 updated: 2026-11-10
 branch: codex/native-abr-recovery-latency
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/92
 supersedes: []
 superseded_by:
 ---
@@ -37,6 +37,7 @@ superseded_by:
 ## Current State
 - The probe adds passive interval/recovery sampling without changing its playback controls. Strict Swift 6 compilation, pinned fixed-path signing, 67 self-tests and strict Swift formatting pass during development; these dirty-candidate checks do not replace final-head validation.
 - Actual fragment-window mapping and separate first-range/first-206-media recording are implemented, with eight focused non-audio Rust tests passing during development. A 206 request is not proof of a completely delivered body or a causal explanation for a decoded frame.
+- Ranged `HEAD` probes remain request/metadata observations, not media-body requests. Exclude them from first-media timing and media-payload counters; an actual ranged `GET` is required for those observations.
 - Both nested probe capture and outer Rust reports use coherent 64 KiB limits; retained logs/reports together remain capped at 32 MiB. Python admission and the derived summary retain their own validation and size bounds.
 - Python helper regressions cover malformed/missing timelines, clocks, stale context, media windows and the exact unsigned-64-bit range boundary. The runner includes derived diagnostics in its existing bounded summary for both fixed-signed local and isolated CI modes.
 - No production upshift controller or demonstrated recovery-latency improvement is included in this slice.
@@ -48,6 +49,7 @@ superseded_by:
 4. Continue the remaining native cache lifecycle/offline and home LAN roadmap work after recovery optimization.
 
 ## Evidence
+- [Passive diagnostics PR #92](https://github.com/Joey-Project/tvOS-net-player/pull/92).
 - [Delivery PR #91](https://github.com/Joey-Project/tvOS-net-player/pull/91), merged foundation `d974dbbb8187b1e035dc2af7d072bae511f29f59`.
 - [Home LAN roadmap](../10/2026-10-23-home-lan-readiness-roadmap-b46388.md).
 - Source thread: `019e7fd0-b463-76f2-a5ab-37d7d77620f4`.
