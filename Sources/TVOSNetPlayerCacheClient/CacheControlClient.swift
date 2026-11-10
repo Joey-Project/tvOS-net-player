@@ -28,6 +28,7 @@ public protocol CacheControlClient: Sendable {
     func getBilibiliLoginSession(id: String) async throws -> BilibiliLoginSession
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
+    func getHLSPlaybackReadiness(_ request: HLSPlaybackReadinessRequest) async throws -> HLSPlaybackReadiness
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult
     func listLibraryItemsPage(
         pageToken: String,
@@ -136,6 +137,11 @@ public struct CacheControlClientUnsupportedOperation: Error, Equatable, Sendable
         code: "task_output_v2",
         message: "Paginated task results are not supported by this cache server."
     )
+
+    public static let hlsPlaybackReadiness = CacheControlClientUnsupportedOperation(
+        code: "hls_playback_readiness",
+        message: "HLS playback readiness is not supported by this cache server."
+    )
 }
 
 public struct CacheControlClientRequestValidationError: Error, Equatable, Sendable {
@@ -168,6 +174,10 @@ public extension CacheControlClient {
 
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+    }
+
+    func getHLSPlaybackReadiness(_ request: HLSPlaybackReadinessRequest) async throws -> HLSPlaybackReadiness {
+        throw CacheControlClientUnsupportedOperation.hlsPlaybackReadiness
     }
 
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
