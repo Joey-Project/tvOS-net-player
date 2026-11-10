@@ -475,6 +475,7 @@ class WorkflowTests(IsolatedEnvironmentTests):
         path = self.paths[0]
         apple = workflow_job(path, "apple-platforms")
         core = workflow_job(path, "core-unit-tests")
+        media = workflow_job(path, "media-network")
         aggregate = workflow_job(path, "tvos-build-and-tests")
         apple_stages = re.findall(r"python3 scripts/ci-stage.py --stage ([a-z-]+)", apple)
         core_stages = re.findall(r"python3 scripts/ci-stage.py --stage ([a-z-]+)", core)
@@ -487,23 +488,26 @@ class WorkflowTests(IsolatedEnvironmentTests):
         self.assertEqual(set(apple_stages) | set(core_stages), set(ci_stage.STAGES))
         self.assertNotIn("needs:", apple)
         self.assertNotIn("needs:", core)
+        self.assertNotIn("needs:", media)
         self.assertTrue(core.split("    steps:\n", 1)[1].startswith(
             "      - name: Establish CI work deadline\n"))
         self.assertIn("timeout-minutes: 60", core)
 
         self.assertIn("name: tvOS build and tests", aggregate)
-        self.assertIn("needs: [apple-platforms, core-unit-tests]", aggregate)
+        self.assertIn("needs: [apple-platforms, core-unit-tests, media-network]", aggregate)
         self.assertIn("if: always()", aggregate)
         self.assertIn("runs-on: ubuntu-latest", aggregate)
         self.assertIn("timeout-minutes: 2", aggregate)
         self.assertNotIn("actions/checkout@", aggregate)
         self.assertIn("APPLE_RESULT: ${{ needs.apple-platforms.result }}", aggregate)
         self.assertIn("CORE_RESULT: ${{ needs.core-unit-tests.result }}", aggregate)
+        self.assertIn("MEDIA_RESULT: ${{ needs.media-network.result }}", aggregate)
         self.assertIn('"$APPLE_RESULT" != "success"', aggregate)
         self.assertIn('"$CORE_RESULT" != "success"', aggregate)
+        self.assertIn('"$MEDIA_RESULT" != "success"', aggregate)
 
-    def test_aggregate_script_accepts_only_both_success_results(self) -> None:
-        step = workflow_steps(self.paths[0])["Require both CI jobs to succeed"]
+    def test_aggregate_script_accepts_only_three_success_results(self) -> None:
+        step = workflow_steps(self.paths[0])["Require all CI jobs to succeed"]
         fragment = run_fragment(step)
         safe_keys = {
             "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -517,14 +521,17 @@ class WorkflowTests(IsolatedEnvironmentTests):
 
         for apple_result in results:
             for core_result in results:
-                with self.subTest(apple=apple_result, core=core_result):
-                    completed = subprocess.run(
-                        ["bash", "-e", "-o", "pipefail", "-c", fragment],
-                        env={**safe_env, "APPLE_RESULT": apple_result, "CORE_RESULT": core_result},
-                        capture_output=True, timeout=2, check=False,
-                    )
-                    self.assertEqual(completed.returncode == 0,
-                                     apple_result == "success" and core_result == "success")
+                for media_result in results:
+                    with self.subTest(apple=apple_result, core=core_result, media=media_result):
+                        completed = subprocess.run(
+                            ["bash", "-e", "-o", "pipefail", "-c", fragment],
+                            env={**safe_env, "APPLE_RESULT": apple_result, "CORE_RESULT": core_result,
+                                 "MEDIA_RESULT": media_result},
+                            capture_output=True, timeout=2, check=False,
+                        )
+                        self.assertEqual(completed.returncode == 0,
+                                         apple_result == "success" and core_result == "success"
+                                         and media_result == "success")
 
     def test_upload_is_always_and_exact_allowlist_is_under_aggregate_cap(self) -> None:
         steps = workflow_steps(self.paths[0])

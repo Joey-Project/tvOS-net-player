@@ -8,7 +8,7 @@
 - LAN cache client v0：输入 Mac mini cache server 地址，刷新 gRPC library 首屏预览，选择可播放 variant，并把 HTTP/HLS playback source 交给 `AVPlayer`。
 - LAN cache server MVP：用 gRPC 提供控制面，用 HTTP Range endpoint 提供 `AVPlayer` 可播放媒体 URL，并包含可落盘恢复的 Bilibili task worker 和 BBDown Rust adapter。
 - Swift package tests：覆盖 core URL 规范化和 cache client model/pagination 行为，不依赖本机 tvOS simulator runtime。
-- GitHub Actions CI：pre-commit checks、tvOS simulator build、macOS app build、LAN cache server build、tvOS/macOS XCTest targets、core tests、cache server integration tests。
+- GitHub Actions CI：pre-commit checks、tvOS simulator build、macOS app build、LAN cache server build、tvOS/macOS XCTest targets、core tests、cache server integration tests，以及独立的原生弱网/ABR/转码验收。
 - LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
 - Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
 
@@ -96,13 +96,13 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 
 ### CI Diagnostics
 
-`just test-ci-helpers` 会运行普通 CI 阶段 runner 与原生 UI helper 的 Python 回归；`just ci` 也包含此检查。普通 GHA CI 将共享 Core 测试与其余 Apple 构建、lint、XCTest 和 Rust 检查分为两个并行作业，保留全部原有命令。统一的 `tvOS build and tests` 门禁只有在两个作业都成功时才通过，失败、取消或跳过均不算成功。
+`just test-ci-helpers` 会运行普通 CI 阶段 runner、原生 UI 与媒体验收 helper 的 Python 回归；`just ci` 也包含此检查。GHA CI 将共享 Core 测试、其余 Apple 构建/lint/XCTest/Rust 检查和原生媒体验收分为三个并行作业，保留全部原有命令。统一的 `tvOS build and tests` 门禁只有在三个作业都成功时才通过，失败、取消或跳过均不算成功。
 
 各阶段记录真实退出码、耗时、超时、输出截断及清理结果，并上传有界日志和小型 JSON 摘要。`ci-stages-<run_id>` 与 `ci-core-stages-<run_id>` 分别保存各自负责的阶段；核对完整 CI 时需一并检查两个产物。本版 JSON 的 `test_summary` 明确为 `null`，测试计数需从保留的阶段日志或原生 UI 结果读取，不把缺失计数当作零；阶段退出成功不替代原生 UI 的指定用例和 metrics 验证。
 
-执行构建和测试的普通 CI 与 UI job 的上限均为 60 分钟，主要工作期限在各自 checkout 前记录，截止于各自首步后的 45 分钟；余量用于独立的诊断、清理、上传和缓存保存。普通 CI 的汇总门禁另有两分钟上限，不执行测试。取消或 runner 被强制终止时，不能保证仍能上传产物。普通 CI 每阶段只保留有界的首尾输出并继续排空其余日志，不因正常输出量大而终止测试。
+Apple、Core 与两端 UI job 的上限仍为 60 分钟，主要工作期限在各自 checkout 前记录，截止于各自首步后的 45 分钟；余量用于独立的诊断、清理、上传和缓存保存。独立的原生 media job 上限为 70 分钟、工作期限为 60 分钟；媒体步骤的外层上限为 52 分钟，内部 runner 仍为 50 分钟，不套用 45 分钟的普通阶段上限。CI 的汇总门禁另有两分钟上限，不执行测试。取消或 runner 被强制终止时，不能保证仍能上传产物。普通 CI 每阶段只保留有界的首尾输出并继续排空其余日志，不因正常输出量大而终止测试。
 
-编译缓存区分 Rust、Swift、普通 CI 与两端 UI job，并绑定实际工具链、平台、依赖及对应源码。PR 可读取适用缓存，只有成功的默认分支 push 才保存；不缓存凭据、用户目录、运行状态、媒体或诊断。缓存命中不会跳过任何原有命令，未命中仍须完成冷构建；配置缓存本身不证明实际命中或提速。
+编译缓存区分 Rust、Swift、普通 CI、两端 UI 与原生 media job，并绑定实际工具链、平台、依赖及对应源码。PR 可读取适用缓存，只有成功的默认分支 push 才保存；不缓存凭据、用户目录、运行状态、媒体或诊断。缓存命中不会跳过任何原有命令，未命中仍须完成冷构建；配置缓存本身不证明实际命中或提速。
 
 Rust 测试 waiter 的超时诊断仅包含有限的任务/结果状态、观察次数和耗时，不包含 source、标题、原始 message、URL、路径或完整 task。原有等待期限和成功条件保持不变；单次超时及后续通过仍不足以证明根因。下一阶段的完整顺序见 [home LAN readiness roadmap](docs/project_journal/2026/10/2026-10-23-home-lan-readiness-roadmap-b46388.md)。
 
@@ -210,6 +210,8 @@ just test-media-network
 播放器保留自动前向缓冲策略，server 继续整片下载，不把缓冲限制为 20 秒。已缓冲内容可以继续使用；当前分片或约 20 秒安全窗口以外的高档替换是允许的后续优化，不代表必须丢弃已有缓冲。播放前必须验证系统静音，结束后保持静音；音轨存在不等于可听音频验收。
 
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
+
+GHA 的 `Native media network acceptance` job 使用同一套严格用例和报告校验，通过显式 `--ci-unsigned` 在一次性的 runner 上编译隔离产物，不需要 Apple 签名 secrets。该模式只允许在 GitHub Actions 中使用，不作为本机固定签名验收的替代。`media-network-e2e-<run_id>` 产物保留有界日志、runner summary 和三个原始媒体报告，保留三天；媒体夹具、日常 server 状态和凭据不会上传。job 失败、取消或跳过都会阻止统一 CI 门禁通过；GHA 结果与本机签名验收分别记录，设计见 [native media CI journal](docs/project_journal/2026/11/2026-11-10-native-media-ci-b46398.md)。
 
 ## LAN Cache Server
 
@@ -366,6 +368,7 @@ scripts/test.sh
 scripts/test-macos.sh
 bash scripts/test-lan-playback.sh
 scripts/test-cache-server.sh
+python3 scripts/media-network-e2e.py --ci-unsigned --artifact-dir "$MEDIA_NETWORK_E2E_ARTIFACT_DIR"
 ```
 
 其中 pre-commit 检查包括 Swift formatter/linter、Rust formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 Rust LAN cache server，`scripts/build-for-testing.sh` 编译 tvOS Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 tvOS app target 的 XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-macos.sh` 执行 macOS app-shell XCTest，`scripts/test-cache-server.sh` 启动真实 Rust server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
