@@ -222,6 +222,43 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func getHLSPlaybackReadiness(
+        _ readinessRequest: HLSPlaybackReadinessRequest
+    ) async throws -> HLSPlaybackReadiness {
+        try Task.checkCancellation()
+        try readinessRequest.validate()
+        do {
+            let readiness = try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_GetHlsPlaybackReadinessRequest()
+                request.sessionID = readinessRequest.sessionID
+                request.variantID = readinessRequest.variantID
+                request.windowStartSeconds = readinessRequest.windowStartSeconds
+                request.windowDurationSeconds = readinessRequest.windowDurationSeconds
+                let response = try await service.getHlsPlaybackReadiness(request, options: callOptions)
+                return try HLSPlaybackReadiness(response, matching: readinessRequest)
+            }
+            try Task.checkCancellation()
+            return readiness
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let rpcError = error as? RPCError, rpcError.code == .unimplemented {
+                throw CacheControlClientUnsupportedOperation.hlsPlaybackReadiness
+            }
+            if let validationError = error as? HLSPlaybackReadinessValidationError {
+                throw validationError
+            }
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
+        }
+    }
+
     public func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
         do {
             return try await withGRPCClient(

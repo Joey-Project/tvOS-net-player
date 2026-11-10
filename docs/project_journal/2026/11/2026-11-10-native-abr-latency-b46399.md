@@ -45,8 +45,8 @@ superseded_by:
 
 ## Next Steps
 1. Keep the bounded diagnostic slice in the native gate and retain exact-run raw evidence for baseline comparison.
-2. Use the [read-only server readiness evidence](2026-11-10-hls-readiness-b46400.md) to distinguish cache readability from fresh origin delivery without treating either as an overall switch recommendation.
-3. Agree on cache-hit versus origin-dependent recovery criteria and a production handover mechanism before implementing active quality changes. Retain the pure AVPlayer-managed long test even if a separate assisted path is introduced.
+2. Use the [read-only server readiness evidence](2026-11-10-hls-readiness-b46400.md) and [shared upshift assessment](2026-11-10-hls-upshift-policy-b46401.md) to distinguish a cached-window opportunity from an origin-dependent prewarm estimate. Neither is a playback safety guarantee.
+3. Complete rendition context acquisition and agree on a production handover mechanism before implementing active quality changes. Retain the pure AVPlayer-managed long test even if a separate assisted path is introduced.
 4. Continue the remaining native cache lifecycle/offline and home LAN roadmap work after recovery optimization.
 
 ## Evidence

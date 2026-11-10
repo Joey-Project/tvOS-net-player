@@ -278,6 +278,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsResolverSettingsWrite: Bool {
         capabilities.contains(CacheServerCapability.resolverSettingsWrite)
     }
+
+    public var supportsHLSPlaybackReadiness: Bool {
+        capabilities.contains(CacheServerCapability.hlsPlaybackReadiness)
+    }
 }
 
 public struct ResolverRegion: RawRepresentable, CaseIterable, Equatable, Hashable, Identifiable, Sendable {
@@ -402,6 +406,7 @@ public enum CacheServerCapability {
     public static let resolverSettingsWrite = "resolverSettingsWrite"
     public static let bilibiliAccessKeyLogin = "bilibiliAccessKeyLogin"
     public static let bilibiliCredentialReadiness = "bilibiliCredentialReadiness"
+    public static let hlsPlaybackReadiness = "hlsPlaybackReadiness"
 }
 
 public enum BilibiliCredentialReadiness: String, Equatable, Sendable {
