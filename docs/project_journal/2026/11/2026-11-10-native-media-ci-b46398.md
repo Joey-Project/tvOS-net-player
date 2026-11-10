@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-10
 updated: 2026-11-10
 branch: codex/native-media-ci
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/91
 supersedes: []
 superseded_by:
 ---
@@ -41,6 +41,7 @@ superseded_by:
 2. Continue to inspect exact-run native reports during future failures rather than treating a compilation or job label as decoded playback proof. Preserve full App UI, authenticated live, offline, audible-audio and physical-device boundaries.
 
 ## Evidence
+- [Delivery PR #91](https://github.com/Joey-Project/tvOS-net-player/pull/91).
 - [Home LAN roadmap](../10/2026-10-23-home-lan-readiness-roadmap-b46388.md).
 - [Native recovery acceptance and historical boundaries](2026-11-09-native-abr-recovery-b46397.md).
 - Source thread: `019e7fd0-b463-76f2-a5ab-37d7d77620f4`.
