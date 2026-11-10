@@ -83,6 +83,8 @@ protocol PlayerPlaybackControlling: AnyObject {
     var readinessStatus: AVPlayerItem.Status { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
     var defaultRate: Float { get set }
+    var actualPlaybackRate: Float? { get }
+    var loadedMediaTimeRanges: [CMTimeRange] { get }
     func currentTime() -> CMTime
     func play()
     func pause()
@@ -96,6 +98,13 @@ protocol PlayerPlaybackControlling: AnyObject {
 
 extension PlayerPlaybackControlling {
     var itemDuration: CMTime { currentItem?.duration ?? .invalid }
+    var actualPlaybackRate: Float? { nil }
+    var loadedMediaTimeRanges: [CMTimeRange] {
+        guard let currentItem else { return [] }
+        return currentItem.loadedTimeRanges
+            .prefix(HLSPlaybackSnapshot.maximumBufferedRangeCount + 1)
+            .map(\.timeRangeValue)
+    }
 
     func cancelPendingSeeks(for item: AVPlayerItem) {
         item.cancelPendingSeeks()
@@ -103,6 +112,8 @@ extension PlayerPlaybackControlling {
 }
 
 extension AVPlayer: PlayerPlaybackControlling {
+    var actualPlaybackRate: Float? { rate }
+
     var readinessStatus: AVPlayerItem.Status {
         currentItem?.status ?? .unknown
     }
@@ -237,6 +248,7 @@ public final class PlayerViewModel: ObservableObject {
     }
     var resumptionReadinessTimeout: Duration = .seconds(20)
     var resumptionSeekTimeout: Duration = .seconds(15)
+    var playbackSnapshotNowNanoseconds: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
 
     private struct PendingReplay {
         let player: AVPlayer
@@ -273,6 +285,58 @@ public final class PlayerViewModel: ObservableObject {
 
     public var isPlaybackPositionUnrestored: Bool {
         isCurrentResumePositionUnrestored
+    }
+
+    /// Captures read-only native playback timing; it does not identify HLS renditions or authorize handover.
+    public func captureHLSPlaybackSnapshot() -> HLSPlaybackSnapshot? {
+        let observedAtNanoseconds = playbackSnapshotNowNanoseconds()
+        guard let player, let controller = playbackController,
+            let item = player.currentItem,
+            controller.currentItem === item,
+            controller.readinessStatus == .readyToPlay,
+            !isCurrentResumePositionUnrestored,
+            resumePositionUnrestoredItem !== item,
+            playbackResumptionOperation == nil,
+            pendingPlaybackResume?.player !== player,
+            pendingReplay?.player !== player,
+            playbackProgressEndedItem !== item
+        else {
+            return nil
+        }
+
+        let timeControlStatus = controller.timeControlStatus
+        let currentTime = controller.currentTime()
+        guard
+            !(timeControlStatus == .paused
+                && Self.isAtPlaybackEnd(currentTime: currentTime, duration: controller.itemDuration)),
+            let actualPlaybackRate = controller.actualPlaybackRate
+        else {
+            return nil
+        }
+
+        guard
+            let snapshot = HLSPlaybackSnapshot.capture(
+                timeControlStatus: timeControlStatus,
+                playbackRate: actualPlaybackRate,
+                currentTime: currentTime,
+                loadedTimeRanges: controller.loadedMediaTimeRanges,
+                observedAtNanoseconds: observedAtNanoseconds
+            ),
+            player === self.player,
+            controller === playbackController,
+            player.currentItem === item,
+            controller.currentItem === item,
+            controller.readinessStatus == .readyToPlay,
+            !isCurrentResumePositionUnrestored,
+            playbackResumptionOperation == nil,
+            pendingPlaybackResume?.player !== player,
+            pendingReplay?.player !== player,
+            playbackProgressEndedItem !== item
+        else {
+            return nil
+        }
+
+        return snapshot
     }
 
     public var playbackState: PlayerPlaybackState {
