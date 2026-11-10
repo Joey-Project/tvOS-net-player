@@ -2332,19 +2332,15 @@ impl Drop for CdnBodyObservation {
             }
             _ => CdnObservationOutcome::Partial,
         };
+        let observation = playback_observation(
+            outcome,
+            bytes,
+            Some(elapsed),
+            first_byte_latency,
+            range_supported,
+        );
         runtime.spawn_blocking(move || {
-            record_cdn_observation(
-                &history,
-                &request,
-                &url,
-                playback_observation(
-                    outcome,
-                    bytes,
-                    Some(elapsed),
-                    first_byte_latency,
-                    range_supported,
-                ),
-            );
+            record_cdn_observation(&history, &request, &url, observation);
         });
     }
 }
@@ -2372,6 +2368,7 @@ fn playback_observation(
         elapsed,
         first_byte_latency,
         range_supported,
+        observed_at: std::time::Instant::now(),
     }
 }
 
@@ -2601,6 +2598,7 @@ async fn probe_hls_mp4_initialization_candidates(
                             elapsed: None,
                             first_byte_latency: None,
                             range_supported: Some(true),
+                            observed_at: std::time::Instant::now(),
                         },
                     );
                 }
@@ -3769,6 +3767,68 @@ mod tests {
             CdnHistory::default().rank_request(&unrelated),
             history.rank_request(&unrelated)
         );
+    }
+
+    #[test]
+    fn dropped_cdn_body_captures_time_before_blocking_recorder_dequeues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking worker should be held before the observation is queued");
+
+        let history = Arc::new(CdnHistory::default());
+        let request = media_request("https://cdn-a.example/video.m4s", Vec::new());
+        let drop_started_at;
+        let drop_finished_at;
+        {
+            let _runtime_guard = runtime.enter();
+            let mut observation = CdnBodyObservation::new(
+                Arc::clone(&history),
+                request.clone(),
+                Some(request.url.clone()),
+                Instant::now() - std::time::Duration::from_millis(10),
+                Some(true),
+                Some(4),
+                true,
+            );
+            observation.observe_chunk(b"data");
+            drop_started_at = std::time::Instant::now();
+            drop(observation);
+            drop_finished_at = std::time::Instant::now();
+        }
+        assert_eq!(history.recent_origin_supply(&request), None);
+        release_tx
+            .send(())
+            .expect("blocking worker should be released");
+        runtime.block_on(async {
+            timeout(std::time::Duration::from_secs(2), blocker)
+                .await
+                .expect("blocking worker should finish within the bound")
+                .expect("blocking worker should not panic");
+            timeout(std::time::Duration::from_secs(2), async {
+                while history.recent_origin_supply(&request).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued observation should be recorded within the bound");
+        });
+
+        let observed_at = history
+            .fresh_origin_observed_at_for_test(&request, &request.url)
+            .expect("complete body should produce a measured observation");
+        assert!(observed_at >= drop_started_at);
+        assert!(observed_at <= drop_finished_at);
     }
 
     #[tokio::test]

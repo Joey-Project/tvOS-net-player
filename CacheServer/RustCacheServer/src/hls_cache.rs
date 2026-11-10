@@ -8929,6 +8929,7 @@ fn passive_cache_observation(
         elapsed,
         first_byte_latency,
         range_supported,
+        observed_at: std::time::Instant::now(),
     }
 }
 
