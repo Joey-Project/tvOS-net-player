@@ -3,7 +3,7 @@ id: 20261109-b46397
 title: Native ABR Recovery And Media Acceptance
 status: completed
 created: 2026-11-09
-updated: 2026-11-09
+updated: 2026-11-10
 branch: codex/native-media-acceptance
 pr: https://github.com/Joey-Project/tvOS-net-player/pull/90
 supersedes: []
@@ -81,6 +81,6 @@ These contracts describe the target-branch outcome. Historical development evide
 - These scenario distinctions implement the clarified product contract; historical failed short recovery reports remain retained and are not relabeled as passes. The future-content case retains the full automatic recovery requirement.
 
 ## Next Steps
-1. Deliver the dedicated credential-free GHA native-media job as slice 3B, retaining the long-window budget, complete named-case/report admission and existing CI/UI gates.
+1. The dedicated credential-free GHA native-media job and its required-gate integration are tracked in [slice 3B](2026-11-10-native-media-ci-b46398.md), retaining the long-window budget, complete named-case/report admission and existing CI/UI gates.
 2. Design recovery-latency optimization and opportunistic higher-quality replacement beyond the safety window separately, with explicit responsiveness and regression criteria. Keep default buffering, whole-fill behavior, representation integrity and all historical negative evidence. `AvPlayerManaged` does not promise a client retry deadline.
 3. Continue native cache lifecycle/offline acceptance and the remaining home LAN roadmap slices in their own PRs. Audible audio, authenticated long-play and physical Apple TV remain separate evidence boundaries.

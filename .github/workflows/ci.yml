@@ -240,19 +240,125 @@ jobs:
           path: .build
           key: ${{ steps.restore-swift.outputs.cache-primary-key }}
 
+  media-network:
+    name: Native media network acceptance
+    runs-on: macos-26
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Establish native media work deadline
+        run: |
+          deadline="$(python3 -c 'import time; print(time.monotonic() + 60 * 60)')"
+          printf 'MEDIA_NETWORK_E2E_JOB_WORK_DEADLINE_MONOTONIC=%s\n' "$deadline" >> "$GITHUB_ENV"
+          printf 'MEDIA_NETWORK_E2E_ARTIFACT_DIR=%s/media-network-e2e-artifacts\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Check out native media repository
+        uses: actions/checkout@v4
+
+      - name: Compute native media cache identity
+        id: media-toolchain
+        timeout-minutes: 5
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          command -v ffmpeg >/dev/null
+          command -v ffprobe >/dev/null
+          capture_version() {
+            local LC_ALL=C output
+            if ! output="$("$@" 2>&1 | head -c 65537)"; then
+              printf 'Could not read bounded version output for %s.\n' "$1" >&2
+              exit 1
+            fi
+            if [[ ${#output} -gt 65536 ]]; then
+              printf 'Version output exceeded its 64 KiB bound for %s.\n' "$1" >&2
+              exit 1
+            fi
+            printf '%s' "$output"
+          }
+          apple="$(capture_version xcodebuild -version)"
+          swift="$(capture_version xcrun swift --version)"
+          sdks="$(capture_version xcodebuild -showsdks)"
+          clang="$(capture_version xcrun clang --version)"
+          os="$(capture_version sw_vers -buildVersion)"
+          rust="$(capture_version rustc -Vv)"
+          cargo="$(capture_version cargo -V)"
+          ffmpeg -version | sed -n '1p'
+          ffprobe -version | sed -n '1p'
+          printf 'Apple toolchain:\n%s\nSwift:\n%s\nApple SDKs:\n%s\nClang:\n%s\nmacOS build:\n%s\nRust:\n%s\nCargo:\n%s\n' \
+            "$apple" "$swift" "$sdks" "$clang" "$os" "$rust" "$cargo"
+          toolchain="$(printf '%s\n' "$apple" "$swift" "$sdks" "$clang" "$os" "$rust" "$cargo" | shasum -a 256 | cut -d ' ' -f 1)"
+          printf 'toolchain=%s\n' "$toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Run native media helper regressions
+        timeout-minutes: 3
+        run: python3 -m unittest discover -s scripts -p 'test_media_network*.py' -v
+
+      - name: Restore native media Rust cache
+        id: restore-media-rust
+        if: steps.media-toolchain.outputs.toolchain != ''
+        uses: actions/cache/restore@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+        with:
+          path: target
+          key: media-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.media-toolchain.outputs.toolchain }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'CacheServer/RustCacheServer/Cargo.toml', 'CacheServer/RustCacheServer/build.rs', 'CacheServer/RustCacheServer/src/**', 'CacheServer/RustCacheServer/tests/**', 'Sources/TVOSNetPlayerCacheClient/Protos/**', 'scripts/local_build.py', 'scripts/media-network-e2e.py', 'scripts/test_media_network_e2e.py', 'scripts/probe-lan-playback.swift') }}
+
+      - name: Run native media network acceptance
+        timeout-minutes: 52
+        run: python3 scripts/media-network-e2e.py --ci-unsigned --artifact-dir "$MEDIA_NETWORK_E2E_ARTIFACT_DIR"
+
+      - name: Summarize native media cache result
+        if: always()
+        timeout-minutes: 1
+        env:
+          MEDIA_RUST_CACHE_OUTCOME: ${{ steps.restore-media-rust.outcome }}
+          MEDIA_RUST_CACHE_HIT: ${{ steps.restore-media-rust.outputs.cache-hit }}
+        run: |
+          printf 'Native media Rust cache: outcome=%s hit=%s\n' "${MEDIA_RUST_CACHE_OUTCOME:-unknown}" "${MEDIA_RUST_CACHE_HIT:-unknown}"
+          {
+            printf '### Native media cache\n\n'
+            printf -- '- Restore outcome: %s\n' "${MEDIA_RUST_CACHE_OUTCOME:-unknown}"
+            printf -- '- Cache hit: %s\n' "${MEDIA_RUST_CACHE_HIT:-unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload native media acceptance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: media-network-e2e-${{ github.run_id }}
+          path: ${{ env.MEDIA_NETWORK_E2E_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Save native media Rust cache
+        if: success() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.restore-media-rust.outputs.cache-primary-key != '' && steps.restore-media-rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: target
+          key: ${{ steps.restore-media-rust.outputs.cache-primary-key }}
+
   tvos-build-and-tests:
     name: tvOS build and tests
-    needs: [apple-platforms, core-unit-tests]
+    needs: [apple-platforms, core-unit-tests, media-network]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Require both CI jobs to succeed
+      - name: Require all CI jobs to succeed
         env:
           APPLE_RESULT: ${{ needs.apple-platforms.result }}
           CORE_RESULT: ${{ needs.core-unit-tests.result }}
+          MEDIA_RESULT: ${{ needs.media-network.result }}
         run: |
-          if [[ "$APPLE_RESULT" != "success" || "$CORE_RESULT" != "success" ]]; then
-            printf 'Required CI jobs did not both succeed (apple=%s, core=%s).\n' "$APPLE_RESULT" "$CORE_RESULT" >&2
+          if [[ "$APPLE_RESULT" != "success" || "$CORE_RESULT" != "success" || "$MEDIA_RESULT" != "success" ]]; then
+            printf 'Required CI jobs did not all succeed (apple=%s, core=%s, media=%s).\n' "$APPLE_RESULT" "$CORE_RESULT" "$MEDIA_RESULT" >&2
             exit 1
           fi
