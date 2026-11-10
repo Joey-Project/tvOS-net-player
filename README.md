@@ -211,6 +211,8 @@ just test-media-network
 
 回升诊断会分别记录客户端播放/连续缓冲边界、高档源站请求对应的真实 MP4 媒体区间，以及高档解码时间。快速 LAN 不代表尚未缓存的高档片段已能及时供给；后续策略会区分缓存命中与依赖源站的区间。约每 10 秒的有界被动采样和派生延迟报告仅用于定位，不会强制切档或承诺回升已加速；设计及后续计划见 [recovery latency journal](docs/project_journal/2026/11/2026-11-10-native-abr-latency-b46399.md)。
 
+只读控制面接口 `CacheService.GetHlsPlaybackReadiness` 按 session、画质和明确的媒体时间窗口分别返回本地缓存可读性与近期源站传输证据，不触发下载、源站探测或播放器切换。结果区分可读、缺失和未知；索引不足、身份变化、I/O 错误、并发繁忙或检查预算不足都不会伪装成缓存缺失或已经准备好。近期吞吐是实际交付速率，不是链路容量保证；重启后的旧 CDN 排序历史不能当作新测量。响应不是缓存租约或升档建议，共享客户端本轮不自动调用或切源。边界见 [readiness journal](docs/project_journal/2026/11/2026-11-10-hls-readiness-b46400.md)。
+
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
 GHA 的 `Native media network acceptance` job 使用同一套严格用例和报告校验，通过显式 `--ci-unsigned` 在一次性的 runner 上编译隔离产物，不需要 Apple 签名 secrets。该模式只允许在 GitHub Actions 中使用，不作为本机固定签名验收的替代。`media-network-e2e-<run_id>` 产物保留有界日志、runner summary 和三个原始媒体报告，保留三天；媒体夹具、日常 server 状态和凭据不会上传。job 失败、取消或跳过都会阻止统一 CI 门禁通过；GHA 结果与本机签名验收分别记录，设计见 [native media CI journal](docs/project_journal/2026/11/2026-11-10-native-media-ci-b46398.md)。

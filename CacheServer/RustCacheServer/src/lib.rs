@@ -19,6 +19,7 @@ mod hls_media_refresh;
 mod hls_network_policy;
 mod hls_playback_progress;
 mod hls_range_cache;
+mod hls_readiness;
 pub mod library;
 pub mod media;
 mod mp4_segments;

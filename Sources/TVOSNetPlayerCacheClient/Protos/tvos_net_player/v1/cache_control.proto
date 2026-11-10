@@ -45,6 +45,10 @@ service TaskService {
 service CacheService {
   rpc ListCacheRoots(ListCacheRootsRequest) returns (ListCacheRootsResponse);
   rpc GetHlsCacheStatus(GetHlsCacheStatusRequest) returns (HlsCacheStatus);
+  // Returns bounded cache-readability and recent measured-origin evidence for
+  // one exact registered HLS variant/window. This is a snapshot, not a lease
+  // or a playback-readiness recommendation, and never fetches from an origin.
+  rpc GetHlsPlaybackReadiness(GetHlsPlaybackReadinessRequest) returns (HlsPlaybackReadiness);
   rpc ReportPlaybackProgress(ReportPlaybackProgressRequest) returns (ReportPlaybackProgressResponse);
   rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
 }
@@ -79,6 +83,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_RESOLVER_SETTINGS_WRITE = 16;
   SERVER_CAPABILITY_BILIBILI_ACCESS_KEY_LOGIN = 17;
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_READINESS = 18;
+  SERVER_CAPABILITY_HLS_PLAYBACK_READINESS = 19;
 }
 
 message GetResolverSettingsRequest {}
@@ -850,6 +855,63 @@ message ListCacheRootsResponse {
 }
 
 message GetHlsCacheStatusRequest {}
+
+message GetHlsPlaybackReadinessRequest {
+  // Both identifiers are bounded and must match a registered session/variant.
+  string session_id = 1;
+  string variant_id = 2;
+  // The start must be finite and non-negative; duration must be finite and in
+  // (0, 60]. The requested window must be representable without overflow.
+  double window_start_seconds = 3;
+  double window_duration_seconds = 4;
+}
+
+// Recent measured supply for this exact representation, sampled no more than
+// 30 seconds ago. Throughput is delivered goodput, not link capacity.
+message HlsOriginSupplyEvidence {
+  uint64 age_millis = 1;
+  uint64 throughput_bits_per_second = 2;
+  optional uint64 first_byte_latency_micros = 3;
+  uint64 freshness_limit_millis = 4;
+}
+
+enum HlsPlaybackCacheState {
+  HLS_PLAYBACK_CACHE_STATE_UNSPECIFIED = 0;
+  HLS_PLAYBACK_CACHE_STATE_READABLE = 1;
+  HLS_PLAYBACK_CACHE_STATE_MISSING = 2;
+  HLS_PLAYBACK_CACHE_STATE_UNKNOWN = 3;
+}
+
+enum HlsPlaybackCacheReason {
+  HLS_PLAYBACK_CACHE_REASON_UNSPECIFIED = 0;
+  HLS_PLAYBACK_CACHE_REASON_NONE = 1;
+  HLS_PLAYBACK_CACHE_REASON_NOT_CACHED = 2;
+  HLS_PLAYBACK_CACHE_REASON_INDEX_UNAVAILABLE = 3;
+  HLS_PLAYBACK_CACHE_REASON_OUT_OF_RANGE = 4;
+  HLS_PLAYBACK_CACHE_REASON_BUSY = 5;
+  HLS_PLAYBACK_CACHE_REASON_BUDGET_EXCEEDED = 6;
+  HLS_PLAYBACK_CACHE_REASON_IDENTITY_CHANGED = 7;
+  HLS_PLAYBACK_CACHE_REASON_IO_FAILURE = 8;
+  HLS_PLAYBACK_CACHE_REASON_UNKNOWN_GENERATION_CHANGED = 9;
+}
+
+message HlsPlaybackReadiness {
+  // Exact request identity/window and process-local session generation. The
+  // generation is not authority across server restarts.
+  string session_id = 1;
+  string variant_id = 2;
+  double window_start_seconds = 3;
+  double window_duration_seconds = 4;
+  uint64 session_generation = 5;
+  // Cache-only evidence. UNKNOWN means readability could not be proved.
+  HlsPlaybackCacheState cache_state = 6;
+  HlsPlaybackCacheReason cache_reason = 7;
+  // Charged inspection work, not unique storage or downloaded bytes.
+  uint64 inspection_budget_used_bytes = 8;
+  // Absent when no fresh exact-representation observation exists.
+  HlsOriginSupplyEvidence video_origin = 9;
+  HlsOriginSupplyEvidence audio_origin = 10;
+}
 
 message HlsCacheStatus {
   bool eviction_enabled = 1;
