@@ -22,6 +22,8 @@ const MAX_REPRESENTATIONS: usize = 512;
 const MAX_ORIGINS_PER_REPRESENTATION: usize = 3;
 const MAX_FILE_BYTES: usize = 192 * 1024;
 const MAX_CANDIDATES: usize = 32;
+const MAX_FRESH_ORIGIN_SUPPLY_ENTRIES: usize = 512;
+pub(crate) const RECENT_ORIGIN_SUPPLY_MAX_AGE: Duration = Duration::from_secs(30);
 const MAX_CONTENT_ID_BYTES: usize = 256;
 const MAX_CODEC_BYTES: usize = 128;
 const PERSISTENCE_THROTTLE: Duration = Duration::from_secs(1);
@@ -54,6 +56,38 @@ struct HistoryState {
     sequence: u64,
     hosts: BTreeMap<String, HostRecord>,
     representations: BTreeMap<String, RepresentationRecord>,
+    #[serde(skip)]
+    fresh_origin_supply: BTreeMap<String, FreshOriginSupplyRecord>,
+    #[serde(skip)]
+    fresh_origin_supply_eviction_floor: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct FreshOriginSupplyRecord {
+    observed_at: Instant,
+    outcome: FreshOriginSupplyOutcome,
+}
+
+#[derive(Clone)]
+enum FreshOriginSupplyOutcome {
+    Invalidated,
+    Measured {
+        throughput_bps: u64,
+        first_byte_latency: Option<Duration>,
+    },
+}
+
+impl FreshOriginSupplyOutcome {
+    fn is_invalidation(&self) -> bool {
+        matches!(self, Self::Invalidated)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecentOriginSupply {
+    pub(crate) age: Duration,
+    pub(crate) throughput_bps: u64,
+    pub(crate) first_byte_latency: Option<Duration>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,6 +152,7 @@ pub(crate) struct CdnObservation {
     pub elapsed: Option<Duration>,
     pub first_byte_latency: Option<Duration>,
     pub range_supported: Option<bool>,
+    pub observed_at: Instant,
 }
 
 impl CdnObservation {
@@ -133,6 +168,7 @@ impl CdnObservation {
             elapsed: None,
             first_byte_latency: None,
             range_supported: None,
+            observed_at: Instant::now(),
         }
     }
 
@@ -150,6 +186,7 @@ impl CdnObservation {
             elapsed: Some(elapsed),
             first_byte_latency: Some(first_byte_latency),
             range_supported,
+            observed_at: Instant::now(),
         }
     }
 
@@ -162,6 +199,7 @@ impl CdnObservation {
             elapsed: Some(elapsed),
             first_byte_latency: None,
             range_supported: None,
+            observed_at: Instant::now(),
         }
     }
 
@@ -256,6 +294,76 @@ impl CdnHistory {
         observation: CdnObservation,
     ) {
         self.record_request_at(request, url, observation, now_seconds());
+    }
+
+    pub(crate) fn recent_origin_supply(
+        &self,
+        request: &BilibiliMediaRequest,
+    ) -> Option<RecentOriginSupply> {
+        self.recent_origin_supply_with_clock(request, Instant::now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fresh_origin_observed_at_for_test(
+        &self,
+        request: &BilibiliMediaRequest,
+        url: &str,
+    ) -> Option<Instant> {
+        let digest = representation_digest(request)?;
+        let origin = canonical_origin(url)?;
+        self.lock_state()
+            .fresh_origin_supply
+            .get(&representation_map_key(&digest, &origin))
+            .map(|record| record.observed_at)
+    }
+
+    #[cfg(test)]
+    fn recent_origin_supply_at(
+        &self,
+        request: &BilibiliMediaRequest,
+        now: Instant,
+    ) -> Option<RecentOriginSupply> {
+        self.recent_origin_supply_with_clock(request, || now)
+    }
+
+    fn recent_origin_supply_with_clock(
+        &self,
+        request: &BilibiliMediaRequest,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<RecentOriginSupply> {
+        let digest = representation_digest(request)?;
+        let state = self.lock_state();
+        let now = clock();
+        std::iter::once(&request.url)
+            .chain(request.backup_urls.iter())
+            .take(MAX_CANDIDATES)
+            .filter_map(|url| {
+                let origin = canonical_origin(url)?;
+                let record = state
+                    .fresh_origin_supply
+                    .get(&representation_map_key(&digest, &origin))?;
+                let FreshOriginSupplyOutcome::Measured {
+                    throughput_bps,
+                    first_byte_latency,
+                } = &record.outcome
+                else {
+                    return None;
+                };
+                let age = now.checked_duration_since(record.observed_at)?;
+                (age <= RECENT_ORIGIN_SUPPLY_MAX_AGE).then_some((
+                    age,
+                    *throughput_bps,
+                    *first_byte_latency,
+                ))
+            })
+            .min_by_key(|(age, _, _)| *age)
+            .map(
+                |(age, throughput_bps, first_byte_latency)| RecentOriginSupply {
+                    age,
+                    throughput_bps,
+                    first_byte_latency,
+                },
+            )
     }
 
     pub(crate) fn record_origin(&self, url: &str, observation: CdnObservation) {
@@ -459,6 +567,42 @@ impl CdnHistory {
         );
         let completed = observation.outcome == CdnObservationOutcome::Complete;
         let integrity_mismatch = observation.outcome == CdnObservationOutcome::IntegrityMismatch;
+        let fresh_key = digest.map(|digest| representation_map_key(digest, &origin));
+        let invalidate_fresh = matches!(
+            observation.outcome,
+            CdnObservationOutcome::ConnectionFailure
+                | CdnObservationOutcome::Timeout
+                | CdnObservationOutcome::ServerFailure
+                | CdnObservationOutcome::SourceUnavailable
+                | CdnObservationOutcome::IntegrityMismatch
+        ) || observation.range_supported == Some(false);
+        if let Some(key) = fresh_key.as_ref() {
+            let fresh_outcome = if invalidate_fresh {
+                Some(FreshOriginSupplyOutcome::Invalidated)
+            } else if completed
+                && observation.source != CdnObservationSource::DownloadShard
+                && let Some(elapsed) = observation.elapsed
+                && !elapsed.is_zero()
+                && observation.bytes > 0
+                && observation
+                    .first_byte_latency
+                    .is_none_or(|latency| latency <= elapsed)
+            {
+                let first_byte_latency = observation.first_byte_latency;
+                let throughput_bps = (u128::from(observation.bytes) * 8 * 1_000_000_000
+                    / elapsed.as_nanos())
+                .min(u128::from(u64::MAX)) as u64;
+                Some(FreshOriginSupplyOutcome::Measured {
+                    throughput_bps,
+                    first_byte_latency,
+                })
+            } else {
+                None
+            };
+            if let Some(fresh_outcome) = fresh_outcome {
+                record_fresh_origin_supply(&mut state, key, observation.observed_at, fresh_outcome);
+            }
+        }
         if transport_failure || completed {
             let entry = state
                 .hosts
@@ -549,6 +693,77 @@ impl CdnHistory {
         let shared = Arc::clone(&self.shared);
         drop(runtime.spawn(run_writer(shared, path)));
     }
+}
+
+fn record_fresh_origin_supply(
+    state: &mut HistoryState,
+    key: &str,
+    observed_at: Instant,
+    outcome: FreshOriginSupplyOutcome,
+) {
+    if let Some(previous) = state.fresh_origin_supply.get(key) {
+        let newer = observed_at > previous.observed_at;
+        let equal_time_failure_wins = observed_at == previous.observed_at
+            && outcome.is_invalidation()
+            && !previous.outcome.is_invalidation();
+        if !newer && !equal_time_failure_wins {
+            return;
+        }
+    } else {
+        if state
+            .fresh_origin_supply_eviction_floor
+            .is_some_and(|floor| observed_at <= floor)
+        {
+            return;
+        }
+        if !make_fresh_origin_supply_room(state, observed_at) {
+            return;
+        }
+    }
+    state.fresh_origin_supply.insert(
+        key.to_owned(),
+        FreshOriginSupplyRecord {
+            observed_at,
+            outcome,
+        },
+    );
+}
+
+// Equal-time invalidations replace measured evidence; equal-time successes keep
+// the first decision. Evicted timestamps form a conservative floor for missing keys.
+fn make_fresh_origin_supply_room(state: &mut HistoryState, incoming_at: Instant) -> bool {
+    let required_evictions = state
+        .fresh_origin_supply
+        .len()
+        .saturating_add(1)
+        .saturating_sub(MAX_FRESH_ORIGIN_SUPPLY_ENTRIES);
+    if required_evictions == 0 {
+        return true;
+    }
+
+    let mut oldest = state
+        .fresh_origin_supply
+        .iter()
+        .map(|(key, record)| (record.observed_at, key.clone()))
+        .collect::<Vec<_>>();
+    oldest.sort();
+    let eviction_candidates = oldest
+        .into_iter()
+        .take(required_evictions)
+        .collect::<Vec<_>>();
+    let next_floor = eviction_candidates
+        .iter()
+        .map(|(observed_at, _)| *observed_at)
+        .chain(state.fresh_origin_supply_eviction_floor)
+        .max();
+    if next_floor.is_some_and(|floor| incoming_at <= floor) {
+        return false;
+    }
+    for (_, key) in eviction_candidates {
+        state.fresh_origin_supply.remove(&key);
+    }
+    state.fresh_origin_supply_eviction_floor = next_floor;
+    true
 }
 
 async fn run_writer(shared: Arc<Shared>, path: PathBuf) {
@@ -1421,6 +1636,7 @@ mod tests {
                 elapsed: Some(Duration::from_millis(10)),
                 first_byte_latency: Some(Duration::from_millis(1)),
                 range_supported: None,
+                observed_at: Instant::now(),
             },
         );
         let state = history.lock_state();
@@ -1646,5 +1862,597 @@ mod tests {
         history.shutdown_and_wait().await;
         history.record_request(&request, &request.url, probe(200, 50));
         assert!(!case_root.exists());
+    }
+
+    fn measured_complete(bytes: u64, elapsed: Duration, ttfb: Option<Duration>) -> CdnObservation {
+        CdnObservation {
+            source: CdnObservationSource::Playback,
+            outcome: CdnObservationOutcome::Complete,
+            bytes,
+            elapsed: Some(elapsed),
+            first_byte_latency: ttfb,
+            range_supported: Some(true),
+            observed_at: Instant::now(),
+        }
+    }
+
+    fn record_measured_at(
+        history: &CdnHistory,
+        request: &BilibiliMediaRequest,
+        url: &str,
+        mut observation: CdnObservation,
+        measured_at: Instant,
+    ) {
+        observation.observed_at = measured_at;
+        history.record_request_at(request, url, observation, 100);
+    }
+
+    #[test]
+    fn recent_origin_supply_reports_goodput_and_expires_monotonically() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let measured_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(
+                1_000,
+                Duration::from_millis(2),
+                Some(Duration::from_millis(1)),
+            ),
+            measured_at,
+        );
+
+        let sample = history
+            .recent_origin_supply_at(&request, measured_at + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(sample.age, Duration::from_secs(3));
+        assert_eq!(sample.throughput_bps, 4_000_000);
+        assert_eq!(sample.first_byte_latency, Some(Duration::from_millis(1)));
+        assert_eq!(
+            history.recent_origin_supply_at(
+                &request,
+                measured_at + RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1)
+            ),
+            None
+        );
+        assert_eq!(
+            history.recent_origin_supply_at(&request, measured_at - Duration::from_nanos(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn production_freshness_clock_is_evaluated_after_state_lock_acquisition() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let observed_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(100, Duration::from_secs(1), None),
+            observed_at,
+        );
+        let decision_time = observed_at + RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1);
+
+        assert_eq!(
+            history.recent_origin_supply_with_clock(&request, || {
+                assert!(matches!(
+                    history.shared.state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                decision_time
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn record_request_uses_the_captured_observation_time() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let observed_at = Instant::now() - RECENT_ORIGIN_SUPPLY_MAX_AGE - Duration::from_secs(1);
+        let mut observation = measured_complete(1_000, Duration::from_secs(1), None);
+        observation.observed_at = observed_at;
+
+        history.record_request(&request, &request.url, observation);
+
+        assert_eq!(history.recent_origin_supply(&request), None);
+        let key = representation_map_key(
+            &representation_digest(&request).unwrap(),
+            "https://a.example",
+        );
+        assert_eq!(
+            history.lock_state().fresh_origin_supply[&key].observed_at,
+            observed_at
+        );
+    }
+
+    #[test]
+    fn delayed_success_cannot_cross_a_failure_tombstone_without_a_prior_sample() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let base = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::Timeout,
+            ),
+            base + Duration::from_secs(2),
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(10_000, Duration::from_secs(1), None),
+            base + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            history.recent_origin_supply_at(&request, base + Duration::from_secs(2)),
+            None
+        );
+        let state = history.lock_state();
+        let key = representation_map_key(
+            &representation_digest(&request).unwrap(),
+            "https://a.example",
+        );
+        let record = &state.fresh_origin_supply[&key];
+        assert_eq!(record.observed_at, base + Duration::from_secs(2));
+        assert!(record.outcome.is_invalidation());
+    }
+
+    #[test]
+    fn delayed_failure_and_success_cannot_replace_a_newer_completion() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let base = Instant::now();
+        let completed_at = base + Duration::from_secs(3);
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(1_000, Duration::from_secs(1), None),
+            completed_at,
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::ConnectionFailure,
+            ),
+            base + Duration::from_secs(1),
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(9_000, Duration::from_secs(1), None),
+            base + Duration::from_secs(2),
+        );
+
+        let sample = history
+            .recent_origin_supply_at(&request, completed_at)
+            .unwrap();
+        assert_eq!(sample.throughput_bps, 8_000);
+        let key = representation_map_key(
+            &representation_digest(&request).unwrap(),
+            "https://a.example",
+        );
+        assert_eq!(
+            history.lock_state().fresh_origin_supply[&key].observed_at,
+            completed_at
+        );
+    }
+
+    #[test]
+    fn equal_time_failure_wins_and_equal_time_success_cannot_revive_supply() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let observed_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(1_000, Duration::from_secs(1), None),
+            observed_at,
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::ServerFailure,
+            ),
+            observed_at,
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(9_000, Duration::from_secs(1), None),
+            observed_at,
+        );
+
+        assert_eq!(history.recent_origin_supply_at(&request, observed_at), None);
+        let key = representation_map_key(
+            &representation_digest(&request).unwrap(),
+            "https://a.example",
+        );
+        assert!(
+            history.lock_state().fresh_origin_supply[&key]
+                .outcome
+                .is_invalidation()
+        );
+    }
+
+    #[test]
+    fn persisted_ewma_and_restart_never_supply_fresh_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cdn-history.json");
+        let history = CdnHistory::load(&path);
+        let request = make_request("https://a.example/video", &[]);
+        let digest = representation_digest(&request).unwrap();
+        history.record_at(&request.url, probe(1_000_000, 100), Some(&digest), 100);
+        let observed_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(1_000, Duration::from_secs(1), None),
+            observed_at,
+        );
+        let invalidated_request = make_request("https://b.example/video", &[]);
+        record_measured_at(
+            &history,
+            &invalidated_request,
+            &invalidated_request.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::Timeout,
+            ),
+            observed_at + Duration::from_secs(1),
+        );
+        history.lock_state().fresh_origin_supply_eviction_floor =
+            Some(observed_at + Duration::from_secs(1));
+        let serialized = serde_json::to_vec(&history.snapshot()).unwrap();
+        let restored_state: HistoryState = serde_json::from_slice(&serialized).unwrap();
+        assert!(restored_state.fresh_origin_supply.is_empty());
+        assert_eq!(restored_state.fresh_origin_supply_eviction_floor, None);
+        assert!(history.recent_origin_supply(&request).is_some());
+        history.flush().unwrap();
+
+        let restored = CdnHistory::load(&path);
+        assert_eq!(restored.recent_origin_supply(&request), None);
+        assert!(restored.lock_state().fresh_origin_supply.is_empty());
+        assert_eq!(
+            restored.lock_state().fresh_origin_supply_eviction_floor,
+            None
+        );
+    }
+
+    #[test]
+    fn recent_origin_supply_requires_exact_representation_and_bounded_candidates() {
+        let history = CdnHistory::default();
+        let origin = "https://same.example/video";
+        let request = make_request("https://primary.example/video", &[origin]);
+        let measured_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            origin,
+            measured_complete(100, Duration::from_secs(1), None),
+            measured_at,
+        );
+
+        let mut other_representation = request.clone();
+        other_representation.size = Some(request.size.unwrap() + 1);
+        assert_eq!(
+            history.recent_origin_supply_at(&other_representation, measured_at),
+            None
+        );
+        let backup_excluded = make_request("https://primary.example/video", &[]);
+        assert_eq!(
+            history.recent_origin_supply_at(&backup_excluded, measured_at),
+            None
+        );
+
+        let mut many = make_request("https://candidate-0.example/video", &[]);
+        many.backup_urls = (1..=MAX_CANDIDATES)
+            .map(|index| format!("https://candidate-{index}.example/video"))
+            .collect();
+        let beyond_limit = many.backup_urls[MAX_CANDIDATES - 1].clone();
+        record_measured_at(
+            &history,
+            &many,
+            &beyond_limit,
+            measured_complete(100, Duration::from_secs(1), None),
+            measured_at,
+        );
+        assert_eq!(history.recent_origin_supply_at(&many, measured_at), None);
+    }
+
+    #[test]
+    fn recent_origin_supply_bounds_raw_candidates_before_deduplication() {
+        let history = CdnHistory::default();
+        let measured_at = Instant::now();
+        let measured_url = "https://measured.example/video";
+        let mut request = make_request("https://primary.example/video", &[]);
+        request.backup_urls = vec![request.url.clone(); MAX_CANDIDATES - 1];
+        request.backup_urls.push(measured_url.to_owned());
+        record_measured_at(
+            &history,
+            &request,
+            measured_url,
+            measured_complete(100, Duration::from_secs(1), None),
+            measured_at,
+        );
+
+        assert_eq!(history.recent_origin_supply_at(&request, measured_at), None);
+        request.backup_urls[0] = measured_url.to_owned();
+        assert!(
+            history
+                .recent_origin_supply_at(&request, measured_at)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unmeasured_success_does_not_refresh_and_failure_invalidation_is_sticky() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let measured_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(1_000, Duration::from_secs(1), None),
+            measured_at,
+        );
+        let mut no_elapsed = measured_complete(2_000, Duration::from_secs(1), None);
+        no_elapsed.elapsed = None;
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            no_elapsed.clone(),
+            measured_at + Duration::from_secs(20),
+        );
+        assert_eq!(
+            history
+                .recent_origin_supply_at(&request, measured_at + Duration::from_secs(29))
+                .unwrap()
+                .age,
+            Duration::from_secs(29)
+        );
+
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::Timeout,
+            ),
+            measured_at + Duration::from_secs(30),
+        );
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            no_elapsed,
+            measured_at + Duration::from_secs(31),
+        );
+        assert_eq!(
+            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(31)),
+            None
+        );
+
+        for outcome in [
+            CdnObservationOutcome::Partial,
+            CdnObservationOutcome::Cancelled,
+        ] {
+            record_measured_at(
+                &history,
+                &request,
+                &request.url,
+                CdnObservation::new(CdnObservationSource::Playback, outcome, 100),
+                measured_at + Duration::from_secs(32),
+            );
+        }
+        assert_eq!(
+            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(32)),
+            None
+        );
+    }
+
+    #[test]
+    fn transfer_failures_and_range_unsupported_invalidate_fresh_supply() {
+        for outcome in [
+            CdnObservationOutcome::ConnectionFailure,
+            CdnObservationOutcome::Timeout,
+            CdnObservationOutcome::ServerFailure,
+            CdnObservationOutcome::SourceUnavailable,
+            CdnObservationOutcome::IntegrityMismatch,
+        ] {
+            let history = CdnHistory::default();
+            let request = make_request("https://a.example/video", &[]);
+            let measured_at = Instant::now();
+            record_measured_at(
+                &history,
+                &request,
+                &request.url,
+                measured_complete(100, Duration::from_secs(1), None),
+                measured_at,
+            );
+            record_measured_at(
+                &history,
+                &request,
+                &request.url,
+                CdnObservation::failure(CdnObservationSource::Playback, outcome),
+                measured_at + Duration::from_secs(1),
+            );
+            assert_eq!(
+                history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(1)),
+                None
+            );
+        }
+
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let measured_at = Instant::now();
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(100, Duration::from_secs(1), None),
+            measured_at,
+        );
+        let mut range_unsupported = measured_complete(100, Duration::from_secs(1), None);
+        range_unsupported.range_supported = Some(false);
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            range_unsupported,
+            measured_at + Duration::from_secs(1),
+        );
+        assert_eq!(
+            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn recent_origin_supply_validates_measurements_saturates_and_is_bounded() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let measured_at = Instant::now();
+        for observation in [
+            measured_complete(100, Duration::ZERO, None),
+            measured_complete(0, Duration::from_secs(1), None),
+            measured_complete(100, Duration::from_secs(1), Some(Duration::from_secs(2))),
+        ] {
+            record_measured_at(&history, &request, &request.url, observation, measured_at);
+            assert_eq!(history.recent_origin_supply_at(&request, measured_at), None);
+        }
+
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(u64::MAX, Duration::from_nanos(1), None),
+            measured_at,
+        );
+        assert_eq!(
+            history
+                .recent_origin_supply_at(&request, measured_at)
+                .unwrap()
+                .throughput_bps,
+            u64::MAX
+        );
+
+        for index in 0..MAX_FRESH_ORIGIN_SUPPLY_ENTRIES + 20 {
+            let mut distinct = request.clone();
+            distinct.cache_key.content_id = format!("BV1-{index}");
+            record_measured_at(
+                &history,
+                &distinct,
+                &distinct.url,
+                measured_complete(1, Duration::from_secs(1), None),
+                measured_at + Duration::from_nanos(index as u64),
+            );
+        }
+        assert_eq!(
+            history.lock_state().fresh_origin_supply.len(),
+            MAX_FRESH_ORIGIN_SUPPLY_ENTRIES
+        );
+    }
+
+    #[test]
+    fn tombstones_count_toward_capacity_and_eviction_blocks_old_revival() {
+        let history = CdnHistory::default();
+        let target = make_request("https://a.example/video", &[]);
+        let base = Instant::now();
+        record_measured_at(
+            &history,
+            &target,
+            &target.url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::Timeout,
+            ),
+            base,
+        );
+        let target_key = representation_map_key(
+            &representation_digest(&target).unwrap(),
+            "https://a.example",
+        );
+
+        for index in 0..MAX_FRESH_ORIGIN_SUPPLY_ENTRIES - 1 {
+            let mut request = target.clone();
+            request.cache_key.content_id = format!("BV1-{index}");
+            record_measured_at(
+                &history,
+                &request,
+                &request.url,
+                measured_complete(100, Duration::from_secs(1), None),
+                base + Duration::from_secs(index as u64 + 1),
+            );
+        }
+        {
+            let state = history.lock_state();
+            assert_eq!(
+                state.fresh_origin_supply.len(),
+                MAX_FRESH_ORIGIN_SUPPLY_ENTRIES
+            );
+            assert!(
+                state.fresh_origin_supply[&target_key]
+                    .outcome
+                    .is_invalidation()
+            );
+        }
+
+        let mut newest = target.clone();
+        newest.cache_key.content_id = "BV1-newest".to_owned();
+        record_measured_at(
+            &history,
+            &newest,
+            &newest.url,
+            measured_complete(100, Duration::from_secs(1), None),
+            base + Duration::from_secs(MAX_FRESH_ORIGIN_SUPPLY_ENTRIES as u64 + 1),
+        );
+        {
+            let state = history.lock_state();
+            assert_eq!(
+                state.fresh_origin_supply.len(),
+                MAX_FRESH_ORIGIN_SUPPLY_ENTRIES
+            );
+            assert!(!state.fresh_origin_supply.contains_key(&target_key));
+            assert_eq!(state.fresh_origin_supply_eviction_floor, Some(base));
+        }
+
+        record_measured_at(
+            &history,
+            &target,
+            &target.url,
+            measured_complete(10_000, Duration::from_secs(1), None),
+            base - Duration::from_nanos(1),
+        );
+        assert_eq!(history.recent_origin_supply_at(&target, base), None);
+        assert!(
+            !history
+                .lock_state()
+                .fresh_origin_supply
+                .contains_key(&target_key)
+        );
     }
 }

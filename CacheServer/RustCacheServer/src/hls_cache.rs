@@ -48,10 +48,16 @@ use crate::{
         RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES, RangeChunkKey, RangeResourceKey,
         SessionPublicationMode,
     },
+    hls_readiness::{
+        CacheWindowInspection, CacheWindowReason, CacheWindowState, HLS_READINESS_BUDGET_BYTES,
+        HLS_READINESS_MAX_BUFFER_BYTES, HLS_READINESS_MAX_RANGES,
+        HLS_READINESS_MAX_SIDX_PREFIX_BYTES, PlaybackWindow, SidxPrefixProbe,
+        selected_playback_ranges, sidx_prefix_probe,
+    },
     library::{OpenedMediaFile, open_read_no_follow},
     mp4_segments::{
-        Mp4SegmentRange, hls_peak_bandwidth_for_ranges, hls_target_duration_for_ranges,
-        mp4_fragment_ranges,
+        MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, hls_peak_bandwidth_for_ranges,
+        hls_target_duration_for_ranges, mp4_fragment_ranges,
     },
     playback_policy::PlaybackPolicy,
     transcoding::{
@@ -104,6 +110,38 @@ struct RangeExtentCommitInput<'a> {
     require_empty_startup: bool,
 }
 
+#[derive(Default)]
+struct HlsReadinessBudget {
+    checked_bytes: u64,
+    range_count: usize,
+}
+
+impl HlsReadinessBudget {
+    fn charge(&mut self, bytes: u64) -> Result<(), CacheWindowReason> {
+        let total = self
+            .checked_bytes
+            .checked_add(bytes)
+            .ok_or(CacheWindowReason::BudgetExceeded)?;
+        if total > HLS_READINESS_BUDGET_BYTES {
+            return Err(CacheWindowReason::BudgetExceeded);
+        }
+        self.checked_bytes = total;
+        Ok(())
+    }
+
+    fn add_ranges(&mut self, count: usize) -> Result<(), CacheWindowReason> {
+        let total = self
+            .range_count
+            .checked_add(count)
+            .ok_or(CacheWindowReason::BudgetExceeded)?;
+        if total > HLS_READINESS_MAX_RANGES {
+            return Err(CacheWindowReason::BudgetExceeded);
+        }
+        self.range_count = total;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum RangeExtentCommitFailure {
     StaleTargetValidator,
@@ -129,6 +167,11 @@ fn session_manifest_publication_guard() -> io::Result<std::sync::MutexGuard<'sta
         .map_err(|_| io::Error::other("HLS session publication lock poisoned"))
 }
 
+#[cfg(test)]
+type ReadinessJobHook = Arc<dyn Fn() + Send + Sync>;
+
+type CheckpointRangeReadResult = (Vec<Option<Vec<u8>>>, bool);
+
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
@@ -136,10 +179,13 @@ pub(crate) struct HlsCacheStore {
     range_cache: Arc<HlsRangeCache>,
     range_checkpoint_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::Mutex<()>>>>>,
     range_maintenance_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::RwLock<()>>>>>,
+    readiness_permits: Arc<Semaphore>,
     #[cfg(test)]
     remove_session_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     range_hash_bytes_read: Arc<AtomicU64>,
+    #[cfg(test)]
+    readiness_job_hook: Arc<Mutex<Option<ReadinessJobHook>>>,
 }
 
 pub(crate) struct HlsRangeEnsure {
@@ -341,10 +387,13 @@ impl HlsCacheStore {
             range_cache: Arc::new(HlsRangeCache::new(2, 0)),
             range_checkpoint_locks: Arc::new(Mutex::new(HashMap::new())),
             range_maintenance_locks: Arc::new(Mutex::new(HashMap::new())),
+            readiness_permits: Arc::new(Semaphore::new(2)),
             #[cfg(test)]
             remove_session_failures: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             range_hash_bytes_read: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            readiness_job_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -626,6 +675,836 @@ impl HlsCacheStore {
             .enter(session_id, HlsRangePriority::Foreground)?;
         self.read_durable_range(session_id, resource, requested)
             .await
+    }
+
+    pub(crate) async fn inspect_cached_playback_window(
+        &self,
+        session_id: &str,
+        variant: &HlsVariant,
+        window: PlaybackWindow,
+    ) -> CacheWindowInspection {
+        if !window.is_valid() {
+            return CacheWindowInspection::unknown(CacheWindowReason::OutOfRange, 0);
+        }
+        let permit = match Arc::clone(&self.readiness_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
+        };
+        let activity = match self
+            .range_cache
+            .enter(session_id, HlsRangePriority::Background)
+        {
+            Ok(activity) => activity,
+            Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
+        };
+
+        let mut resources = vec![variant.video.clone()];
+        if let Some(audio) = &variant.audio {
+            resources.push(audio.clone());
+        }
+        resources.sort_by(|left, right| left.id.cmp(&right.id));
+        if resources.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 0);
+        }
+        let mut publication_guards = Vec::with_capacity(resources.len());
+        for resource in &resources {
+            let key = match self.range_resource_key(session_id, resource) {
+                Ok(key) => key,
+                Err(_) => {
+                    return CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 0);
+                }
+            };
+            let lock = self.range_publication_lock(&key);
+            match lock.try_lock_owned() {
+                Ok(guard) => publication_guards.push(guard),
+                Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
+            }
+        }
+
+        let store = self.clone();
+        let session_id = session_id.to_owned();
+        let variant = variant.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _activity = activity;
+            let _publication_guards = publication_guards;
+            #[cfg(test)]
+            {
+                let hook = {
+                    store
+                        .readiness_job_hook
+                        .lock()
+                        .expect("readiness test hook lock should not be poisoned")
+                        .clone()
+                };
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            store.inspect_cached_playback_window_sync(&session_id, &variant, window)
+        })
+        .await
+        {
+            Ok(inspection) => inspection,
+            Err(_) => CacheWindowInspection::unknown(CacheWindowReason::IoFailure, 0),
+        }
+    }
+
+    fn inspect_cached_playback_window_sync(
+        &self,
+        session_id: &str,
+        variant: &HlsVariant,
+        window: PlaybackWindow,
+    ) -> CacheWindowInspection {
+        if !window.is_valid() {
+            return CacheWindowInspection::unknown(CacheWindowReason::OutOfRange, 0);
+        }
+
+        let mut budget = HlsReadinessBudget::default();
+        let mut missing = false;
+        for resource in std::iter::once(&variant.video).chain(variant.audio.iter()) {
+            let result =
+                self.inspect_resource_window_sync(session_id, resource, window, &mut budget);
+            if result.state == CacheWindowState::Unknown {
+                return CacheWindowInspection::unknown(result.reason, budget.checked_bytes);
+            }
+            missing |= result.state == CacheWindowState::Missing;
+        }
+        if missing {
+            CacheWindowInspection::missing(CacheWindowReason::NotCached, budget.checked_bytes)
+        } else {
+            CacheWindowInspection::readable(budget.checked_bytes)
+        }
+    }
+
+    fn inspect_resource_window_sync(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let metadata = match self.read_resource_metadata_for_readiness(session_id, resource, budget)
+        {
+            Ok(metadata) => metadata,
+            Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        };
+        let indexed_segments = metadata.as_ref().and_then(|metadata| {
+            (metadata.initialization_length > 0
+                && metadata.initialization_length < metadata.total_length)
+                .then(|| {
+                    validated_cached_segments(
+                        metadata.segments.clone(),
+                        metadata.initialization_length,
+                        metadata.total_length,
+                    )
+                })
+                .filter(|segments| !segments.is_empty())
+                .map(|segments| {
+                    (
+                        metadata.initialization_length,
+                        metadata.total_length,
+                        segments,
+                    )
+                })
+        });
+
+        if let Some(metadata) = metadata.as_ref() {
+            let expected_cache_key =
+                PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone());
+            if metadata.cache_key != expected_cache_key {
+                return CacheWindowInspection::unknown(
+                    CacheWindowReason::IdentityChanged,
+                    budget.checked_bytes,
+                );
+            }
+        }
+
+        if let Some(metadata) = metadata.as_ref() {
+            let path = match self.resource_path(session_id, &resource.id) {
+                Ok(path) => path,
+                Err(_) => {
+                    return CacheWindowInspection::unknown(
+                        CacheWindowReason::IdentityChanged,
+                        budget.checked_bytes,
+                    );
+                }
+            };
+            let identity = match safe_file_identity(self, &path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return CacheWindowInspection::unknown(
+                        readiness_reason_for_io(&error),
+                        budget.checked_bytes,
+                    );
+                }
+            };
+            if let Some(identity) = identity {
+                if metadata.total_length == 0 {
+                    return CacheWindowInspection::unknown(
+                        CacheWindowReason::IndexUnavailable,
+                        budget.checked_bytes,
+                    );
+                }
+                return if let Some((initialization_length, total_length, segments)) =
+                    indexed_segments
+                {
+                    self.inspect_complete_indexed_resource(
+                        &path,
+                        &identity,
+                        initialization_length,
+                        total_length,
+                        &segments,
+                        window,
+                        budget,
+                    )
+                } else {
+                    self.inspect_complete_sidx_resource(
+                        &path,
+                        &identity,
+                        metadata.total_length,
+                        window,
+                        budget,
+                    )
+                };
+            }
+        }
+
+        let loaded = match self.load_range_manifest_for_readiness(session_id, resource, budget) {
+            Ok(loaded) => loaded,
+            Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        };
+        match loaded {
+            Some(loaded) => {
+                if let Some((initialization_length, total_length, segments)) = indexed_segments {
+                    if loaded.manifest.total_length != Some(total_length) {
+                        return CacheWindowInspection::unknown(
+                            CacheWindowReason::IdentityChanged,
+                            budget.checked_bytes,
+                        );
+                    }
+                    self.inspect_partial_indexed_resource(
+                        session_id,
+                        resource,
+                        &loaded,
+                        initialization_length,
+                        total_length,
+                        &segments,
+                        window,
+                        budget,
+                    )
+                } else {
+                    self.inspect_partial_sidx_resource(
+                        session_id, resource, &loaded, window, budget,
+                    )
+                }
+            }
+            None => {
+                if let Some((initialization_length, total_length, segments)) = indexed_segments {
+                    match selected_playback_ranges(
+                        initialization_length,
+                        total_length,
+                        &segments,
+                        window,
+                    ) {
+                        Ok(ranges) => match budget.add_ranges(ranges.len()) {
+                            Ok(()) => CacheWindowInspection::missing(
+                                CacheWindowReason::NotCached,
+                                budget.checked_bytes,
+                            ),
+                            Err(reason) => {
+                                CacheWindowInspection::unknown(reason, budget.checked_bytes)
+                            }
+                        },
+                        Err(reason) => CacheWindowInspection::unknown(reason, budget.checked_bytes),
+                    }
+                } else {
+                    CacheWindowInspection::unknown(
+                        CacheWindowReason::NotCached,
+                        budget.checked_bytes,
+                    )
+                }
+            }
+        }
+    }
+
+    fn read_resource_metadata_for_readiness(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        budget: &mut HlsReadinessBudget,
+    ) -> Result<Option<PersistedHlsCachedResource>, CacheWindowReason> {
+        let path = self
+            .resource_metadata_path(session_id, &resource.id)
+            .map_err(|_| CacheWindowReason::IdentityChanged)?;
+        let Some(path_identity) =
+            safe_file_identity(self, &path).map_err(|error| readiness_reason_for_io(&error))?
+        else {
+            return Ok(None);
+        };
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        let mut file = open_range_file(&mut options, &path)
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        if file_object_identity(&opened_metadata) != path_identity {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let length = opened_metadata.len();
+        if length > RANGE_MAX_MANIFEST_BYTES {
+            return Err(CacheWindowReason::IndexUnavailable);
+        }
+        budget.charge(length)?;
+        let capacity = usize::try_from(length).map_err(|_| CacheWindowReason::BudgetExceeded)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(length)
+            .read_to_end(&mut bytes)
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        let final_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        if bytes.len() as u64 != length
+            || final_metadata.len() != length
+            || file_object_identity(&final_metadata) != path_identity
+            || safe_file_identity(self, &path)
+                .map_err(|error| readiness_reason_for_io(&error))?
+                .as_deref()
+                != Some(path_identity.as_str())
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let metadata = serde_json::from_slice::<PersistedHlsCachedResource>(&bytes)
+            .map_err(|_| CacheWindowReason::IndexUnavailable)?;
+        if metadata.schema_version != HLS_CACHE_SCHEMA_VERSION || metadata.id != resource.id {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        Ok(Some(metadata))
+    }
+
+    fn load_range_manifest_for_readiness(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        budget: &mut HlsReadinessBudget,
+    ) -> Result<Option<LoadedRangeManifest>, CacheWindowReason> {
+        let path = self
+            .resource_range_manifest_path(session_id, &resource.id)
+            .map_err(|_| CacheWindowReason::IdentityChanged)?;
+        let manifest_identity =
+            safe_file_identity(self, &path).map_err(|error| readiness_reason_for_io(&error))?;
+        let Some(_) = manifest_identity else {
+            let data_path = self
+                .resource_range_data_path(session_id, &resource.id)
+                .map_err(|_| CacheWindowReason::IdentityChanged)?;
+            if safe_file_identity(self, &data_path)
+                .map_err(|error| readiness_reason_for_io(&error))?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            return self
+                .load_range_manifest(session_id, resource)
+                .map_err(|error| readiness_reason_for_range_error(&error));
+        };
+        budget.charge(RANGE_MAX_MANIFEST_BYTES + 1)?;
+        self.load_range_manifest(session_id, resource)
+            .map_err(|error| readiness_reason_for_range_error(&error))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_complete_indexed_resource(
+        &self,
+        path: &Path,
+        identity: &str,
+        initialization_length: u64,
+        total_length: u64,
+        segments: &[HlsMediaSegment],
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let ranges =
+            match selected_playback_ranges(initialization_length, total_length, segments, window) {
+                Ok(ranges) => ranges,
+                Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+            };
+        match self.read_complete_ranges_for_readiness(
+            path,
+            identity,
+            total_length,
+            &ranges,
+            &[],
+            budget,
+        ) {
+            Ok(_) => CacheWindowInspection::readable(budget.checked_bytes),
+            Err(reason) => CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        }
+    }
+
+    fn inspect_complete_sidx_resource(
+        &self,
+        path: &Path,
+        identity: &str,
+        total_length: u64,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let prefix_length = total_length.min(HLS_READINESS_MAX_SIDX_PREFIX_BYTES);
+        if prefix_length == 0 {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        }
+        let prefix_range = 0..prefix_length;
+        let prefix_ranges = std::slice::from_ref(&prefix_range);
+        let prefix_output = match self.read_complete_ranges_for_readiness(
+            path,
+            identity,
+            total_length,
+            prefix_ranges,
+            &[0],
+            budget,
+        ) {
+            Ok(mut output) => output.pop().flatten().unwrap_or_default(),
+            Err(reason) => {
+                return CacheWindowInspection::unknown(reason, budget.checked_bytes);
+            }
+        };
+        let Some(probe) = sidx_prefix_probe(&prefix_output, total_length) else {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        };
+        drop(prefix_output);
+        self.finish_complete_sidx_inspection(path, identity, total_length, probe, window, budget)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_complete_sidx_inspection(
+        &self,
+        path: &Path,
+        identity: &str,
+        total_length: u64,
+        probe: SidxPrefixProbe,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        if probe.trailing_length > MAX_SIDX_TRAILER_BYTES
+            || probe.trailing_offset.checked_add(probe.trailing_length) != Some(total_length)
+        {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        }
+        let trailer = if probe.trailing_length == 0 {
+            Vec::new()
+        } else {
+            let range = probe.trailing_offset..total_length;
+            let ranges = std::slice::from_ref(&range);
+            match self.read_complete_ranges_for_readiness(
+                path,
+                identity,
+                total_length,
+                ranges,
+                &[0],
+                budget,
+            ) {
+                Ok(mut output) => output.pop().flatten().unwrap_or_default(),
+                Err(reason) => {
+                    return CacheWindowInspection::unknown(reason, budget.checked_bytes);
+                }
+            }
+        };
+        let initialization_length = probe.initialization_length;
+        let Some(segments) = probe.into_segments(&trailer) else {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        };
+        drop(trailer);
+        self.finish_complete_indexed_inspection(
+            path,
+            identity,
+            total_length,
+            initialization_length,
+            &segments,
+            window,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_complete_indexed_inspection(
+        &self,
+        path: &Path,
+        identity: &str,
+        total_length: u64,
+        initialization_length: u64,
+        segments: &[HlsMediaSegment],
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let ranges =
+            match selected_playback_ranges(initialization_length, total_length, segments, window) {
+                Ok(ranges) => ranges,
+                Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+            };
+        match self.read_complete_ranges_for_readiness(
+            path,
+            identity,
+            total_length,
+            &ranges,
+            &[],
+            budget,
+        ) {
+            Ok(_) => CacheWindowInspection::readable(budget.checked_bytes),
+            Err(reason) => CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_partial_indexed_resource(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        loaded: &LoadedRangeManifest,
+        initialization_length: u64,
+        total_length: u64,
+        segments: &[HlsMediaSegment],
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let ranges =
+            match selected_playback_ranges(initialization_length, total_length, segments, window) {
+                Ok(ranges) => ranges,
+                Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+            };
+        match self.read_checkpoint_ranges_for_readiness(
+            session_id,
+            resource,
+            loaded,
+            &ranges,
+            &[],
+            budget,
+        ) {
+            Ok((_, true)) => {
+                CacheWindowInspection::missing(CacheWindowReason::NotCached, budget.checked_bytes)
+            }
+            Ok((_, false)) => CacheWindowInspection::readable(budget.checked_bytes),
+            Err(reason) => CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        }
+    }
+
+    fn inspect_partial_sidx_resource(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        loaded: &LoadedRangeManifest,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        let Some(total_length) = loaded.manifest.total_length else {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        };
+        let prefix_length = contiguous_range_prefix(&loaded.manifest.extents)
+            .min(total_length)
+            .min(HLS_READINESS_MAX_SIDX_PREFIX_BYTES);
+        if prefix_length == 0 || !range_is_covered(&loaded.manifest.extents, 0..prefix_length) {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        }
+        let prefix_range = 0..prefix_length;
+        let prefix_ranges = std::slice::from_ref(&prefix_range);
+        let prefix = match self.read_checkpoint_ranges_for_readiness(
+            session_id,
+            resource,
+            loaded,
+            prefix_ranges,
+            &[0],
+            budget,
+        ) {
+            Ok((mut output, false)) => output.pop().flatten().unwrap_or_default(),
+            Ok((_, true)) => {
+                return CacheWindowInspection::unknown(
+                    CacheWindowReason::IndexUnavailable,
+                    budget.checked_bytes,
+                );
+            }
+            Err(reason) => return CacheWindowInspection::unknown(reason, budget.checked_bytes),
+        };
+        let Some(probe) = sidx_prefix_probe(&prefix, total_length) else {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        };
+        drop(prefix);
+        self.finish_partial_sidx_inspection(
+            session_id,
+            resource,
+            loaded,
+            total_length,
+            probe,
+            window,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_partial_sidx_inspection(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        loaded: &LoadedRangeManifest,
+        total_length: u64,
+        probe: SidxPrefixProbe,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> CacheWindowInspection {
+        if probe.trailing_length > MAX_SIDX_TRAILER_BYTES
+            || probe.trailing_offset.checked_add(probe.trailing_length) != Some(total_length)
+        {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        }
+        let trailer = if probe.trailing_length == 0 {
+            Vec::new()
+        } else {
+            let range = probe.trailing_offset..total_length;
+            if !range_is_covered(&loaded.manifest.extents, range.clone()) {
+                return CacheWindowInspection::unknown(
+                    CacheWindowReason::IndexUnavailable,
+                    budget.checked_bytes,
+                );
+            }
+            match self.read_checkpoint_ranges_for_readiness(
+                session_id,
+                resource,
+                loaded,
+                &[range],
+                &[0],
+                budget,
+            ) {
+                Ok((mut output, false)) => output.pop().flatten().unwrap_or_default(),
+                Ok((_, true)) => {
+                    return CacheWindowInspection::unknown(
+                        CacheWindowReason::IndexUnavailable,
+                        budget.checked_bytes,
+                    );
+                }
+                Err(reason) => {
+                    return CacheWindowInspection::unknown(reason, budget.checked_bytes);
+                }
+            }
+        };
+        let initialization_length = probe.initialization_length;
+        let Some(segments) = probe.into_segments(&trailer) else {
+            return CacheWindowInspection::unknown(
+                CacheWindowReason::IndexUnavailable,
+                budget.checked_bytes,
+            );
+        };
+        drop(trailer);
+        self.inspect_partial_indexed_resource(
+            session_id,
+            resource,
+            loaded,
+            initialization_length,
+            total_length,
+            &segments,
+            window,
+            budget,
+        )
+    }
+
+    fn read_complete_ranges_for_readiness(
+        &self,
+        path: &Path,
+        expected_identity: &str,
+        total_length: u64,
+        ranges: &[Range<u64>],
+        materialize: &[usize],
+        budget: &mut HlsReadinessBudget,
+    ) -> Result<Vec<Option<Vec<u8>>>, CacheWindowReason> {
+        budget.add_ranges(ranges.len())?;
+        let work_bytes = ranges.iter().try_fold(0_u64, |total, range| {
+            if range.start >= range.end {
+                return None;
+            }
+            total.checked_add(range.end - range.start)
+        });
+        let work_bytes = work_bytes.ok_or(CacheWindowReason::BudgetExceeded)?;
+        if ranges.iter().any(|range| range.end > total_length) {
+            return Err(CacheWindowReason::OutOfRange);
+        }
+        budget.charge(work_bytes)?;
+        let mut outputs = readiness_materialized_outputs(ranges, materialize)?;
+
+        let path_identity = safe_file_identity(self, path)
+            .map_err(|error| readiness_reason_for_io(&error))?
+            .ok_or(CacheWindowReason::IdentityChanged)?;
+        if path_identity != expected_identity {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        let mut file =
+            open_range_file(&mut options, path).map_err(|error| readiness_reason_for_io(&error))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        if file_object_identity(&opened_metadata) != expected_identity
+            || opened_metadata.len() != total_length
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+
+        let mut chunk = vec![0; HLS_READINESS_MAX_BUFFER_BYTES / 2];
+        for (range_index, range) in ranges.iter().enumerate() {
+            let mut cursor = range.start;
+            while cursor < range.end {
+                let count = usize::try_from((range.end - cursor).min(chunk.len() as u64))
+                    .map_err(|_| CacheWindowReason::BudgetExceeded)?;
+                file.seek(SeekFrom::Start(cursor))
+                    .map_err(|error| readiness_reason_for_io(&error))?;
+                file.read_exact(&mut chunk[..count])
+                    .map_err(|error| readiness_reason_for_io(&error))?;
+                copy_materialized_range_chunk(
+                    range_index,
+                    range,
+                    cursor,
+                    &chunk[..count],
+                    &mut outputs,
+                )?;
+                cursor += count as u64;
+            }
+        }
+        let final_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        if file_object_identity(&final_metadata) != expected_identity
+            || final_metadata.len() != total_length
+            || safe_file_identity(self, path)
+                .map_err(|error| readiness_reason_for_io(&error))?
+                .as_deref()
+                != Some(expected_identity)
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        Ok(outputs)
+    }
+
+    fn read_checkpoint_ranges_for_readiness(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        loaded: &LoadedRangeManifest,
+        ranges: &[Range<u64>],
+        materialize: &[usize],
+        budget: &mut HlsReadinessBudget,
+    ) -> Result<CheckpointRangeReadResult, CacheWindowReason> {
+        budget.add_ranges(ranges.len())?;
+        let Some(total_length) = loaded.manifest.total_length else {
+            return Err(CacheWindowReason::IndexUnavailable);
+        };
+        if ranges
+            .iter()
+            .any(|range| range.start >= range.end || range.end > total_length)
+        {
+            return Err(CacheWindowReason::IndexUnavailable);
+        }
+        let missing = ranges
+            .iter()
+            .any(|range| !range_is_covered(&loaded.manifest.extents, range.clone()));
+        let selected_extents = loaded
+            .manifest
+            .extents
+            .iter()
+            .filter(|extent| {
+                ranges
+                    .iter()
+                    .any(|range| extent.start < range.end && range.start < extent.end)
+            })
+            .collect::<Vec<_>>();
+        let work_bytes = selected_extents.iter().try_fold(0_u64, |total, extent| {
+            total.checked_add(extent.end - extent.start)
+        });
+        budget.charge(work_bytes.ok_or(CacheWindowReason::BudgetExceeded)?)?;
+        let mut outputs = readiness_materialized_outputs(ranges, materialize)?;
+
+        let path = self
+            .data_path_for_manifest(session_id, resource, &loaded.manifest)
+            .map_err(|error| readiness_reason_for_range_error(&error))?;
+        self.reject_cache_path_symlink(&path)
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        let mut file = open_range_file(&mut options, &path)
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        let identity = file_object_identity(&opened_metadata);
+        if loaded.manifest.data_identity.as_deref() != Some(identity.as_str()) {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let initial_file_length = opened_metadata.len();
+        let mut chunk = vec![0; HLS_READINESS_MAX_BUFFER_BYTES / 2];
+        for extent in &selected_extents {
+            if extent.end > initial_file_length {
+                return Err(CacheWindowReason::IdentityChanged);
+            }
+            let digest = self
+                .hash_checkpoint_extent(&mut file, extent, &mut chunk, |chunk_start, data| {
+                    for (range_index, range) in ranges.iter().enumerate() {
+                        copy_materialized_range_chunk(
+                            range_index,
+                            range,
+                            chunk_start,
+                            data,
+                            &mut outputs,
+                        )
+                        .map_err(|_| {
+                            HlsRangeError::InvalidResponse(
+                                "readiness buffer copy failed".to_owned(),
+                            )
+                        })?;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| readiness_reason_for_range_error(&error))?;
+            if digest != extent.sha256 {
+                return Err(CacheWindowReason::IdentityChanged);
+            }
+        }
+        let final_metadata = file
+            .metadata()
+            .map_err(|error| readiness_reason_for_io(&error))?;
+        if file_object_identity(&final_metadata) != identity
+            || final_metadata.len() < initial_file_length
+            || selected_extents
+                .iter()
+                .any(|extent| extent.end > final_metadata.len())
+            || !self
+                .range_data_object_is_still_bound(session_id, resource, &identity)
+                .map_err(|error| readiness_reason_for_range_error(&error))?
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        Ok((outputs, missing))
     }
 
     pub(crate) async fn read_resource_range_prefix(
@@ -4078,6 +4957,24 @@ impl HlsCacheStore {
         let key = self.range_resource_key(session_id, resource)?;
         let publication_lock = self.range_publication_lock(&key);
         let _publication = publication_lock.lock().await;
+        self.read_durable_range_locked(session_id, resource, requested, after_open)
+    }
+
+    fn read_durable_range_locked<F>(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        requested: Range<u64>,
+        after_open: F,
+    ) -> Result<Option<Vec<u8>>, HlsRangeError>
+    where
+        F: FnOnce(),
+    {
+        if requested.start >= requested.end {
+            return Err(HlsRangeError::InvalidResponse(
+                "requested HLS range is empty or reversed".to_owned(),
+            ));
+        }
         if let Some(cached) = self.cached_resource(session_id, &resource.id) {
             if requested.end > cached.total_length {
                 return Err(HlsRangeError::InvalidResponse(
@@ -4136,40 +5033,30 @@ impl HlsCacheStore {
                     "checkpointed HLS range extends past the data file",
                 )));
             }
-            let mut hasher = Sha256::new();
-            let mut cursor = extent.start;
             let mut chunk = vec![0; RANGE_MAX_CHUNK_BYTES as usize];
-            while cursor < extent.end {
-                let count = usize::try_from((extent.end - cursor).min(chunk.len() as u64))
-                    .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
-                file.seek(SeekFrom::Start(cursor))?;
-                file.read_exact(&mut chunk[..count])?;
-                if let Some(read_counter) = self.range_hash_bytes_counter() {
-                    read_counter.fetch_add(count as u64, Ordering::Relaxed);
-                }
-                let chunk_end = cursor + count as u64;
-                hasher.update(&chunk[..count]);
-
-                let copy_start = requested.start.max(cursor);
-                let copy_end = requested.end.min(chunk_end);
-                if copy_start < copy_end {
-                    let source_start = usize::try_from(copy_start - cursor).map_err(|_| {
-                        HlsRangeError::InvalidResponse("range is too large".to_owned())
-                    })?;
-                    let source_end = usize::try_from(copy_end - cursor).map_err(|_| {
-                        HlsRangeError::InvalidResponse("range is too large".to_owned())
-                    })?;
-                    let target_start =
-                        usize::try_from(copy_start - requested.start).map_err(|_| {
+            let digest =
+                self.hash_checkpoint_extent(&mut file, extent, &mut chunk, |cursor, data| {
+                    let chunk_end = cursor + data.len() as u64;
+                    let copy_start = requested.start.max(cursor);
+                    let copy_end = requested.end.min(chunk_end);
+                    if copy_start < copy_end {
+                        let source_start = usize::try_from(copy_start - cursor).map_err(|_| {
                             HlsRangeError::InvalidResponse("range is too large".to_owned())
                         })?;
-                    let target_end = target_start + (source_end - source_start);
-                    bytes[target_start..target_end]
-                        .copy_from_slice(&chunk[source_start..source_end]);
-                }
-                cursor = chunk_end;
-            }
-            if format!("{:x}", hasher.finalize()) != extent.sha256 {
+                        let source_end = usize::try_from(copy_end - cursor).map_err(|_| {
+                            HlsRangeError::InvalidResponse("range is too large".to_owned())
+                        })?;
+                        let target_start =
+                            usize::try_from(copy_start - requested.start).map_err(|_| {
+                                HlsRangeError::InvalidResponse("range is too large".to_owned())
+                            })?;
+                        let target_end = target_start + (source_end - source_start);
+                        bytes[target_start..target_end]
+                            .copy_from_slice(&data[source_start..source_end]);
+                    }
+                    Ok(())
+                })?;
+            if digest != extent.sha256 {
                 return Err(identity_error_at("range-read-extent-hash"));
             }
         }
@@ -4181,6 +5068,40 @@ impl HlsCacheStore {
             return Err(identity_error_at("range-read-final-object-or-length"));
         }
         Ok(Some(bytes))
+    }
+
+    fn hash_checkpoint_extent<F>(
+        &self,
+        file: &mut fs::File,
+        extent: &PersistedRangeExtent,
+        chunk: &mut [u8],
+        mut consume: F,
+    ) -> Result<String, HlsRangeError>
+    where
+        F: FnMut(u64, &[u8]) -> Result<(), HlsRangeError>,
+    {
+        if chunk.is_empty() {
+            return Err(HlsRangeError::InvalidResponse(
+                "checkpoint hash buffer is empty".to_owned(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let mut cursor = extent.start;
+        while cursor < extent.end {
+            let count = usize::try_from((extent.end - cursor).min(chunk.len() as u64))
+                .map_err(|_| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+            file.seek(SeekFrom::Start(cursor))?;
+            file.read_exact(&mut chunk[..count])?;
+            if let Some(read_counter) = self.range_hash_bytes_counter() {
+                read_counter.fetch_add(count as u64, Ordering::Relaxed);
+            }
+            hasher.update(&chunk[..count]);
+            consume(cursor, &chunk[..count])?;
+            cursor = cursor
+                .checked_add(count as u64)
+                .ok_or_else(|| HlsRangeError::InvalidResponse("range is too large".to_owned()))?;
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     async fn fill_missing_ranges_with_progress<F, P>(
@@ -7573,6 +8494,102 @@ fn hls_range_error_to_io(error: HlsRangeError) -> io::Error {
 static IDENTITY_DIAGNOSTIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 const IDENTITY_DIAGNOSTIC_BUDGET: usize = 32;
 
+fn readiness_materialized_outputs(
+    ranges: &[Range<u64>],
+    materialize: &[usize],
+) -> Result<Vec<Option<Vec<u8>>>, CacheWindowReason> {
+    let mut outputs = std::iter::repeat_with(|| None)
+        .take(ranges.len())
+        .collect::<Vec<Option<Vec<u8>>>>();
+    let mut total_bytes = 0_usize;
+    for &index in materialize {
+        let range = ranges
+            .get(index)
+            .ok_or(CacheWindowReason::IndexUnavailable)?;
+        if outputs[index].is_some() || range.start >= range.end {
+            return Err(CacheWindowReason::IndexUnavailable);
+        }
+        let length = usize::try_from(range.end - range.start)
+            .map_err(|_| CacheWindowReason::BudgetExceeded)?;
+        total_bytes = total_bytes
+            .checked_add(length)
+            .ok_or(CacheWindowReason::BudgetExceeded)?;
+        if total_bytes > HLS_READINESS_MAX_BUFFER_BYTES / 4 {
+            return Err(CacheWindowReason::BudgetExceeded);
+        }
+        outputs[index] = Some(vec![0; length]);
+    }
+    Ok(outputs)
+}
+
+fn copy_materialized_range_chunk(
+    range_index: usize,
+    range: &Range<u64>,
+    chunk_start: u64,
+    chunk: &[u8],
+    outputs: &mut [Option<Vec<u8>>],
+) -> Result<(), CacheWindowReason> {
+    let Some(output) = outputs.get_mut(range_index).and_then(Option::as_mut) else {
+        return Ok(());
+    };
+    let chunk_end = chunk_start
+        .checked_add(u64::try_from(chunk.len()).map_err(|_| CacheWindowReason::BudgetExceeded)?)
+        .ok_or(CacheWindowReason::BudgetExceeded)?;
+    let copy_start = range.start.max(chunk_start);
+    let copy_end = range.end.min(chunk_end);
+    if copy_start >= copy_end {
+        return Ok(());
+    }
+    let source_start =
+        usize::try_from(copy_start - chunk_start).map_err(|_| CacheWindowReason::BudgetExceeded)?;
+    let source_end =
+        usize::try_from(copy_end - chunk_start).map_err(|_| CacheWindowReason::BudgetExceeded)?;
+    let target_start =
+        usize::try_from(copy_start - range.start).map_err(|_| CacheWindowReason::BudgetExceeded)?;
+    let target_end = target_start
+        .checked_add(source_end - source_start)
+        .ok_or(CacheWindowReason::BudgetExceeded)?;
+    output
+        .get_mut(target_start..target_end)
+        .ok_or(CacheWindowReason::IndexUnavailable)?
+        .copy_from_slice(&chunk[source_start..source_end]);
+    Ok(())
+}
+
+fn contiguous_range_prefix(extents: &[PersistedRangeExtent]) -> u64 {
+    let mut end = 0_u64;
+    for extent in extents {
+        if extent.start > end {
+            break;
+        }
+        end = end.max(extent.end);
+    }
+    end
+}
+
+fn readiness_reason_for_io(error: &io::Error) -> CacheWindowReason {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        CacheWindowReason::IdentityChanged
+    } else {
+        CacheWindowReason::IoFailure
+    }
+}
+
+fn readiness_reason_for_range_error(error: &HlsRangeError) -> CacheWindowReason {
+    match error {
+        HlsRangeError::IdentityChanged => CacheWindowReason::IdentityChanged,
+        HlsRangeError::Io(error) => readiness_reason_for_io(error),
+        HlsRangeError::InvalidResponse(_) => CacheWindowReason::IndexUnavailable,
+        HlsRangeError::SessionRemoving | HlsRangeError::Cancelled | HlsRangeError::Preempted => {
+            CacheWindowReason::Busy
+        }
+        HlsRangeError::Network(_)
+        | HlsRangeError::UpstreamStatus(_)
+        | HlsRangeError::RangeUnsupported
+        | HlsRangeError::QuotaExceeded => CacheWindowReason::IoFailure,
+    }
+}
+
 fn identity_error_at(stage: &'static str) -> HlsRangeError {
     if IDENTITY_DIAGNOSTIC_COUNT.fetch_add(1, Ordering::Relaxed) < IDENTITY_DIAGNOSTIC_BUDGET {
         eprintln!("HLS cache identity check failed at {stage}");
@@ -7912,6 +8929,7 @@ fn passive_cache_observation(
         elapsed,
         first_byte_latency,
         range_supported,
+        observed_at: std::time::Instant::now(),
     }
 }
 
@@ -17216,5 +18234,701 @@ done
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_cold_query_is_unknown_and_nonmutating() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("readiness-cold", "https://example.test/video.m4s");
+        let resource = &session.variant.video;
+        let resource_path = store
+            .resource_path(&session.id, &resource.id)
+            .expect("resource path should be valid");
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("metadata path should be valid");
+        let range_path = store
+            .resource_range_manifest_path(&session.id, &resource.id)
+            .expect("range manifest path should be valid");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::NotCached, result.reason);
+        assert_eq!(0, result.checked_bytes);
+        assert!(!resource_path.exists());
+        assert!(!metadata_path.exists());
+        assert!(!range_path.exists());
+        assert_eq!((0, 0), store.range_activity_counts());
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_complete_video_and_audio_include_init_ranges() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session =
+            sample_session_with_audio("readiness-complete-av", "https://example.test/video.m4s");
+        let body = multi_fragment_fake_mp4();
+        let initialization_length = multi_fragment_fake_mp4_initialization_length();
+        let segments = multi_fragment_fake_mp4_segments();
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            persist_complete_readiness_resource(
+                &store,
+                &session,
+                resource,
+                &body,
+                initialization_length,
+                &segments,
+                true,
+            );
+        }
+        let video_range_manifest = store
+            .resource_range_manifest_path(&session.id, &session.variant.video.id)
+            .expect("video range manifest path should be valid");
+        let audio = session.variant.audio.as_ref().expect("audio should exist");
+        let audio_range_manifest = store
+            .resource_range_manifest_path(&session.id, &audio.id)
+            .expect("audio range manifest path should be valid");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.5, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Readable, result.state);
+        assert_eq!(CacheWindowReason::None, result.reason);
+        assert!(result.checked_bytes > (body.len() as u64) * 2);
+        assert!(result.checked_bytes <= HLS_READINESS_BUDGET_BYTES);
+        assert!(!video_range_manifest.exists());
+        assert!(!audio_range_manifest.exists());
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_unknown_beats_a_known_missing_resource() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session =
+            sample_session_with_audio("readiness-unknown-wins", "https://example.test/video.m4s");
+        let body = multi_fragment_fake_mp4();
+        let initialization_length = multi_fragment_fake_mp4_initialization_length();
+        let segments = multi_fragment_fake_mp4_segments();
+        persist_complete_readiness_resource(
+            &store,
+            &session,
+            &session.variant.video,
+            &body,
+            initialization_length,
+            &segments,
+            false,
+        );
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.5, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::NotCached, result.reason);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_known_missing_audio_is_missing() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session =
+            sample_session_with_audio("readiness-missing-audio", "https://example.test/video.m4s");
+        let body = multi_fragment_fake_mp4();
+        let initialization_length = multi_fragment_fake_mp4_initialization_length();
+        let segments = multi_fragment_fake_mp4_segments();
+        persist_complete_readiness_resource(
+            &store,
+            &session,
+            &session.variant.video,
+            &body,
+            initialization_length,
+            &segments,
+            true,
+        );
+        let audio = session.variant.audio.as_ref().expect("audio should exist");
+        persist_complete_readiness_resource(
+            &store,
+            &session,
+            audio,
+            &body,
+            initialization_length,
+            &segments,
+            false,
+        );
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(1.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Missing, result.state);
+        assert_eq!(CacheWindowReason::NotCached, result.reason);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_partial_sidx_gap_is_missing() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("readiness-sidx-gap", "https://example.test/video.m4s");
+        let (body, prefix_length) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let range = 0..prefix_length;
+        seed_readiness_checkpoint(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            std::slice::from_ref(&range),
+        )
+        .await;
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(1.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Missing, result.state);
+        assert_eq!(CacheWindowReason::NotCached, result.reason);
+        assert!(result.checked_bytes < HLS_READINESS_BUDGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_partial_sidx_checks_video_audio_and_charges_extents() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session =
+            sample_session_with_audio("readiness-sidx-av", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let audio = session.variant.audio.as_mut().expect("audio should exist");
+        audio.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            seed_readiness_checkpoint(
+                &store,
+                &session.id,
+                resource,
+                &body,
+                std::slice::from_ref(&range),
+            )
+            .await;
+        }
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.5, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Readable, result.state);
+        assert_eq!(CacheWindowReason::None, result.reason);
+        assert_eq!(
+            2 * (RANGE_MAX_MANIFEST_BYTES + 1) + 4 * body.len() as u64,
+            result.checked_bytes,
+            "index reads and repeated complete-extent verification are charged",
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_corrupt_audio_extent_is_unknown() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session =
+            sample_session_with_audio("readiness-corrupt-audio", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let audio = session.variant.audio.as_mut().expect("audio should exist");
+        audio.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            seed_readiness_checkpoint(
+                &store,
+                &session.id,
+                resource,
+                &body,
+                std::slice::from_ref(&range),
+            )
+            .await;
+        }
+        let audio = session.variant.audio.as_ref().expect("audio should exist");
+        let audio_data_path = store
+            .resource_range_data_path(&session.id, &audio.id)
+            .expect("audio data path should be valid");
+        let mut audio_data = fs::OpenOptions::new()
+            .write(true)
+            .open(&audio_data_path)
+            .expect("audio checkpoint should open");
+        audio_data.seek(SeekFrom::Start(0)).unwrap();
+        audio_data.write_all(b"X").unwrap();
+        audio_data.sync_all().unwrap();
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(1.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_rejects_complete_resource_cache_key_mismatch() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("readiness-key-mismatch", "https://example.test/video.m4s");
+        let body = multi_fragment_fake_mp4();
+        persist_complete_readiness_resource(
+            &store,
+            &session,
+            &session.variant.video,
+            &body,
+            multi_fragment_fake_mp4_initialization_length(),
+            &multi_fragment_fake_mp4_segments(),
+            true,
+        );
+        let mut variant = session.variant.clone();
+        variant
+            .video
+            .request
+            .cache_key
+            .source_hash
+            .push_str("-changed");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &variant,
+                PlaybackWindow::new(0.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_rejects_partial_representation_mismatch() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session =
+            sample_session("readiness-representation", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        seed_readiness_checkpoint(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            std::slice::from_ref(&range),
+        )
+        .await;
+        let mut variant = session.variant.clone();
+        variant.video.request.bandwidth = Some(2_000_000);
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &variant,
+                PlaybackWindow::new(0.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_readiness_ignores_benign_checkpoint_mtime_change() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("readiness-mtime", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        seed_readiness_checkpoint(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            std::slice::from_ref(&range),
+        )
+        .await;
+        let data_path = store
+            .resource_range_data_path(&session.id, &session.variant.video.id)
+            .expect("checkpoint path should be valid");
+        set_file_modified_time(&data_path, SystemTime::now() - Duration::from_secs(60));
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Readable, result.state);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_short_checkpoint_read_is_unknown() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("readiness-short-read", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        seed_readiness_checkpoint(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            std::slice::from_ref(&range),
+        )
+        .await;
+        let data_path = store
+            .resource_range_data_path(&session.id, &session.variant.video.id)
+            .expect("checkpoint path should be valid");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(data_path)
+            .expect("checkpoint should open")
+            .set_len(body.len() as u64 - 1)
+            .expect("checkpoint should truncate");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_readiness_checkpoint_object_swap_is_unknown() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("readiness-object-swap", "https://example.test/video.m4s");
+        let (body, _) = readiness_sidx_fixture();
+        session.variant.video.request.size = Some(body.len() as u64);
+        let range = 0..body.len() as u64;
+        seed_readiness_checkpoint(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            std::slice::from_ref(&range),
+        )
+        .await;
+        let data_path = store
+            .resource_range_data_path(&session.id, &session.variant.video.id)
+            .expect("checkpoint path should be valid");
+        let replacement = temp.path().join("replacement-range-data");
+        fs::write(&replacement, &body).expect("replacement should be written");
+        fs::rename(&replacement, &data_path).expect("checkpoint object should be swapped");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 0.5).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_publication_lock_contention_is_busy() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("readiness-busy", "https://example.test/video.m4s");
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("resource key should be valid");
+        let publication_lock = store.range_publication_lock(&key);
+        let _publication = publication_lock.lock().await;
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::Busy, result.reason);
+        assert_eq!((0, 0), store.range_activity_counts());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_readiness_cancelled_waiters_keep_blocking_permits_and_leases() {
+        use std::sync::{Condvar, mpsc};
+
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (released, condition) = &*self.0;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *released = true;
+                condition.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let first = sample_session("readiness-cancel-first", "https://example.test/video.m4s");
+        let second = sample_session("readiness-cancel-second", "https://example.test/video.m4s");
+        let third = sample_session("readiness-cancel-third", "https://example.test/video.m4s");
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let hook_entered = entered_sender.clone();
+        let hook_release = Arc::clone(&release);
+        *store
+            .readiness_job_hook
+            .lock()
+            .expect("readiness test hook lock should not be poisoned") =
+            Some(Arc::new(move || {
+                let _ = hook_entered.send(());
+                let (released, condition) = &*hook_release;
+                let released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = condition
+                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }));
+
+        let first_store = store.clone();
+        let first_task = tokio::spawn(async move {
+            first_store
+                .inspect_cached_playback_window(
+                    &first.id,
+                    &first.variant,
+                    PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+                )
+                .await
+        });
+        let second_store = store.clone();
+        let second_task = tokio::spawn(async move {
+            second_store
+                .inspect_cached_playback_window(
+                    &second.id,
+                    &second.variant,
+                    PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+                )
+                .await
+        });
+        let entry_deadline = Instant::now() + Duration::from_secs(2);
+        let mut both_entered = true;
+        for _ in 0..2 {
+            let remaining = entry_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || entered_receiver.recv_timeout(remaining).is_err() {
+                both_entered = false;
+                break;
+            }
+        }
+        first_task.abort();
+        second_task.abort();
+        let _ = first_task.await;
+        let _ = second_task.await;
+
+        let third_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.inspect_cached_playback_window(
+                &third.id,
+                &third.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            ),
+        )
+        .await
+        .expect("busy query should complete promptly");
+        let active_while_blocked = store.range_activity_counts();
+        release_on_drop.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.range_activity_counts().0 != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("blocking jobs should release their lifecycle leases");
+
+        assert!(both_entered, "both inspection jobs should enter the hook");
+        assert_eq!(CacheWindowState::Unknown, third_result.state);
+        assert_eq!(CacheWindowReason::Busy, third_result.reason);
+        assert_eq!((2, 0), active_while_blocked);
+        assert_eq!((0, 0), store.range_activity_counts());
+    }
+
+    #[test]
+    fn cache_readiness_budget_caps_charged_work_and_range_count() {
+        let mut budget = HlsReadinessBudget::default();
+        assert_eq!(Ok(()), budget.charge(HLS_READINESS_BUDGET_BYTES));
+        assert_eq!(Err(CacheWindowReason::BudgetExceeded), budget.charge(1));
+        assert_eq!(HLS_READINESS_BUDGET_BYTES, budget.checked_bytes);
+
+        let mut ranges = HlsReadinessBudget::default();
+        assert_eq!(Ok(()), ranges.add_ranges(HLS_READINESS_MAX_RANGES));
+        assert_eq!(Err(CacheWindowReason::BudgetExceeded), ranges.add_ranges(1));
+        assert_eq!(HLS_READINESS_MAX_RANGES, ranges.range_count);
+    }
+
+    fn persist_complete_readiness_resource(
+        store: &HlsCacheStore,
+        session: &HlsPlaybackSession,
+        resource: &HlsMediaResource,
+        body: &[u8],
+        initialization_length: u64,
+        segments: &[PersistedHlsMediaSegment],
+        write_resource: bool,
+    ) {
+        let path = store
+            .resource_path(&session.id, &resource.id)
+            .expect("resource path should be valid");
+        if write_resource {
+            store
+                .ensure_cache_directory(path.parent().expect("resource parent should exist"))
+                .expect("resource directory should be created");
+            fs::write(&path, body).expect("complete resource should be written");
+        }
+        let metadata = PersistedHlsCachedResource {
+            schema_version: HLS_CACHE_SCHEMA_VERSION,
+            id: resource.id.clone(),
+            content_type: resource.content_type().to_owned(),
+            total_length: body.len() as u64,
+            initialization_length,
+            segments: segments.to_vec(),
+            cache_key: PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone()),
+        };
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("resource metadata path should be valid");
+        store
+            .write_json_atomically(&metadata_path, &metadata)
+            .expect("resource metadata should be written");
+    }
+
+    async fn seed_readiness_checkpoint(
+        store: &HlsCacheStore,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        body: &[u8],
+        ranges: &[Range<u64>],
+    ) {
+        let key = store
+            .range_resource_key(session_id, resource)
+            .expect("resource key should be valid");
+        let mut loaded = store
+            .ensure_range_manifest(session_id, resource, &key)
+            .expect("range manifest should be initialized");
+        if loaded.manifest.total_length != Some(body.len() as u64) {
+            loaded = store
+                .publish_range_manifest(session_id, resource, loaded, |manifest| {
+                    manifest.total_length = Some(body.len() as u64);
+                })
+                .await
+                .expect("range length should be checkpointed");
+        }
+        for range in ranges {
+            let start = usize::try_from(range.start).expect("range start should fit usize");
+            let end = usize::try_from(range.end).expect("range end should fit usize");
+            store
+                .commit_range_extent(
+                    session_id,
+                    resource,
+                    &loaded.manifest,
+                    range.clone(),
+                    &body[start..end],
+                    &resource.request.url,
+                    None,
+                    None,
+                )
+                .await
+                .expect("checkpoint extent should be committed");
+            loaded = store
+                .load_range_manifest(session_id, resource)
+                .expect("range manifest should load")
+                .expect("range manifest should remain present");
+        }
+    }
+
+    fn readiness_sidx_fixture() -> (Vec<u8>, u64) {
+        let mut initialization = Vec::new();
+        initialization.extend(mp4_box(*b"ftyp", b"isom"));
+        initialization.extend(mp4_box(*b"moov", b"metadata"));
+        let first_fragment = b"first-fragment";
+        let second_fragment = b"second-fragment";
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 0, 0]);
+        payload.extend(1_u32.to_be_bytes());
+        payload.extend(1_000_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(2_u16.to_be_bytes());
+        for fragment in [first_fragment.as_slice(), second_fragment.as_slice()] {
+            payload.extend(u32::try_from(fragment.len()).unwrap().to_be_bytes());
+            payload.extend(1_000_u32.to_be_bytes());
+            payload.extend(0x9000_0000_u32.to_be_bytes());
+        }
+        let sidx = mp4_box(*b"sidx", &payload);
+        let prefix_length = (initialization.len() + sidx.len()) as u64;
+        let body = [
+            initialization.as_slice(),
+            sidx.as_slice(),
+            first_fragment,
+            second_fragment,
+        ]
+        .concat();
+        (body, prefix_length)
     }
 }

@@ -42,6 +42,7 @@ use crate::{
         TokenizedBilibiliCandidate, validate_bilibili_resolution_selection,
     },
     bilibili_worker::BilibiliDownloadError,
+    cdn_history::RECENT_ORIGIN_SUPPLY_MAX_AGE,
     config::{BbdownRestrictedArea, CacheServerOptions},
     generated::tvos_net_player::v1::{
         BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity,
@@ -58,14 +59,15 @@ use crate::{
         CreateBilibiliPlaybackTaskV2Request, CreateBilibiliTaskRequest,
         CreateBilibiliTaskV2Request, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
         GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
-        GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
-        GetResolverSettingsRequest, GetServerInfoRequest, GetTaskRequest, HealthState,
-        HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
+        GetHlsCacheStatusRequest, GetHlsPlaybackReadinessRequest, GetLibraryItemRequest,
+        GetPlaybackSourceRequest, GetResolverSettingsRequest, GetServerInfoRequest, GetTaskRequest,
+        HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
         HlsCacheFillFailureKind, HlsCacheFillState, HlsCacheFillStatus, HlsCacheStatus,
-        HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackProgressStatus,
-        HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan, LanTranscodingPlanState,
-        LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
-        LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
+        HlsOriginSupplyEvidence, HlsPlaybackActivityState as ProtoHlsPlaybackActivityState,
+        HlsPlaybackCacheReason, HlsPlaybackCacheState, HlsPlaybackProgressStatus,
+        HlsPlaybackReadiness, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
+        LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
+        LanTranscodingStatus, LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListBilibiliResolutionCandidatesRequest,
         ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
         ListLibraryItemsResponse, ListTaskResultsRequest, ListTaskResultsResponse, PageInfo,
@@ -93,6 +95,7 @@ use crate::{
         HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
         PlaybackProgressReport,
     },
+    hls_readiness::{CacheWindowReason, CacheWindowState, PlaybackWindow},
     library::ROOT_ID,
     playback_policy::PlaybackPolicy,
     resolver_catalog::{self, Region},
@@ -212,6 +215,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliCredentialProfiles.into(),
                 ServerCapability::BilibiliPlaybackPolicy.into(),
                 ServerCapability::Hls.into(),
+                ServerCapability::HlsPlaybackReadiness.into(),
                 ServerCapability::ResolverSettingsWrite.into(),
             ],
         };
@@ -2552,11 +2556,23 @@ fn bounded_client_task_result(
 #[derive(Clone)]
 pub struct CacheGrpcService {
     state: AppState,
+    #[cfg(test)]
+    after_inspection_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CacheGrpcService {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            #[cfg(test)]
+            after_inspection_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_inspection_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_inspection_hook = Some(Arc::new(hook));
+        self
     }
 }
 
@@ -2605,6 +2621,90 @@ impl CacheService for CacheGrpcService {
             )),
             playback: Some(proto_hls_playback_progress_status(&playback)),
         }))
+    }
+
+    async fn get_hls_playback_readiness(
+        &self,
+        request: Request<GetHlsPlaybackReadinessRequest>,
+    ) -> Result<Response<HlsPlaybackReadiness>, Status> {
+        let request = request.into_inner();
+        validate_readiness_id(&request.session_id, "session")?;
+        validate_readiness_id(&request.variant_id, "variant")?;
+        let window = PlaybackWindow::new(
+            request.window_start_seconds,
+            request.window_duration_seconds,
+        )
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "Playback window start and duration must be finite; start must be non-negative and duration must be greater than zero and at most 60 seconds.",
+            )
+        })?;
+
+        let handle = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .ok_or_else(|| Status::not_found("HLS playback session was not found."))?;
+        let variant = std::iter::once(&handle.session.variant)
+            .chain(handle.session.alternate_variants.iter())
+            .find(|variant| variant.id == request.variant_id)
+            .ok_or_else(|| Status::not_found("HLS playback variant was not found."))?;
+
+        let inspection = self
+            .state
+            .hls_cache
+            .inspect_cached_playback_window(&request.session_id, variant, window)
+            .await;
+
+        #[cfg(test)]
+        if let Some(hook) = self.after_inspection_hook.as_ref() {
+            hook();
+        }
+
+        let unchanged = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .is_some_and(|current| {
+                current.generation == handle.generation && current.session == handle.session
+            });
+
+        let mut response = HlsPlaybackReadiness {
+            session_id: request.session_id,
+            variant_id: request.variant_id,
+            window_start_seconds: window.start_seconds,
+            window_duration_seconds: window.duration_seconds,
+            session_generation: handle.generation,
+            cache_state: if unchanged {
+                proto_cache_window_state(inspection.state)
+            } else {
+                HlsPlaybackCacheState::Unknown.into()
+            },
+            cache_reason: if unchanged {
+                proto_cache_window_reason(inspection.reason)
+            } else {
+                HlsPlaybackCacheReason::UnknownGenerationChanged.into()
+            },
+            inspection_budget_used_bytes: inspection.checked_bytes,
+            video_origin: None,
+            audio_origin: None,
+        };
+
+        if unchanged {
+            response.video_origin = self
+                .state
+                .cdn_history
+                .recent_origin_supply(&variant.video.request)
+                .map(proto_origin_supply_evidence);
+            response.audio_origin = variant.audio.as_ref().and_then(|audio| {
+                self.state
+                    .cdn_history
+                    .recent_origin_supply(&audio.request)
+                    .map(proto_origin_supply_evidence)
+            });
+        }
+
+        Ok(Response::new(response))
     }
 
     async fn report_playback_progress(
@@ -2668,6 +2768,55 @@ impl CacheService for CacheGrpcService {
 
         let deleted = self.state.delete_local_library_item(id).await?;
         Ok(Response::new(DeleteLibraryItemResponse { deleted }))
+    }
+}
+
+fn validate_readiness_id(value: &str, label: &str) -> Result<(), Status> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(match label {
+            "session" => "Session id is invalid or exceeds the size limit.",
+            _ => "Variant id is invalid or exceeds the size limit.",
+        }));
+    }
+    Ok(())
+}
+
+fn proto_cache_window_state(state: CacheWindowState) -> i32 {
+    match state {
+        CacheWindowState::Readable => HlsPlaybackCacheState::Readable.into(),
+        CacheWindowState::Missing => HlsPlaybackCacheState::Missing.into(),
+        CacheWindowState::Unknown => HlsPlaybackCacheState::Unknown.into(),
+    }
+}
+
+fn proto_cache_window_reason(reason: CacheWindowReason) -> i32 {
+    match reason {
+        CacheWindowReason::None => HlsPlaybackCacheReason::None.into(),
+        CacheWindowReason::NotCached => HlsPlaybackCacheReason::NotCached.into(),
+        CacheWindowReason::IndexUnavailable => HlsPlaybackCacheReason::IndexUnavailable.into(),
+        CacheWindowReason::OutOfRange => HlsPlaybackCacheReason::OutOfRange.into(),
+        CacheWindowReason::Busy => HlsPlaybackCacheReason::Busy.into(),
+        CacheWindowReason::BudgetExceeded => HlsPlaybackCacheReason::BudgetExceeded.into(),
+        CacheWindowReason::IdentityChanged => HlsPlaybackCacheReason::IdentityChanged.into(),
+        CacheWindowReason::IoFailure => HlsPlaybackCacheReason::IoFailure.into(),
+    }
+}
+
+fn proto_origin_supply_evidence(
+    supply: crate::cdn_history::RecentOriginSupply,
+) -> HlsOriginSupplyEvidence {
+    HlsOriginSupplyEvidence {
+        age_millis: u64::try_from(supply.age.as_millis()).unwrap_or(u64::MAX),
+        throughput_bits_per_second: supply.throughput_bps,
+        first_byte_latency_micros: supply
+            .first_byte_latency
+            .map(|latency| u64::try_from(latency.as_micros()).unwrap_or(u64::MAX)),
+        freshness_limit_millis: u64::try_from(RECENT_ORIGIN_SUPPLY_MAX_AGE.as_millis())
+            .unwrap_or(u64::MAX),
     }
 }
 
@@ -14163,6 +14312,329 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_playback_readiness_validates_and_is_wired_over_grpc_without_origin_requests() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let (origin_url, origin_task, origin_requests) =
+            start_counted_readiness_mp4_upstream().await;
+        let media_url = format!("{origin_url}?token=readiness-secret");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+
+        let request = |session_id: &str, variant_id: &str, start: f64, duration: f64| {
+            GetHlsPlaybackReadinessRequest {
+                session_id: session_id.to_owned(),
+                variant_id: variant_id.to_owned(),
+                window_start_seconds: start,
+                window_duration_seconds: duration,
+            }
+        };
+        let service = CacheGrpcService::new(state.clone());
+        let server_info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should load")
+            .into_inner();
+        assert!(
+            server_info
+                .capabilities
+                .contains(&ServerCapability::HlsPlaybackReadiness.into())
+        );
+        for invalid in [
+            request("", "variant", 0.0, 1.0),
+            request("session", &"v".repeat(257), 0.0, 1.0),
+            request("session", "variant", f64::NAN, 1.0),
+            request("session", "variant", -1.0, 1.0),
+            request("session", "variant", 0.0, f64::INFINITY),
+            request("session", "variant", 0.0, 0.0),
+            request("session", "variant", 0.0, 60.001),
+        ] {
+            let error = service
+                .get_hls_playback_readiness(Request::new(invalid))
+                .await
+                .expect_err("invalid request must be rejected");
+            assert_eq!(tonic::Code::InvalidArgument, error.code());
+        }
+
+        let missing_session = service
+            .get_hls_playback_readiness(Request::new(request("missing", "variant", 0.0, 1.0)))
+            .await
+            .expect_err("unregistered session must be rejected");
+        assert_eq!(tonic::Code::NotFound, missing_session.code());
+
+        let empty_cache_metadata = playback_task_metadata_with_options(
+            "readiness-empty-cache",
+            sample_playback_plan_with_video_url(&media_url),
+            &state.options,
+        )
+        .expect("empty-cache playback metadata should be valid");
+        let empty_cache_session = empty_cache_metadata.hls_session;
+        state
+            .hls_cache
+            .save_session(&empty_cache_session)
+            .expect("empty-cache session metadata should persist");
+        state.hls_sessions.insert(empty_cache_session.clone());
+        assert_eq!(0, origin_requests.load(AtomicOrdering::SeqCst));
+        let empty_cache = service
+            .get_hls_playback_readiness(Request::new(request(
+                &empty_cache_session.id,
+                &empty_cache_session.variant.id,
+                0.0,
+                1.0,
+            )))
+            .await
+            .expect("empty-cache query should return evidence")
+            .into_inner();
+        assert_eq!(
+            HlsPlaybackCacheState::Unknown as i32,
+            empty_cache.cache_state
+        );
+        assert_eq!(
+            HlsPlaybackCacheReason::NotCached as i32,
+            empty_cache.cache_reason
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(
+                    &empty_cache_session.id,
+                    &empty_cache_session.variant.video.id
+                )
+                .is_none()
+        );
+        assert!(empty_cache.video_origin.is_none());
+        assert!(empty_cache.audio_origin.is_none());
+        assert_eq!(0, origin_requests.load(AtomicOrdering::SeqCst));
+
+        let (session_id, hls_session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1readiness",
+            sample_playback_plan_with_video_and_audio_url(&media_url),
+        );
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &hls_session)
+            .await
+            .expect("complete local HLS fixture should populate cache");
+
+        let partial =
+            create_partial_hls_playback_task(&state, "BV1partial-readiness", &media_url).await;
+        let partial_session = state
+            .hls_sessions
+            .get_with_generation(&partial.task_id)
+            .expect("partial playback session should remain registered")
+            .session;
+        let partial_readiness = service
+            .get_hls_playback_readiness(Request::new(request(
+                &partial.task_id,
+                &partial_session.variant.id,
+                0.0,
+                1.0,
+            )))
+            .await
+            .expect("partial audio cache should return conservative evidence")
+            .into_inner();
+        assert_eq!(
+            HlsPlaybackCacheState::Unknown as i32,
+            partial_readiness.cache_state
+        );
+        assert_eq!(
+            HlsPlaybackCacheReason::NotCached as i32,
+            partial_readiness.cache_reason
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&partial.task_id, &partial_session.variant.video.id)
+                .is_some()
+        );
+        let partial_audio = partial_session
+            .variant
+            .audio
+            .as_ref()
+            .expect("partial fixture should declare audio");
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&partial.task_id, &partial_audio.id)
+                .is_none()
+        );
+
+        let variant_id = hls_session.variant.id.clone();
+        let unknown_variant = service
+            .get_hls_playback_readiness(Request::new(request(
+                &session_id,
+                "unknown-variant",
+                0.0,
+                1.0,
+            )))
+            .await
+            .expect_err("unknown variant must be rejected");
+        assert_eq!(tonic::Code::NotFound, unknown_variant.code());
+
+        let checked_bytes_before = state
+            .hls_cache
+            .completed_primary_resource_bytes(&hls_session)
+            .expect("cached primary resource should be measurable");
+        let upstream_requests_before = origin_requests.load(AtomicOrdering::SeqCst);
+        let measured = || {
+            crate::cdn_history::CdnObservation::playback_complete(
+                1_000,
+                Duration::from_millis(10),
+                Duration::from_millis(2),
+                Some(true),
+            )
+        };
+        state.cdn_history.record_request(
+            &hls_session.variant.video.request,
+            &hls_session.variant.video.request.url,
+            measured(),
+        );
+        if let Some(audio) = &hls_session.variant.audio {
+            state
+                .cdn_history
+                .record_request(&audio.request, &audio.request.url, measured());
+        }
+
+        let generation_before_race = state
+            .hls_sessions
+            .get_with_generation(&session_id)
+            .expect("playback session should remain registered")
+            .generation;
+        let race_state = state.clone();
+        let race_session = hls_session.clone();
+        let race_response = CacheGrpcService::new(state.clone())
+            .with_after_inspection_hook(move || {
+                race_state.hls_sessions.insert(race_session.clone());
+            })
+            .get_hls_playback_readiness(Request::new(request(&session_id, &variant_id, 0.0, 1.0)))
+            .await
+            .expect("generation-race query should return conservative evidence")
+            .into_inner();
+        assert_eq!(generation_before_race, race_response.session_generation);
+        assert_eq!(
+            HlsPlaybackCacheState::Unknown as i32,
+            race_response.cache_state
+        );
+        assert_eq!(
+            HlsPlaybackCacheReason::UnknownGenerationChanged as i32,
+            race_response.cache_reason
+        );
+        assert!(race_response.video_origin.is_none());
+        assert!(race_response.audio_origin.is_none());
+        assert!(
+            state
+                .hls_sessions
+                .get_with_generation(&session_id)
+                .unwrap()
+                .generation
+                > generation_before_race
+        );
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&session_id)
+            .expect("playback session should remain registered after generation race")
+            .generation;
+
+        let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gRPC fixture should bind");
+        let grpc_address = grpc_listener.local_addr().unwrap();
+        let grpc_state = state.clone();
+        let grpc_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::generated::tvos_net_player::v1::cache_service_server::CacheServiceServer::new(
+                        CacheGrpcService::new(grpc_state),
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    grpc_listener,
+                ))
+                .await
+                .expect("gRPC fixture should serve");
+        });
+        let mut client = crate::generated::tvos_net_player::v1::cache_service_client::CacheServiceClient::connect(
+            format!("http://{grpc_address}"),
+        )
+        .await
+        .expect("generated gRPC client should connect");
+        let readiness = client
+            .get_hls_playback_readiness(request(&session_id, &variant_id, 0.0, 1.0))
+            .await
+            .expect("readiness RPC should be wired")
+            .into_inner();
+
+        assert_eq!(session_id, readiness.session_id);
+        assert_eq!(variant_id, readiness.variant_id);
+        assert_eq!(generation, readiness.session_generation);
+        assert_eq!(
+            HlsPlaybackCacheState::Readable as i32,
+            readiness.cache_state
+        );
+        assert_eq!(HlsPlaybackCacheReason::None as i32, readiness.cache_reason);
+        assert!(readiness.inspection_budget_used_bytes > 0);
+        let video_origin = readiness
+            .video_origin
+            .as_ref()
+            .expect("fresh video supply should be reported");
+        assert_eq!(800_000, video_origin.throughput_bits_per_second);
+        assert_eq!(Some(2_000), video_origin.first_byte_latency_micros);
+        assert_eq!(30_000, video_origin.freshness_limit_millis);
+        assert!(video_origin.age_millis <= video_origin.freshness_limit_millis);
+        let audio_origin = readiness
+            .audio_origin
+            .as_ref()
+            .expect("fresh audio supply should be reported");
+        assert_eq!(800_000, audio_origin.throughput_bits_per_second);
+        assert_eq!(Some(2_000), audio_origin.first_byte_latency_micros);
+
+        let encoded = readiness.encode_to_vec();
+        assert!(
+            !encoded
+                .windows(media_url.len())
+                .any(|window| window == media_url.as_bytes())
+        );
+        assert!(
+            !encoded
+                .windows(b"readiness-secret".len())
+                .any(|window| window == b"readiness-secret")
+        );
+        assert_eq!(
+            checked_bytes_before,
+            state
+                .hls_cache
+                .completed_primary_resource_bytes(&hls_session)
+                .expect("cached primary resource should remain measurable")
+        );
+        assert_eq!(
+            upstream_requests_before,
+            origin_requests.load(AtomicOrdering::SeqCst),
+            "readiness query must not request origin bytes or start a cache fill"
+        );
+        let task = state
+            .tasks
+            .get_task(&session_id)
+            .expect("playable task should remain registered");
+        assert!(task.hls_cache_fill_status.is_none());
+
+        grpc_task.abort();
+        let grpc_join = grpc_task
+            .await
+            .expect_err("aborted gRPC server should stop");
+        assert!(grpc_join.is_cancelled());
+        origin_task.abort();
+        let origin_join = origin_task
+            .await
+            .expect_err("aborted origin server should stop");
+        assert!(origin_join.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn get_hls_cache_status_reports_weak_network_policy() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -24745,6 +25217,41 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task, request_count)
     }
 
+    async fn start_counted_readiness_mp4_upstream()
+    -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("readiness origin listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&request_count);
+        let body = readiness_indexed_mp4();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(move || {
+                        let requests = Arc::clone(&requests_for_route);
+                        let body = body.clone();
+                        async move {
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "video/mp4")
+                                .body(Body::from(body))
+                                .unwrap()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("readiness origin should serve");
+        });
+
+        (format!("http://{addr}/video.m4s"), task, request_count)
+    }
+
     async fn start_failing_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         let (url, task, _) = start_counted_failing_mp4_upstream().await;
         (url, task)
@@ -24883,6 +25390,47 @@ mod tests {
         bytes.extend(mp4_box(*b"moov", b"metadata"));
         bytes.extend(mp4_box(*b"moof", b"frag"));
         bytes.extend(mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn readiness_indexed_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        let mut tkhd = vec![0; 12];
+        tkhd.extend(1_u32.to_be_bytes());
+        tkhd.extend(0_u32.to_be_bytes());
+        let mut mdhd = vec![0, 0, 0, 0];
+        mdhd.extend(0_u32.to_be_bytes());
+        mdhd.extend(0_u32.to_be_bytes());
+        mdhd.extend(1_000_u32.to_be_bytes());
+        mdhd.extend(0_u32.to_be_bytes());
+        mdhd.extend(0_u16.to_be_bytes());
+        mdhd.extend(0_u16.to_be_bytes());
+        let trak = mp4_box(
+            *b"trak",
+            &[
+                mp4_box(*b"tkhd", &tkhd),
+                mp4_box(*b"mdia", &mp4_box(*b"mdhd", &mdhd)),
+            ]
+            .concat(),
+        );
+        bytes.extend(mp4_box(*b"moov", &trak));
+        for (duration, payload) in [
+            (1_000_u32, b"first-media".as_slice()),
+            (2_000, b"second-media".as_slice()),
+        ] {
+            let mut tfhd = vec![0, 0, 0, 0];
+            tfhd.extend(1_u32.to_be_bytes());
+            let mut trun = vec![0, 0, 1, 0];
+            trun.extend(1_u32.to_be_bytes());
+            trun.extend(duration.to_be_bytes());
+            let traf = mp4_box(
+                *b"traf",
+                &[mp4_box(*b"tfhd", &tfhd), mp4_box(*b"trun", &trun)].concat(),
+            );
+            bytes.extend(mp4_box(*b"moof", &traf));
+            bytes.extend(mp4_box(*b"mdat", payload));
+        }
         bytes
     }
 

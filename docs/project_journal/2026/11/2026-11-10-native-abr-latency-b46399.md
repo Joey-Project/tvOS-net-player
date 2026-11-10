@@ -40,12 +40,13 @@ superseded_by:
 - Ranged `HEAD` probes remain request/metadata observations, not media-body requests. Exclude them from first-media timing and media-payload counters; an actual ranged `GET` is required for those observations.
 - Both nested probe capture and outer Rust reports use coherent 64 KiB limits; retained logs/reports together remain capped at 32 MiB. Python admission and the derived summary retain their own validation and size bounds.
 - Python helper regressions cover malformed/missing timelines, clocks, stale context, media windows and the exact unsigned-64-bit range boundary. The runner includes derived diagnostics in its existing bounded summary for both fixed-signed local and isolated CI modes.
-- No production upshift controller or demonstrated recovery-latency improvement is included in this slice.
+- The diagnostic slice is delivered through PR #92, including complete local CI, fixed-signed native acceptance, GHA native/UI evidence and current-head GitHub Codex review. No production upshift controller or demonstrated recovery-latency improvement is included.
+- The local baseline's first accepted high-media request was about 76.123 seconds after recovery and overlapped indexed fragments at 528-532 seconds. A preceding sample had playhead 111.351 seconds and loaded end 529.364 seconds; the first high frame followed that request by about 412.695 seconds. GHA showed comparable future-media context. These correlations do not prove a unique cause, fixed retry interval or complete cache coverage.
 
 ## Next Steps
-1. Use the bounded diagnostic slice in the existing native gate and retain exact-run raw evidence for baseline comparison.
-2. Compare retry delay, requested media time and client loaded coverage. Establish a baseline before selecting a bounded no-source-switch experiment or proposing a production assisted-switch contract.
-3. Agree on cache-hit versus origin-dependent recovery criteria before implementing active quality changes. Retain the pure AVPlayer-managed long test even if a separate production-assisted path is introduced.
+1. Keep the bounded diagnostic slice in the native gate and retain exact-run raw evidence for baseline comparison.
+2. Use the [read-only server readiness evidence](2026-11-10-hls-readiness-b46400.md) to distinguish cache readability from fresh origin delivery without treating either as an overall switch recommendation.
+3. Agree on cache-hit versus origin-dependent recovery criteria and a production handover mechanism before implementing active quality changes. Retain the pure AVPlayer-managed long test even if a separate assisted path is introduced.
 4. Continue the remaining native cache lifecycle/offline and home LAN roadmap work after recovery optimization.
 
 ## Evidence
