@@ -405,17 +405,48 @@ final class UIPlaybackTests: XCTestCase {
             "playing",
             "Playback started automatically before explicit Continue."
         )
-        XCTAssertTrue(
-            waitUntil(timeout: 75) {
-                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
-                    && status(selectedStatus, contains: "Cached")
-                    && status(decoyStatus, contains: "Cached")
-                    && selectedPlay.exists && selectedPlay.isEnabled
-                    && decoyPlay.exists && decoyPlay.isEnabled
-            },
-            "The original task/result identity was not restored after relaunch. "
-                + accessibilityDescription(taskStatus)
-        )
+        let restoredResultsDeadline = Date().addingTimeInterval(75)
+        guard
+            waitUntil(
+                timeout: 75,
+                condition: {
+                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                })
+        else {
+            XCTFail("The cached task summary was not restored after relaunch. " + accessibilityDescription(taskStatus))
+            return
+        }
+        guard moveFocus(until: selectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline) else {
+            XCTFail(
+                "Remote navigation could not materialize and focus the exact selected result without activating it. "
+                    + taskWatchFocusDescription(target: selectedPlay)
+                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
+                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
+                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
+            )
+            return
+        }
+        guard
+            waitUntil(
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
+                condition: {
+                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                        && status(selectedStatus, contains: "Cached")
+                        && status(decoyStatus, contains: "Cached")
+                        && selectedPlay.exists && selectedPlay.isEnabled
+                        && decoyPlay.exists && decoyPlay.isEnabled
+                })
+        else {
+            XCTFail(
+                "The original task/result identity was not restored after relaunch. "
+                    + accessibilityDescription(taskStatus)
+                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
+                    + "; selectedPlay: \(taskWatchFocusDescription(target: selectedPlay))"
+                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
+                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
+            )
+            return
+        }
         RunLoop.current.run(until: Date().addingTimeInterval(2.2))
         XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
         XCTAssertNotEqual(playbackState.value as? String, "playing")
@@ -717,16 +748,25 @@ final class UIPlaybackTests: XCTestCase {
     private func moveFocus(
         until element: XCUIElement,
         direction: XCUIRemote.Button,
-        limit: Int
+        limit: Int,
+        deadline: Date? = nil
     ) -> Bool {
         for _ in 0..<limit {
-            if element.exists && element.hasFocus {
+            if let deadline, Date() >= deadline { return false }
+            let isFocused = element.exists && element.hasFocus
+            if let deadline, Date() >= deadline { return false }
+            if isFocused {
                 return true
             }
+            if let deadline, Date() >= deadline { return false }
             XCUIRemote.shared.press(direction)
-            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            let remaining = deadline?.timeIntervalSinceNow ?? 0.15
+            guard remaining > 0 else { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(min(0.15, remaining)))
         }
-        return element.exists && element.hasFocus
+        guard deadline.map({ Date() < $0 }) ?? true else { return false }
+        let isFocused = element.exists && element.hasFocus
+        return (deadline.map { Date() < $0 } ?? true) && isFocused
     }
 
     private func playbackTimeline() -> (current: Double, duration: Double)? {

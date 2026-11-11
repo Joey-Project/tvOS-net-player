@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-11
 updated: 2026-11-11
 branch: codex/hls-rendition-catalog
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/96
 supersedes: []
 superseded_by:
 ---
@@ -32,6 +32,8 @@ superseded_by:
 - Focused Swift development validation passes 30 tests: four catalog model tests, eight production catalog transport tests, nine readiness tests and nine prior upshift transport regressions. Strict formatting passes for the six involved Swift files; this does not replace frozen-head full validation.
 - Rust development validation passes the catalog filter (13 tests) and master filter (14 tests), with zero failures. These filters overlap and are not a combined unique-test count. The generated gRPC cached-positive test uses actual downloaded video/audio cache files, clears upstream URLs and verifies no new origin requests, playback lease or fill from the query. Full `just lint` also passes.
 - UI scenario setup requires the complete expected fixture source before its single submission. Synchronize tvOS keyboard editing and retain bounded phase-specific input diagnostics; truncated input must fail setup rather than masquerade as a task-watch recovery failure. Preserve all existing recovery deadlines, single-submission and playback assertions.
+- Exercise login-start timeout separation with an explicit response gate held beyond the ordinary status timeout, rather than a narrow pair of scheduler-sensitive sleeps. Retain bounded login-start expiry and cancellation coverage independently.
+- After tvOS relaunch, use bounded remote navigation to materialize restored result controls before checking both exact result identities and enabled Play actions. Keep the original restore deadline, no-autoplay requirement and explicit Continue/checkpoint/restart assertions.
 - Cover live-style and offline-cache availability, weak-policy fallback, disabled alternates, unavailable/unauthorized/changed registrations, limits, optional hints/rates and exact UTF-8 identities.
 - Compare catalog selection with real loopback HLS master output and prove no origin requests, source restoration, fill promotion or playback-use side effects are created by the query.
 - Exercise production generated Swift gRPC transport, unsupported-server fallback, cancellation and response admission independently of native playback.
