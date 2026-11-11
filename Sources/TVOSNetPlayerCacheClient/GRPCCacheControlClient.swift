@@ -259,6 +259,40 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func getHLSRenditionCatalog(
+        _ catalogRequest: HLSRenditionCatalogRequest
+    ) async throws -> HLSRenditionCatalog {
+        try Task.checkCancellation()
+        try catalogRequest.validate()
+        do {
+            let catalog = try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_GetHlsRenditionCatalogRequest()
+                request.sessionID = catalogRequest.sessionID
+                let response = try await service.getHlsRenditionCatalog(request, options: callOptions)
+                return try HLSRenditionCatalog(response, matching: catalogRequest)
+            }
+            try Task.checkCancellation()
+            return catalog
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let rpcError = error as? RPCError, rpcError.code == .unimplemented {
+                throw CacheControlClientUnsupportedOperation.hlsRenditionCatalog
+            }
+            if let validationError = error as? HLSRenditionCatalogValidationError {
+                throw validationError
+            }
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
+        }
+    }
+
     public func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
         do {
             return try await withGRPCClient(

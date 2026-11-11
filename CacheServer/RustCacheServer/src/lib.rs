@@ -14,6 +14,7 @@ pub mod generated;
 pub mod grpc_services;
 mod hls;
 mod hls_cache;
+mod hls_catalog;
 mod hls_fill_scheduler;
 mod hls_media_refresh;
 mod hls_network_policy;
@@ -101,6 +102,7 @@ use crate::{
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
 const HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS: usize = 1;
+const HLS_CATALOG_CACHE_PROBE_MAX_CONCURRENT_OPERATIONS: usize = 2;
 const TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS: usize = 32;
 const LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS: usize = 4;
 const LOCAL_LIBRARY_DELETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,6 +140,7 @@ pub struct AppState {
     playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) task_resource_open_permits: Arc<Semaphore>,
+    pub(crate) hls_catalog_cache_probe_permits: Arc<Semaphore>,
     pub(crate) local_library_deletion_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
@@ -803,6 +806,9 @@ impl AppState {
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
         let task_resource_open_permits =
             Arc::new(Semaphore::new(TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS));
+        let hls_catalog_cache_probe_permits = Arc::new(Semaphore::new(
+            HLS_CATALOG_CACHE_PROBE_MAX_CONCURRENT_OPERATIONS,
+        ));
         let lan_transcoding_permits = Arc::new(Semaphore::new(
             options.lan_transcoding_max_concurrent_jobs.max(1),
         ));
@@ -845,6 +851,7 @@ impl AppState {
             playback_planning_active_jobs,
             hls_cache_finalization_permits,
             task_resource_open_permits,
+            hls_catalog_cache_probe_permits,
             local_library_deletion_permits: Arc::new(Semaphore::new(
                 LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS,
             )),
@@ -1517,7 +1524,10 @@ impl AppState {
         Some(handle)
     }
 
-    fn registered_hls_session_is_authorized_for_serving(&self, session_id: &str) -> bool {
+    pub(crate) fn registered_hls_session_is_authorized_for_serving(
+        &self,
+        session_id: &str,
+    ) -> bool {
         if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
             return false;
         }
@@ -1542,6 +1552,22 @@ impl AppState {
             TaskState::Completed => false,
             _ => false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quarantine_hls_session_for_tests(&self, session_id: String) {
+        let mut startup = self
+            .hls_runtime_startup
+            .lock()
+            .expect("HLS runtime startup lock poisoned");
+        startup.pending = Some(PendingHlsRuntimeStartup {
+            finalizer_restore_sessions: None,
+            completed_cache_session_ids: Arc::new(HashSet::new()),
+            reconciliation_sessions: Vec::new(),
+            reconciliation_session_ids: HashSet::from([session_id]),
+            restorable_completed_session_ids: Arc::new(HashSet::new()),
+            finalizer_owned_session_ids: Arc::new(HashSet::new()),
+        });
     }
 
     pub(crate) async fn delete_local_library_item(&self, item_id: &str) -> Result<bool, Status> {

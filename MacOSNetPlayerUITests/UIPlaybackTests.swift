@@ -8,6 +8,10 @@ final class UIPlaybackTests: XCTestCase {
         case missingServerAddress(String)
     }
 
+    private struct SourceInputError: Error, CustomStringConvertible {
+        let description: String
+    }
+
     private var app: XCUIApplication!
     private var serverAddress = ""
     private var didLaunchApp = false
@@ -612,6 +616,7 @@ final class UIPlaybackTests: XCTestCase {
         let sourceField = app.textFields["bilibili-source"]
         clickVisible(sourceField, scrollingIn: controls)
         sourceField.typeText("BV1xK4y1P7mN")
+        try requireSourceValue("BV1xK4y1P7mN", in: sourceField, phase: "before enabling Submit")
     }
 
     private func prepareTaskWatchScenario(source: String) throws {
@@ -628,6 +633,28 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(
             serverAddressIsEmpty(sourceField), "Unexpected initial source: \(accessibilityDescription(sourceField))")
         sourceField.typeText(source)
+        try requireSourceValue(source, in: sourceField, phase: "after text entry, before Submit")
+    }
+
+    private func requireSourceValue(_ expected: String, in field: XCUIElement, phase: String) throws {
+        guard field.value as? String == expected else {
+            throw SourceInputError(
+                description: "Bilibili source value mismatch \(phase). "
+                    + sourceInputDescription(field, expected: expected)
+            )
+        }
+    }
+
+    private func sourceInputDescription(_ field: XCUIElement, expected: String) -> String {
+        "expected=\(boundedTextDescription(expected)), actual=\(boundedTextDescription(field.value as? String)), "
+            + "fieldClickCompleted=true, fieldHittable=\(field.isHittable), "
+            + "keyboardPresent=\(app.keyboards.firstMatch.exists)"
+    }
+
+    private func boundedTextDescription(_ value: String?) -> String {
+        guard let value else { return "<non-string>" }
+        let prefix = String(decoding: value.utf8.prefix(48), as: UTF8.self)
+        return "utf8Length=\(value.utf8.count), prefix=\(String(reflecting: prefix))"
     }
 
     private func pausedSeekBaseline(state: XCUIElement, timeline: XCUIElement, action: String) throws -> Double {

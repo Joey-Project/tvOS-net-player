@@ -630,24 +630,55 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 
     @MainActor
     func testLoginStartCanOutlastOrdinaryStatusTimeout() async {
+        let startGate = LoginStartCancellationGate()
         let client = LoginClient(
             serverInfo: .fixture(capabilities: [
                 CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliLoginSessions,
             ]),
             credentialStatus: .fixture(),
-            startDelay: .milliseconds(75)
+            startGate: startGate
         )
+        let ordinaryTimeout = Duration.milliseconds(100)
         let model = BilibiliLoginViewModel(
-            operationTimeout: .milliseconds(20),
-            loginStartTimeout: .milliseconds(150),
+            operationTimeout: ordinaryTimeout,
+            loginStartTimeout: .seconds(5),
             pollInterval: .seconds(2),
             clientFactory: { _ in client }
         )
 
         await model.activate(serverAddressText: "mac-mini.local")
-        await model.startLogin()
+        let completed = XCTestExpectation(description: "Login start completes after the gate is released")
+        let startTask = Task {
+            await model.startLogin()
+            completed.fulfill()
+        }
 
+        let entryDeadline = ContinuousClock.now + .seconds(5)
+        while !(await startGate.isWaiting), ContinuousClock.now < entryDeadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let startEnteredGate = await startGate.isWaiting
+        XCTAssertTrue(startEnteredGate, "Login start did not reach its response gate.")
+
+        if startEnteredGate {
+            let heldAt = ContinuousClock.now
+            try? await Task.sleep(for: ordinaryTimeout + .milliseconds(50))
+            let heldDuration = heldAt.duration(to: .now)
+            XCTAssertGreaterThanOrEqual(heldDuration, ordinaryTimeout)
+            XCTAssertTrue(model.isStartingLogin)
+            XCTAssertNil(model.verificationQRPayload)
+        }
+
+        await startGate.release()
+        let completionResult = await XCTWaiter.fulfillment(of: [completed], timeout: 7)
+        if completionResult != .completed {
+            startTask.cancel()
+            model.deactivate()
+        }
+        await startTask.value
+
+        XCTAssertEqual(completionResult, .completed, "The released login start did not complete within its bound.")
         XCTAssertEqual(model.status, .sessionPending)
         XCTAssertNotNil(model.verificationQRPayload)
         model.deactivate()
@@ -868,6 +899,7 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 private actor LoginStartCancellationGate {
     private var continuation: CheckedContinuation<Void, Error>?
     private(set) var cancellationObserved = false
+    private(set) var isWaiting = false
 
     func wait() async throws {
         try await withTaskCancellationHandler {
@@ -877,6 +909,7 @@ private actor LoginStartCancellationGate {
                     continuation.resume(throwing: CancellationError())
                 } else {
                     self.continuation = continuation
+                    isWaiting = true
                 }
             }
         } onCancel: {
@@ -884,10 +917,17 @@ private actor LoginStartCancellationGate {
         }
     }
 
+    func release() {
+        continuation?.resume()
+        continuation = nil
+        isWaiting = false
+    }
+
     private func cancel() {
         cancellationObserved = true
         continuation?.resume(throwing: CancellationError())
         continuation = nil
+        isWaiting = false
     }
 }
 

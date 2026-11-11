@@ -32,7 +32,7 @@ use crate::{
     cdn_history::{CdnObservation, CdnObservationOutcome, CdnObservationSource},
     hls::{
         HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, mp4_initialization_length,
-        should_forward_media_request_header,
+        resource_has_upstream, should_forward_media_request_header,
     },
     hls_cache::{
         HlsCacheFillControl, HlsRangeEnsure, HlsStartupProbeEvidence, OpenedPrewarmedHlsResource,
@@ -319,38 +319,21 @@ fn hls_master_playlist_response(
     let generation = handle.generation;
     let session = handle.session;
 
-    let mut variants = vec![session.variant.clone()];
-    if session.advertise_alternate_variants {
-        variants.extend(session.alternate_variants.iter().cloned());
-    }
-    variants.retain(|variant| {
-        [&variant.video]
-            .into_iter()
-            .chain(variant.audio.iter())
-            .all(|resource| {
-                resource_has_upstream(resource)
-                    || state
-                        .state
-                        .hls_cache
-                        .open_cached_resource(&session_id, &resource.id)
-                        .is_some()
-            })
-    });
-    if variants.is_empty() {
+    let Some(playlist_session) =
+        session.prepare_master_playlist_with_resource_availability(|resource_id| {
+            state
+                .state
+                .hls_cache
+                .open_cached_resource(&session_id, resource_id)
+                .is_some()
+        })
+    else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "No complete HLS representation is available offline.\n",
             head_only,
         );
-    }
-    let selected_index = variants
-        .iter()
-        .position(|variant| variant.id == session.variant.id)
-        .unwrap_or(0);
-    let mut playlist_session = session.clone();
-    playlist_session.variant = variants.remove(selected_index);
-    playlist_session.alternate_variants = variants;
-    playlist_session.advertise_alternate_variants = true;
+    };
     let weak_network_preference = session.effective_policy.weak_network_preference;
     let body = if head_only {
         Body::empty()
@@ -1710,15 +1693,6 @@ impl Drop for HlsRangePolicyObservation {
     fn drop(&mut self) {
         self.finish();
     }
-}
-
-fn resource_has_upstream(resource: &HlsMediaResource) -> bool {
-    !resource.request.url.trim().is_empty()
-        || resource
-            .request
-            .backup_urls
-            .iter()
-            .any(|url| !url.trim().is_empty())
 }
 
 async fn proxy_hls_media_resource(

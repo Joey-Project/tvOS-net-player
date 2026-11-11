@@ -7,6 +7,10 @@ final class UIPlaybackTests: XCTestCase {
         case missingServerAddress(String)
     }
 
+    private struct SourceInputError: Error, CustomStringConvertible {
+        let description: String
+    }
+
     private var app: XCUIApplication!
     private var serverAddress = ""
     private var didLaunchApp = false
@@ -401,17 +405,48 @@ final class UIPlaybackTests: XCTestCase {
             "playing",
             "Playback started automatically before explicit Continue."
         )
-        XCTAssertTrue(
-            waitUntil(timeout: 75) {
-                status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
-                    && status(selectedStatus, contains: "Cached")
-                    && status(decoyStatus, contains: "Cached")
-                    && selectedPlay.exists && selectedPlay.isEnabled
-                    && decoyPlay.exists && decoyPlay.isEnabled
-            },
-            "The original task/result identity was not restored after relaunch. "
-                + accessibilityDescription(taskStatus)
-        )
+        let restoredResultsDeadline = Date().addingTimeInterval(75)
+        guard
+            waitUntil(
+                timeout: 75,
+                condition: {
+                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                })
+        else {
+            XCTFail("The cached task summary was not restored after relaunch. " + accessibilityDescription(taskStatus))
+            return
+        }
+        guard moveFocus(until: selectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline) else {
+            XCTFail(
+                "Remote navigation could not materialize and focus the exact selected result without activating it. "
+                    + taskWatchFocusDescription(target: selectedPlay)
+                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
+                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
+                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
+            )
+            return
+        }
+        guard
+            waitUntil(
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
+                condition: {
+                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                        && status(selectedStatus, contains: "Cached")
+                        && status(decoyStatus, contains: "Cached")
+                        && selectedPlay.exists && selectedPlay.isEnabled
+                        && decoyPlay.exists && decoyPlay.isEnabled
+                })
+        else {
+            XCTFail(
+                "The original task/result identity was not restored after relaunch. "
+                    + accessibilityDescription(taskStatus)
+                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
+                    + "; selectedPlay: \(taskWatchFocusDescription(target: selectedPlay))"
+                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
+                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
+            )
+            return
+        }
         RunLoop.current.run(until: Date().addingTimeInterval(2.2))
         XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
         XCTAssertNotEqual(playbackState.value as? String, "playing")
@@ -475,18 +510,14 @@ final class UIPlaybackTests: XCTestCase {
             focusDown(until: sourceField, limit: 80),
             "Remote focus could not reach the Bilibili source field. \(accessibilityDescription(sourceField))"
         )
-        remote.press(.select)
-        sourceField.typeText(source)
-        if app.keyboards.firstMatch.exists {
-            remote.press(.menu)
-        }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        try enterSource(source, in: sourceField)
 
         let submit = app.buttons["bilibili-submit"]
         XCTAssertTrue(
             focusDown(until: submit, limit: 80),
             "Remote focus could not reach the visible Bilibili submit control. \(accessibilityDescription(submit))"
         )
+        try requireSourceValue(source, in: sourceField, phase: "before enabling Submit")
         XCTAssertTrue(submit.isEnabled, "The single-result Bilibili input should be ready for one submission.")
     }
 
@@ -536,19 +567,77 @@ final class UIPlaybackTests: XCTestCase {
             focusDown(until: sourceField, limit: 80),
             "Remote focus could not reach the Bilibili source field. " + accessibilityDescription(sourceField)
         )
-        remote.press(.select)
-        sourceField.typeText("BV1xK4y1P7mN")
-        if app.keyboards.firstMatch.exists {
-            remote.press(.menu)
-        }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        let source = "BV1xK4y1P7mN"
+        try enterSource(source, in: sourceField)
 
         let submit = app.buttons["bilibili-submit"]
         XCTAssertTrue(
             focusDown(until: submit, limit: 80),
             "Remote focus could not reach the task submit control. " + accessibilityDescription(submit)
         )
+        try requireSourceValue(source, in: sourceField, phase: "before enabling Submit")
         XCTAssertTrue(submit.isEnabled)
+    }
+
+    private func enterSource(_ source: String, in field: XCUIElement) throws {
+        let remote = XCUIRemote.shared
+        remote.press(.select)
+        let keyboard = app.keyboards.firstMatch
+        guard waitUntil(timeout: 5, condition: { keyboard.exists }) else {
+            throw SourceInputError(
+                description: "Bilibili editing keyboard did not appear after selecting the source field. "
+                    + sourceInputDescription(field, expected: source)
+            )
+        }
+        field.typeText(source)
+        let valueWhileEditing = field.value as? String
+        if valueWhileEditing == source {
+            try requireSourceValue(source, in: field, phase: "while editing, before keyboard dismissal")
+        }
+
+        remote.press(.menu)
+        guard waitUntil(timeout: 10, condition: { !keyboard.exists }) else {
+            throw SourceInputError(
+                description: "Bilibili source keyboard did not dismiss. "
+                    + sourceInputDescription(
+                        field, expected: source, valueWhileEditing: valueWhileEditing
+                    )
+            )
+        }
+        try requireSourceValue(
+            source, in: field, phase: "after keyboard dismissal", valueWhileEditing: valueWhileEditing)
+    }
+
+    private func requireSourceValue(
+        _ expected: String,
+        in field: XCUIElement,
+        phase: String,
+        valueWhileEditing: String? = nil
+    ) throws {
+        guard field.value as? String == expected else {
+            throw SourceInputError(
+                description: "Bilibili source value mismatch \(phase). "
+                    + sourceInputDescription(
+                        field, expected: expected, valueWhileEditing: valueWhileEditing
+                    )
+            )
+        }
+    }
+
+    private func sourceInputDescription(
+        _ field: XCUIElement,
+        expected: String,
+        valueWhileEditing: String? = nil
+    ) -> String {
+        "expected=\(boundedTextDescription(expected)), actual=\(boundedTextDescription(field.value as? String)), "
+            + "valueWhileEditing=\(boundedTextDescription(valueWhileEditing)), "
+            + "fieldFocused=\(field.hasFocus), keyboardPresent=\(app.keyboards.firstMatch.exists)"
+    }
+
+    private func boundedTextDescription(_ value: String?) -> String {
+        guard let value else { return "<non-string>" }
+        let prefix = String(decoding: value.utf8.prefix(48), as: UTF8.self)
+        return "utf8Length=\(value.utf8.count), prefix=\(String(reflecting: prefix))"
     }
 
     private func pausedCheckpointBaseline(state: XCUIElement, timeline: XCUIElement) throws -> Double {
@@ -659,16 +748,25 @@ final class UIPlaybackTests: XCTestCase {
     private func moveFocus(
         until element: XCUIElement,
         direction: XCUIRemote.Button,
-        limit: Int
+        limit: Int,
+        deadline: Date? = nil
     ) -> Bool {
         for _ in 0..<limit {
-            if element.exists && element.hasFocus {
+            if let deadline, Date() >= deadline { return false }
+            let isFocused = element.exists && element.hasFocus
+            if let deadline, Date() >= deadline { return false }
+            if isFocused {
                 return true
             }
+            if let deadline, Date() >= deadline { return false }
             XCUIRemote.shared.press(direction)
-            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            let remaining = deadline?.timeIntervalSinceNow ?? 0.15
+            guard remaining > 0 else { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(min(0.15, remaining)))
         }
-        return element.exists && element.hasFocus
+        guard deadline.map({ Date() < $0 }) ?? true else { return false }
+        let isFocused = element.exists && element.hasFocus
+        return (deadline.map { Date() < $0 } ?? true) && isFocused
     }
 
     private func playbackTimeline() -> (current: Double, duration: Double)? {
