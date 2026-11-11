@@ -8332,6 +8332,38 @@ fn planned_range_chunks(total: u64) -> Vec<Range<u64>> {
     chunks
 }
 
+#[cfg(test)]
+pub(crate) fn planned_background_ranges_for_test(
+    total: u64,
+    requested: &[Range<u64>],
+) -> Result<Vec<Range<u64>>, String> {
+    if total == 0 {
+        return Err("background range total length was zero".to_owned());
+    }
+    if requested
+        .iter()
+        .any(|range| range.start >= range.end || range.end > total)
+    {
+        return Err("background range was empty, inverted, or beyond its resource".to_owned());
+    }
+
+    let chunks = planned_range_chunks(total);
+    let mut selected = vec![false; chunks.len()];
+    selected[0] = true;
+    for requested in requested {
+        for (index, chunk) in chunks.iter().enumerate() {
+            if chunk.start < requested.end && requested.start < chunk.end {
+                selected[index] = true;
+            }
+        }
+    }
+    Ok(chunks
+        .into_iter()
+        .zip(selected)
+        .filter_map(|(chunk, selected)| selected.then_some(chunk))
+        .collect())
+}
+
 fn range_size_is_resumable(total: u64) -> bool {
     total > 0 && total <= RANGE_MAX_SIZE
 }
@@ -12608,6 +12640,210 @@ mod tests {
         );
         assert!(!range_size_is_resumable(RANGE_MAX_SIZE + 1));
         assert!(!range_size_is_resumable(64 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn background_parent_planner_includes_startup_and_deduplicates_intersections() {
+        assert_eq!(
+            vec![0..524_288, 524_288..1_048_576, 1_048_576..1_300_000],
+            planned_background_ranges_for_test(
+                1_300_000,
+                &[700_000..710_000, 700_000..710_000, 1_200_000..1_250_000],
+            )
+            .unwrap()
+        );
+        let overflow = Range {
+            start: u64::MAX - 1,
+            end: u64::MAX,
+        };
+        assert!(planned_background_ranges_for_test(100, std::slice::from_ref(&overflow)).is_err());
+    }
+
+    type RecordedRangeUpstreamState = (Arc<Vec<u8>>, Arc<Mutex<Vec<Range<u64>>>>);
+
+    async fn upstream_recording_range(
+        State((body, requested_ranges)): State<RecordedRangeUpstreamState>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let Some(range_header) = headers
+            .get(reqwest::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+        else {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("bad range response should build");
+        };
+        let Some((start, inclusive_end)) = range_header.split_once('-') else {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("bad range response should build");
+        };
+        let (Ok(start), Ok(inclusive_end)) = (start.parse::<u64>(), inclusive_end.parse::<u64>())
+        else {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("bad range response should build");
+        };
+        let Some(end) = inclusive_end.checked_add(1) else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        if start >= end || end > body.len() as u64 {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        }
+        {
+            let mut requested_ranges = requested_ranges
+                .lock()
+                .expect("range request capture should not be poisoned");
+            if requested_ranges.len() >= 128 {
+                return Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .expect("request limit response should build");
+            }
+            requested_ranges.push(start..end);
+        }
+        let payload = body[start as usize..end as usize].to_vec();
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                format!("bytes {start}-{inclusive_end}/{}", body.len()),
+            )
+            .header(reqwest::header::CONTENT_LENGTH, payload.len())
+            .header(reqwest::header::ETAG, "\"local-range-v1\"")
+            .body(Body::from(payload))
+            .expect("partial range response should build")
+    }
+
+    #[tokio::test]
+    async fn background_intervention_plan_bounds_real_unaligned_fetches() {
+        const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024;
+        const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let total = 2 * 1024 * 1024_u64;
+        let body = Arc::new(
+            (0..total)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let captured_ranges = Arc::new(Mutex::new(Vec::<Range<u64>>::new()));
+        let app = Router::new()
+            .route("/video.m4s", get(upstream_recording_range))
+            .with_state((Arc::clone(&body), Arc::clone(&captured_ranges)));
+        let (url, server) = start_hls_cache_upstream(app).await;
+
+        let result = tokio::time::timeout(OPERATION_TIMEOUT, async {
+            let wanted = RANGE_STARTUP_CHUNK_BYTES + RANGE_MIN_CHUNK_BYTES + 17
+                ..RANGE_STARTUP_CHUNK_BYTES + RANGE_MIN_CHUNK_BYTES + 37;
+            let plan = planned_background_ranges_for_test(total, std::slice::from_ref(&wanted))
+                .map_err(|error| format!("background planner failed: {error}"))?;
+            let planned_bytes = plan
+                .iter()
+                .try_fold(0_u64, |sum, range| sum.checked_add(range.end - range.start))
+                .ok_or_else(|| "planned byte count overflowed".to_owned())?;
+            if plan.len() > 128 || planned_bytes > MAX_TRANSFER_BYTES {
+                return Err(format!(
+                    "plan exceeded bounds: {} spans, {planned_bytes} bytes",
+                    plan.len()
+                ));
+            }
+            let parent = logical_range_parent(total, wanted.start)
+                .ok_or_else(|| "unaligned request had no logical parent".to_owned())?;
+            if !plan.contains(&(0..RANGE_STARTUP_CHUNK_BYTES)) || !plan.contains(&parent) {
+                return Err("plan omitted startup or selected logical parent".to_owned());
+            }
+            if planned_bytes <= wanted.end - wanted.start {
+                return Err(
+                    "expanded transfer did not exceed the tiny logical selection".to_owned(),
+                );
+            }
+
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| format!("local HTTP client failed: {error}"))?;
+            let temp = TempDir::new().map_err(|error| format!("temp dir failed: {error}"))?;
+            let store = temp_store(&temp).with_range_budget(MAX_TRANSFER_BYTES);
+            let mut session = sample_session("background-unaligned-range", &url);
+            session.variant.video.request.size = Some(total);
+            let resource = session.variant.video.clone();
+            store
+                .save_session(&session)
+                .map_err(|error| format!("session save failed: {error}"))?;
+
+            for span in &plan {
+                store
+                    .ensure_resource_range(
+                        &client,
+                        &session.id,
+                        &resource,
+                        span.clone(),
+                        HlsRangePriority::Background,
+                        &|| HlsCacheFillControl::Continue,
+                    )
+                    .await
+                    .map_err(|error| format!("background range {span:?} failed: {error}"))?;
+            }
+
+            let actual_ranges = captured_ranges
+                .lock()
+                .map_err(|_| "range request capture was poisoned".to_owned())?
+                .clone();
+            if actual_ranges.is_empty() || actual_ranges.len() > 128 {
+                return Err(format!(
+                    "unexpected actual GET count: {}",
+                    actual_ranges.len()
+                ));
+            }
+            let actual_bytes = actual_ranges
+                .iter()
+                .try_fold(0_u64, |sum, range| sum.checked_add(range.end - range.start))
+                .ok_or_else(|| "actual range byte count overflowed".to_owned())?;
+            if actual_bytes > planned_bytes {
+                return Err(format!(
+                    "actual Range GET bytes {actual_bytes} exceeded planned {planned_bytes}"
+                ));
+            }
+            if actual_ranges.iter().any(|actual| {
+                !plan
+                    .iter()
+                    .any(|planned| planned.start <= actual.start && actual.end <= planned.end)
+            }) {
+                return Err("actual Range GET escaped the expanded plan".to_owned());
+            }
+            let cached = store
+                .read_resource_range(&session.id, &resource, wanted.clone())
+                .await
+                .map_err(|error| format!("cached range read failed: {error}"))?
+                .ok_or_else(|| "selected range was not readable from cache".to_owned())?;
+            if cached != body[wanted.start as usize..wanted.end as usize] {
+                return Err("selected cached bytes differed from the known resource".to_owned());
+            }
+
+            Ok::<_, String>((plan, actual_ranges, actual_bytes, planned_bytes, wanted))
+        })
+        .await
+        .map_err(|_| "background range operation exceeded 10 seconds".to_owned())
+        .and_then(|result| result);
+
+        server.abort();
+        let _ = server.await;
+        let (plan, actual_ranges, actual_bytes, planned_bytes, wanted) =
+            result.expect("bounded real local HTTP background range regression should pass");
+        assert!(planned_bytes > wanted.end - wanted.start);
+        assert!(actual_bytes <= planned_bytes);
+        assert!(!plan.is_empty());
+        assert!(!actual_ranges.is_empty());
     }
 
     #[test]

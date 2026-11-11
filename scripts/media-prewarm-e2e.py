@@ -8,6 +8,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -27,6 +28,10 @@ COMMAND_LOG_BYTES = 8 * 1024 * 1024
 ARTIFACT_BYTES = 32 * 1024 * 1024
 REPORT_BYTES = 64 * 1024
 PREWARM_BYTES = 8 * 1024 * 1024
+PREWARM_TRANSFER_BYTES = 16 * 1024 * 1024
+MAX_PREWARM_RANGES = 128
+MAX_RESOURCE_ID_LENGTH = 256
+U64_MAX = 2**64 - 1
 WINDOW_MAX_SECONDS = 22.0
 TESTS = {
     "off": "media_prewarm_comparison_tests::native_single_player_prewarm_control",
@@ -163,10 +168,61 @@ def _diagnostic_window(probe: dict[str, Any], report_name: str) -> dict[str, Any
             "decoded_frame_continuity": continuity}
 
 
+def _range_list(value: Any, resource_ids: set[str], name: str, report_name: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_PREWARM_RANGES:
+        raise PrewarmError(f"{name} must contain 1-128 canonical ranges: {report_name}")
+    ranges: list[dict[str, Any]] = []
+    previous: tuple[str, int, int] | None = None
+    for item in value:
+        if (not isinstance(item, dict) or set(item) != {"resource_id", "start", "end"}
+                or not isinstance(item.get("resource_id"), str)
+                or not item["resource_id"] or len(item["resource_id"]) > MAX_RESOURCE_ID_LENGTH
+                or item["resource_id"].strip() != item["resource_id"]
+                or item["resource_id"] not in resource_ids
+                or not _exact_int(item.get("start")) or not _exact_int(item.get("end"))
+                or item["start"] < 0 or item["end"] > U64_MAX or item["end"] <= item["start"]):
+            raise PrewarmError(f"{name} contains an invalid range: {report_name}")
+        current = (item["resource_id"], item["start"], item["end"])
+        if previous is not None:
+            if current < previous or (current[0] == previous[0] and current[1] < previous[2]):
+                raise PrewarmError(f"{name} is overlapping or not canonically ordered: {report_name}")
+        previous = current
+        ranges.append(item)
+    return ranges
+
+
+def _range_bytes(ranges: list[dict[str, Any]], name: str, report_name: str) -> int:
+    total = 0
+    for item in ranges:
+        total += item["end"] - item["start"]
+        if total > U64_MAX:
+            raise PrewarmError(f"{name} byte sum overflows u64: {report_name}")
+    return total
+
+
+def _selected_ranges_covered(selected: list[dict[str, Any]], transfer: list[dict[str, Any]]) -> bool:
+    by_resource: dict[str, list[dict[str, Any]]] = {}
+    for item in transfer:
+        by_resource.setdefault(item["resource_id"], []).append(item)
+    for wanted in selected:
+        cursor = wanted["start"]
+        for item in by_resource.get(wanted["resource_id"], []):
+            if item["end"] <= cursor:
+                continue
+            if item["start"] > cursor:
+                break
+            cursor = item["end"]
+            if cursor >= wanted["end"]:
+                break
+        if cursor < wanted["end"]:
+            return False
+    return True
+
+
 def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> dict[str, Any]:
     value = report.get("prewarm_comparison")
     expected_mode = "off" if mode == "off" else "on"
-    if (not isinstance(value, dict) or not _exact_int(value.get("schema_version"), 1)
+    if (not isinstance(value, dict) or not _exact_int(value.get("schema_version"), 2)
             or value.get("mode") != expected_mode
             or value.get("boundary_policy") != "unbuffered_after_20s_safety"):
         raise PrewarmError(f"Prewarm comparison identity is invalid: {report_name}")
@@ -184,18 +240,42 @@ def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> di
             or end - start > WINDOW_MAX_SECONDS):
         raise PrewarmError(f"Target window violates the unbuffered 20-second safety boundary: {report_name}")
     budget, planned = value.get("byte_budget"), value.get("planned_bytes")
+    transfer_budget, planned_transfer = value.get("transfer_byte_budget"), value.get("planned_transfer_bytes")
     requested, operations = value.get("operation_requested_bytes"), value.get("operation_count")
     elapsed = value.get("elapsed_seconds")
     provenance = value.get("provenance")
+    id_map = value.get("resource_ids")
+    if (not isinstance(id_map, dict) or set(id_map) != {"video", "audio"}
+            or any(not isinstance(item, str) or not item or len(item) > MAX_RESOURCE_ID_LENGTH
+                   or item.strip() != item for item in id_map.values())
+            or id_map["video"] == id_map["audio"]):
+        raise PrewarmError(f"Prewarm resource identities are invalid: {report_name}")
+    ids = set(id_map.values())
+    selected = _range_list(value.get("selected_ranges"), ids, "selected_ranges", report_name)
+    transfer = _range_list(value.get("transfer_plan"), ids, "transfer_plan", report_name)
+    selected_sum = _range_bytes(selected, "selected_ranges", report_name)
+    transfer_sum = _range_bytes(transfer, "transfer_plan", report_name)
     if (not _exact_int(budget, PREWARM_BYTES) or not _exact_int(planned) or planned <= 0 or planned > budget
+            or planned != selected_sum
+            or not _exact_int(transfer_budget, PREWARM_TRANSFER_BYTES)
+            or not _exact_int(planned_transfer) or planned_transfer <= 0 or planned_transfer > transfer_budget
+            or planned_transfer != transfer_sum
+            or not _selected_ranges_covered(selected, transfer)
+            or any(not any(r["resource_id"] == resource_id and r["start"] == 0 for r in transfer)
+                   for resource_id in ids)
+            or value.get("coverage_semantics") != "sum_of_fully_readable_selected_ranges"
             or not _exact_int(requested) or not _exact_int(operations) or not _finite(elapsed)
             or elapsed < 0 or elapsed > 15 or value.get("completed") is not True
             or not isinstance(provenance, dict)
-            or provenance.get("origin_counters_include_playback_and_prewarm") is not True):
+            or provenance.get("origin_counters_include_playback_and_prewarm") is not True
+            or provenance.get("transfer_accounting") != "planned_background_parent_chunks_and_startup_not_wire_bytes"
+            or provenance.get("expanded_transfer_may_overlap_buffered_media") is not True
+            or any(key in value for key in ("source_url", "url", "credentials", "headers", "cookies"))):
         raise PrewarmError(f"Prewarm bounds, completion, or provenance are invalid: {report_name}")
     if mode == "off" and (requested != 0 or operations != 0):
         raise PrewarmError("Control report claims prewarm operations.")
-    if mode == "on" and (requested != planned or requested > budget or operations <= 0):
+    if mode == "on" and (requested != planned_transfer or requested > transfer_budget
+                          or operations != len(transfer)):
         raise PrewarmError("Treatment report lacks bounded prewarm operations.")
     coverage = value.get("cache_covered_bytes_before"), value.get("cache_covered_bytes_after")
     if any(not _exact_int(item) or item < 0 or item > planned for item in coverage):
@@ -217,7 +297,9 @@ def validate_report(path: Path, mode: str) -> dict[str, Any]:
             or report.get("source_duration_seconds") != 3600):
         raise PrewarmError(f"Prewarm report identity/status is invalid: {path.name}")
     probe = report.get("probe")
-    if not isinstance(probe, dict) or not _exact_int(probe.get("schema_version"), 1) or probe.get("status") != "completed":
+    if (not isinstance(probe, dict) or not _exact_int(probe.get("schema_version"), 1)
+            or probe.get("status") != "completed"
+            or probe.get("diagnostic_optional_recovery_high") is not True):
         raise PrewarmError(f"Probe report is not completed: {path.name}")
     if (probe.get("requested_duration_seconds") != 600 or probe.get("overall_deadline_seconds") != 720
             or probe.get("deadline_mode") != "cooperative" or probe.get("audio_track_present") is not True
@@ -262,6 +344,8 @@ def validate_report(path: Path, mode: str) -> dict[str, Any]:
             phases.append([s["observed_monotonic_seconds"] for s in valid_samples])
         else:
             optional = entry.get("diagnostic_optional_recovery_high") is True
+            if not optional:
+                raise PrewarmError(f"Optional recovery entry flag is missing: {path.name}")
             if entry.get("matched") is not True:
                 if not optional or valid_samples:
                     raise PrewarmError(f"Missing recovery high is not explicitly censored: {path.name}")
@@ -422,11 +506,65 @@ def _comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
                                 "large_gap_count": [case["continuity"]["large_gap_count"] for case in (off, on)],
                                 "clock_anomaly_count": [case["continuity"]["observation_clock_anomaly_count"] for case in (off, on)],
                                 "timeline_waiting_sample_count": waiting_samples},
-        "prewarm_readiness": {"control_completed": off["prewarm"]["completed"],
-                              "treatment_completed": on["prewarm"]["completed"],
-                              "treatment_covered_bytes": on["prewarm"]["cache_covered_bytes_after"]},
+        "prewarm_readiness": {
+            "coverage_semantics": "sum_of_fully_readable_selected_ranges",
+            "transfer_accounting": "planned_background_parent_chunks_and_startup_not_wire_bytes",
+            "expanded_transfer_may_overlap_buffered_media": True,
+            "control": {"planned_logical_selected_bytes": off["prewarm"]["planned_bytes"],
+                        "planned_expanded_transfer_bytes": off["prewarm"]["planned_transfer_bytes"],
+                        "operation_count": off["prewarm"]["operation_count"]},
+            "treatment": {"planned_logical_selected_bytes": on["prewarm"]["planned_bytes"],
+                          "planned_expanded_transfer_bytes": on["prewarm"]["planned_transfer_bytes"],
+                          "operation_count": on["prewarm"]["operation_count"],
+                          "covered_logical_selected_bytes": on["prewarm"]["cache_covered_bytes_after"]}},
         "acceptance_passed": False,
     }
+
+
+def validate_single_case_log(path: Path, case_name: str, *, returncode: int = 0,
+                             timed_out: bool = False) -> None:
+    if timed_out:
+        raise PrewarmError("Single-case Rust test process timed out.")
+    if returncode != 0:
+        raise PrewarmError(f"Single-case Rust test process exited {returncode}.")
+    try:
+        with path.open("rb") as log:
+            raw = log.read(COMMAND_LOG_BYTES + 1)
+        if len(raw) > COMMAND_LOG_BYTES:
+            raise PrewarmError("Single-case Rust test log exceeds its output bound.")
+        lines = raw.decode("utf-8").splitlines()
+    except PrewarmError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise PrewarmError("Single-case Rust test log is missing or invalid.") from error
+    seen = 0
+    pending = False
+    summaries: list[int] = []
+    summary = re.compile(
+        r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+        r"\d+ filtered out(?:; finished in \d+(?:\.\d+)?s)?")
+    for index, line in enumerate(lines):
+        if line.startswith("test result:"):
+            if pending or summary.fullmatch(line) is None:
+                raise PrewarmError("Single-case Rust log contains a malformed or premature summary.")
+            summaries.append(index)
+        elif line.startswith("test "):
+            match = re.fullmatch(r"test (.+) \.\.\.(?: (.*))?", line)
+            if pending or match is None or match.group(1) != case_name or seen:
+                raise PrewarmError("Single-case Rust log has a duplicate, unexpected, or malformed case.")
+            seen += 1
+            status = match.group(2)
+            if status is None:
+                pending = True
+            elif status != "ok":
+                raise PrewarmError("Single-case Rust test did not pass.")
+        elif line in {"ok", "FAILED", "ignored", "bench"}:
+            if line != "ok" or not pending:
+                raise PrewarmError("Single-case Rust log contains an orphan or non-passing status.")
+            pending = False
+    if (pending or seen != 1 or len(summaries) != 1
+            or any(line.strip() for line in lines[summaries[0] + 1:])):
+        raise PrewarmError("Single-case Rust log lacks one passing case and a terminal summary.")
 
 
 def _run_command(argv: list[str], *, log: Path, env: dict[str, str], deadline: float,
@@ -495,6 +633,7 @@ def run(artifact_arg: str | None = None, local_config_arg: str | None = None) ->
                     _run_command(build_test_argv(binary, mode), log=logs / f"{mode}-test.log", env=case_env,
                                  deadline=runtime_deadline, artifact_dir=artifacts,
                                  timeout=min(CASE_BUDGET_SECONDS, remaining))
+                    validate_single_case_log(logs / f"{mode}-test.log", TESTS[mode])
                     case = validate_report(rust / CASES[mode]["report"], mode)
                     controls[mode] = case
                 comparison = _comparison(controls["off"], controls["on"])

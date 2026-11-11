@@ -43,19 +43,29 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
             "buffered_ahead_seconds": 9, "decoded_width": 640, "decoded_height": 360,
             "time_control_status": "playing", "indicated_bitrate": 1000000})
     prewarm_contract = {
-        "schema_version": 1, "mode": "off" if mode == "off" else "on",
+        "schema_version": 2, "mode": "off" if mode == "off" else "on",
         "boundary_policy": "unbuffered_after_20s_safety",
         "recovery_snapshot": {"schema_version": 1, "observed_monotonic_seconds": 135,
                               "playhead_seconds": 100, "loaded_end_seconds": 110},
         "target_window_start_seconds": 130, "target_window_end_seconds": 150,
         "byte_budget": prewarm.PREWARM_BYTES, "planned_bytes": 1000,
-        "operation_requested_bytes": 0 if mode == "off" else 1000,
-        "operation_count": 0 if mode == "off" else 2,
+        "transfer_byte_budget": prewarm.PREWARM_TRANSFER_BYTES, "planned_transfer_bytes": 1250,
+        "resource_ids": {"video": "video-id", "audio": "audio-id"},
+        "selected_ranges": [{"resource_id": "audio-id", "start": 50, "end": 250},
+                            {"resource_id": "video-id", "start": 100, "end": 900}],
+        "transfer_plan": [{"resource_id": "audio-id", "start": 0, "end": 250},
+                          {"resource_id": "video-id", "start": 0, "end": 500},
+                          {"resource_id": "video-id", "start": 500, "end": 1000}],
+        "coverage_semantics": "sum_of_fully_readable_selected_ranges",
+        "operation_requested_bytes": 0 if mode == "off" else 1250,
+        "operation_count": 0 if mode == "off" else 3,
         "elapsed_seconds": 0 if mode == "off" else 1.5,
         "cache_covered_bytes_before": 0,
         "cache_covered_bytes_after": 0 if mode == "off" else 1000,
         "completed": True,
-        "provenance": {"origin_counters_include_playback_and_prewarm": True},
+        "provenance": {"origin_counters_include_playback_and_prewarm": True,
+                        "transfer_accounting": "planned_background_parent_chunks_and_startup_not_wire_bytes",
+                        "expanded_transfer_may_overlap_buffered_media": True},
     }
     return {
         "schema_version": 1, "status": "passed", "case_full_name": case,
@@ -79,6 +89,7 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
                        **({"elapsed_seconds": 600} if name == "play" else {})} for name in (
                 "play", "pause", "resume", "seek_forward", "seek_forward_play", "seek_back",
                 "seek_back_play", "rate_1_25", "duration_remainder")],
+            "diagnostic_optional_recovery_high": True,
             "video_size_expectations": {"enabled": True, "complete": recovered,
                 "semantics": "ordered_decoded_size_subsequence",
                 "minimum_distinct_display_timestamps_per_size": 3, "entries": entries},
@@ -182,6 +193,105 @@ class PrewarmRunnerTests(unittest.TestCase):
         self.assertIsNotNone(comparison["recovery_high"]["raw_observed_latency_delta_seconds"])
         self.assertFalse(comparison["acceptance_passed"])
         self.assertIn("not_origin_prewarm", comparison["client_high_request_count"]["source"])
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_logical_selected_bytes"], 1000)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_expanded_transfer_bytes"], 1250)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["operation_count"], 3)
+
+    def test_schema_two_accepts_selection_spanning_adjacent_parent_chunks(self) -> None:
+        report = make_report("on")
+        comparison = report["prewarm_comparison"]
+        self.assertEqual(comparison["selected_ranges"][1]["start"], 100)
+        self.assertEqual(comparison["transfer_plan"][1]["end"], comparison["transfer_plan"][2]["start"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "treatment.json"
+            path.write_text(json.dumps(report))
+            validated = prewarm.validate_report(path, "on")
+        self.assertEqual(validated["prewarm"]["planned_bytes"], 1000)
+        self.assertEqual(validated["prewarm"]["planned_transfer_bytes"], 1250)
+
+    def test_schema_one_selected_only_reports_are_refused(self) -> None:
+        report = make_report("on")
+        report["prewarm_comparison"]["schema_version"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.json"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+    def test_transfer_plan_contract_rejects_malformed_or_underaccounted_plans(self) -> None:
+        mutations = [
+            lambda c: c.update(planned_transfer_bytes=prewarm.PREWARM_TRANSFER_BYTES + 1),
+            lambda c: c.update(transfer_byte_budget=prewarm.PREWARM_TRANSFER_BYTES + 1),
+            lambda c: c.update(planned_transfer_bytes=369),
+            lambda c: c.update(operation_requested_bytes=1000),
+            lambda c: c.update(operation_count=2),
+            lambda c: c.update(transfer_plan=[c["selected_ranges"][0], c["selected_ranges"][1]]),
+            lambda c: c.update(transfer_plan=[{"resource_id": "unknown", "start": 0, "end": 500},
+                                               c["transfer_plan"][0], c["transfer_plan"][1]]),
+            lambda c: c.update(transfer_plan=[{"resource_id": "audio-id", "start": 0, "end": 120},
+                                               {"resource_id": "video-id", "start": 0, "end": 200},
+                                               {"resource_id": "video-id", "start": 150, "end": 250}]),
+            lambda c: c.update(transfer_plan=[{"resource_id": "audio-id", "start": 0, "end": 120},
+                                               {"resource_id": "video-id", "start": 150, "end": 250},
+                                               {"resource_id": "video-id", "start": 0, "end": 150}]),
+            lambda c: c.update(selected_ranges=[{"resource_id": "audio-id", "start": 5, "end": 4},
+                                                c["selected_ranges"][1]]),
+            lambda c: c.update(selected_ranges=[{"resource_id": "audio-id", "start": 0,
+                                                 "end": prewarm.U64_MAX},
+                                                {"resource_id": "video-id", "start": 0,
+                                                 "end": prewarm.U64_MAX}]),
+            lambda c: c.update(transfer_plan=[{"resource_id": "audio-id", "start": 0, "end": 120},
+                                               {"resource_id": "video-id", "start": 0, "end": 150},
+                                               {"resource_id": "video-id", "start": 150, "end": prewarm.U64_MAX}]),
+            lambda c: c.update(coverage_semantics="wire_download_bytes"),
+            lambda c: c.update(resource_ids={"video": "same", "audio": "same"}),
+            lambda c: c.update(source_url="https://private.invalid/media"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            for mutation in mutations:
+                report = make_report("on")
+                mutation(report["prewarm_comparison"])
+                path.write_text(json.dumps(report))
+                with self.subTest(mutation=mutation), self.assertRaises(prewarm.PrewarmError):
+                    prewarm.validate_report(path, "on")
+
+    def test_control_keeps_zero_intervention_and_full_transfer_plan(self) -> None:
+        report = make_report("off")
+        contract = report["prewarm_comparison"]
+        self.assertEqual(contract["operation_requested_bytes"], 0)
+        self.assertEqual(contract["operation_count"], 0)
+        self.assertEqual(contract["planned_transfer_bytes"], 1250)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.json"
+            path.write_text(json.dumps(report))
+            validated = prewarm.validate_report(path, "off")
+        self.assertEqual(len(validated["prewarm"]["transfer_plan"]), 3)
+
+    def test_single_case_log_requires_exact_case_and_terminal_one_pass_summary(self) -> None:
+        case = prewarm.TESTS["on"]
+        valid = ("running 1 test\nnoise from --nocapture\n"
+                 f"test {case} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; "
+                 "0 measured; 7 filtered out; finished in 1.25s\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "case.log"
+            path.write_text(valid)
+            prewarm.validate_single_case_log(path, case)
+            invalid_logs = [
+                valid.replace("1 passed", "0 passed"),
+                valid.replace(f"test {case} ... ok\n", ""),
+                valid.replace(f"test {case} ... ok\n", f"test {case} ... ok\ntest {case} ... ok\n"),
+                valid.replace(f"test {case} ... ok\n", f"test {case} ... ok\ntest other::case ... ok\n"),
+                valid.replace(case, "unexpected::case"),
+                valid + "late output\n",
+            ]
+            for content in invalid_logs:
+                path.write_text(content)
+                with self.subTest(content=content), self.assertRaises(prewarm.PrewarmError):
+                    prewarm.validate_single_case_log(path, case)
+            path.write_text(valid)
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_single_case_log(path, case, returncode=1)
 
     def test_missing_recovery_is_censored_not_zero(self) -> None:
         off, on = make_report("off", recovered=False), make_report("on")
@@ -234,6 +344,12 @@ class PrewarmRunnerTests(unittest.TestCase):
                 prewarm.validate_report(path, "off")
             entry["diagnostic_optional_recovery_high"] = True
             entry["samples"] = [sample(1, 1, 140)]
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "off")
+
+            report = make_report("off", recovered=False)
+            report["probe"]["diagnostic_optional_recovery_high"] = False
             path.write_text(json.dumps(report))
             with self.assertRaises(prewarm.PrewarmError):
                 prewarm.validate_report(path, "off")

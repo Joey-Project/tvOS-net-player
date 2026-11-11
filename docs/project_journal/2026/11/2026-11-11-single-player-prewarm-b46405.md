@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-11
 updated: 2026-11-11
 branch: codex/single-player-prewarm-diagnostic
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/98
 supersedes: []
 superseded_by:
 ---
@@ -21,7 +21,8 @@ superseded_by:
 ## Validation Slice
 - Add an explicitly selected, credential-free comparison of prewarm disabled/enabled with matched synthetic media, origin impairment/recovery and fresh per-run player/cache state. Keep the existing strict three-case native gate independent and unchanged.
 - Prepare only the target higher rendition, including initialization/video/separate-audio data. Record actual preparation coverage and completion; a request, response header or throughput estimate alone is not cache readiness.
-- Publish a bounded passive position/buffer snapshot at the actual recovery trigger in both modes. Select full fragments beyond the greater of the continuous loaded boundary and playhead plus twenty seconds. Keep preparation to twenty seconds of media, eight MiB of planned ranges and a fifteen-second operation deadline; do not delay the recovery clock until preparation completes.
+- Publish a bounded passive position/buffer snapshot at the actual recovery trigger in both modes. Select full fragments beyond the greater of the continuous loaded boundary and playhead plus twenty seconds. Keep the logical selection to twenty seconds of media and eight MiB. Before execution, derive the real Background parent-chunk/startup plan from the cache planner, deduplicate it and enforce a separate sixteen-MiB transfer-plan bound and fifteen-second operation deadline. Do not delay the recovery clock until preparation completes.
+- Background alignment may fetch bytes adjacent to the logical window or already buffered media. Report those expanded spans separately before executing them; they only populate the cache and do not replace client buffers. Selected readable-range coverage, requested expanded spans and actual wire traffic are different quantities. A test-only planner exposure does not change production cache behavior or priority.
 - Keep shared origin counters explicitly aggregate: proactive fetches can overlap ordinary playback. Use separate LAN ingress and decoded-frame evidence for actual client demand and display recovery, rather than resetting or relabelling origin events.
 - Distinguish proactive server origin requests from player demand. Never label a prewarm GET as the player's first high-rendition request or use it as evidence of decoded upshift.
 - Measure recovery to an observed decoded high frame, actual observed rendition sequence, playback timeline/stall observations and bounded decoded-frame observation gaps. Report unavailable observations and recovery not seen within the bound explicitly; do not convert missing evidence into zero latency or successful optimization.
@@ -44,6 +45,7 @@ superseded_by:
 - If preparation alone is insufficient, discuss a separate delivery-policy experiment. Buffer caps, forced item replacement, changed published media and dual players remain outside this decision.
 
 ## Evidence
+- [Single-player prewarm comparison PR #98](https://github.com/Joey-Project/tvOS-net-player/pull/98).
 - [Owned assessment PR #97](https://github.com/Joey-Project/tvOS-net-player/pull/97).
 - [Native recovery-latency workstream](2026-11-10-native-abr-latency-b46399.md).
 - Source thread: `019e7fd0-b463-76f2-a5ab-37d7d77620f4`.

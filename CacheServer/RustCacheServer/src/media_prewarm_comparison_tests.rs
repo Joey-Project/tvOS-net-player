@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::mp4_segments::Mp4SegmentRange;
 
 pub(super) const PREWARM_BYTE_BUDGET: u64 = 8 * 1024 * 1024;
+pub(super) const PREWARM_TRANSFER_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
+const PREWARM_TRANSFER_RANGE_LIMIT: usize = 128;
 const SAFETY_SECONDS: f64 = 20.0;
 const WINDOW_SECONDS: f64 = 20.0;
 const SNAPSHOT_MAX_BYTES: u64 = 4096;
@@ -75,6 +77,17 @@ pub(super) struct PrewarmPlan {
     pub end_seconds: f64,
     pub planned_bytes: u64,
     pub ranges: Vec<SelectedRange>,
+    pub resource_ids: PrewarmResourceIds,
+    pub transfer_ranges: Vec<SelectedRange>,
+    pub planned_transfer_bytes: u64,
+    pub video_total_length: u64,
+    pub audio_total_length: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct PrewarmResourceIds {
+    pub video: String,
+    pub audio: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,12 +100,17 @@ pub(super) struct PrewarmComparisonReport {
     pub target_window_end_seconds: f64,
     pub byte_budget: u64,
     pub planned_bytes: u64,
+    pub transfer_byte_budget: u64,
+    pub planned_transfer_bytes: u64,
     pub operation_requested_bytes: u64,
     pub operation_count: u64,
     pub elapsed_seconds: f64,
+    pub coverage_semantics: &'static str,
     pub cache_covered_bytes_before: u64,
     pub cache_covered_bytes_after: u64,
     pub selected_ranges: Vec<SelectedRange>,
+    pub transfer_plan: Vec<SelectedRange>,
+    pub resource_ids: PrewarmResourceIds,
     pub completed: bool,
     pub provenance: PrewarmProvenance,
 }
@@ -100,11 +118,14 @@ pub(super) struct PrewarmComparisonReport {
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct PrewarmProvenance {
     pub origin_counters_include_playback_and_prewarm: bool,
+    pub transfer_accounting: &'static str,
+    pub expanded_transfer_may_overlap_buffered_media: bool,
 }
 
 pub(super) struct PrewarmTrackInput<'a> {
     pub track_index: usize,
     pub resource_id: &'a str,
+    pub actual_total_length: u64,
     pub initialization_bytes: u64,
     pub fragments: &'a [Mp4SegmentRange],
 }
@@ -198,14 +219,42 @@ pub(super) fn plan_window(
     }
 
     let mut ranges = Vec::new();
+    let mut transfer_ranges = Vec::new();
+    let mut resource_ids = PrewarmResourceIds {
+        video: String::new(),
+        audio: String::new(),
+    };
     let mut selected_video_fragments = 0_u64;
     let mut selected_audio_fragments = 0_u64;
+    let mut video_total_length = 0_u64;
+    let mut audio_total_length = 0_u64;
     for track in tracks {
-        if track.initialization_bytes == 0 || track.fragments.is_empty() {
+        if track.initialization_bytes == 0
+            || track.actual_total_length == 0
+            || track.initialization_bytes > track.actual_total_length
+            || track.fragments.is_empty()
+        {
             return Err("prewarm resource lacked initialization or media fragments".to_owned());
         }
+        let resource_id = track.resource_id.to_owned();
+        let resource_id_slot = if track.track_index == 0 {
+            &mut resource_ids.video
+        } else if track.track_index == 1 {
+            &mut resource_ids.audio
+        } else {
+            return Err("prewarm resource had an unknown track index".to_owned());
+        };
+        if !resource_id_slot.is_empty() || resource_id.is_empty() {
+            return Err("prewarm resource identifiers were empty or duplicated".to_owned());
+        }
+        *resource_id_slot = resource_id.clone();
+        if track.track_index == 0 {
+            video_total_length = track.actual_total_length;
+        } else {
+            audio_total_length = track.actual_total_length;
+        }
         ranges.push(SelectedRange {
-            resource_id: track.resource_id.to_owned(),
+            resource_id: resource_id.clone(),
             start: 0,
             end: track.initialization_bytes,
         });
@@ -225,8 +274,11 @@ pub(super) fn plan_window(
                 if fragment.length == 0 {
                     return Err("selected media fragment had an empty range".to_owned());
                 }
+                if byte_end > track.actual_total_length {
+                    return Err("selected media fragment exceeded its resource length".to_owned());
+                }
                 ranges.push(SelectedRange {
-                    resource_id: track.resource_id.to_owned(),
+                    resource_id: resource_id.clone(),
                     start: fragment.offset,
                     end: byte_end,
                 });
@@ -245,9 +297,38 @@ pub(super) fn plan_window(
             }
             elapsed_millis = next_millis;
         }
+        let requested = ranges
+            .iter()
+            .filter(|range| range.resource_id == resource_id)
+            .map(|range| range.start..range.end)
+            .collect::<Vec<_>>();
+        let parents = crate::hls_cache::planned_background_ranges_for_test(
+            track.actual_total_length,
+            &requested,
+        )?;
+        transfer_ranges.extend(parents.into_iter().map(|range| SelectedRange {
+            resource_id: resource_id.clone(),
+            start: range.start,
+            end: range.end,
+        }));
     }
     if selected_video_fragments == 0 || selected_audio_fragments == 0 {
         return Err("prewarm window lacked high video or shared audio media fragments".to_owned());
+    }
+    if resource_ids.video == resource_ids.audio {
+        return Err("prewarm video and audio resource identifiers were not distinct".to_owned());
+    }
+    ranges.sort_by(|left, right| {
+        (&left.resource_id, left.start, left.end).cmp(&(&right.resource_id, right.start, right.end))
+    });
+    if ranges
+        .windows(2)
+        .any(|pair| pair[0].resource_id == pair[1].resource_id && pair[0].end > pair[1].start)
+    {
+        return Err("selected prewarm ranges overlapped or were not canonical".to_owned());
+    }
+    if ranges.len() > PREWARM_TRANSFER_RANGE_LIMIT {
+        return Err("selected prewarm plan exceeded the 128-range limit".to_owned());
     }
     let planned_bytes = ranges.iter().try_fold(0_u64, |total, range| {
         total
@@ -257,11 +338,53 @@ pub(super) fn plan_window(
     if planned_bytes > PREWARM_BYTE_BUDGET {
         return Err("selected prewarm ranges exceeded the 8 MiB combined budget".to_owned());
     }
+    transfer_ranges.sort_by(|left, right| {
+        (&left.resource_id, left.start, left.end).cmp(&(&right.resource_id, right.start, right.end))
+    });
+    let mut canonical_transfer_ranges: Vec<SelectedRange> =
+        Vec::with_capacity(transfer_ranges.len());
+    for range in transfer_ranges {
+        if let Some(previous) = canonical_transfer_ranges.last_mut()
+            && previous.resource_id == range.resource_id
+            && previous.end == range.start
+        {
+            previous.end = range.end;
+        } else {
+            canonical_transfer_ranges.push(range);
+        }
+    }
+    let transfer_ranges = canonical_transfer_ranges;
+    if transfer_ranges.len() > PREWARM_TRANSFER_RANGE_LIMIT {
+        return Err("expanded prewarm plan exceeded the 128-range limit".to_owned());
+    }
+    let planned_transfer_bytes = transfer_ranges.iter().try_fold(0_u64, |total, range| {
+        total
+            .checked_add(range.byte_len()?)
+            .ok_or_else(|| "expanded prewarm byte count overflowed".to_owned())
+    })?;
+    if planned_transfer_bytes > PREWARM_TRANSFER_BYTE_BUDGET {
+        return Err("expanded prewarm ranges exceeded the 16 MiB transfer budget".to_owned());
+    }
+    for selected in &ranges {
+        let contained = transfer_ranges.iter().any(|transfer| {
+            transfer.resource_id == selected.resource_id
+                && transfer.start <= selected.start
+                && selected.end <= transfer.end
+        });
+        if !contained {
+            return Err("expanded prewarm plan did not contain every selected range".to_owned());
+        }
+    }
     Ok(PrewarmPlan {
         start_seconds,
         end_seconds,
         planned_bytes,
         ranges,
+        resource_ids,
+        transfer_ranges,
+        planned_transfer_bytes,
+        video_total_length,
+        audio_total_length,
     })
 }
 
@@ -272,7 +395,7 @@ pub(super) fn report_for(
     execution: PrewarmExecution,
 ) -> PrewarmComparisonReport {
     PrewarmComparisonReport {
-        schema_version: 1,
+        schema_version: 2,
         mode: mode.label(),
         boundary_policy: "unbuffered_after_20s_safety",
         recovery_snapshot: snapshot,
@@ -280,15 +403,22 @@ pub(super) fn report_for(
         target_window_end_seconds: plan.end_seconds,
         byte_budget: PREWARM_BYTE_BUDGET,
         planned_bytes: plan.planned_bytes,
+        transfer_byte_budget: PREWARM_TRANSFER_BYTE_BUDGET,
+        planned_transfer_bytes: plan.planned_transfer_bytes,
         operation_requested_bytes: execution.requested_bytes,
         operation_count: execution.operation_count,
         elapsed_seconds: execution.elapsed_seconds,
+        coverage_semantics: "sum_of_fully_readable_selected_ranges",
         cache_covered_bytes_before: execution.coverage_before,
         cache_covered_bytes_after: execution.coverage_after,
         selected_ranges: plan.ranges,
+        transfer_plan: plan.transfer_ranges,
+        resource_ids: plan.resource_ids,
         completed: execution.completed,
         provenance: PrewarmProvenance {
             origin_counters_include_playback_and_prewarm: true,
+            transfer_accounting: "planned_background_parent_chunks_and_startup_not_wire_bytes",
+            expanded_transfer_may_overlap_buffered_media: true,
         },
     }
 }
@@ -347,12 +477,14 @@ mod unit_tests {
             PrewarmTrackInput {
                 track_index: 0,
                 resource_id: "high",
+                actual_total_length: 2 * 1024 * 1024,
                 initialization_bytes: video_initialization_bytes,
                 fragments: video_fragments,
             },
             PrewarmTrackInput {
                 track_index: 1,
                 resource_id: "audio",
+                actual_total_length: 2 * 1024 * 1024,
                 initialization_bytes: audio_initialization_bytes,
                 fragments: audio_fragments,
             },
@@ -477,8 +609,8 @@ mod unit_tests {
             snapshot(40.0, 48.0),
             plan.clone(),
             PrewarmExecution {
-                requested_bytes: plan.planned_bytes,
-                operation_count: plan.ranges.len() as u64,
+                requested_bytes: plan.planned_transfer_bytes,
+                operation_count: plan.transfer_ranges.len() as u64,
                 elapsed_seconds: 1.25,
                 coverage_before: 4,
                 coverage_after: 100,
@@ -487,11 +619,37 @@ mod unit_tests {
         );
         assert_eq!(control.operation_requested_bytes, 0);
         assert_eq!(control.operation_count, 0);
-        assert_eq!(treatment.operation_requested_bytes, treatment.planned_bytes);
+        assert_eq!(control.schema_version, 2);
+        assert_eq!(control.transfer_byte_budget, PREWARM_TRANSFER_BYTE_BUDGET);
+        assert_eq!(
+            treatment.planned_transfer_bytes,
+            plan.planned_transfer_bytes
+        );
+        assert_eq!(
+            treatment.transfer_plan.len() as u64,
+            treatment.operation_count
+        );
+        assert_eq!(
+            treatment.operation_requested_bytes,
+            treatment.planned_transfer_bytes
+        );
+        assert_eq!(
+            treatment.coverage_semantics,
+            "sum_of_fully_readable_selected_ranges"
+        );
         assert!(
             treatment
                 .provenance
                 .origin_counters_include_playback_and_prewarm
+        );
+        assert_eq!(
+            treatment.provenance.transfer_accounting,
+            "planned_background_parent_chunks_and_startup_not_wire_bytes"
+        );
+        assert!(
+            treatment
+                .provenance
+                .expanded_transfer_may_overlap_buffered_media
         );
         assert!(
             !report_for(
@@ -509,5 +667,77 @@ mod unit_tests {
             )
             .completed
         );
+    }
+
+    #[test]
+    fn background_transfer_expansion_uses_real_parent_chunks_and_deduplicates() {
+        let plan = crate::hls_cache::planned_background_ranges_for_test(
+            1_300_000,
+            &[700_000..710_000, 700_000..710_000, 1_200_000..1_250_000],
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            vec![0..524_288, 524_288..1_048_576, 1_048_576..1_300_000]
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>(),
+            1_300_000
+        );
+        assert!(crate::hls_cache::planned_background_ranges_for_test(0, &[]).is_err());
+        let overflow = std::ops::Range {
+            start: u64::MAX - 1,
+            end: u64::MAX,
+        };
+        let inverted = std::ops::Range { start: 9, end: 8 };
+        assert!(
+            crate::hls_cache::planned_background_ranges_for_test(
+                100,
+                std::slice::from_ref(&overflow)
+            )
+            .is_err()
+        );
+        assert!(
+            crate::hls_cache::planned_background_ranges_for_test(
+                100,
+                std::slice::from_ref(&inverted)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn planner_rejects_expanded_transfer_above_budget_before_execution() {
+        let mut video = fragments(100, 1);
+        let mut audio = fragments(100, 1);
+        for (index, fragment) in video.iter_mut().enumerate().skip(60).take(20) {
+            fragment.offset = (index as u64) * 128 * 1024 * 1024;
+        }
+        for (index, fragment) in audio.iter_mut().enumerate().skip(60).take(20) {
+            fragment.offset = (index as u64) * 128 * 1024 * 1024;
+        }
+        let plan = plan_window(
+            &snapshot(40.0, 48.0),
+            3600.0,
+            [
+                PrewarmTrackInput {
+                    track_index: 0,
+                    resource_id: "high",
+                    actual_total_length: 64 * 1024 * 1024 * 1024,
+                    initialization_bytes: 64,
+                    fragments: &video,
+                },
+                PrewarmTrackInput {
+                    track_index: 1,
+                    resource_id: "audio",
+                    actual_total_length: 64 * 1024 * 1024 * 1024,
+                    initialization_bytes: 32,
+                    fragments: &audio,
+                },
+            ],
+        );
+        assert!(plan.is_err());
     }
 }

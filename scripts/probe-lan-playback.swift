@@ -557,7 +557,10 @@ private struct ProbeOptions {
     let minimumSteadyPlaySeconds: TimeInterval?
     let controlsAfterVideoSizeExpectations: Bool
 
-    static func parse(_ arguments: [String]) throws -> ProbeOptions {
+    static func parse(
+        _ arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> ProbeOptions {
         var urlValue: String?
         var duration = 60.0
         var deadline = 120.0
@@ -565,7 +568,7 @@ private struct ProbeOptions {
         var expectedVideoSizes: [VideoSize]?
         var readyMarkerPath: String?
         var recoveryObservationTriggerPath: String?
-        let recoverySnapshotPath = ProcessInfo.processInfo.environment["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH"]
+        let recoverySnapshotPath = environment["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH"]
             .flatMap { $0.isEmpty ? nil : $0 }
         var minimumSteadyPlaySeconds: TimeInterval?
         var controlsAfterVideoSizeExpectations = false
@@ -662,8 +665,7 @@ private struct ProbeOptions {
                     expectedVideoSizes: expectedVideoSizes ?? [],
                     controlsAfterVideoSizeExpectations: controlsAfterVideoSizeExpectations,
                     duration: duration,
-                    deadline: deadline,
-                    minimumSteadyPlaySeconds: minimumSteadyPlaySeconds
+                    deadline: deadline
                 )
             else {
                 throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 13)
@@ -826,6 +828,35 @@ private struct ProbeOptions {
             throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 5)
         }
         passed.append("marker_and_minimum_steady_play_options_parse")
+        let rustRecoveryArguments = [
+            "--url", "http://192.168.1.8/live.m3u8",
+            "--duration", "600",
+            "--deadline", "720",
+            "--expect-video-sizes", "640x360,320x180,640x360",
+            "--ready-marker", "/tmp/ready.json",
+            "--recovery-observation-trigger", "/tmp/recovery.trigger",
+            "--controls-after-video-size-expectations",
+        ]
+        let rustRecoveryOptions = try parse(
+            rustRecoveryArguments,
+            environment: ["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH": "/tmp/recovery.json"]
+        )
+        guard rustRecoveryOptions.recoverySnapshotPath == "/tmp/recovery.json",
+            rustRecoveryOptions.minimumSteadyPlaySeconds == nil,
+            rustRecoveryOptions.duration == 600,
+            rustRecoveryOptions.deadline == 720
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 6)
+        }
+        passed.append("rust_recovery_snapshot_arguments_parse_without_minimum_steady_play")
+        let compatibleMinimumOptions = try parse(
+            rustRecoveryArguments + ["--minimum-steady-play-seconds", "110"],
+            environment: ["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH": "/tmp/recovery.json"]
+        )
+        guard compatibleMinimumOptions.minimumSteadyPlaySeconds == 110 else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 7)
+        }
+        passed.append("recovery_snapshot_admission_remains_compatible_with_minimum_steady_play")
         try reject("public_ipv4", arguments: ["--url", "http://8.8.8.8/live.m3u8"], expectedCode: 6)
         try reject("public_ipv6", arguments: ["--url", "http://[2001:4860:4860::8888]/live.m3u8"], expectedCode: 6)
         try reject("userinfo", arguments: ["--url", "http://name:secret@192.168.1.8/live.m3u8"], expectedCode: 6)
@@ -972,13 +1003,12 @@ private enum RecoverySnapshotPolicy {
         expectedVideoSizes: [VideoSize],
         controlsAfterVideoSizeExpectations: Bool,
         duration: Double,
-        deadline: Double,
-        minimumSteadyPlaySeconds: Double?
+        deadline: Double
     ) -> Bool {
         path.hasPrefix("/") && !path.hasSuffix("/") && triggerPath != nil
             && expectedVideoSizes == expectedSizes
             && controlsAfterVideoSizeExpectations
-            && duration == 600 && deadline == 720 && minimumSteadyPlaySeconds == 110
+            && duration == 600 && deadline == 720
     }
 
     static func runSelfTest() throws -> [String] {
@@ -988,8 +1018,7 @@ private enum RecoverySnapshotPolicy {
             expectedVideoSizes: expectedSizes,
             controlsAfterVideoSizeExpectations: true,
             duration: 600,
-            deadline: 720,
-            minimumSteadyPlaySeconds: 110
+            deadline: 720
         )
         let invalid =
             accepts(
@@ -998,8 +1027,7 @@ private enum RecoverySnapshotPolicy {
                 expectedVideoSizes: expectedSizes,
                 controlsAfterVideoSizeExpectations: true,
                 duration: 600,
-                deadline: 720,
-                minimumSteadyPlaySeconds: 110
+                deadline: 720
             )
             || accepts(
                 path: "/tmp/recovery.json",
@@ -1007,8 +1035,7 @@ private enum RecoverySnapshotPolicy {
                 expectedVideoSizes: expectedSizes,
                 controlsAfterVideoSizeExpectations: true,
                 duration: 600,
-                deadline: 720,
-                minimumSteadyPlaySeconds: 110
+                deadline: 720
             )
             || accepts(
                 path: "/tmp/recovery.json",
@@ -1016,8 +1043,7 @@ private enum RecoverySnapshotPolicy {
                 expectedVideoSizes: [VideoSize(width: 640, height: 360), VideoSize(width: 320, height: 180)],
                 controlsAfterVideoSizeExpectations: true,
                 duration: 600,
-                deadline: 720,
-                minimumSteadyPlaySeconds: 110
+                deadline: 720
             )
             || accepts(
                 path: "/tmp/recovery.json",
@@ -1025,8 +1051,7 @@ private enum RecoverySnapshotPolicy {
                 expectedVideoSizes: expectedSizes,
                 controlsAfterVideoSizeExpectations: true,
                 duration: 130,
-                deadline: 175,
-                minimumSteadyPlaySeconds: 110
+                deadline: 175
             )
         guard valid, !invalid else {
             throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 1)
@@ -1047,6 +1072,10 @@ private enum RecoverySnapshotPolicy {
             tracker.diagnosticProgress[2]["matched"] as? Bool == false,
             tracker.diagnosticProgress[2]["distinct_frame_count"] as? Int == 0,
             (tracker.diagnosticProgress[2]["samples"] as? [[String: Any]])?.isEmpty == true,
+            tracker.diagnosticProgress[2]["diagnostic_optional_recovery_high"] as? Bool == true,
+            tracker.diagnosticProgress[0]["diagnostic_optional_recovery_high"] == nil,
+            tracker.diagnosticProgress[1]["diagnostic_optional_recovery_high"] == nil,
+            tracker.progress.allSatisfy({ $0["diagnostic_optional_recovery_high"] == nil }),
             tracker.hasValidNumericSamplesAllowingMissingTrailingEntry
         else {
             throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 2)
@@ -1075,10 +1104,21 @@ private enum RecoverySnapshotPolicy {
             observedElapsedSeconds: 9,
             observedMonotonicSeconds: 9
         )
-        guard tracker.isComplete, tracker.hasValidNumericSamples else {
+        guard tracker.isComplete, tracker.hasValidNumericSamples,
+            tracker.diagnosticProgress[2]["matched"] as? Bool == true,
+            tracker.diagnosticProgress[2]["distinct_frame_count"] as? Int == 3,
+            (tracker.diagnosticProgress[2]["samples"] as? [[String: Any]])?.count == 3,
+            tracker.diagnosticProgress[2]["diagnostic_optional_recovery_high"] as? Bool == true,
+            tracker.diagnosticProgress[0]["diagnostic_optional_recovery_high"] == nil,
+            tracker.diagnosticProgress[1]["diagnostic_optional_recovery_high"] == nil
+        else {
             throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 4)
         }
-        return ["diagnostic_optional_recovery_high_requires_first_two_and_censors_incomplete_third"]
+        return [
+            "recovery_snapshot_admission_accepts_optional_minimum_steady_play",
+            "diagnostic_optional_recovery_high_marks_third_entry_for_matched_and_censored",
+            "diagnostic_optional_recovery_high_preserves_normal_entries_and_honest_censoring",
+        ]
     }
 }
 
@@ -1406,18 +1446,20 @@ private struct VideoSizeExpectationTracker {
     }
 
     var diagnosticProgress: [[String: Any]] {
-        guard entries.count == 3, currentIndex == 2 else { return progress }
-        return progress.enumerated().map { index, entry in
-            guard index == 2 else { return entry }
-            return [
-                "expected_width": entries[index].size.width,
-                "expected_height": entries[index].size.height,
+        guard entries.count == 3, currentIndex >= 2 else { return progress }
+        var result = progress
+        if currentIndex == 2 {
+            result[2] = [
+                "expected_width": entries[2].size.width,
+                "expected_height": entries[2].size.height,
                 "matched": false,
                 "distinct_frame_count": 0,
                 "required_distinct_frame_count": 3,
                 "samples": [[String: Any]](),
             ]
         }
+        result[2]["diagnostic_optional_recovery_high"] = true
+        return result
     }
 
     var hasValidNumericSamples: Bool {

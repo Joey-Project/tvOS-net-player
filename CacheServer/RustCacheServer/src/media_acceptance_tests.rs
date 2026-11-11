@@ -1439,12 +1439,14 @@ async fn wait_for_recovery_plan(
             crate::media_prewarm_comparison_tests::PrewarmTrackInput {
                 track_index: 0,
                 resource_id: video_resource_id,
+                actual_total_length: fixture.high_video.record.file_bytes,
                 initialization_bytes: fixture.high_video.record.initialization_bytes,
                 fragments: &fixture.high_video.fragments,
             },
             crate::media_prewarm_comparison_tests::PrewarmTrackInput {
                 track_index: 1,
                 resource_id: audio_resource_id,
+                actual_total_length: fixture.audio.record.file_bytes,
                 initialization_bytes: audio,
                 fragments: &fixture.audio.fragments,
             },
@@ -1488,9 +1490,25 @@ async fn prewarm_selected_ranges(
     audio: &crate::hls::HlsMediaResource,
     plan: &crate::media_prewarm_comparison_tests::PrewarmPlan,
 ) -> Result<(u64, u64), String> {
+    if plan.resource_ids.video != high.id
+        || plan.resource_ids.audio != audio.id
+        || high.id == audio.id
+        || plan.transfer_ranges.is_empty()
+    {
+        return Err("expanded prewarm plan did not match its two known resources".to_owned());
+    }
+    for selected in &plan.ranges {
+        if !plan.transfer_ranges.iter().any(|transfer| {
+            transfer.resource_id == selected.resource_id
+                && transfer.start <= selected.start
+                && selected.end <= transfer.end
+        }) {
+            return Err("expanded prewarm plan omitted a selected range".to_owned());
+        }
+    }
     let mut requested_bytes = 0_u64;
     let mut operation_count = 0_u64;
-    for range in &plan.ranges {
+    for range in &plan.transfer_ranges {
         let resource = match range.resource_id.as_str() {
             id if id == high.id => high,
             id if id == audio.id => audio,
@@ -1503,7 +1521,12 @@ async fn prewarm_selected_ranges(
         operation_count = operation_count
             .checked_add(1)
             .ok_or_else(|| "prewarm operation count overflowed".to_owned())?;
-        cache
+        let expected_total = match range.resource_id.as_str() {
+            id if id == high.id => plan.video_total_length,
+            id if id == audio.id => plan.audio_total_length,
+            _ => return Err("expanded prewarm plan referenced an unexpected resource".to_owned()),
+        };
+        let ready = cache
             .ensure_resource_range(
                 client,
                 session_id,
@@ -1514,9 +1537,14 @@ async fn prewarm_selected_ranges(
             )
             .await
             .map_err(|_| "bounded selected HLS range prewarm failed".to_owned())?;
+        if ready.total_length != expected_total {
+            return Err("prewarm resource length changed from the inspected fixture".to_owned());
+        }
     }
-    if requested_bytes != plan.planned_bytes {
-        return Err("prewarm operation byte total differed from the checked plan".to_owned());
+    if requested_bytes != plan.planned_transfer_bytes
+        || operation_count != plan.transfer_ranges.len() as u64
+    {
+        return Err("prewarm operation totals differed from the expanded checked plan".to_owned());
     }
     Ok((requested_bytes, operation_count))
 }
@@ -3171,40 +3199,20 @@ async fn run_native_probe(
 ) -> Result<ProcessCapture, String> {
     ensure_loopback_url(&master_url)?;
     let mut command = Command::new(probe_path);
-    command.args([
-        "--url".to_owned(),
-        master_url,
-        "--duration".to_owned(),
-        duration.to_string(),
-        "--deadline".to_owned(),
-        deadline.to_string(),
-        "--expect-video-sizes".to_owned(),
-        expected_sizes,
-    ]);
-    if let Some(path) = marker_paths.ready {
-        command.args([
-            "--ready-marker".to_owned(),
-            path.to_string_lossy().into_owned(),
-            "--controls-after-video-size-expectations".to_owned(),
-        ]);
-    }
-    if let Some(path) = marker_paths.recovery_observation {
-        command.args([
-            "--recovery-observation-trigger".to_owned(),
-            path.to_string_lossy().into_owned(),
-        ]);
-    }
-    if let Some(path) = marker_paths.recovery_snapshot {
+    let (arguments, recovery_snapshot) = native_probe_arguments(
+        &master_url,
+        duration,
+        deadline,
+        &expected_sizes,
+        &marker_paths,
+        minimum_steady_play_seconds,
+    );
+    command.args(arguments);
+    if let Some(path) = recovery_snapshot {
         command.env(
             "LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH",
             path.to_string_lossy().as_ref(),
         );
-    }
-    if let Some(seconds) = minimum_steady_play_seconds {
-        command.args([
-            "--minimum-steady-play-seconds".to_owned(),
-            seconds.to_string(),
-        ]);
     }
     run_process(
         command,
@@ -3212,6 +3220,92 @@ async fn run_native_probe(
         MAX_PROBE_JSON_BYTES,
     )
     .await
+}
+
+fn native_probe_arguments(
+    master_url: &str,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: &str,
+    marker_paths: &ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
+) -> (Vec<String>, Option<PathBuf>) {
+    let mut arguments = vec![
+        "--url".to_owned(),
+        master_url.to_owned(),
+        "--duration".to_owned(),
+        duration.to_string(),
+        "--deadline".to_owned(),
+        deadline.to_string(),
+        "--expect-video-sizes".to_owned(),
+        expected_sizes.to_owned(),
+    ];
+    if let Some(path) = &marker_paths.ready {
+        arguments.extend([
+            "--ready-marker".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--controls-after-video-size-expectations".to_owned(),
+        ]);
+    }
+    if let Some(path) = &marker_paths.recovery_observation {
+        arguments.extend([
+            "--recovery-observation-trigger".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(seconds) = minimum_steady_play_seconds {
+        arguments.extend([
+            "--minimum-steady-play-seconds".to_owned(),
+            seconds.to_string(),
+        ]);
+    }
+    (arguments, marker_paths.recovery_snapshot.clone())
+}
+
+#[cfg(test)]
+mod prewarm_probe_contract_tests {
+    use super::*;
+
+    #[test]
+    fn prewarm_probe_command_keeps_recovery_snapshot_without_steady_minimum() {
+        let markers = ProbeMarkerPaths {
+            ready: Some(PathBuf::from("/tmp/ready.json")),
+            recovery_observation: Some(PathBuf::from("/tmp/recovery.trigger")),
+            recovery_snapshot: Some(PathBuf::from("/tmp/recovery.json")),
+        };
+        let (arguments, snapshot) = native_probe_arguments(
+            "http://127.0.0.1:12345/master.m3u8",
+            600,
+            720,
+            "640x360,320x180,640x360",
+            &markers,
+            None,
+        );
+        assert_eq!(
+            arguments,
+            vec![
+                "--url",
+                "http://127.0.0.1:12345/master.m3u8",
+                "--duration",
+                "600",
+                "--deadline",
+                "720",
+                "--expect-video-sizes",
+                "640x360,320x180,640x360",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--controls-after-video-size-expectations",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+            ]
+        );
+        assert_eq!(snapshot, Some(PathBuf::from("/tmp/recovery.json")));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| { argument == "--minimum-steady-play-seconds" })
+        );
+    }
 }
 
 fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
