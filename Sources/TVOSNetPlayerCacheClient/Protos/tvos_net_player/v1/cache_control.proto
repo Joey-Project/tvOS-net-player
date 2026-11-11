@@ -49,6 +49,9 @@ service CacheService {
   // one exact registered HLS variant/window. This is a snapshot, not a lease
   // or a playback-readiness recommendation, and never fetches from an origin.
   rpc GetHlsPlaybackReadiness(GetHlsPlaybackReadinessRequest) returns (HlsPlaybackReadiness);
+  // Bounded metadata for variants advertised by the ordinary HLS master path.
+  // This does not restore sources, fetch media or authorize a quality switch.
+  rpc GetHlsRenditionCatalog(GetHlsRenditionCatalogRequest) returns (HlsRenditionCatalog);
   rpc ReportPlaybackProgress(ReportPlaybackProgressRequest) returns (ReportPlaybackProgressResponse);
   rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
 }
@@ -84,6 +87,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_ACCESS_KEY_LOGIN = 17;
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_READINESS = 18;
   SERVER_CAPABILITY_HLS_PLAYBACK_READINESS = 19;
+  SERVER_CAPABILITY_HLS_RENDITION_CATALOG = 20;
 }
 
 message GetResolverSettingsRequest {}
@@ -911,6 +915,41 @@ message HlsPlaybackReadiness {
   // Absent when no fresh exact-representation observation exists.
   HlsOriginSupplyEvidence video_origin = 9;
   HlsOriginSupplyEvidence audio_origin = 10;
+}
+
+message GetHlsRenditionCatalogRequest {
+  string session_id = 1;
+}
+
+// A point-in-time view of an already registered, serving-authorized session.
+// At most 128 renditions and 64 KiB encoded metadata; no silent truncation.
+// Generation is process-local, not restart authority or a cache lease.
+message HlsRenditionCatalog {
+  string session_id = 1;
+  uint64 session_generation = 2;
+  repeated HlsRenditionDescriptor renditions = 3;
+}
+
+message HlsRenditionDescriptor {
+  string variant_id = 1;
+  // The literal HLS BANDWIDTH value, which may use the existing server default.
+  // Never use it as separate resource rates, measured goodput or link capacity.
+  uint64 advertised_bandwidth_bits_per_second = 2;
+  // Optional nominal rates from the exact registered media requests, not
+  // measurements or values inferred by subtracting an aggregate bandwidth.
+  optional uint64 video_resource_bandwidth_bits_per_second = 3;
+  optional uint64 audio_resource_bandwidth_bits_per_second = 4;
+  // A separate audio resource, not a claim that a decoded audio track exists.
+  bool has_separate_audio = 5;
+  // Bounded optional format hints; absent or unsupported hints stay unknown.
+  // No raw request URL, headers, cache key or decoder-supported flag is exposed.
+  optional string video_resource_codecs = 6;
+  optional string audio_resource_codecs = 7;
+  optional string video_resource_mime_type = 8;
+  optional string audio_resource_mime_type = 9;
+  // Declared master resolution only, never decoded-frame dimensions.
+  optional uint32 advertised_width = 10;
+  optional uint32 advertised_height = 11;
 }
 
 message HlsCacheStatus {

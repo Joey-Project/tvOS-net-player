@@ -447,6 +447,38 @@ impl HlsPlaybackSession {
         playlist
     }
 
+    pub(crate) fn prepare_master_playlist_with_resource_availability(
+        &self,
+        mut is_resource_cached: impl FnMut(&str) -> bool,
+    ) -> Option<Self> {
+        let mut variants = Vec::new();
+        for variant in self.advertised_variants() {
+            let resources = [&variant.video].into_iter().chain(variant.audio.iter());
+            if resources
+                .into_iter()
+                .all(|resource| resource_has_upstream(resource) || is_resource_cached(&resource.id))
+            {
+                variants.push(variant.clone());
+            }
+        }
+        if variants.is_empty() {
+            return None;
+        }
+        let selected_index = variants
+            .iter()
+            .position(|variant| variant.id == self.variant.id)
+            .unwrap_or(0);
+        let mut prepared = self.clone();
+        prepared.variant = variants.remove(selected_index);
+        prepared.alternate_variants = variants;
+        prepared.advertise_alternate_variants = true;
+        Some(prepared)
+    }
+
+    pub(crate) fn advertised_variant_count(&self) -> usize {
+        self.advertised_variants().count()
+    }
+
     pub(crate) fn variant_is_advertised_with_filter(
         &self,
         variant_id: &str,
@@ -628,7 +660,7 @@ impl HlsPlaybackSession {
         std::iter::once(&self.variant).chain(self.alternate_variants.iter().take(alternate_count))
     }
 
-    fn advertised_variants_with_filter(
+    pub(crate) fn advertised_variants_with_filter(
         &self,
         is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
     ) -> Vec<&HlsVariant> {
@@ -1163,6 +1195,15 @@ impl HlsMediaResource {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("application/octet-stream")
     }
+}
+
+pub(crate) fn resource_has_upstream(resource: &HlsMediaResource) -> bool {
+    !resource.request.url.trim().is_empty()
+        || resource
+            .request
+            .backup_urls
+            .iter()
+            .any(|url| !url.trim().is_empty())
 }
 
 pub(crate) fn should_forward_media_request_header(
@@ -2055,6 +2096,73 @@ mod tests {
                 .servable_media_playlist("video.m3u8", 128, 10_000, &[])
                 .is_some()
         );
+    }
+
+    #[test]
+    fn master_resource_preparation_preserves_advertisement_and_fallback_rules() {
+        let mut selected = dash_variant();
+        selected.id = "h264-1080p".to_owned();
+        selected.abr = Some(abr_level("dash-video", 1, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 0, 2, true));
+        alternate.video.as_mut().unwrap().url.clear();
+        alternate.audio.as_mut().unwrap().url.clear();
+
+        let mut session = HlsPlaybackSession::from_playback_entry(
+            "session-master-preparation",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+        session.variant.video.request.url.clear();
+        session.variant.audio.as_mut().unwrap().request.url.clear();
+
+        assert!(
+            session
+                .prepare_master_playlist_with_resource_availability(|_| false)
+                .is_none()
+        );
+        let video_resource_id = session.variant.video.id.clone();
+        assert!(
+            session
+                .prepare_master_playlist_with_resource_availability(|resource_id| {
+                    resource_id == video_resource_id.as_str()
+                })
+                .is_none(),
+            "a cached video without its separate audio resource is not master-servable"
+        );
+
+        let prepared = session
+            .prepare_master_playlist_with_resource_availability(|_| true)
+            .expect("cached candidates should prepare");
+        assert_eq!(2, prepared.advertised_variant_count());
+        let weak_selected =
+            prepared.advertised_variants_with_filter(|variant| variant.id == "h264-720p");
+        assert_eq!("h264-720p", weak_selected[0].id);
+        assert!(
+            prepared
+                .master_playlist_with_variant_filter(|variant| variant.id == "h264-720p")
+                .contains("segments/v1-video.m3u8")
+        );
+
+        let fallback = prepared.advertised_variants_with_filter(|_| false);
+        assert_eq!(1, fallback.len());
+        assert_eq!("h264-720p", fallback[0].id);
+
+        let mut disabled = session;
+        disabled.advertise_alternate_variants = false;
+        let prepared = disabled
+            .prepare_master_playlist_with_resource_availability(|_| true)
+            .expect("selected resource should prepare");
+        assert_eq!(1, prepared.advertised_variant_count());
+        assert_eq!(1, prepared.advertised_variants_with_filter(|_| true).len());
+        assert!(!prepared.master_playlist().contains("v1-video.m3u8"));
     }
 
     #[test]

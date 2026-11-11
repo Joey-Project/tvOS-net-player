@@ -59,13 +59,14 @@ use crate::{
         CreateBilibiliPlaybackTaskV2Request, CreateBilibiliTaskRequest,
         CreateBilibiliTaskV2Request, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
         GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
-        GetHlsCacheStatusRequest, GetHlsPlaybackReadinessRequest, GetLibraryItemRequest,
-        GetPlaybackSourceRequest, GetResolverSettingsRequest, GetServerInfoRequest, GetTaskRequest,
-        HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
-        HlsCacheFillFailureKind, HlsCacheFillState, HlsCacheFillStatus, HlsCacheStatus,
-        HlsOriginSupplyEvidence, HlsPlaybackActivityState as ProtoHlsPlaybackActivityState,
-        HlsPlaybackCacheReason, HlsPlaybackCacheState, HlsPlaybackProgressStatus,
-        HlsPlaybackReadiness, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
+        GetHlsCacheStatusRequest, GetHlsPlaybackReadinessRequest, GetHlsRenditionCatalogRequest,
+        GetLibraryItemRequest, GetPlaybackSourceRequest, GetResolverSettingsRequest,
+        GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
+        HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheFillFailureKind,
+        HlsCacheFillState, HlsCacheFillStatus, HlsCacheStatus, HlsOriginSupplyEvidence,
+        HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackCacheReason,
+        HlsPlaybackCacheState, HlsPlaybackProgressStatus, HlsPlaybackReadiness,
+        HlsRenditionCatalog, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
         LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
         LanTranscodingStatus, LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListBilibiliResolutionCandidatesRequest,
@@ -86,6 +87,7 @@ use crate::{
         HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
         hls_session_declared_size_bytes, timestamp_from_system_time,
     },
+    hls_catalog,
     hls_fill_scheduler::HlsFillPreemptionToken,
     hls_media_refresh::{is_expired_cache_error, same_hls_media_refresh_binding},
     hls_network_policy::{
@@ -216,6 +218,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliPlaybackPolicy.into(),
                 ServerCapability::Hls.into(),
                 ServerCapability::HlsPlaybackReadiness.into(),
+                ServerCapability::HlsRenditionCatalog.into(),
                 ServerCapability::ResolverSettingsWrite.into(),
             ],
         };
@@ -2558,6 +2561,10 @@ pub struct CacheGrpcService {
     state: AppState,
     #[cfg(test)]
     after_inspection_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_catalog_probe_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    during_catalog_cache_probe_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CacheGrpcService {
@@ -2566,12 +2573,31 @@ impl CacheGrpcService {
             state,
             #[cfg(test)]
             after_inspection_hook: None,
+            #[cfg(test)]
+            after_catalog_probe_hook: None,
+            #[cfg(test)]
+            during_catalog_cache_probe_hook: None,
         }
     }
 
     #[cfg(test)]
     fn with_after_inspection_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.after_inspection_hook = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_catalog_probe_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_catalog_probe_hook = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_during_catalog_cache_probe_hook(
+        mut self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.during_catalog_cache_probe_hook = Some(Arc::new(hook));
         self
     }
 }
@@ -2707,6 +2733,139 @@ impl CacheService for CacheGrpcService {
         Ok(Response::new(response))
     }
 
+    async fn get_hls_rendition_catalog(
+        &self,
+        request: Request<GetHlsRenditionCatalogRequest>,
+    ) -> Result<Response<HlsRenditionCatalog>, Status> {
+        let request = request.into_inner();
+        validate_readiness_id(&request.session_id, "session")?;
+        if !self
+            .state
+            .registered_hls_session_is_authorized_for_serving(&request.session_id)
+        {
+            return Err(Status::not_found("HLS playback session was not found."));
+        }
+        let handle = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .ok_or_else(|| Status::not_found("HLS playback session was not found."))?;
+        let snapshot_current = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .is_some_and(|current| {
+                current.generation == handle.generation && current.session == handle.session
+            })
+            && self
+                .state
+                .registered_hls_session_is_authorized_for_serving(&request.session_id);
+        if !snapshot_current {
+            return Err(Status::aborted(
+                "The HLS playback session changed before the rendition catalog was prepared.",
+            ));
+        }
+        let advertised =
+            hls_catalog::validate_advertised_session(&handle.session, &request.session_id)?;
+        hls_catalog::build_catalog(&handle.session, handle.generation, &advertised)?;
+        let prepared = if advertised.is_empty() {
+            None
+        } else {
+            let permit = Arc::clone(&self.state.hls_catalog_cache_probe_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::unavailable("HLS catalog cache inspection is unavailable."))?;
+            let still_current = self
+                .state
+                .hls_sessions
+                .get_with_generation(&request.session_id)
+                .is_some_and(|current| {
+                    current.generation == handle.generation && current.session == handle.session
+                })
+                && self
+                    .state
+                    .registered_hls_session_is_authorized_for_serving(&request.session_id);
+            if !still_current {
+                return Err(Status::aborted(
+                    "The HLS playback session changed before the rendition catalog was inspected.",
+                ));
+            }
+            let cache = self.state.hls_cache.clone();
+            let session = handle.session.clone();
+            let session_id = request.session_id.clone();
+            #[cfg(test)]
+            let blocking_hook = self.during_catalog_cache_probe_hook.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(hook) = blocking_hook {
+                    hook();
+                }
+                session.prepare_master_playlist_with_resource_availability(|resource_id| {
+                    cache
+                        .open_cached_resource(&session_id, resource_id)
+                        .is_some()
+                })
+            })
+            .await
+            .map_err(|_| Status::internal("HLS catalog cache inspection failed."))?
+        };
+
+        #[cfg(test)]
+        if let Some(hook) = self.after_catalog_probe_hook.as_ref() {
+            hook();
+        }
+
+        let unchanged = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .is_some_and(|current| {
+                current.generation == handle.generation && current.session == handle.session
+            })
+            && self
+                .state
+                .registered_hls_session_is_authorized_for_serving(&request.session_id);
+        if !unchanged {
+            return Err(Status::aborted(
+                "The HLS playback session changed while the rendition catalog was inspected.",
+            ));
+        }
+
+        let prepared = prepared.ok_or_else(|| {
+            Status::failed_precondition(
+                "No complete HLS representation is available for cataloging.",
+            )
+        })?;
+        let renditions = prepared.advertised_variants_with_filter(|variant| {
+            self.state
+                .hls_network_policy
+                .variant_is_advertisable_for_policy(
+                    handle.session.effective_policy.weak_network_preference,
+                    &request.session_id,
+                    handle.generation,
+                    &variant.id,
+                )
+        });
+        let catalog = hls_catalog::build_catalog(&handle.session, handle.generation, &renditions)?;
+        let still_unchanged = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .is_some_and(|current| {
+                current.generation == handle.generation && current.session == handle.session
+            })
+            && self
+                .state
+                .registered_hls_session_is_authorized_for_serving(&request.session_id);
+        if !still_unchanged {
+            return Err(Status::aborted(
+                "The HLS playback session changed while the rendition catalog was prepared.",
+            ));
+        }
+        Ok(Response::new(catalog))
+    }
+
     async fn report_playback_progress(
         &self,
         request: Request<ReportPlaybackProgressRequest>,
@@ -2772,11 +2931,7 @@ impl CacheService for CacheGrpcService {
 }
 
 fn validate_readiness_id(value: &str, label: &str) -> Result<(), Status> {
-    if value.is_empty()
-        || value.len() > 256
-        || value.trim() != value
-        || value.chars().any(char::is_control)
-    {
+    if !hls_catalog::valid_identifier(value) {
         return Err(Status::invalid_argument(match label {
             "session" => "Session id is invalid or exceeds the size limit.",
             _ => "Variant id is invalid or exceeds the size limit.",
@@ -14632,6 +14787,621 @@ mod tests {
             .await
             .expect_err("aborted origin server should stop");
         assert!(origin_join.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn hls_rendition_catalog_is_a_bounded_read_only_generated_grpc_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let (origin_url, origin_task, origin_requests) =
+            start_counted_readiness_mp4_upstream().await;
+        let media_url = format!("{origin_url}?catalog=unexported");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let (session_id, mut session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1catalog",
+            sample_playback_plan_with_video_and_audio_url(&media_url),
+        );
+        session.variant.id = "rendition-雪".to_owned();
+        session.variant.bandwidth = 1_200_000;
+        session.variant.width = Some(1920);
+        session.variant.height = None;
+        session.variant.video.request.bandwidth = Some(0);
+        session.variant.video.request.codecs = Some("https://origin.invalid/private".to_owned());
+        session.variant.video.request.mime_type = Some("video/mp4;profile=high".to_owned());
+        let audio = session
+            .variant
+            .audio
+            .as_mut()
+            .expect("fixture should declare separate audio");
+        audio.request.bandwidth = Some(128_000);
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.mime_type = Some("audio/mp4".to_owned());
+        state.hls_sessions.insert(session.clone());
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&session_id)
+            .expect("catalog session should be registered")
+            .generation;
+        assert!(
+            !state
+                .hls_cache_playback_leases
+                .lock()
+                .expect("playback lease lock should be available")
+                .contains_key(&session_id)
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&session_id, &session.variant.video.id)
+                .is_none()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gRPC fixture should bind");
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::generated::tvos_net_player::v1::cache_service_server::CacheServiceServer::new(
+                        CacheGrpcService::new(server_state),
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .expect("gRPC fixture should serve");
+        });
+        let mut client = crate::generated::tvos_net_player::v1::cache_service_client::CacheServiceClient::connect(
+            format!("http://{address}"),
+        )
+        .await
+        .expect("generated gRPC client should connect");
+        let catalog = client
+            .get_hls_rendition_catalog(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("catalog RPC should be wired")
+            .into_inner();
+
+        assert_eq!(session_id, catalog.session_id);
+        assert_eq!(generation, catalog.session_generation);
+        assert_eq!(1, catalog.renditions.len());
+        let rendition = &catalog.renditions[0];
+        assert_eq!("rendition-雪", rendition.variant_id);
+        assert_eq!(1_200_000, rendition.advertised_bandwidth_bits_per_second);
+        assert_eq!(None, rendition.video_resource_bandwidth_bits_per_second);
+        assert_eq!(
+            Some(128_000),
+            rendition.audio_resource_bandwidth_bits_per_second
+        );
+        assert!(rendition.has_separate_audio);
+        assert_eq!(None, rendition.video_resource_codecs);
+        assert_eq!(
+            Some("mp4a.40.2"),
+            rendition.audio_resource_codecs.as_deref()
+        );
+        assert_eq!(None, rendition.video_resource_mime_type);
+        assert_eq!(
+            Some("audio/mp4"),
+            rendition.audio_resource_mime_type.as_deref()
+        );
+        assert_eq!(None, rendition.advertised_width);
+        assert_eq!(None, rendition.advertised_height);
+        let encoded = catalog.encode_to_vec();
+        assert!(encoded.len() <= hls_catalog::MAX_HLS_CATALOG_ENCODED_BYTES);
+        for secret in [media_url.as_bytes(), &b"catalog=unexported"[..]] {
+            assert!(!encoded.windows(secret.len()).any(|window| window == secret));
+        }
+        assert_eq!(0, origin_requests.load(AtomicOrdering::SeqCst));
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+        assert!(
+            !state
+                .hls_cache_playback_leases
+                .lock()
+                .expect("playback lease lock should be available")
+                .contains_key(&session_id)
+        );
+        assert!(
+            state
+                .tasks
+                .get_task(&session_id)
+                .expect("playable task should remain registered")
+                .hls_cache_fill_status
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&session_id, &session.variant.video.id)
+                .is_none()
+        );
+
+        let server_info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should load")
+            .into_inner();
+        assert!(
+            server_info
+                .capabilities
+                .contains(&ServerCapability::HlsRenditionCatalog.into())
+        );
+
+        server.abort();
+        let server_join = server.await.expect_err("gRPC server should stop");
+        assert!(server_join.is_cancelled());
+        origin_task.abort();
+        let origin_join = origin_task.await.expect_err("origin should stop");
+        assert!(origin_join.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn hls_rendition_catalog_includes_cached_resources_after_origin_urls_are_cleared() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let (origin_url, origin_task, origin_requests) =
+            start_counted_readiness_mp4_upstream().await;
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let (session_id, mut session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1catalogcached",
+            sample_playback_plan_with_video_and_audio_url(&origin_url),
+        );
+        let rendition_id = session.variant.id.clone();
+        let video_resource_id = session.variant.video.id.clone();
+        let audio_resource_id = session
+            .variant
+            .audio
+            .as_ref()
+            .expect("fixture should declare separate audio")
+            .id
+            .clone();
+
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &session)
+            .await
+            .expect("loopback origin resources should populate the cache");
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&session_id, &video_resource_id)
+                .is_some(),
+            "video cache file should be registered"
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&session_id, &audio_resource_id)
+                .is_some(),
+            "audio cache file should be registered"
+        );
+        let requests_after_fill = origin_requests.load(AtomicOrdering::SeqCst);
+        assert!(
+            requests_after_fill > 0,
+            "origin fixture should be downloaded"
+        );
+
+        session.variant.video.request.url.clear();
+        session
+            .variant
+            .audio
+            .as_mut()
+            .expect("fixture should declare separate audio")
+            .request
+            .url
+            .clear();
+        state.hls_sessions.insert(session.clone());
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&session_id)
+            .expect("offline catalog session should be registered")
+            .generation;
+        assert!(generation > 0);
+        assert!(
+            !state
+                .hls_cache_playback_leases
+                .lock()
+                .expect("playback lease lock should be available")
+                .contains_key(&session_id)
+        );
+        assert!(
+            state
+                .tasks
+                .get_task(&session_id)
+                .expect("playable task should remain registered")
+                .hls_cache_fill_status
+                .is_none()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gRPC fixture should bind");
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::generated::tvos_net_player::v1::cache_service_server::CacheServiceServer::new(
+                        CacheGrpcService::new(server_state),
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .expect("gRPC fixture should serve");
+        });
+        let mut client = crate::generated::tvos_net_player::v1::cache_service_client::CacheServiceClient::connect(
+            format!("http://{address}"),
+        )
+        .await
+        .expect("generated gRPC client should connect");
+        let catalog = client
+            .get_hls_rendition_catalog(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("catalog should include a fully cached offline candidate")
+            .into_inner();
+
+        assert_eq!(session_id, catalog.session_id);
+        assert_eq!(generation, catalog.session_generation);
+        assert_eq!(1, catalog.renditions.len());
+        assert_eq!(rendition_id, catalog.renditions[0].variant_id);
+        assert_eq!(
+            requests_after_fill,
+            origin_requests.load(AtomicOrdering::SeqCst)
+        );
+        assert!(
+            !state
+                .hls_cache_playback_leases
+                .lock()
+                .expect("playback lease lock should be available")
+                .contains_key(&session_id),
+            "catalog query must not acquire a playback lease"
+        );
+        assert!(
+            state
+                .tasks
+                .get_task(&session_id)
+                .expect("playable task should remain registered")
+                .hls_cache_fill_status
+                .is_none(),
+            "catalog query must not start or change a cache fill"
+        );
+
+        server.abort();
+        let server_join = server.await.expect_err("gRPC server should stop");
+        assert!(server_join.is_cancelled());
+        origin_task.abort();
+        let origin_join = origin_task.await.expect_err("origin should stop");
+        assert!(origin_join.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn hls_rendition_catalog_rejects_missing_invalid_duplicate_and_changed_sessions() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = CacheGrpcService::new(state.clone());
+        let invalid_request = service
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: String::new(),
+            }))
+            .await
+            .expect_err("empty session id should be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, invalid_request.code());
+        let missing = service
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: "missing-catalog-session".to_owned(),
+            }))
+            .await
+            .expect_err("missing session should be rejected");
+        assert_eq!(tonic::Code::NotFound, missing.code());
+
+        let unauthorized = HlsPlaybackSession::from_selected_variant(
+            "unserved-catalog-session",
+            "Episode",
+            &playback_variant_with_url(
+                "h264",
+                "avc1.640028",
+                1_000_000,
+                "https://media.invalid/v.m4s",
+            ),
+        )
+        .expect("unserved fixture should map");
+        state.hls_sessions.insert(unauthorized);
+        let rejected = service
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: "unserved-catalog-session".to_owned(),
+            }))
+            .await
+            .expect_err("unserved registered session should be rejected");
+        assert_eq!(tonic::Code::NotFound, rejected.code());
+
+        let quarantined = HlsPlaybackSession::from_selected_variant(
+            "quarantined-catalog-session",
+            "Episode",
+            &playback_variant_with_url(
+                "h264",
+                "avc1.640028",
+                1_000_000,
+                "https://media.invalid/v.m4s",
+            ),
+        )
+        .expect("quarantined fixture should map");
+        state.hls_sessions.insert(quarantined);
+        state.quarantine_hls_session_for_tests("quarantined-catalog-session".to_owned());
+        let quarantined = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: "quarantined-catalog-session".to_owned(),
+            }))
+            .await
+            .expect_err("startup-quarantined session should be rejected");
+        assert_eq!(tonic::Code::NotFound, quarantined.code());
+
+        let (session_id, mut session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1catalograce",
+            sample_playback_plan_with_video_and_audio_url("https://media.invalid/video.m4s"),
+        );
+        session.alternate_variants = vec![session.variant.clone()];
+        state.hls_sessions.insert(session.clone());
+        let duplicate = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect_err("duplicate rendition identifiers should be rejected");
+        assert_eq!(tonic::Code::FailedPrecondition, duplicate.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+
+        session.alternate_variants.clear();
+        session.variant.id = " leading-whitespace".to_owned();
+        state.hls_sessions.insert(session.clone());
+        let invalid_metadata = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect_err("invalid registered rendition id should be rejected");
+        assert_eq!(tonic::Code::FailedPrecondition, invalid_metadata.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+
+        session.variant.id = "h264".to_owned();
+        session.variant.bandwidth = 0;
+        state.hls_sessions.insert(session.clone());
+        let invalid_bandwidth = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect_err("zero advertised bandwidth should be rejected");
+        assert_eq!(tonic::Code::FailedPrecondition, invalid_bandwidth.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+
+        session.alternate_variants =
+            vec![session.variant.clone(); hls_catalog::MAX_HLS_CATALOG_RENDITIONS - 1];
+        for (index, variant) in session.alternate_variants.iter_mut().enumerate() {
+            variant.id = format!("candidate-{index}");
+            variant.bandwidth = 1_000_000;
+            variant.video.request.codecs = Some("x".repeat(256));
+            if let Some(audio) = variant.audio.as_mut() {
+                audio.request.codecs = Some("y".repeat(256));
+            }
+        }
+        session.variant.bandwidth = 1_000_000;
+        state.hls_sessions.insert(session.clone());
+        let oversized = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect_err("oversized encoded candidate set should be rejected");
+        assert_eq!(tonic::Code::ResourceExhausted, oversized.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+
+        session.alternate_variants.clear();
+        state.hls_sessions.insert(session.clone());
+        let race_state = state.clone();
+        let replacement = session.clone();
+        let raced = CacheGrpcService::new(state.clone())
+            .with_after_catalog_probe_hook(move || {
+                race_state.hls_sessions.insert(replacement.clone());
+            })
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest { session_id }))
+            .await
+            .expect_err("registry generation change during cache work should abort");
+        assert_eq!(tonic::Code::Aborted, raced.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_hls_rendition_catalog_keeps_blocking_probe_permit_until_worker_exits() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let (session_id, _, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1catalogcancel",
+            sample_playback_plan_with_video_url("https://media.invalid/video.m4s"),
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let service =
+            CacheGrpcService::new(state.clone()).with_during_catalog_cache_probe_hook(move || {
+                started_tx
+                    .send(())
+                    .expect("test should observe blocking worker start");
+                release_rx
+                    .lock()
+                    .expect("release channel lock should be available")
+                    .recv()
+                    .expect("test should release blocking worker");
+                finished_tx
+                    .send(())
+                    .expect("test should observe blocking worker finish");
+            });
+        let request = tokio::spawn(async move {
+            service
+                .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                    session_id,
+                }))
+                .await
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking cache inspection should start");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request task should cancel")
+                .is_cancelled()
+        );
+        assert_eq!(1, state.hls_catalog_cache_probe_permits.available_permits());
+
+        release_tx
+            .send(())
+            .expect("blocking worker should still be waiting");
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking worker should finish after release");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.hls_catalog_cache_probe_permits.available_permits() != 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("blocking permit should release when the worker exits");
+    }
+
+    #[tokio::test]
+    async fn hls_rendition_catalog_offline_and_muxed_metadata_match_master_availability() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let (session_id, mut session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1catalogoffline",
+            sample_playback_plan_with_video_url("https://media.invalid/video.m4s"),
+        );
+        session.variant.video.request.url.clear();
+        session.variant.audio = None;
+        session.advertise_alternate_variants = false;
+        state.hls_sessions.insert(session.clone());
+        let before_lease = state
+            .hls_cache_playback_leases
+            .lock()
+            .expect("playback lease lock should be available")
+            .contains_key(&session_id);
+
+        let offline = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect_err("offline session must not produce an empty successful catalog");
+        assert_eq!(tonic::Code::FailedPrecondition, offline.code());
+        assert_eq!(2, state.hls_catalog_cache_probe_permits.available_permits());
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&session_id, &session.variant.video.id)
+                .is_none()
+        );
+        assert_eq!(
+            before_lease,
+            state
+                .hls_cache_playback_leases
+                .lock()
+                .expect("playback lease lock should be available")
+                .contains_key(&session_id)
+        );
+
+        session.variant.video.request.url = "https://media.invalid/video.m4s".to_owned();
+        state.hls_sessions.insert(session.clone());
+        let muxed = CacheGrpcService::new(state.clone())
+            .get_hls_rendition_catalog(Request::new(GetHlsRenditionCatalogRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect("muxed rendition should be cataloged")
+            .into_inner();
+        assert_eq!(1, muxed.renditions.len());
+        let rendition = &muxed.renditions[0];
+        assert!(!rendition.has_separate_audio);
+        assert_eq!(None, rendition.audio_resource_bandwidth_bits_per_second);
+        assert_eq!(None, rendition.audio_resource_codecs);
+        assert_eq!(None, rendition.audio_resource_mime_type);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture should bind");
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/hls/{session_id}/master.m3u8",
+                get(crate::media::hls_master_playlist_get),
+            )
+            .with_state(crate::media::MediaState::new(state.clone()));
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("HTTP fixture should serve");
+        });
+        let http = reqwest::Client::new();
+        let online_master = http
+            .get(format!("http://{address}/hls/{session_id}/master.m3u8"))
+            .send()
+            .await
+            .expect("online master should be served over HTTP");
+        assert_eq!(StatusCode::OK, online_master.status());
+        let online_master_body = online_master
+            .text()
+            .await
+            .expect("master playlist body should be readable");
+        assert!(!online_master_body.contains(",AUDIO="));
+
+        session.variant.video.request.url.clear();
+        state.hls_sessions.insert(session);
+        let offline_master = http
+            .get(format!("http://{address}/hls/{session_id}/master.m3u8"))
+            .send()
+            .await
+            .expect("offline master response should be served over HTTP");
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, offline_master.status());
+        http_server.abort();
+        let http_join = http_server.await.expect_err("HTTP server should stop");
+        assert!(http_join.is_cancelled());
     }
 
     #[tokio::test]

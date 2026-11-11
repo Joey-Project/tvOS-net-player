@@ -29,6 +29,7 @@ public protocol CacheControlClient: Sendable {
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
     func getHLSPlaybackReadiness(_ request: HLSPlaybackReadinessRequest) async throws -> HLSPlaybackReadiness
+    func getHLSRenditionCatalog(_ request: HLSRenditionCatalogRequest) async throws -> HLSRenditionCatalog
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult
     func listLibraryItemsPage(
         pageToken: String,
@@ -142,6 +143,11 @@ public struct CacheControlClientUnsupportedOperation: Error, Equatable, Sendable
         code: "hls_playback_readiness",
         message: "HLS playback readiness is not supported by this cache server."
     )
+
+    public static let hlsRenditionCatalog = CacheControlClientUnsupportedOperation(
+        code: "hls_rendition_catalog",
+        message: "HLS rendition catalogs are not supported by this cache server."
+    )
 }
 
 public struct CacheControlClientRequestValidationError: Error, Equatable, Sendable {
@@ -178,6 +184,10 @@ public extension CacheControlClient {
 
     func getHLSPlaybackReadiness(_ request: HLSPlaybackReadinessRequest) async throws -> HLSPlaybackReadiness {
         throw CacheControlClientUnsupportedOperation.hlsPlaybackReadiness
+    }
+
+    func getHLSRenditionCatalog(_ request: HLSRenditionCatalogRequest) async throws -> HLSRenditionCatalog {
+        throw CacheControlClientUnsupportedOperation.hlsRenditionCatalog
     }
 
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {

@@ -282,6 +282,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsHLSPlaybackReadiness: Bool {
         capabilities.contains(CacheServerCapability.hlsPlaybackReadiness)
     }
+
+    public var supportsHLSRenditionCatalog: Bool {
+        capabilities.contains(CacheServerCapability.hlsRenditionCatalog)
+    }
 }
 
 public struct ResolverRegion: RawRepresentable, CaseIterable, Equatable, Hashable, Identifiable, Sendable {
@@ -407,6 +411,7 @@ public enum CacheServerCapability {
     public static let bilibiliAccessKeyLogin = "bilibiliAccessKeyLogin"
     public static let bilibiliCredentialReadiness = "bilibiliCredentialReadiness"
     public static let hlsPlaybackReadiness = "hlsPlaybackReadiness"
+    public static let hlsRenditionCatalog = "hlsRenditionCatalog"
 }
 
 public enum BilibiliCredentialReadiness: String, Equatable, Sendable {

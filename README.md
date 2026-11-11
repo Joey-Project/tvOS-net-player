@@ -215,7 +215,9 @@ just test-media-network
 
 共享 Swift 客户端与 AppCore 提供显式调用的只读升档评估：高档窗口已完整缓存时可给出缓存侧机会；尚未缓存时，只有近期视频/音频供给、目标码率、实际播放速度和现有连续缓冲共同支持准备时间估算，才建议预热。源站路径默认保护至少 20 秒媒体内容，这是评估安全余量，不设置 AVPlayer 的前向缓冲上限；未知、过期或身份不匹配的证据维持当前策略。这些建议不触发下载或播放器切换，不是播放安全保证；实际切换与回升延迟优化尚未接入。设计见 [shared upshift assessment](docs/project_journal/2026/11/2026-11-10-hls-upshift-policy-b46401.md)。
 
-共享播放器可显式采集原生播放快照，保留真实播放速度、当前位置、连续缓冲边界和观察年龄；不会把跨越空洞的未来缓冲、默认倍速或历史进度当作当前播放证据。快照不证明当前画质、目标解码能力或升档安全性，不自动查询服务器或改变播放；精确目标元数据和主动接续仍需后续实现。边界见 [native playback snapshot](docs/project_journal/2026/11/2026-11-10-hls-playback-context-b46402.md)。
+共享播放器可显式采集原生播放快照，保留真实播放速度、当前位置、连续缓冲边界和观察年龄；不会把跨越空洞的未来缓冲、默认倍速或历史进度当作当前播放证据。快照不证明当前画质、目标解码能力或升档安全性，不自动查询服务器或改变播放。边界见 [native playback snapshot](docs/project_journal/2026/11/2026-11-10-hls-playback-context-b46402.md)。
+
+只读 `CacheService.GetHlsRenditionCatalog`（能力 20）返回已注册且允许服务的 session 在普通 HLS master 中公布的候选，复用资源可用性与弱网筛选规则。master 声明的总带宽与各视频/独立音频资源的名义码率分开记录，缺失值不推算；格式提示和声明尺寸不证明解码支持或当前画质。响应最多 128 个候选、64 KiB，不返回源站 URL、请求头或凭据，不恢复源、不下载，也不更新播放使用记录。共享 Swift 客户端仅显式查询，旧服务器使用兼容的 unsupported-operation 结果；目录快照不是缓存租约或切档许可，主动预热与接续仍需后续实现。边界见 [rendition catalog](docs/project_journal/2026/11/2026-11-11-hls-rendition-catalog-b46403.md)。
 
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 

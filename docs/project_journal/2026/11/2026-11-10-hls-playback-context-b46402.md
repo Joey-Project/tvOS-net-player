@@ -3,7 +3,7 @@ id: 20261110-b46402
 title: Native HLS Playback Snapshot
 status: completed
 created: 2026-11-10
-updated: 2026-11-10
+updated: 2026-11-11
 branch: codex/hls-playback-context
 pr:
 supersedes: []
@@ -39,7 +39,7 @@ superseded_by:
 - Muted media tests do not establish audible audio acceptance. No authenticated live Bilibili or physical Apple TV validation belongs to this slice.
 
 ## Next Steps
-1. Deliver exact served-rendition metadata and bind target context to the current native item/session before any asynchronous production action.
+1. Use the separately scoped [read-only rendition catalog](2026-11-11-hls-rendition-catalog-b46403.md) and bind target context to the current native item/session before any asynchronous production action. A catalog is not the currently decoded rendition or a handover lease.
 2. Implement the agreed prewarm/handover path separately, with real decoded-frame, continuity and latency acceptance; do not label this snapshot work as a recovery-latency improvement.
 
 ## Evidence
