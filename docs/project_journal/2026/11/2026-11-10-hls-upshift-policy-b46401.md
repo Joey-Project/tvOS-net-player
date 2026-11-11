@@ -39,7 +39,7 @@ superseded_by:
 - Require complete local lint/CI, the existing fixed-signed three-case native suite with system mute, current-head GitHub CI/UI/native artifacts, GitHub Codex review and every conversation resolved before normal protected squash merge.
 
 ## Next Steps
-1. Agree on production rendition handover and complete rendition context acquisition before active quality changes.
+1. Use the [native playback snapshot](2026-11-10-hls-playback-context-b46402.md) for actual client timing; complete exact served-rendition metadata and agree on production handover before active quality changes.
 2. Measure the separately implemented assisted path against the retained automatic baseline; do not relabel a policy unit test or eventual long recovery as optimized latency.
 
 ## Evidence

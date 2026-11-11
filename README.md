@@ -215,6 +215,8 @@ just test-media-network
 
 共享 Swift 客户端与 AppCore 提供显式调用的只读升档评估：高档窗口已完整缓存时可给出缓存侧机会；尚未缓存时，只有近期视频/音频供给、目标码率、实际播放速度和现有连续缓冲共同支持准备时间估算，才建议预热。源站路径默认保护至少 20 秒媒体内容，这是评估安全余量，不设置 AVPlayer 的前向缓冲上限；未知、过期或身份不匹配的证据维持当前策略。这些建议不触发下载或播放器切换，不是播放安全保证；实际切换与回升延迟优化尚未接入。设计见 [shared upshift assessment](docs/project_journal/2026/11/2026-11-10-hls-upshift-policy-b46401.md)。
 
+共享播放器可显式采集原生播放快照，保留真实播放速度、当前位置、连续缓冲边界和观察年龄；不会把跨越空洞的未来缓冲、默认倍速或历史进度当作当前播放证据。快照不证明当前画质、目标解码能力或升档安全性，不自动查询服务器或改变播放；精确目标元数据和主动接续仍需后续实现。边界见 [native playback snapshot](docs/project_journal/2026/11/2026-11-10-hls-playback-context-b46402.md)。
+
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
 GHA 的 `Native media network acceptance` job 使用同一套严格用例和报告校验，通过显式 `--ci-unsigned` 在一次性的 runner 上编译隔离产物，不需要 Apple 签名 secrets。该模式只允许在 GitHub Actions 中使用，不作为本机固定签名验收的替代。`media-network-e2e-<run_id>` 产物保留有界日志、runner summary 和三个原始媒体报告，保留三天；媒体夹具、日常 server 状态和凭据不会上传。job 失败、取消或跳过都会阻止统一 CI 门禁通过；GHA 结果与本机签名验收分别记录，设计见 [native media CI journal](docs/project_journal/2026/11/2026-11-10-native-media-ci-b46398.md)。
