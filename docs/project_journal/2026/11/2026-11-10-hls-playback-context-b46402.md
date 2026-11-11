@@ -39,7 +39,7 @@ superseded_by:
 - Muted media tests do not establish audible audio acceptance. No authenticated live Bilibili or physical Apple TV validation belongs to this slice.
 
 ## Next Steps
-1. Use the separately scoped [read-only rendition catalog](2026-11-11-hls-rendition-catalog-b46403.md) and bind target context to the current native item/session before any asynchronous production action. A catalog is not the currently decoded rendition or a handover lease.
+1. Use the [owned assessment](2026-11-11-hls-owned-assessment-b46404.md) to combine timing and the [read-only catalog](2026-11-11-hls-rendition-catalog-b46403.md) with current native item/session identity. Neither the catalog nor its local owner token proves the currently decoded rendition or grants a handover lease.
 2. Implement the agreed prewarm/handover path separately, with real decoded-frame, continuity and latency acceptance; do not label this snapshot work as a recovery-latency improvement.
 
 ## Evidence

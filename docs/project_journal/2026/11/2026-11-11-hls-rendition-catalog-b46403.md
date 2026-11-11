@@ -41,7 +41,7 @@ superseded_by:
 - Keep actual audible audio, authenticated live Bilibili and physical Apple TV validation separate; none is implicit in this metadata slice.
 
 ## Next Steps
-1. Bind catalog/readiness/native timing to a current owned item/session during asynchronous production preparation, revalidating all observations before any action.
+1. Use the [owned assessment](2026-11-11-hls-owned-assessment-b46404.md) to bind catalog/readiness/native timing to the current item/session, then revalidate observations before any later action.
 2. Implement a separately agreed target-specific serving and handover path that preserves audio and timeline continuity. The production handover preference remains unconfirmed; retain the pure automatic long gate.
 
 ## Evidence

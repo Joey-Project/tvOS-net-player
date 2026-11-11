@@ -146,19 +146,22 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
     public let libraryItemID: String
     public let variantID: String
     public let resumptionIdentity: ClientPlaybackIdentity?
+    public let hlsSession: PlayerHLSPlaybackSessionContext?
 
     public init(
         endpoint: CacheServerEndpoint,
         playbackURI: String = "",
         libraryItemID: String = "",
         variantID: String = "",
-        resumptionIdentity: ClientPlaybackIdentity? = nil
+        resumptionIdentity: ClientPlaybackIdentity? = nil,
+        hlsSession: PlayerHLSPlaybackSessionContext? = nil
     ) {
         self.endpoint = endpoint
         self.playbackURI = playbackURI
         self.libraryItemID = libraryItemID
         self.variantID = variantID
         self.resumptionIdentity = resumptionIdentity
+        self.hlsSession = hlsSession
     }
 
     func withPlaybackURI(_ playbackURI: String) -> Self {
@@ -167,7 +170,8 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
             playbackURI: playbackURI,
             libraryItemID: libraryItemID,
             variantID: variantID,
-            resumptionIdentity: resumptionIdentity
+            resumptionIdentity: resumptionIdentity,
+            hlsSession: playbackURI.utf8.elementsEqual(self.playbackURI.utf8) ? hlsSession : nil
         )
     }
 }
@@ -198,7 +202,10 @@ public final class PlayerViewModel: ObservableObject {
     private let resumptionStore: ClientResumptionStore?
     private let cacheClientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let playbackProgressReportInterval: Duration?
+    var playbackNotificationCenter = NotificationCenter.default
     private var playbackProgressContext: PlayerPlaybackProgressContext?
+    private var hlsUpshiftOwner: HLSUpshiftOwner?
+    private var hlsUpshiftTask: Task<HLSOwnedUpshiftAssessment?, Never>?
     private var playbackController: (any PlayerPlaybackControlling)?
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
@@ -248,13 +255,49 @@ public final class PlayerViewModel: ObservableObject {
     }
     var resumptionReadinessTimeout: Duration = .seconds(20)
     var resumptionSeekTimeout: Duration = .seconds(15)
-    var playbackSnapshotNowNanoseconds: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+    var playbackSnapshotNowNanoseconds: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
 
     private struct PendingReplay {
         let player: AVPlayer
         let item: AVPlayerItem
         let controller: any PlayerPlaybackControlling
         let interactionSequence: Int
+    }
+
+    private struct HLSAssessmentStart {
+        let id: UUID
+        let sessionID: String
+        let snapshot: HLSPlaybackSnapshot
+        let service: HLSUpshiftPreparationService
+    }
+
+    @MainActor
+    private final class HLSUpshiftOwner {
+        let id: UUID
+        let snapshot: HLSPlaybackSnapshot
+        let serverID: String
+        let context: PlayerPlaybackProgressContext
+        weak var player: AVPlayer?
+        weak var controller: (any PlayerPlaybackControlling)?
+        weak var item: AVPlayerItem?
+
+        init(
+            id: UUID,
+            snapshot: HLSPlaybackSnapshot,
+            serverID: String,
+            context: PlayerPlaybackProgressContext,
+            player: AVPlayer,
+            controller: any PlayerPlaybackControlling,
+            item: AVPlayerItem
+        ) {
+            self.id = id
+            self.snapshot = snapshot
+            self.serverID = serverID
+            self.context = context
+            self.player = player
+            self.controller = controller
+            self.item = item
+        }
     }
     private var pendingReplay: PendingReplay?
 
@@ -335,8 +378,152 @@ public final class PlayerViewModel: ObservableObject {
         else {
             return nil
         }
-
         return snapshot
+    }
+
+    /// Returns `nil` when no structured HLS session is associated or the assessment is cancelled,
+    /// stale, unsupported, or no longer owned by this player.
+    public func assessHLSUpshift(
+        targetVariantID: String,
+        windowStartSeconds: Double,
+        windowDurationSeconds: Double,
+        targetDecoderSupported: Bool?,
+        serverSummary: CacheServerSummary
+    ) async -> HLSOwnedUpshiftAssessment? {
+        guard !Task.isCancelled else { return nil }
+        let id = UUID()
+        let cancellation = HLSPreparationCancellationFlag()
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled, !cancellation.isCancelled,
+                let start = beginHLSUpshiftAssessment(id: id, serverSummary: serverSummary)
+            else { return nil }
+
+            let task = Task<HLSOwnedUpshiftAssessment?, Never> { [weak self] in
+                let prepared = await start.service.assess(
+                    sessionID: start.sessionID,
+                    targetVariantID: targetVariantID,
+                    windowStartSeconds: windowStartSeconds,
+                    windowDurationSeconds: windowDurationSeconds,
+                    targetDecoderSupported: targetDecoderSupported,
+                    snapshot: start.snapshot,
+                    isCancelled: { cancellation.isCancelled },
+                    isCurrent: { [weak self] in
+                        !cancellation.isCancelled && self?.isCurrentHLSUpshiftOwner(id) == true
+                    }
+                )
+                guard !Task.isCancelled, !cancellation.isCancelled, let prepared,
+                    let self, self.isCurrentHLSUpshiftOwner(id)
+                else {
+                    return nil
+                }
+                return HLSOwnedUpshiftAssessment(
+                    snapshot: start.snapshot,
+                    rendition: prepared.rendition,
+                    recommendation: prepared.recommendation,
+                    ownerToken: id
+                )
+            }
+            hlsUpshiftTask = task
+            let result = await task.value
+            if hlsUpshiftOwner?.id == id {
+                hlsUpshiftTask = nil
+            }
+            guard !Task.isCancelled, !cancellation.isCancelled,
+                let result, isCurrentHLSUpshiftAssessment(result)
+            else {
+                return nil
+            }
+            return result
+        } onCancel: { [weak self] in
+            cancellation.cancel()
+            Task { @MainActor [weak self] in
+                self?.invalidateHLSUpshiftAssessment(ifOwnedBy: id)
+            }
+        }
+    }
+
+    private func beginHLSUpshiftAssessment(
+        id: UUID,
+        serverSummary: CacheServerSummary
+    ) -> HLSAssessmentStart? {
+        invalidateHLSUpshiftAssessment()
+        guard let context = playbackProgressContext,
+            let hlsSession = context.hlsSession,
+            serverSummary.id.utf8.elementsEqual(hlsSession.serverID.utf8),
+            serverSummary.supportsHLSPlaybackReadiness,
+            serverSummary.supportsHLSRenditionCatalog,
+            let player, let controller = playbackController,
+            let item = player.currentItem, controller.currentItem === item,
+            let snapshot = captureHLSPlaybackSnapshot()
+        else { return nil }
+
+        hlsUpshiftOwner = HLSUpshiftOwner(
+            id: id,
+            snapshot: snapshot,
+            serverID: hlsSession.serverID,
+            context: context,
+            player: player,
+            controller: controller,
+            item: item
+        )
+        let service = HLSUpshiftPreparationService(
+            client: cacheClientFactory(context.endpoint),
+            serverSummary: serverSummary,
+            monotonicNowNanoseconds: playbackSnapshotNowNanoseconds
+        )
+        return HLSAssessmentStart(id: id, sessionID: hlsSession.sessionID, snapshot: snapshot, service: service)
+    }
+
+    /// Checks local playback ownership and freshness; this is neither a lease nor permission to switch.
+    public func isCurrentHLSUpshiftAssessment(_ assessment: HLSOwnedUpshiftAssessment) -> Bool {
+        guard let owner = hlsUpshiftOwner, owner.id == assessment.ownerToken,
+            owner.snapshot == assessment.snapshot,
+            isCurrentHLSUpshiftOwner(owner.id),
+            let session = owner.context.hlsSession,
+            assessment.recommendation.sessionID.utf8.elementsEqual(session.sessionID.utf8),
+            assessment.recommendation.variantID.utf8.elementsEqual(assessment.rendition.variantID.utf8),
+            HLSUpshiftPreparationService.isFresh(
+                snapshot: assessment.snapshot,
+                rendition: assessment.rendition,
+                recommendation: assessment.recommendation,
+                nowNanoseconds: playbackSnapshotNowNanoseconds()
+            )
+        else { return false }
+        return true
+    }
+
+    /// Explicitly invalidate when the known server or client scope changes.
+    public func invalidateHLSUpshiftAssessment() {
+        hlsUpshiftOwner = nil
+        hlsUpshiftTask?.cancel()
+        hlsUpshiftTask = nil
+    }
+
+    private func isCurrentHLSUpshiftOwner(_ id: UUID) -> Bool {
+        guard let owner = hlsUpshiftOwner, owner.id == id,
+            let player = owner.player, let controller = owner.controller, let item = owner.item,
+            self.player === player, player.currentItem === item,
+            playbackController === controller, controller.currentItem === item,
+            controller.readinessStatus == .readyToPlay,
+            (controller.timeControlStatus == .playing) == owner.snapshot.isPlaying,
+            let actualRate = controller.actualPlaybackRate,
+            Double(actualRate) == owner.snapshot.playbackRate,
+            let context = playbackProgressContext,
+            context == owner.context,
+            context.hlsSession?.serverID.utf8.elementsEqual(owner.serverID.utf8) == true,
+            !isCurrentResumePositionUnrestored,
+            resumePositionUnrestoredItem !== item,
+            playbackResumptionOperation == nil,
+            pendingPlaybackResume?.player !== player,
+            pendingReplay?.player !== player,
+            playbackProgressEndedItem !== item
+        else { return false }
+        return true
+    }
+
+    private func invalidateHLSUpshiftAssessment(ifOwnedBy id: UUID) {
+        guard hlsUpshiftOwner?.id == id else { return }
+        invalidateHLSUpshiftAssessment()
     }
 
     public var playbackState: PlayerPlaybackState {
@@ -513,6 +700,7 @@ public final class PlayerViewModel: ObservableObject {
         suppressCurrentPosition: Bool = false,
         resumptionOperation: PlaybackResumptionOperation? = nil
     ) {
+        invalidateHLSUpshiftAssessment()
         let queuedStoppedReport =
             suppressCurrentPosition
             ? false : queueCurrentPlaybackProgressReport(intent: .stopped)
@@ -805,6 +993,7 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     public func setPlaybackSpeed(_ speed: PlayerPlaybackSpeed) {
+        invalidateHLSUpshiftAssessment()
         playbackSpeed = speed
         guard let player else {
             statusMessage = "Playback speed \(speed.displayTitle) selected."
@@ -918,6 +1107,7 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func markManualInteraction(preservingResumptionResult: Bool = false) {
+        invalidateHLSUpshiftAssessment()
         manualInteractionSequence += 1
         pendingReplay = nil
         if preservingResumptionResult, let operation = playbackResumptionOperation,
@@ -1293,7 +1483,8 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        playbackEndObserver = NotificationCenter.default
+        playbackEndObserver =
+            playbackNotificationCenter
             .publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
             .sink { [weak self] notification in
                 let endedItem = notification.object as? AVPlayerItem
@@ -1381,11 +1572,13 @@ public final class PlayerViewModel: ObservableObject {
 
     private func observePlaybackTimeJumps(for item: AVPlayerItem?) {
         guard let item else { return }
-        playbackTimeJumpObserver = NotificationCenter.default
+        playbackTimeJumpObserver =
+            playbackNotificationCenter
             .publisher(for: .AVPlayerItemTimeJumped, object: item)
             .sink { [weak self, weak item] _ in
                 Task { @MainActor [weak self, weak item] in
                     guard let self, let item, self.player?.currentItem === item else { return }
+                    self.invalidateHLSUpshiftAssessment()
                     self.handlePlaybackTimeJump(using: self.player)
                 }
             }
@@ -1435,6 +1628,7 @@ public final class PlayerViewModel: ObservableObject {
         guard player?.currentItem === item, playbackProgressEndedItem !== item else {
             return
         }
+        invalidateHLSUpshiftAssessment()
         let queuedStoppedReport: Bool
         if let terminalTime {
             queuePlaybackProgressReport(
