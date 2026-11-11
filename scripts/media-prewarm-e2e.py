@@ -548,7 +548,8 @@ def validate_single_case_log(path: Path, case_name: str, *, returncode: int = 0,
             if pending or summary.fullmatch(line) is None:
                 raise PrewarmError("Single-case Rust log contains a malformed or premature summary.")
             summaries.append(index)
-        elif line.startswith("test "):
+            continue
+        if line.startswith("test "):
             match = re.fullmatch(r"test (.+) \.\.\.(?: (.*))?", line)
             if pending or match is None or match.group(1) != case_name or seen:
                 raise PrewarmError("Single-case Rust log has a duplicate, unexpected, or malformed case.")
@@ -556,9 +557,16 @@ def validate_single_case_log(path: Path, case_name: str, *, returncode: int = 0,
             status = match.group(2)
             if status is None:
                 pending = True
-            elif status != "ok":
+            elif status == "ok":
+                pass
+            elif status in {"FAILED", "ignored", "bench"}:
                 raise PrewarmError("Single-case Rust test did not pass.")
-        elif line in {"ok", "FAILED", "ignored", "bench"}:
+            elif status.startswith(("ok ", "FAILED ", "ignored ", "bench ")):
+                raise PrewarmError("Single-case Rust test has an ambiguous inline status.")
+            else:
+                pending = True
+            continue
+        if line in {"ok", "FAILED", "ignored", "bench"}:
             if line != "ok" or not pending:
                 raise PrewarmError("Single-case Rust log contains an orphan or non-passing status.")
             pending = False

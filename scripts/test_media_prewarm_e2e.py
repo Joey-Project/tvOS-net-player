@@ -270,28 +270,60 @@ class PrewarmRunnerTests(unittest.TestCase):
 
     def test_single_case_log_requires_exact_case_and_terminal_one_pass_summary(self) -> None:
         case = prewarm.TESTS["on"]
+        summary = ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                   "7 filtered out; finished in 1.25s")
         valid = ("running 1 test\nnoise from --nocapture\n"
-                 f"test {case} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; "
-                 "0 measured; 7 filtered out; finished in 1.25s\n")
+                 f"test {case} ... ok\n{summary}\n")
+        inline_diagnostic = ("running 1 test\n"
+                             f"test {case} ... HLS foreground range upstream returned 503 Service Unavailable\n"
+                             "retrying through standalone path\n"
+                             "ok\n"
+                             f"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                             "7 filtered out; finished in 1.25s\n")
+        bare_header = ("running 1 test\n"
+                       f"test {case} ...\n"
+                       "HLS foreground range upstream returned 503\n"
+                       "retrying through standalone path\n"
+                       "ok\n"
+                       f"{summary}\n")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "case.log"
-            path.write_text(valid)
-            prewarm.validate_single_case_log(path, case)
-            invalid_logs = [
-                valid.replace("1 passed", "0 passed"),
-                valid.replace(f"test {case} ... ok\n", ""),
-                valid.replace(f"test {case} ... ok\n", f"test {case} ... ok\ntest {case} ... ok\n"),
-                valid.replace(f"test {case} ... ok\n", f"test {case} ... ok\ntest other::case ... ok\n"),
-                valid.replace(case, "unexpected::case"),
-                valid + "late output\n",
-            ]
-            for content in invalid_logs:
-                path.write_text(content)
-                with self.subTest(content=content), self.assertRaises(prewarm.PrewarmError):
+            for content in (valid, inline_diagnostic, bare_header):
+                with self.subTest(accepted_log=content):
+                    path.write_text(content)
                     prewarm.validate_single_case_log(path, case)
+
+            invalid_logs = {
+                "zero passed summary": valid.replace("1 passed", "0 passed"),
+                "missing case header": valid.replace(f"test {case} ... ok\n", ""),
+                "missing standalone ok": (f"test {case} ... upstream returned 503\n{summary}\n"),
+                "failure": (f"test {case} ... FAILED\n{summary}\n"),
+                "ignored": (f"test {case} ... ignored\n{summary}\n"),
+                "bench": (f"test {case} ... bench\n{summary}\n"),
+                "ambiguous status prefix": (f"test {case} ... ok but not terminal\n{summary}\n"),
+                "ambiguous failure prefix": (f"test {case} ... FAILED after setup\n{summary}\n"),
+                "ambiguous ignored prefix": (f"test {case} ... ignored after setup\n{summary}\n"),
+                "ambiguous bench prefix": (f"test {case} ... bench details\n{summary}\n"),
+                "standalone failure while pending": (
+                    f"test {case} ... HLS upstream returned 503\nFAILED\n{summary}\n"),
+                "duplicate case": (f"test {case} ... ok\ntest {case} ... ok\n{summary}\n"),
+                "unexpected case": (f"test other::case ... ok\n{summary}\n"),
+                "interleaved header": (f"test {case} ... warning\ntest other::case ... ok\n{summary}\n"),
+                "orphan status": (f"ok\ntest {case} ... ok\n{summary}\n"),
+                "premature summary": (f"{summary}\ntest {case} ... ok\n"),
+                "duplicated summary": (f"test {case} ... ok\n{summary}\n{summary}\n"),
+                "trailing output": (f"test {case} ... ok\n{summary}\nlate output\n"),
+            }
+            for label, content in invalid_logs.items():
+                path.write_text(content)
+                with self.subTest(rejected_log=label), self.assertRaises(prewarm.PrewarmError):
+                    prewarm.validate_single_case_log(path, case)
+
             path.write_text(valid)
             with self.assertRaises(prewarm.PrewarmError):
                 prewarm.validate_single_case_log(path, case, returncode=1)
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_single_case_log(path, case, timed_out=True)
 
     def test_missing_recovery_is_censored_not_zero(self) -> None:
         off, on = make_report("off", recovered=False), make_report("on")
