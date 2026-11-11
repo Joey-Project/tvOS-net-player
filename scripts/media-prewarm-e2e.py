@@ -222,7 +222,7 @@ def _selected_ranges_covered(selected: list[dict[str, Any]], transfer: list[dict
 def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> dict[str, Any]:
     value = report.get("prewarm_comparison")
     expected_mode = "off" if mode == "off" else "on"
-    if (not isinstance(value, dict) or not _exact_int(value.get("schema_version"), 2)
+    if (not isinstance(value, dict) or not _exact_int(value.get("schema_version"), 3)
             or value.get("mode") != expected_mode
             or value.get("boundary_policy") != "unbuffered_after_20s_safety"):
         raise PrewarmError(f"Prewarm comparison identity is invalid: {report_name}")
@@ -242,7 +242,13 @@ def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> di
     budget, planned = value.get("byte_budget"), value.get("planned_bytes")
     transfer_budget, planned_transfer = value.get("transfer_byte_budget"), value.get("planned_transfer_bytes")
     requested, operations = value.get("operation_requested_bytes"), value.get("operation_count")
+    attempted = value.get("attempted_ranges")
+    completed_bytes, completed_count = (value.get("completed_transfer_bytes"),
+                                        value.get("completed_transfer_count"))
+    preempted_count, defer_count = (value.get("preempted_operation_count"),
+                                    value.get("foreground_defer_count"))
     elapsed = value.get("elapsed_seconds")
+    failure = value.get("failure")
     provenance = value.get("provenance")
     id_map = value.get("resource_ids")
     if (not isinstance(id_map, dict) or set(id_map) != {"video", "audio"}
@@ -264,19 +270,65 @@ def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> di
             or any(not any(r["resource_id"] == resource_id and r["start"] == 0 for r in transfer)
                    for resource_id in ids)
             or value.get("coverage_semantics") != "sum_of_fully_readable_selected_ranges"
-            or not _exact_int(requested) or not _exact_int(operations) or not _finite(elapsed)
-            or elapsed < 0 or elapsed > 15 or value.get("completed") is not True
+            or not _exact_int(requested) or requested > transfer_budget
+            or not _exact_int(operations) or operations > MAX_PREWARM_RANGES
+            or not isinstance(attempted, list) or len(attempted) != operations
+            or not _exact_int(completed_bytes) or not _exact_int(completed_count)
+            or not _exact_int(preempted_count) or not _exact_int(defer_count)
+            or not _finite(elapsed) or elapsed < 0 or elapsed > 15
+            or value.get("completed") is not True
             or not isinstance(provenance, dict)
             or provenance.get("origin_counters_include_playback_and_prewarm") is not True
             or provenance.get("transfer_accounting") != "planned_background_parent_chunks_and_startup_not_wire_bytes"
             or provenance.get("expanded_transfer_may_overlap_buffered_media") is not True
             or any(key in value for key in ("source_url", "url", "credentials", "headers", "cookies"))):
         raise PrewarmError(f"Prewarm bounds, completion, or provenance are invalid: {report_name}")
-    if mode == "off" and (requested != 0 or operations != 0):
-        raise PrewarmError("Control report claims prewarm operations.")
-    if mode == "on" and (requested != planned_transfer or requested > transfer_budget
-                          or operations != len(transfer)):
-        raise PrewarmError("Treatment report lacks bounded prewarm operations.")
+    if (not isinstance(failure, dict)
+            or set(failure) != {"category", "resource_id", "start", "end", "upstream_status"}
+            or any(failure[key] is not None for key in
+                   ("category", "resource_id", "start", "end", "upstream_status"))):
+        raise PrewarmError(f"Successful prewarm report contains failure details: {report_name}")
+
+    plan_by_span = {(item["resource_id"], item["start"], item["end"]): item for item in transfer}
+    attempted_bytes = 0
+    preempted = 0
+    completed_spans: set[tuple[str, int, int]] = set()
+    span_states: dict[tuple[str, int, int], str] = {}
+    for attempt in attempted:
+        if (not isinstance(attempt, dict) or set(attempt) != {"resource_id", "start", "end", "outcome"}
+                or not isinstance(attempt.get("resource_id"), str)
+                or not _exact_int(attempt.get("start")) or not _exact_int(attempt.get("end"))
+                or attempt["start"] < 0 or attempt["end"] <= attempt["start"]
+                or attempt["end"] > U64_MAX
+                or not isinstance(attempt.get("outcome"), str)
+                or attempt["outcome"] not in ("completed", "preempted")):
+            raise PrewarmError(f"Attempted range is invalid or has an unsupported outcome: {report_name}")
+        span = (attempt["resource_id"], attempt["start"], attempt["end"])
+        if span not in plan_by_span or span_states.get(span) == "completed":
+            raise PrewarmError(f"Attempted range is unplanned or retries a completed span: {report_name}")
+        span_length = attempt["end"] - attempt["start"]
+        attempted_bytes += span_length
+        if attempted_bytes > transfer_budget:
+            raise PrewarmError(f"Cumulative attempted range bytes exceed the transfer budget: {report_name}")
+        outcome = attempt["outcome"]
+        if outcome == "preempted":
+            preempted += 1
+            span_states[span] = "preempted"
+        else:
+            completed_spans.add(span)
+            span_states[span] = "completed"
+    if (requested != attempted_bytes or operations != len(attempted)
+            or preempted_count != preempted or defer_count > preempted):
+        raise PrewarmError(f"Prewarm attempt counters do not match attempted ranges: {report_name}")
+    completed_sum = sum(end - start for _, start, end in completed_spans)
+    if completed_bytes != completed_sum or completed_count != len(completed_spans):
+        raise PrewarmError(f"Unique completed transfer counters do not match completed spans: {report_name}")
+    if mode == "off":
+        if any((requested, operations, completed_bytes, completed_count, preempted_count, defer_count)):
+            raise PrewarmError("Control report claims prewarm operations or transfers.")
+    elif (set(completed_spans) != set(plan_by_span) or completed_bytes != planned_transfer
+          or completed_count != len(transfer)):
+        raise PrewarmError("Treatment report does not uniquely complete the full transfer plan.")
     coverage = value.get("cache_covered_bytes_before"), value.get("cache_covered_bytes_after")
     if any(not _exact_int(item) or item < 0 or item > planned for item in coverage):
         raise PrewarmError(f"Selected-window cache coverage is invalid: {report_name}")
@@ -512,10 +564,18 @@ def _comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
             "expanded_transfer_may_overlap_buffered_media": True,
             "control": {"planned_logical_selected_bytes": off["prewarm"]["planned_bytes"],
                         "planned_expanded_transfer_bytes": off["prewarm"]["planned_transfer_bytes"],
-                        "operation_count": off["prewarm"]["operation_count"]},
+            "actual_attempt_count": off["prewarm"]["operation_count"],
+                        "actual_attempted_span_bytes": off["prewarm"]["operation_requested_bytes"],
+                        "preempted_operation_count": off["prewarm"]["preempted_operation_count"],
+                        "completed_plan_span_count": off["prewarm"]["completed_transfer_count"],
+                        "completed_plan_span_bytes": off["prewarm"]["completed_transfer_bytes"]},
             "treatment": {"planned_logical_selected_bytes": on["prewarm"]["planned_bytes"],
                           "planned_expanded_transfer_bytes": on["prewarm"]["planned_transfer_bytes"],
-                          "operation_count": on["prewarm"]["operation_count"],
+                          "actual_attempt_count": on["prewarm"]["operation_count"],
+                          "actual_attempted_span_bytes": on["prewarm"]["operation_requested_bytes"],
+                          "preempted_operation_count": on["prewarm"]["preempted_operation_count"],
+                          "completed_plan_span_count": on["prewarm"]["completed_transfer_count"],
+                          "completed_plan_span_bytes": on["prewarm"]["completed_transfer_bytes"],
                           "covered_logical_selected_bytes": on["prewarm"]["cache_covered_bytes_after"]}},
         "acceptance_passed": False,
     }

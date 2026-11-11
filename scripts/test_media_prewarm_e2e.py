@@ -43,7 +43,7 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
             "buffered_ahead_seconds": 9, "decoded_width": 640, "decoded_height": 360,
             "time_control_status": "playing", "indicated_bitrate": 1000000})
     prewarm_contract = {
-        "schema_version": 2, "mode": "off" if mode == "off" else "on",
+        "schema_version": 3, "mode": "off" if mode == "off" else "on",
         "boundary_policy": "unbuffered_after_20s_safety",
         "recovery_snapshot": {"schema_version": 1, "observed_monotonic_seconds": 135,
                               "playhead_seconds": 100, "loaded_end_seconds": 110},
@@ -59,6 +59,17 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
         "coverage_semantics": "sum_of_fully_readable_selected_ranges",
         "operation_requested_bytes": 0 if mode == "off" else 1250,
         "operation_count": 0 if mode == "off" else 3,
+        "attempted_ranges": [] if mode == "off" else [
+            {**span, "outcome": "completed"} for span in (
+                {"resource_id": "audio-id", "start": 0, "end": 250},
+                {"resource_id": "video-id", "start": 0, "end": 500},
+                {"resource_id": "video-id", "start": 500, "end": 1000})],
+        "completed_transfer_bytes": 0 if mode == "off" else 1250,
+        "completed_transfer_count": 0 if mode == "off" else 3,
+        "preempted_operation_count": 0,
+        "foreground_defer_count": 0,
+        "failure": {"category": None, "resource_id": None, "start": None, "end": None,
+                    "upstream_status": None},
         "elapsed_seconds": 0 if mode == "off" else 1.5,
         "cache_covered_bytes_before": 0,
         "cache_covered_bytes_after": 0 if mode == "off" else 1000,
@@ -195,9 +206,14 @@ class PrewarmRunnerTests(unittest.TestCase):
         self.assertIn("not_origin_prewarm", comparison["client_high_request_count"]["source"])
         self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_logical_selected_bytes"], 1000)
         self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_expanded_transfer_bytes"], 1250)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["operation_count"], 3)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempt_count"], 3)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempted_span_bytes"], 1250)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["completed_plan_span_count"], 3)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["completed_plan_span_bytes"], 1250)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["preempted_operation_count"], 0)
+        self.assertIn("not_wire_bytes", comparison["prewarm_readiness"]["transfer_accounting"])
 
-    def test_schema_two_accepts_selection_spanning_adjacent_parent_chunks(self) -> None:
+    def test_schema_three_accepts_selection_spanning_adjacent_parent_chunks(self) -> None:
         report = make_report("on")
         comparison = report["prewarm_comparison"]
         self.assertEqual(comparison["selected_ranges"][1]["start"], 100)
@@ -209,11 +225,40 @@ class PrewarmRunnerTests(unittest.TestCase):
         self.assertEqual(validated["prewarm"]["planned_bytes"], 1000)
         self.assertEqual(validated["prewarm"]["planned_transfer_bytes"], 1250)
 
+    def test_schema_three_accepts_repeated_preemption_then_unique_completion(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        plan = contract["transfer_plan"]
+        contract["attempted_ranges"] = [
+            {**plan[0], "outcome": "preempted"},
+            {**plan[0], "outcome": "preempted"},
+            {**plan[0], "outcome": "completed"},
+            {**plan[1], "outcome": "completed"},
+            {**plan[2], "outcome": "completed"},
+        ]
+        contract.update(operation_count=5, operation_requested_bytes=1750,
+                        preempted_operation_count=2, foreground_defer_count=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "treatment.json"
+            path.write_text(json.dumps(report))
+            validated = prewarm.validate_report(path, "on")
+        self.assertEqual(validated["prewarm"]["completed_transfer_bytes"], 1250)
+        self.assertEqual(validated["prewarm"]["completed_transfer_count"], 3)
+
     def test_schema_one_selected_only_reports_are_refused(self) -> None:
         report = make_report("on")
         report["prewarm_comparison"]["schema_version"] = 1
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.json"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+    def test_schema_two_reports_are_not_accepted_as_compatibility_input(self) -> None:
+        report = make_report("on")
+        report["prewarm_comparison"]["schema_version"] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema-two.json"
             path.write_text(json.dumps(report))
             with self.assertRaises(prewarm.PrewarmError):
                 prewarm.validate_report(path, "on")
@@ -267,6 +312,105 @@ class PrewarmRunnerTests(unittest.TestCase):
             path.write_text(json.dumps(report))
             validated = prewarm.validate_report(path, "off")
         self.assertEqual(len(validated["prewarm"]["transfer_plan"]), 3)
+        self.assertEqual(validated["prewarm"]["completed_transfer_bytes"], 0)
+        self.assertEqual(validated["prewarm"]["completed_transfer_count"], 0)
+
+    def test_schema_three_rejects_attempt_budget_and_accounting_forgery(self) -> None:
+        cases = []
+        cases.append(("attempt bytes undercharged", lambda c: c.update(operation_requested_bytes=1249)))
+        cases.append(("attempt count forged", lambda c: c.update(operation_count=4)))
+        cases.append(("unplanned retry", lambda c: c["attempted_ranges"].append(
+            {"resource_id": "unknown", "start": 0, "end": 1, "outcome": "preempted"})))
+        cases.append(("duplicate completion", lambda c: c["attempted_ranges"].append(
+            {**c["transfer_plan"][0], "outcome": "completed"})))
+        cases.append(("missing completed span", lambda c: c["attempted_ranges"].pop()))
+        cases.append(("unknown outcome", lambda c: c["attempted_ranges"][0].update(outcome="retry")))
+        cases.append(("nonretryable outcome on passed report",
+                      lambda c: c["attempted_ranges"][0].update(outcome="network")))
+        cases.append(("preemption counter forged", lambda c: c.update(preempted_operation_count=1)))
+        cases.append(("defer exceeds preemption", lambda c: c.update(foreground_defer_count=1)))
+        cases.append(("completed byte counter forged", lambda c: c.update(completed_transfer_bytes=1249)))
+        cases.append(("completed count forged", lambda c: c.update(completed_transfer_count=2)))
+        cases.append(("failure on passed report", lambda c: c["failure"].update(category="network")))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "treatment.json"
+            for label, mutate in cases:
+                report = make_report("on")
+                mutate(report["prewarm_comparison"])
+                path.write_text(json.dumps(report))
+                with self.subTest(case=label), self.assertRaises(prewarm.PrewarmError):
+                    prewarm.validate_report(path, "on")
+
+            report = make_report("on")
+            contract = report["prewarm_comparison"]
+            contract["transfer_plan"] = [
+                {"resource_id": "audio-id", "start": 0, "end": prewarm.PREWARM_TRANSFER_BYTES // 2},
+                {"resource_id": "video-id", "start": 0, "end": prewarm.PREWARM_TRANSFER_BYTES // 2},
+            ]
+            contract["planned_transfer_bytes"] = prewarm.PREWARM_TRANSFER_BYTES
+            contract["attempted_ranges"] = [
+                {**contract["transfer_plan"][0], "outcome": "preempted"},
+                {**contract["transfer_plan"][0], "outcome": "preempted"},
+                {**contract["transfer_plan"][0], "outcome": "completed"},
+                {**contract["transfer_plan"][1], "outcome": "completed"},
+            ]
+            contract.update(operation_count=4, operation_requested_bytes=2 * prewarm.PREWARM_TRANSFER_BYTES,
+                            preempted_operation_count=2, foreground_defer_count=2)
+            contract["completed_transfer_bytes"] = prewarm.PREWARM_TRANSFER_BYTES
+            contract["completed_transfer_count"] = 2
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+            report = make_report("on")
+            contract = report["prewarm_comparison"]
+            plan = contract["transfer_plan"]
+            contract["attempted_ranges"] = [
+                {**plan[0], "outcome": "preempted"} for _ in range(prewarm.MAX_PREWARM_RANGES)
+            ] + [{**plan[0], "outcome": "completed"},
+                 {**plan[1], "outcome": "completed"}, {**plan[2], "outcome": "completed"}]
+            contract.update(operation_count=prewarm.MAX_PREWARM_RANGES + 3,
+                            operation_requested_bytes=prewarm.MAX_PREWARM_RANGES * 250 + 1250,
+                            preempted_operation_count=prewarm.MAX_PREWARM_RANGES,
+                            foreground_defer_count=prewarm.MAX_PREWARM_RANGES)
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+    def test_control_rejects_each_nonzero_intervention_or_transfer_field(self) -> None:
+        fields = ("operation_requested_bytes", "operation_count", "completed_transfer_bytes",
+                  "completed_transfer_count", "preempted_operation_count", "foreground_defer_count")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.json"
+            for field in fields:
+                report = make_report("off")
+                report["prewarm_comparison"][field] = 1
+                path.write_text(json.dumps(report))
+                with self.subTest(field=field), self.assertRaises(prewarm.PrewarmError):
+                    prewarm.validate_report(path, "off")
+            report = make_report("off")
+            report["prewarm_comparison"]["attempted_ranges"] = [
+                {**report["prewarm_comparison"]["transfer_plan"][0], "outcome": "completed"}]
+            report["prewarm_comparison"].update(operation_count=1, operation_requested_bytes=250,
+                                                 completed_transfer_count=1, completed_transfer_bytes=250)
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "off")
+
+    def test_failed_diagnostic_is_not_accepted_as_a_censored_success(self) -> None:
+        report = make_report("on", recovered=False)
+        report["status"] = "failed"
+        report["prewarm_comparison"].update(
+            completed=False,
+            failure={"category": "network", "resource_id": "video-id", "start": 0,
+                     "end": 500, "upstream_status": None},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "failed.json"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
 
     def test_single_case_log_requires_exact_case_and_terminal_one_pass_summary(self) -> None:
         case = prewarm.TESTS["on"]

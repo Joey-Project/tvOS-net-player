@@ -437,6 +437,11 @@ impl HlsCacheStore {
         self.range_cache.range_activity_counts()
     }
 
+    #[cfg(test)]
+    pub(crate) fn foreground_activity_count_for_test(&self) -> usize {
+        self.range_cache.foreground_activity_count()
+    }
+
     pub(crate) async fn drain_range_writers(&self) {
         self.range_cache.drain().await;
     }
@@ -12725,6 +12730,80 @@ mod tests {
             .expect("partial range response should build")
     }
 
+    struct ForegroundPreemptionFixture {
+        body: Arc<Vec<u8>>,
+        foreground_started: Notify,
+        foreground_release: Notify,
+        background_requests: AtomicUsize,
+    }
+
+    fn fixture_range(headers: &HeaderMap, total: usize) -> Option<(usize, usize)> {
+        let value = headers
+            .get(reqwest::header::RANGE)?
+            .to_str()
+            .ok()?
+            .strip_prefix("bytes=")?;
+        let (start, inclusive_end) = value.split_once('-')?;
+        let start = start.parse::<usize>().ok()?;
+        let end = inclusive_end.parse::<usize>().ok()?.checked_add(1)?;
+        (start < end && end <= total).then_some((start, end))
+    }
+
+    fn fixture_partial_response(
+        start: usize,
+        end: usize,
+        total: usize,
+        body: Body,
+    ) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_LENGTH, (end - start).to_string())
+            .header(
+                "content-range",
+                format!("bytes {start}-{}/{total}", end - 1),
+            )
+            .header(reqwest::header::ETAG, "\"foreground-preemption-v1\"")
+            .body(body)
+            .expect("fixture range response should build")
+    }
+
+    async fn upstream_held_foreground_range(
+        State(fixture): State<Arc<ForegroundPreemptionFixture>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let Some((start, end)) = fixture_range(&headers, fixture.body.len()) else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        let payload = fixture.body[start..end].to_vec();
+        let total = fixture.body.len();
+        fixture.foreground_started.notify_one();
+        let release = Arc::clone(&fixture);
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            release.foreground_release.notified().await;
+            Ok::<_, std::convert::Infallible>(payload)
+        }));
+        fixture_partial_response(start, end, total, body)
+    }
+
+    async fn upstream_background_range(
+        State(fixture): State<Arc<ForegroundPreemptionFixture>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        fixture.background_requests.fetch_add(1, Ordering::SeqCst);
+        let Some((start, end)) = fixture_range(&headers, fixture.body.len()) else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        let payload = fixture.body[start..end].to_vec();
+        let total = fixture.body.len();
+        fixture_partial_response(start, end, total, Body::from(payload))
+    }
+
     #[tokio::test]
     async fn background_intervention_plan_bounds_real_unaligned_fetches() {
         const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024;
@@ -12844,6 +12923,105 @@ mod tests {
         assert!(actual_bytes <= planned_bytes);
         assert!(!plan.is_empty());
         assert!(!actual_ranges.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_foreground_range_preempts_distinct_background_resource_until_released() {
+        const TOTAL: u64 = 2 * 1024 * 1024;
+        let fixture = Arc::new(ForegroundPreemptionFixture {
+            body: Arc::new(vec![0x5a; TOTAL as usize]),
+            foreground_started: Notify::new(),
+            foreground_release: Notify::new(),
+            background_requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/video.m4s", get(upstream_held_foreground_range))
+            .route("/audio.m4s", get(upstream_background_range))
+            .with_state(Arc::clone(&fixture));
+        let (video_url, server) = start_hls_cache_upstream(app).await;
+        let audio_url = format!("{}/audio.m4s", video_url.trim_end_matches("/video.m4s"));
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let client = reqwest::Client::new();
+        let mut session = sample_session_with_audio("foreground-preemption", &video_url);
+        session.variant.video.request.size = Some(TOTAL);
+        let audio = session
+            .variant
+            .audio
+            .as_mut()
+            .expect("sample session should include audio");
+        audio.request.url = audio_url;
+        audio.request.size = Some(TOTAL);
+        store
+            .save_session(&session)
+            .expect("session should be published");
+
+        let foreground_store = store.clone();
+        let foreground_client = client.clone();
+        let foreground_session = session.clone();
+        let foreground_task = tokio::spawn(async move {
+            foreground_store
+                .ensure_resource_range(
+                    &foreground_client,
+                    &foreground_session.id,
+                    &foreground_session.variant.video,
+                    0..64 * 1024,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.foreground_started.notified(),
+        )
+        .await
+        .expect("real foreground request should reach the loopback origin");
+        assert_eq!(store.foreground_activity_count_for_test(), 1);
+
+        let audio = session
+            .variant
+            .audio
+            .as_ref()
+            .expect("sample session should include audio");
+        let preempted = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.ensure_resource_range(
+                &client,
+                &session.id,
+                audio,
+                0..64 * 1024,
+                HlsRangePriority::Background,
+                &|| HlsCacheFillControl::Continue,
+            ),
+        )
+        .await
+        .expect("background arbitration should be prompt")
+        .expect_err("distinct background range should be preempted");
+        assert!(matches!(preempted, HlsRangeError::Preempted));
+        assert_eq!(fixture.background_requests.load(Ordering::SeqCst), 0);
+
+        fixture.foreground_release.notify_one();
+        let foreground_result = tokio::time::timeout(Duration::from_secs(2), foreground_task)
+            .await
+            .expect("foreground range should finish after release")
+            .expect("foreground task should join");
+        foreground_result.expect("foreground range should complete");
+        assert_eq!(store.foreground_activity_count_for_test(), 0);
+        store
+            .ensure_resource_range(
+                &client,
+                &session.id,
+                audio,
+                0..64 * 1024,
+                HlsRangePriority::Background,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("background range should succeed after foreground release");
+        assert!(fixture.background_requests.load(Ordering::SeqCst) > 0);
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

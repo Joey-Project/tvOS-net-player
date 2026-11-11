@@ -1287,61 +1287,58 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         let coverage_before =
             selected_range_coverage(&state.hls_cache, &session.id, high, audio, &plan).await?;
         let started = Instant::now();
-        if let Ok(mut data) = report.lock() {
-            data.prewarm_comparison = Some(crate::media_prewarm_comparison_tests::report_for(
-                mode,
-                snapshot.clone(),
-                plan.clone(),
-                crate::media_prewarm_comparison_tests::PrewarmExecution {
-                    requested_bytes: 0,
-                    operation_count: 0,
-                    elapsed_seconds: 0.0,
-                    coverage_before,
-                    coverage_after: coverage_before,
-                    completed: false,
-                },
-            ));
-        }
-        let (operation_requested_bytes, operation_count) = match mode {
-            crate::media_prewarm_comparison_tests::PrewarmMode::Off => (0, 0),
-            crate::media_prewarm_comparison_tests::PrewarmMode::On => timeout(
-                Duration::from_secs(15),
+        let mut execution =
+            crate::media_prewarm_comparison_tests::PrewarmExecution::initial(coverage_before);
+        publish_prewarm_progress(&report, mode, &snapshot, &plan, &mut execution, started)?;
+        let prewarm_result = match mode {
+            crate::media_prewarm_comparison_tests::PrewarmMode::Off => {
+                execution.completed = true;
+                Ok(())
+            }
+            crate::media_prewarm_comparison_tests::PrewarmMode::On => {
                 prewarm_selected_ranges(
-                    &state.hls_cache,
-                    &state.hls_upstream_client,
-                    &session.id,
-                    high,
-                    audio,
-                    &plan,
-                ),
-            )
-            .await
-            .map_err(|_| "bounded HLS prewarm exceeded its 15-second deadline".to_owned())??,
+                    PrewarmRunContext {
+                        cache: &state.hls_cache,
+                        client: &state.hls_upstream_client,
+                        session_id: &session.id,
+                        high,
+                        audio,
+                        plan: &plan,
+                        deadline: tokio::time::Instant::now() + Duration::from_secs(15),
+                        report: &report,
+                        mode,
+                        snapshot: &snapshot,
+                        started,
+                    },
+                    &mut execution,
+                )
+                .await
+            }
         };
-        let elapsed = started.elapsed().as_secs_f64();
-        let coverage_after =
-            selected_range_coverage(&state.hls_cache, &session.id, high, audio, &plan).await?;
-        if mode == crate::media_prewarm_comparison_tests::PrewarmMode::On
-            && coverage_after < plan.planned_bytes
-        {
-            return Err("prewarm did not durably cover every selected range".to_owned());
+        let coverage_after = if prewarm_result.is_ok() {
+            selected_range_coverage(&state.hls_cache, &session.id, high, audio, &plan).await
+        } else {
+            Err("coverage observation skipped after prewarm failure".to_owned())
+        };
+        if let Ok(coverage_after) = coverage_after {
+            execution.coverage_after = Some(coverage_after);
         }
-        let comparison = crate::media_prewarm_comparison_tests::report_for(
-            mode,
-            snapshot,
-            plan,
-            crate::media_prewarm_comparison_tests::PrewarmExecution {
-                requested_bytes: operation_requested_bytes,
-                operation_count,
-                elapsed_seconds: elapsed,
-                coverage_before,
-                coverage_after,
-                completed: true,
-            },
-        );
-        if let Ok(mut data) = report.lock() {
-            data.prewarm_comparison = Some(comparison);
-        }
+        let prewarm_result = if prewarm_result.is_ok()
+            && execution.coverage_after.is_none_or(|coverage| {
+                mode == crate::media_prewarm_comparison_tests::PrewarmMode::On
+                    && coverage < plan.planned_bytes
+            }) {
+            execution.failure = prewarm_failure_without_range(
+                crate::media_prewarm_comparison_tests::PrewarmFailureCategory::CacheCoverageIncomplete,
+            );
+            Err("successful prewarm did not produce a valid durable coverage observation or cover every selected range".to_owned())
+        } else {
+            prewarm_result
+        };
+        execution.completed = prewarm_result.is_ok();
+        execution.elapsed_seconds = started.elapsed().as_secs_f64();
+        publish_prewarm_progress(&report, mode, &snapshot, &plan, &mut execution, started)?;
+        prewarm_result?;
     }
 
     let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
@@ -1482,71 +1479,460 @@ async fn selected_range_coverage(
     Ok(covered)
 }
 
-async fn prewarm_selected_ranges(
-    cache: &HlsCacheStore,
-    client: &reqwest::Client,
-    session_id: &str,
-    high: &crate::hls::HlsMediaResource,
-    audio: &crate::hls::HlsMediaResource,
+fn publish_prewarm_progress(
+    report: &ReportStore,
+    mode: crate::media_prewarm_comparison_tests::PrewarmMode,
+    snapshot: &crate::media_prewarm_comparison_tests::RecoverySnapshot,
     plan: &crate::media_prewarm_comparison_tests::PrewarmPlan,
-) -> Result<(u64, u64), String> {
-    if plan.resource_ids.video != high.id
+    execution: &mut crate::media_prewarm_comparison_tests::PrewarmExecution,
+    started: Instant,
+) -> Result<(), String> {
+    execution.elapsed_seconds = started.elapsed().as_secs_f64();
+    let comparison = crate::media_prewarm_comparison_tests::report_for(
+        mode,
+        snapshot.clone(),
+        plan.clone(),
+        execution.clone(),
+    );
+    report
+        .lock()
+        .map_err(|_| "acceptance report lock was poisoned".to_owned())?
+        .prewarm_comparison = Some(comparison);
+    Ok(())
+}
+
+fn prewarm_failure_without_range(
+    category: crate::media_prewarm_comparison_tests::PrewarmFailureCategory,
+) -> crate::media_prewarm_comparison_tests::PrewarmFailure {
+    crate::media_prewarm_comparison_tests::PrewarmFailure {
+        category: Some(category),
+        ..Default::default()
+    }
+}
+
+fn prewarm_failure_for_range(
+    category: crate::media_prewarm_comparison_tests::PrewarmFailureCategory,
+    range: &crate::media_prewarm_comparison_tests::SelectedRange,
+    upstream_status: Option<u16>,
+) -> crate::media_prewarm_comparison_tests::PrewarmFailure {
+    crate::media_prewarm_comparison_tests::PrewarmFailure {
+        category: Some(category),
+        resource_id: Some(range.resource_id.clone()),
+        start: Some(range.start),
+        end: Some(range.end),
+        upstream_status,
+    }
+}
+
+fn prewarm_failure_message(
+    failure: &crate::media_prewarm_comparison_tests::PrewarmFailure,
+) -> String {
+    let category = match failure.category {
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::PlanInvalid) => {
+            "plan_invalid"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::Cancelled) => {
+            "cancelled"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::SessionRemoving) => {
+            "session_removing"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::IdentityChanged) => {
+            "identity_changed"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::QuotaExceeded) => {
+            "quota_exceeded"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::UpstreamStatus) => {
+            "upstream_status"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::Network) => "network",
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::Io) => "io",
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::RangeUnsupported) => {
+            "range_unsupported"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::InvalidResponse) => {
+            "invalid_response"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::DeadlineExceeded) => {
+            "deadline_exceeded"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::AttemptLimit) => {
+            "attempt_limit"
+        }
+        Some(crate::media_prewarm_comparison_tests::PrewarmFailureCategory::ByteBudgetExceeded) => {
+            "byte_budget_exceeded"
+        }
+        Some(
+            crate::media_prewarm_comparison_tests::PrewarmFailureCategory::ResourceLengthChanged,
+        ) => "resource_length_changed",
+        Some(
+            crate::media_prewarm_comparison_tests::PrewarmFailureCategory::CacheCoverageIncomplete,
+        ) => "cache_coverage_incomplete",
+        None => "unknown",
+    };
+    match (
+        &failure.resource_id,
+        failure.start,
+        failure.end,
+        failure.upstream_status,
+    ) {
+        (Some(resource), Some(start), Some(end), Some(status)) => format!(
+            "bounded HLS prewarm failed: category={category} resource={resource} range={start}..{end} upstream_status={status}"
+        ),
+        (Some(resource), Some(start), Some(end), None) => format!(
+            "bounded HLS prewarm failed: category={category} resource={resource} range={start}..{end}"
+        ),
+        _ => format!("bounded HLS prewarm failed: category={category}"),
+    }
+}
+
+fn prewarm_range_error(
+    error: &crate::hls_range_cache::HlsRangeError,
+) -> (
+    crate::media_prewarm_comparison_tests::PrewarmOutcome,
+    Option<crate::media_prewarm_comparison_tests::PrewarmFailureCategory>,
+    Option<u16>,
+) {
+    use crate::hls_range_cache::HlsRangeError;
+    use crate::media_prewarm_comparison_tests::{
+        PrewarmFailureCategory as Failure, PrewarmOutcome,
+    };
+
+    match error {
+        HlsRangeError::Preempted => (PrewarmOutcome::Preempted, None, None),
+        HlsRangeError::Cancelled => (PrewarmOutcome::Cancelled, Some(Failure::Cancelled), None),
+        HlsRangeError::SessionRemoving => (
+            PrewarmOutcome::SessionRemoving,
+            Some(Failure::SessionRemoving),
+            None,
+        ),
+        HlsRangeError::IdentityChanged => (
+            PrewarmOutcome::IdentityChanged,
+            Some(Failure::IdentityChanged),
+            None,
+        ),
+        HlsRangeError::QuotaExceeded => (
+            PrewarmOutcome::QuotaExceeded,
+            Some(Failure::QuotaExceeded),
+            None,
+        ),
+        HlsRangeError::UpstreamStatus(status) => (
+            PrewarmOutcome::UpstreamStatus,
+            Some(Failure::UpstreamStatus),
+            Some(status.as_u16()),
+        ),
+        HlsRangeError::Network(_) => (PrewarmOutcome::Network, Some(Failure::Network), None),
+        HlsRangeError::Io(_) => (PrewarmOutcome::Io, Some(Failure::Io), None),
+        HlsRangeError::RangeUnsupported => (
+            PrewarmOutcome::RangeUnsupported,
+            Some(Failure::RangeUnsupported),
+            None,
+        ),
+        HlsRangeError::InvalidResponse(_) => (
+            PrewarmOutcome::InvalidResponse,
+            Some(Failure::InvalidResponse),
+            None,
+        ),
+    }
+}
+
+async fn wait_for_foreground_quiescence(
+    cache: &HlsCacheStore,
+    deadline: tokio::time::Instant,
+) -> bool {
+    const QUIET_INTERVAL: Duration = Duration::from_millis(100);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let mut quiet_since = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        if cache.foreground_activity_count_for_test() == 0 {
+            let quiet_start = *quiet_since.get_or_insert(now);
+            if now.duration_since(quiet_start) >= QUIET_INTERVAL {
+                return true;
+            }
+        } else {
+            quiet_since = None;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_for = remaining.min(POLL_INTERVAL);
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(sleep_for))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+}
+
+struct PrewarmRunContext<'a> {
+    cache: &'a HlsCacheStore,
+    client: &'a reqwest::Client,
+    session_id: &'a str,
+    high: &'a crate::hls::HlsMediaResource,
+    audio: &'a crate::hls::HlsMediaResource,
+    plan: &'a crate::media_prewarm_comparison_tests::PrewarmPlan,
+    deadline: tokio::time::Instant,
+    report: &'a ReportStore,
+    mode: crate::media_prewarm_comparison_tests::PrewarmMode,
+    snapshot: &'a crate::media_prewarm_comparison_tests::RecoverySnapshot,
+    started: Instant,
+}
+
+async fn prewarm_selected_ranges(
+    context: PrewarmRunContext<'_>,
+    execution: &mut crate::media_prewarm_comparison_tests::PrewarmExecution,
+) -> Result<(), String> {
+    use crate::media_prewarm_comparison_tests::{
+        PrewarmAttempt, PrewarmFailureCategory as Failure, PrewarmOutcome,
+    };
+
+    let PrewarmRunContext {
+        cache,
+        client,
+        session_id,
+        high,
+        audio,
+        plan,
+        deadline,
+        report,
+        mode,
+        snapshot,
+        started,
+    } = context;
+
+    let invalid_plan = plan.resource_ids.video != high.id
         || plan.resource_ids.audio != audio.id
         || high.id == audio.id
         || plan.transfer_ranges.is_empty()
+        || plan.transfer_ranges.len() > 128
+        || plan.ranges.is_empty()
+        || plan.ranges.len() > 128;
+    if invalid_plan {
+        execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
+        return Err(record_prewarm_failure(
+            report, mode, snapshot, plan, execution, started,
+        )?);
+    }
+
+    let selected_bytes_valid = plan
+        .ranges
+        .iter()
+        .try_fold(0_u64, |sum, range| sum.checked_add(range.byte_len().ok()?))
+        .is_some_and(|bytes| bytes == plan.planned_bytes && bytes <= 8 * 1024 * 1024);
+    if !selected_bytes_valid {
+        execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
+        return Err(record_prewarm_failure(
+            report, mode, snapshot, plan, execution, started,
+        )?);
+    }
+    let transfer_bytes = match plan
+        .transfer_ranges
+        .iter()
+        .try_fold(0_u64, |sum, range| sum.checked_add(range.byte_len().ok()?))
     {
-        return Err("expanded prewarm plan did not match its two known resources".to_owned());
-    }
-    for selected in &plan.ranges {
-        if !plan.transfer_ranges.iter().any(|transfer| {
-            transfer.resource_id == selected.resource_id
-                && transfer.start <= selected.start
-                && selected.end <= transfer.end
-        }) {
-            return Err("expanded prewarm plan omitted a selected range".to_owned());
+        Some(bytes) if bytes == plan.planned_transfer_bytes => bytes,
+        _ => {
+            execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
+            return Err(record_prewarm_failure(
+                report, mode, snapshot, plan, execution, started,
+            )?);
         }
+    };
+    if transfer_bytes > 16 * 1024 * 1024 {
+        execution.failure = prewarm_failure_without_range(Failure::ByteBudgetExceeded);
+        return Err(record_prewarm_failure(
+            report, mode, snapshot, plan, execution, started,
+        )?);
     }
-    let mut requested_bytes = 0_u64;
-    let mut operation_count = 0_u64;
+    if plan
+        .transfer_ranges
+        .iter()
+        .any(|range| range.resource_id != high.id && range.resource_id != audio.id)
+        || plan.transfer_ranges.windows(2).any(|pair| {
+            pair[0].resource_id > pair[1].resource_id
+                || (pair[0].resource_id == pair[1].resource_id && pair[0].end > pair[1].start)
+        })
+        || plan.ranges.iter().any(|selected| {
+            !plan.transfer_ranges.iter().any(|transfer| {
+                transfer.resource_id == selected.resource_id
+                    && transfer.start <= selected.start
+                    && selected.end <= transfer.end
+            })
+        })
+    {
+        execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
+        return Err(record_prewarm_failure(
+            report, mode, snapshot, plan, execution, started,
+        )?);
+    }
+
     for range in &plan.transfer_ranges {
-        let resource = match range.resource_id.as_str() {
-            id if id == high.id => high,
-            id if id == audio.id => audio,
-            _ => return Err("prewarm plan referenced an unexpected HLS resource".to_owned()),
+        let length = match range.byte_len() {
+            Ok(length) => length,
+            Err(_) => {
+                execution.failure = prewarm_failure_for_range(Failure::PlanInvalid, range, None);
+                return Err(record_prewarm_failure(
+                    report, mode, snapshot, plan, execution, started,
+                )?);
+            }
         };
-        let length = range.byte_len()?;
-        requested_bytes = requested_bytes
-            .checked_add(length)
-            .ok_or_else(|| "prewarm requested-byte count overflowed".to_owned())?;
-        operation_count = operation_count
-            .checked_add(1)
-            .ok_or_else(|| "prewarm operation count overflowed".to_owned())?;
-        let expected_total = match range.resource_id.as_str() {
-            id if id == high.id => plan.video_total_length,
-            id if id == audio.id => plan.audio_total_length,
-            _ => return Err("expanded prewarm plan referenced an unexpected resource".to_owned()),
+        let resource = if range.resource_id == high.id {
+            high
+        } else {
+            audio
         };
-        let ready = cache
-            .ensure_resource_range(
+        let expected_total = if range.resource_id == high.id {
+            plan.video_total_length
+        } else {
+            plan.audio_total_length
+        };
+        loop {
+            let range_count = execution.attempted_ranges.len();
+            let next_requested_bytes = execution.operation_requested_bytes.saturating_add(length);
+            if range_count >= 128 {
+                execution.failure = prewarm_failure_for_range(Failure::AttemptLimit, range, None);
+                return Err(record_prewarm_failure(
+                    report, mode, snapshot, plan, execution, started,
+                )?);
+            }
+            if next_requested_bytes > 16 * 1024 * 1024 {
+                execution.failure =
+                    prewarm_failure_for_range(Failure::ByteBudgetExceeded, range, None);
+                return Err(record_prewarm_failure(
+                    report, mode, snapshot, plan, execution, started,
+                )?);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                execution.failure =
+                    prewarm_failure_for_range(Failure::DeadlineExceeded, range, None);
+                return Err(record_prewarm_failure(
+                    report, mode, snapshot, plan, execution, started,
+                )?);
+            }
+
+            let attempt_index = execution.attempted_ranges.len();
+            execution.operation_requested_bytes = next_requested_bytes;
+            execution.operation_count = u64::try_from(attempt_index + 1).unwrap_or(u64::MAX);
+            execution.attempted_ranges.push(PrewarmAttempt {
+                resource_id: range.resource_id.clone(),
+                start: range.start,
+                end: range.end,
+                outcome: PrewarmOutcome::InProgress,
+            });
+            let control = || HlsCacheFillControl::Continue;
+            let ensure = cache.ensure_resource_range(
                 client,
                 session_id,
                 resource,
                 range.start..range.end,
                 HlsRangePriority::Background,
-                &|| HlsCacheFillControl::Continue,
-            )
-            .await
-            .map_err(|_| "bounded selected HLS range prewarm failed".to_owned())?;
-        if ready.total_length != expected_total {
-            return Err("prewarm resource length changed from the inspected fixture".to_owned());
+                &control,
+            );
+            publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+
+            match tokio::time::timeout_at(deadline, ensure).await {
+                Err(_) => {
+                    execution.attempted_ranges[attempt_index].outcome =
+                        PrewarmOutcome::DeadlineExceeded;
+                    execution.failure =
+                        prewarm_failure_for_range(Failure::DeadlineExceeded, range, None);
+                    return Err(record_prewarm_failure(
+                        report, mode, snapshot, plan, execution, started,
+                    )?);
+                }
+                Ok(Err(error)) => {
+                    let (outcome, category, upstream_status) = prewarm_range_error(&error);
+                    execution.attempted_ranges[attempt_index].outcome = outcome;
+                    if outcome == PrewarmOutcome::Preempted {
+                        execution.preempted_operation_count += 1;
+                        publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+                        if execution.attempted_ranges.len() >= 128 {
+                            execution.failure =
+                                prewarm_failure_for_range(Failure::AttemptLimit, range, None);
+                            return Err(record_prewarm_failure(
+                                report, mode, snapshot, plan, execution, started,
+                            )?);
+                        }
+                        if execution.operation_requested_bytes.saturating_add(length)
+                            > 16 * 1024 * 1024
+                        {
+                            execution.failure =
+                                prewarm_failure_for_range(Failure::ByteBudgetExceeded, range, None);
+                            return Err(record_prewarm_failure(
+                                report, mode, snapshot, plan, execution, started,
+                            )?);
+                        }
+                        execution.foreground_defer_count += 1;
+                        publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+                        if !wait_for_foreground_quiescence(cache, deadline).await {
+                            execution.failure =
+                                prewarm_failure_for_range(Failure::DeadlineExceeded, range, None);
+                            return Err(record_prewarm_failure(
+                                report, mode, snapshot, plan, execution, started,
+                            )?);
+                        }
+                        continue;
+                    }
+                    execution.failure = prewarm_failure_for_range(
+                        category.expect("non-preempted HLS errors have typed categories"),
+                        range,
+                        upstream_status,
+                    );
+                    return Err(record_prewarm_failure(
+                        report, mode, snapshot, plan, execution, started,
+                    )?);
+                }
+                Ok(Ok(ready)) if ready.total_length != expected_total => {
+                    execution.attempted_ranges[attempt_index].outcome =
+                        PrewarmOutcome::ResourceLengthChanged;
+                    execution.failure =
+                        prewarm_failure_for_range(Failure::ResourceLengthChanged, range, None);
+                    return Err(record_prewarm_failure(
+                        report, mode, snapshot, plan, execution, started,
+                    )?);
+                }
+                Ok(Ok(_)) => {
+                    execution.attempted_ranges[attempt_index].outcome = PrewarmOutcome::Completed;
+                    execution.completed_transfer_bytes =
+                        execution.completed_transfer_bytes.saturating_add(length);
+                    execution.completed_transfer_count += 1;
+                    publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+                    break;
+                }
+            }
         }
     }
-    if requested_bytes != plan.planned_transfer_bytes
-        || operation_count != plan.transfer_ranges.len() as u64
+
+    if execution.operation_count != execution.attempted_ranges.len() as u64
+        || execution.completed_transfer_bytes != plan.planned_transfer_bytes
+        || execution.completed_transfer_count != plan.transfer_ranges.len() as u64
     {
-        return Err("prewarm operation totals differed from the expanded checked plan".to_owned());
+        execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
+        return Err(record_prewarm_failure(
+            report, mode, snapshot, plan, execution, started,
+        )?);
     }
-    Ok((requested_bytes, operation_count))
+    execution.completed = true;
+    publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+    Ok(())
+}
+
+fn record_prewarm_failure(
+    report: &ReportStore,
+    mode: crate::media_prewarm_comparison_tests::PrewarmMode,
+    snapshot: &crate::media_prewarm_comparison_tests::RecoverySnapshot,
+    plan: &crate::media_prewarm_comparison_tests::PrewarmPlan,
+    execution: &mut crate::media_prewarm_comparison_tests::PrewarmExecution,
+    started: Instant,
+) -> Result<String, String> {
+    execution.completed = false;
+    publish_prewarm_progress(report, mode, snapshot, plan, execution, started)?;
+    Ok(prewarm_failure_message(&execution.failure))
 }
 
 struct CaseDirectories {
@@ -6240,5 +6626,592 @@ mod recovery_observation_tests {
 
         let evidence = validate_player_observation(&gapped, 160.0).unwrap();
         assert_eq!(evidence.range_end, 10.0);
+    }
+}
+
+#[cfg(test)]
+mod prewarm_retry_tests {
+    use super::*;
+    use crate::{
+        bbdown_adapter::{
+            BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
+            BilibiliMediaRequestKind,
+        },
+        hls::{HlsMediaResource, HlsVariant},
+        media_prewarm_comparison_tests::{
+            PrewarmExecution, PrewarmFailureCategory, PrewarmMode, PrewarmOutcome, PrewarmPlan,
+            PrewarmResourceIds, RecoverySnapshot, SelectedRange,
+        },
+    };
+    use std::{convert::Infallible, sync::atomic::AtomicUsize};
+    use tokio::sync::Notify;
+
+    struct LoopbackUpstream {
+        bytes: Arc<Vec<u8>>,
+        foreground_started: Notify,
+        foreground_release: Notify,
+        background_requests: AtomicUsize,
+        fail_background: bool,
+    }
+
+    async fn start_upstream(
+        total: u64,
+        fail_background: bool,
+    ) -> (String, Arc<LoopbackUpstream>, JoinHandle<()>) {
+        let state = Arc::new(LoopbackUpstream {
+            bytes: Arc::new(vec![0x5a; total as usize]),
+            foreground_started: Notify::new(),
+            foreground_release: Notify::new(),
+            background_requests: AtomicUsize::new(0),
+            fail_background,
+        });
+        let app = Router::new()
+            .route("/video.m4s", get(held_foreground_range))
+            .route("/audio.m4s", get(background_range))
+            .with_state(Arc::clone(&state));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("loopback listener should expose its address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("loopback server should run");
+        });
+        (format!("http://{address}"), state, server)
+    }
+
+    fn parse_range(headers: &HeaderMap, total: usize) -> Option<(usize, usize)> {
+        let value = headers.get(RANGE)?.to_str().ok()?.strip_prefix("bytes=")?;
+        let (start, inclusive_end) = value.split_once('-')?;
+        let start = start.parse::<usize>().ok()?;
+        let end = inclusive_end.parse::<usize>().ok()?.checked_add(1)?;
+        (start < end && end <= total).then_some((start, end))
+    }
+
+    fn partial_response(start: usize, end: usize, total: usize, body: Body) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_LENGTH, (end - start).to_string())
+            .header(CONTENT_RANGE, format!("bytes {start}-{}/{total}", end - 1))
+            .header(reqwest::header::ETAG, "\"prewarm-retry-v1\"")
+            .body(body)
+            .expect("loopback range response should build")
+    }
+
+    async fn held_foreground_range(
+        State(state): State<Arc<LoopbackUpstream>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let Some((start, end)) = parse_range(&headers, state.bytes.len()) else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        let payload = state.bytes[start..end].to_vec();
+        let total = state.bytes.len();
+        let release = Arc::clone(&state);
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            release.foreground_started.notify_one();
+            release.foreground_release.notified().await;
+            Ok::<_, Infallible>(payload)
+        }));
+        partial_response(start, end, total, body)
+    }
+
+    async fn background_range(
+        State(state): State<Arc<LoopbackUpstream>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        state.background_requests.fetch_add(1, Ordering::SeqCst);
+        if state.fail_background {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::empty())
+                .expect("failure response should build");
+        }
+        let Some((start, end)) = parse_range(&headers, state.bytes.len()) else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        partial_response(
+            start,
+            end,
+            state.bytes.len(),
+            Body::from(state.bytes[start..end].to_vec()),
+        )
+    }
+
+    fn resource(
+        id: &str,
+        url: String,
+        kind: BilibiliMediaRequestKind,
+        total: u64,
+        source_hash: &str,
+    ) -> HlsMediaResource {
+        HlsMediaResource {
+            id: id.to_owned(),
+            request: BilibiliMediaRequest {
+                kind,
+                stream_id: None,
+                url,
+                backup_urls: Vec::new(),
+                headers: vec![BilibiliHttpHeader {
+                    name: "referer".to_owned(),
+                    value: "https://www.bilibili.com".to_owned(),
+                }],
+                mime_type: Some("video/mp4".to_owned()),
+                codecs: Some(match kind {
+                    BilibiliMediaRequestKind::Audio => "mp4a.40.2".to_owned(),
+                    _ => "avc1.640028".to_owned(),
+                }),
+                bandwidth: Some(1_000_000),
+                width: Some(1920),
+                height: Some(1080),
+                frame_rate: Some("30".to_owned()),
+                size: Some(total),
+                duration_seconds: Some(60),
+                cache_key: BilibiliMediaCacheKey {
+                    content_id: "prewarm-retry-test".to_owned(),
+                    media_kind: kind,
+                    stream_id: None,
+                    codecs: Some(match kind {
+                        BilibiliMediaRequestKind::Audio => "mp4a.40.2".to_owned(),
+                        _ => "avc1.640028".to_owned(),
+                    }),
+                    source_hash: source_hash.to_owned(),
+                },
+            },
+        }
+    }
+
+    fn session(base_url: &str, total: u64) -> HlsPlaybackSession {
+        HlsPlaybackSession {
+            id: "prewarm-retry-session".to_owned(),
+            title: "prewarm retry fixture".to_owned(),
+            accepted_identity: None,
+            variant: HlsVariant {
+                id: "h264".to_owned(),
+                bandwidth: 1_000_000,
+                codecs: vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()],
+                width: Some(1920),
+                height: Some(1080),
+                duration_seconds: 60,
+                video: resource(
+                    "video.m4s",
+                    format!("{base_url}/video.m4s"),
+                    BilibiliMediaRequestKind::Video,
+                    total,
+                    "prewarm-video-source",
+                ),
+                audio: Some(resource(
+                    "audio.m4s",
+                    format!("{base_url}/audio.m4s"),
+                    BilibiliMediaRequestKind::Audio,
+                    total,
+                    "prewarm-audio-source",
+                )),
+            },
+            alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
+            abr: Default::default(),
+            variants: Vec::new(),
+            transcoding: Default::default(),
+            effective_policy: PlaybackPolicy::default(),
+        }
+    }
+
+    fn plan(selected_end: u64, transfer_end: u64, total: u64) -> PrewarmPlan {
+        PrewarmPlan {
+            start_seconds: 60.0,
+            end_seconds: 80.0,
+            planned_bytes: selected_end,
+            ranges: vec![SelectedRange {
+                resource_id: "audio.m4s".to_owned(),
+                start: 0,
+                end: selected_end,
+            }],
+            resource_ids: PrewarmResourceIds {
+                video: "video.m4s".to_owned(),
+                audio: "audio.m4s".to_owned(),
+            },
+            transfer_ranges: vec![SelectedRange {
+                resource_id: "audio.m4s".to_owned(),
+                start: 0,
+                end: transfer_end,
+            }],
+            planned_transfer_bytes: transfer_end,
+            video_total_length: total,
+            audio_total_length: total,
+        }
+    }
+
+    fn report_store() -> ReportStore {
+        Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::SinglePlayerPrewarmTreatment,
+        )))
+    }
+
+    fn recovery_snapshot() -> RecoverySnapshot {
+        RecoverySnapshot {
+            schema_version: 1,
+            observed_monotonic_seconds: 100.0,
+            playhead_seconds: 60.0,
+            loaded_end_seconds: 80.0,
+        }
+    }
+
+    async fn run_prewarm(
+        cache: HlsCacheStore,
+        client: reqwest::Client,
+        session: HlsPlaybackSession,
+        plan: PrewarmPlan,
+        report: ReportStore,
+        deadline: Duration,
+    ) -> (Result<(), String>, PrewarmExecution) {
+        let mut execution = PrewarmExecution::initial(0);
+        let started = Instant::now();
+        let snapshot = recovery_snapshot();
+        let result = prewarm_selected_ranges(
+            PrewarmRunContext {
+                cache: &cache,
+                client: &client,
+                session_id: &session.id,
+                high: &session.variant.video,
+                audio: session
+                    .variant
+                    .audio
+                    .as_ref()
+                    .expect("fixture audio should exist"),
+                plan: &plan,
+                deadline: tokio::time::Instant::now() + deadline,
+                report: &report,
+                mode: PrewarmMode::On,
+                snapshot: &snapshot,
+                started,
+            },
+            &mut execution,
+        )
+        .await;
+        (result, execution)
+    }
+
+    fn spawn_foreground(
+        cache: HlsCacheStore,
+        client: reqwest::Client,
+        session: HlsPlaybackSession,
+    ) -> JoinHandle<
+        Result<crate::hls_range_cache::HlsReadyRange, crate::hls_range_cache::HlsRangeError>,
+    > {
+        tokio::spawn(async move {
+            cache
+                .ensure_resource_range(
+                    &client,
+                    &session.id,
+                    &session.variant.video,
+                    0..64 * 1024,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        })
+    }
+
+    async fn wait_for_preempted_attempt(report: &ReportStore) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let preempted = report
+                    .lock()
+                    .expect("report lock should be available")
+                    .prewarm_comparison
+                    .as_ref()
+                    .is_some_and(|comparison| comparison.preempted_operation_count > 0);
+                if preempted {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("prewarm should publish its preempted attempt");
+    }
+
+    fn fixture_cache(session: &HlsPlaybackSession) -> (tempfile::TempDir, HlsCacheStore) {
+        let temp = tempfile::tempdir().expect("cache temp dir should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let cache = HlsCacheStore::new(root).with_range_budget(32 * 1024 * 1024);
+        cache
+            .save_session(session)
+            .expect("HLS fixture session should be saved");
+        (temp, cache)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_caller_waits_for_quiescence_before_retrying_large_span() {
+        const TOTAL: u64 = 6 * 1024 * 1024;
+        const SPAN: u64 = 5 * 1024 * 1024 + 512 * 1024;
+        const _: () = {
+            assert!(SPAN * 2 <= 16 * 1024 * 1024);
+            assert!(SPAN * 3 > 16 * 1024 * 1024);
+        };
+
+        let (base_url, upstream, server) = start_upstream(TOTAL, false).await;
+        let session = session(&base_url, TOTAL);
+        let (_temp, cache) = fixture_cache(&session);
+        let client = reqwest::Client::new();
+        let foreground = spawn_foreground(cache.clone(), client.clone(), session.clone());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.foreground_started.notified(),
+        )
+        .await
+        .expect("foreground loopback request should be held");
+        assert_eq!(cache.foreground_activity_count_for_test(), 1);
+
+        let report = report_store();
+        let prewarm = tokio::spawn(run_prewarm(
+            cache.clone(),
+            client,
+            session.clone(),
+            plan(SPAN, SPAN, TOTAL),
+            Arc::clone(&report),
+            Duration::from_secs(5),
+        ));
+        wait_for_preempted_attempt(&report).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let held = report
+            .lock()
+            .expect("report lock should be available")
+            .prewarm_comparison
+            .clone()
+            .expect("prewarm progress should be published");
+        assert_eq!(held.attempted_ranges.len(), 1);
+        assert_eq!(held.operation_count, 1);
+        assert_eq!(held.operation_requested_bytes, SPAN);
+        assert_eq!(held.preempted_operation_count, 1);
+        assert_eq!(held.foreground_defer_count, 1);
+        assert_eq!(upstream.background_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.foreground_activity_count_for_test(), 1);
+
+        upstream.foreground_release.notify_one();
+        let (result, execution) = tokio::time::timeout(Duration::from_secs(8), prewarm)
+            .await
+            .expect("prewarm should complete after foreground release")
+            .expect("prewarm task should join");
+        result.expect("prewarm caller should succeed after quiescence");
+        tokio::time::timeout(Duration::from_secs(2), foreground)
+            .await
+            .expect("foreground request should finish after release")
+            .expect("foreground task should join")
+            .expect("foreground range should complete");
+
+        assert_eq!(execution.attempted_ranges.len(), 2);
+        assert_eq!(execution.operation_count, 2);
+        assert_eq!(execution.operation_requested_bytes, SPAN * 2);
+        assert!(execution.operation_requested_bytes <= 16 * 1024 * 1024);
+        assert_eq!(
+            execution.attempted_ranges[0].outcome,
+            PrewarmOutcome::Preempted
+        );
+        assert_eq!(
+            execution.attempted_ranges[1].outcome,
+            PrewarmOutcome::Completed
+        );
+        assert_eq!(execution.completed_transfer_bytes, SPAN);
+        assert_eq!(execution.completed_transfer_count, 1);
+        assert_eq!(execution.preempted_operation_count, 1);
+        assert_eq!(execution.foreground_defer_count, 1);
+        assert!(execution.completed);
+        assert!(execution.failure.category.is_none());
+        assert!(upstream.background_requests.load(Ordering::SeqCst) > 0);
+        assert_eq!(cache.foreground_activity_count_for_test(), 0);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_caller_does_not_retry_upstream_status_and_keeps_partial_failure() {
+        const TOTAL: u64 = 1024 * 1024;
+        let (base_url, upstream, server) = start_upstream(TOTAL, true).await;
+        let session = session(&base_url, TOTAL);
+        let (_temp, cache) = fixture_cache(&session);
+        let report = report_store();
+        let (result, execution) = run_prewarm(
+            cache,
+            reqwest::Client::new(),
+            session,
+            plan(32, 32, TOTAL),
+            Arc::clone(&report),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(result.unwrap_err().contains("category=upstream_status"));
+        assert_eq!(upstream.background_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.operation_count, 1);
+        assert_eq!(execution.attempted_ranges.len(), 1);
+        assert_eq!(execution.operation_requested_bytes, 32);
+        assert_eq!(
+            execution.attempted_ranges[0].outcome,
+            PrewarmOutcome::UpstreamStatus
+        );
+        assert_eq!(execution.completed_transfer_bytes, 0);
+        assert_eq!(execution.completed_transfer_count, 0);
+        assert_eq!(execution.preempted_operation_count, 0);
+        assert_eq!(execution.foreground_defer_count, 0);
+        assert!(!execution.completed);
+        assert_eq!(
+            execution.failure.category,
+            Some(PrewarmFailureCategory::UpstreamStatus)
+        );
+        assert_eq!(execution.failure.resource_id.as_deref(), Some("audio.m4s"));
+        assert_eq!(execution.failure.start, Some(0));
+        assert_eq!(execution.failure.end, Some(32));
+        assert_eq!(execution.failure.upstream_status, Some(503));
+        assert!(execution.elapsed_seconds > 0.0);
+        let serialized = serde_json::to_string(
+            &report
+                .lock()
+                .expect("report lock should be available")
+                .prewarm_comparison,
+        )
+        .expect("partial report should serialize");
+        assert!(!serialized.contains(&base_url));
+        assert!(serialized.contains("\"upstream_status\":503"));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_caller_rejects_overbudget_retry_without_fake_attempt() {
+        const TOTAL: u64 = 10 * 1024 * 1024;
+        const SELECTED: u64 = 8 * 1024 * 1024;
+        const TRANSFER: u64 = 9 * 1024 * 1024;
+        let (base_url, upstream, server) = start_upstream(TOTAL, false).await;
+        let session = session(&base_url, TOTAL);
+        let (_temp, cache) = fixture_cache(&session);
+        let client = reqwest::Client::new();
+        let foreground = spawn_foreground(cache.clone(), client.clone(), session.clone());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.foreground_started.notified(),
+        )
+        .await
+        .expect("foreground loopback request should be held");
+
+        let report = report_store();
+        let (result, execution) = run_prewarm(
+            cache.clone(),
+            client,
+            session,
+            plan(SELECTED, TRANSFER, TOTAL),
+            report,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .contains("category=byte_budget_exceeded")
+        );
+        assert_eq!(execution.attempted_ranges.len(), 1);
+        assert_eq!(execution.operation_count, 1);
+        assert_eq!(execution.operation_requested_bytes, TRANSFER);
+        assert_eq!(
+            execution.attempted_ranges[0].outcome,
+            PrewarmOutcome::Preempted
+        );
+        assert_eq!(execution.preempted_operation_count, 1);
+        assert_eq!(execution.foreground_defer_count, 0);
+        assert_eq!(
+            execution.failure.category,
+            Some(PrewarmFailureCategory::ByteBudgetExceeded)
+        );
+        assert_eq!(execution.failure.resource_id.as_deref(), Some("audio.m4s"));
+        assert_eq!(execution.failure.start, Some(0));
+        assert_eq!(execution.failure.end, Some(TRANSFER));
+        assert_eq!(upstream.background_requests.load(Ordering::SeqCst), 0);
+
+        upstream.foreground_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), foreground)
+            .await
+            .expect("foreground request should finish after release")
+            .expect("foreground task should join")
+            .expect("foreground range should complete");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_caller_deadline_preserves_partial_attempt_progress() {
+        const TOTAL: u64 = 1024 * 1024;
+        let (base_url, upstream, server) = start_upstream(TOTAL, false).await;
+        let session = session(&base_url, TOTAL);
+        let (_temp, cache) = fixture_cache(&session);
+        let client = reqwest::Client::new();
+        let foreground = spawn_foreground(cache.clone(), client.clone(), session.clone());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.foreground_started.notified(),
+        )
+        .await
+        .expect("foreground loopback request should be held");
+
+        let report = report_store();
+        let (result, execution) = run_prewarm(
+            cache.clone(),
+            client,
+            session,
+            plan(32, 32, TOTAL),
+            Arc::clone(&report),
+            Duration::from_millis(150),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("category=deadline_exceeded"));
+        assert_eq!(execution.attempted_ranges.len(), 1);
+        assert_eq!(execution.operation_count, 1);
+        assert_eq!(execution.operation_requested_bytes, 32);
+        assert_eq!(
+            execution.attempted_ranges[0].outcome,
+            PrewarmOutcome::Preempted
+        );
+        assert_eq!(execution.preempted_operation_count, 1);
+        assert_eq!(execution.foreground_defer_count, 1);
+        assert_eq!(
+            execution.failure.category,
+            Some(PrewarmFailureCategory::DeadlineExceeded)
+        );
+        assert_eq!(execution.failure.resource_id.as_deref(), Some("audio.m4s"));
+        assert_eq!(execution.failure.start, Some(0));
+        assert_eq!(execution.failure.end, Some(32));
+        assert!(execution.elapsed_seconds >= 0.1);
+        assert!(!execution.completed);
+        assert_eq!(upstream.background_requests.load(Ordering::SeqCst), 0);
+        let persisted = report
+            .lock()
+            .expect("report lock should be available")
+            .prewarm_comparison
+            .clone()
+            .expect("partial report should be persisted in memory");
+        assert_eq!(persisted.operation_count, 1);
+        assert_eq!(persisted.operation_requested_bytes, 32);
+        assert_eq!(persisted.elapsed_seconds, execution.elapsed_seconds);
+        assert_eq!(
+            persisted.failure.category,
+            Some(PrewarmFailureCategory::DeadlineExceeded)
+        );
+
+        upstream.foreground_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), foreground)
+            .await
+            .expect("foreground request should finish after release")
+            .expect("foreground task should join")
+            .expect("foreground range should complete");
+        server.abort();
     }
 }

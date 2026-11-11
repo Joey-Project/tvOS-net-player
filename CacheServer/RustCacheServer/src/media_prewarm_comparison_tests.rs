@@ -104,15 +104,77 @@ pub(super) struct PrewarmComparisonReport {
     pub planned_transfer_bytes: u64,
     pub operation_requested_bytes: u64,
     pub operation_count: u64,
+    pub attempted_ranges: Vec<PrewarmAttempt>,
+    pub completed_transfer_bytes: u64,
+    pub completed_transfer_count: u64,
+    pub preempted_operation_count: u64,
+    pub foreground_defer_count: u64,
     pub elapsed_seconds: f64,
     pub coverage_semantics: &'static str,
     pub cache_covered_bytes_before: u64,
-    pub cache_covered_bytes_after: u64,
+    pub cache_covered_bytes_after: Option<u64>,
     pub selected_ranges: Vec<SelectedRange>,
     pub transfer_plan: Vec<SelectedRange>,
     pub resource_ids: PrewarmResourceIds,
     pub completed: bool,
+    pub failure: PrewarmFailure,
     pub provenance: PrewarmProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PrewarmOutcome {
+    InProgress,
+    Completed,
+    Preempted,
+    Cancelled,
+    SessionRemoving,
+    IdentityChanged,
+    QuotaExceeded,
+    UpstreamStatus,
+    Network,
+    Io,
+    RangeUnsupported,
+    InvalidResponse,
+    DeadlineExceeded,
+    ResourceLengthChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PrewarmFailureCategory {
+    PlanInvalid,
+    Cancelled,
+    SessionRemoving,
+    IdentityChanged,
+    QuotaExceeded,
+    UpstreamStatus,
+    Network,
+    Io,
+    RangeUnsupported,
+    InvalidResponse,
+    DeadlineExceeded,
+    AttemptLimit,
+    ByteBudgetExceeded,
+    ResourceLengthChanged,
+    CacheCoverageIncomplete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct PrewarmAttempt {
+    pub resource_id: String,
+    pub start: u64,
+    pub end: u64,
+    pub outcome: PrewarmOutcome,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct PrewarmFailure {
+    pub category: Option<PrewarmFailureCategory>,
+    pub resource_id: Option<String>,
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+    pub upstream_status: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,13 +192,39 @@ pub(super) struct PrewarmTrackInput<'a> {
     pub fragments: &'a [Mp4SegmentRange],
 }
 
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct PrewarmExecution {
-    pub requested_bytes: u64,
+    pub operation_requested_bytes: u64,
     pub operation_count: u64,
+    pub attempted_ranges: Vec<PrewarmAttempt>,
+    pub completed_transfer_bytes: u64,
+    pub completed_transfer_count: u64,
+    pub preempted_operation_count: u64,
+    pub foreground_defer_count: u64,
     pub elapsed_seconds: f64,
     pub coverage_before: u64,
-    pub coverage_after: u64,
+    pub coverage_after: Option<u64>,
     pub completed: bool,
+    pub failure: PrewarmFailure,
+}
+
+impl PrewarmExecution {
+    pub(super) fn initial(coverage: u64) -> Self {
+        Self {
+            operation_requested_bytes: 0,
+            operation_count: 0,
+            attempted_ranges: Vec::new(),
+            completed_transfer_bytes: 0,
+            completed_transfer_count: 0,
+            preempted_operation_count: 0,
+            foreground_defer_count: 0,
+            elapsed_seconds: 0.0,
+            coverage_before: coverage,
+            coverage_after: None,
+            completed: false,
+            failure: PrewarmFailure::default(),
+        }
+    }
 }
 
 pub(super) fn read_recovery_snapshot(
@@ -395,7 +483,7 @@ pub(super) fn report_for(
     execution: PrewarmExecution,
 ) -> PrewarmComparisonReport {
     PrewarmComparisonReport {
-        schema_version: 2,
+        schema_version: 3,
         mode: mode.label(),
         boundary_policy: "unbuffered_after_20s_safety",
         recovery_snapshot: snapshot,
@@ -405,8 +493,13 @@ pub(super) fn report_for(
         planned_bytes: plan.planned_bytes,
         transfer_byte_budget: PREWARM_TRANSFER_BYTE_BUDGET,
         planned_transfer_bytes: plan.planned_transfer_bytes,
-        operation_requested_bytes: execution.requested_bytes,
+        operation_requested_bytes: execution.operation_requested_bytes,
         operation_count: execution.operation_count,
+        attempted_ranges: execution.attempted_ranges,
+        completed_transfer_bytes: execution.completed_transfer_bytes,
+        completed_transfer_count: execution.completed_transfer_count,
+        preempted_operation_count: execution.preempted_operation_count,
+        foreground_defer_count: execution.foreground_defer_count,
         elapsed_seconds: execution.elapsed_seconds,
         coverage_semantics: "sum_of_fully_readable_selected_ranges",
         cache_covered_bytes_before: execution.coverage_before,
@@ -415,6 +508,7 @@ pub(super) fn report_for(
         transfer_plan: plan.transfer_ranges,
         resource_ids: plan.resource_ids,
         completed: execution.completed,
+        failure: execution.failure,
         provenance: PrewarmProvenance {
             origin_counters_include_playback_and_prewarm: true,
             transfer_accounting: "planned_background_parent_chunks_and_startup_not_wire_bytes",
@@ -489,6 +583,32 @@ mod unit_tests {
                 fragments: audio_fragments,
             },
         ]
+    }
+
+    fn completed_execution(
+        plan: &PrewarmPlan,
+        coverage_before: u64,
+        coverage_after: u64,
+    ) -> PrewarmExecution {
+        let mut execution = PrewarmExecution::initial(coverage_before);
+        execution.operation_requested_bytes = plan.planned_transfer_bytes;
+        execution.operation_count = plan.transfer_ranges.len() as u64;
+        execution.attempted_ranges = plan
+            .transfer_ranges
+            .iter()
+            .map(|range| PrewarmAttempt {
+                resource_id: range.resource_id.clone(),
+                start: range.start,
+                end: range.end,
+                outcome: PrewarmOutcome::Completed,
+            })
+            .collect();
+        execution.completed_transfer_bytes = plan.planned_transfer_bytes;
+        execution.completed_transfer_count = plan.transfer_ranges.len() as u64;
+        execution.elapsed_seconds = 1.25;
+        execution.coverage_after = Some(coverage_after);
+        execution.completed = true;
+        execution
     }
 
     #[test]
@@ -596,30 +716,30 @@ mod unit_tests {
             snapshot(40.0, 48.0),
             plan.clone(),
             PrewarmExecution {
-                requested_bytes: 0,
-                operation_count: 0,
                 elapsed_seconds: 0.0,
-                coverage_before: 4,
-                coverage_after: 4,
                 completed: true,
+                ..PrewarmExecution::initial(4)
             },
         );
         let treatment = report_for(
             PrewarmMode::On,
             snapshot(40.0, 48.0),
             plan.clone(),
-            PrewarmExecution {
-                requested_bytes: plan.planned_transfer_bytes,
-                operation_count: plan.transfer_ranges.len() as u64,
-                elapsed_seconds: 1.25,
-                coverage_before: 4,
-                coverage_after: 100,
-                completed: true,
-            },
+            completed_execution(&plan, 4, 100),
         );
         assert_eq!(control.operation_requested_bytes, 0);
         assert_eq!(control.operation_count, 0);
-        assert_eq!(control.schema_version, 2);
+        assert_eq!(control.schema_version, 3);
+        assert!(control.attempted_ranges.is_empty());
+        assert_eq!(control.completed_transfer_bytes, 0);
+        assert_eq!(control.completed_transfer_count, 0);
+        assert_eq!(control.preempted_operation_count, 0);
+        assert_eq!(control.foreground_defer_count, 0);
+        assert!(control.failure.category.is_none());
+        assert!(control.failure.resource_id.is_none());
+        assert!(control.failure.start.is_none());
+        assert!(control.failure.end.is_none());
+        assert!(control.failure.upstream_status.is_none());
         assert_eq!(control.transfer_byte_budget, PREWARM_TRANSFER_BYTE_BUDGET);
         assert_eq!(
             treatment.planned_transfer_bytes,
@@ -633,6 +753,19 @@ mod unit_tests {
             treatment.operation_requested_bytes,
             treatment.planned_transfer_bytes
         );
+        assert_eq!(
+            treatment.completed_transfer_bytes,
+            treatment.planned_transfer_bytes
+        );
+        assert_eq!(
+            treatment.completed_transfer_count,
+            treatment.transfer_plan.len() as u64
+        );
+        assert_eq!(
+            treatment.operation_count,
+            treatment.attempted_ranges.len() as u64
+        );
+        assert_eq!(treatment.failure.category, None);
         assert_eq!(
             treatment.coverage_semantics,
             "sum_of_fully_readable_selected_ranges"
@@ -657,15 +790,39 @@ mod unit_tests {
                 snapshot(40.0, 48.0),
                 plan,
                 PrewarmExecution {
-                    requested_bytes: 0,
-                    operation_count: 0,
-                    elapsed_seconds: 0.0,
-                    coverage_before: 0,
-                    coverage_after: 0,
                     completed: false,
+                    ..PrewarmExecution::initial(0)
                 }
             )
             .completed
+        );
+    }
+
+    #[test]
+    fn coverage_after_serializes_unknown_as_null_and_observed_as_integer() {
+        let plan = plan_window(
+            &snapshot(40.0, 48.0),
+            3600.0,
+            tracks(64, &fragments(100, 20), 32, &fragments(100, 10)),
+        )
+        .unwrap();
+        let mut execution = PrewarmExecution::initial(4);
+        let unknown = report_for(
+            PrewarmMode::On,
+            snapshot(40.0, 48.0),
+            plan.clone(),
+            execution.clone(),
+        );
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap()["cache_covered_bytes_after"],
+            serde_json::Value::Null
+        );
+
+        execution.coverage_after = Some(100);
+        let observed = report_for(PrewarmMode::On, snapshot(40.0, 48.0), plan, execution);
+        assert_eq!(
+            serde_json::to_value(observed).unwrap()["cache_covered_bytes_after"],
+            serde_json::json!(100)
         );
     }
 
