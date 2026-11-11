@@ -7,6 +7,10 @@ final class UIPlaybackTests: XCTestCase {
         case missingServerAddress(String)
     }
 
+    private struct SourceInputError: Error, CustomStringConvertible {
+        let description: String
+    }
+
     private var app: XCUIApplication!
     private var serverAddress = ""
     private var didLaunchApp = false
@@ -475,18 +479,14 @@ final class UIPlaybackTests: XCTestCase {
             focusDown(until: sourceField, limit: 80),
             "Remote focus could not reach the Bilibili source field. \(accessibilityDescription(sourceField))"
         )
-        remote.press(.select)
-        sourceField.typeText(source)
-        if app.keyboards.firstMatch.exists {
-            remote.press(.menu)
-        }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        try enterSource(source, in: sourceField)
 
         let submit = app.buttons["bilibili-submit"]
         XCTAssertTrue(
             focusDown(until: submit, limit: 80),
             "Remote focus could not reach the visible Bilibili submit control. \(accessibilityDescription(submit))"
         )
+        try requireSourceValue(source, in: sourceField, phase: "before enabling Submit")
         XCTAssertTrue(submit.isEnabled, "The single-result Bilibili input should be ready for one submission.")
     }
 
@@ -536,19 +536,77 @@ final class UIPlaybackTests: XCTestCase {
             focusDown(until: sourceField, limit: 80),
             "Remote focus could not reach the Bilibili source field. " + accessibilityDescription(sourceField)
         )
-        remote.press(.select)
-        sourceField.typeText("BV1xK4y1P7mN")
-        if app.keyboards.firstMatch.exists {
-            remote.press(.menu)
-        }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        let source = "BV1xK4y1P7mN"
+        try enterSource(source, in: sourceField)
 
         let submit = app.buttons["bilibili-submit"]
         XCTAssertTrue(
             focusDown(until: submit, limit: 80),
             "Remote focus could not reach the task submit control. " + accessibilityDescription(submit)
         )
+        try requireSourceValue(source, in: sourceField, phase: "before enabling Submit")
         XCTAssertTrue(submit.isEnabled)
+    }
+
+    private func enterSource(_ source: String, in field: XCUIElement) throws {
+        let remote = XCUIRemote.shared
+        remote.press(.select)
+        let keyboard = app.keyboards.firstMatch
+        guard waitUntil(timeout: 5, condition: { keyboard.exists }) else {
+            throw SourceInputError(
+                description: "Bilibili editing keyboard did not appear after selecting the source field. "
+                    + sourceInputDescription(field, expected: source)
+            )
+        }
+        field.typeText(source)
+        let valueWhileEditing = field.value as? String
+        if valueWhileEditing == source {
+            try requireSourceValue(source, in: field, phase: "while editing, before keyboard dismissal")
+        }
+
+        remote.press(.menu)
+        guard waitUntil(timeout: 10, condition: { !keyboard.exists }) else {
+            throw SourceInputError(
+                description: "Bilibili source keyboard did not dismiss. "
+                    + sourceInputDescription(
+                        field, expected: source, valueWhileEditing: valueWhileEditing
+                    )
+            )
+        }
+        try requireSourceValue(
+            source, in: field, phase: "after keyboard dismissal", valueWhileEditing: valueWhileEditing)
+    }
+
+    private func requireSourceValue(
+        _ expected: String,
+        in field: XCUIElement,
+        phase: String,
+        valueWhileEditing: String? = nil
+    ) throws {
+        guard field.value as? String == expected else {
+            throw SourceInputError(
+                description: "Bilibili source value mismatch \(phase). "
+                    + sourceInputDescription(
+                        field, expected: expected, valueWhileEditing: valueWhileEditing
+                    )
+            )
+        }
+    }
+
+    private func sourceInputDescription(
+        _ field: XCUIElement,
+        expected: String,
+        valueWhileEditing: String? = nil
+    ) -> String {
+        "expected=\(boundedTextDescription(expected)), actual=\(boundedTextDescription(field.value as? String)), "
+            + "valueWhileEditing=\(boundedTextDescription(valueWhileEditing)), "
+            + "fieldFocused=\(field.hasFocus), keyboardPresent=\(app.keyboards.firstMatch.exists)"
+    }
+
+    private func boundedTextDescription(_ value: String?) -> String {
+        guard let value else { return "<non-string>" }
+        let prefix = String(decoding: value.utf8.prefix(48), as: UTF8.self)
+        return "utf8Length=\(value.utf8.count), prefix=\(String(reflecting: prefix))"
     }
 
     private func pausedCheckpointBaseline(state: XCUIElement, timeline: XCUIElement) throws -> Double {
