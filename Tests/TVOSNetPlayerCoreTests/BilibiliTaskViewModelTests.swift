@@ -2966,6 +2966,168 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testPlaybackProgressContextBindsTopLevelAndExactInlineResultSessions() async throws {
+        let decoy = BilibiliTaskResultItem.fixture(
+            id: "decoy-result",
+            state: "TASK_STATE_PLAYABLE",
+            playbackSourceItemID: "decoy-result"
+        )
+        let selected = BilibiliTaskResultItem.fixture(
+            id: "selected-result",
+            state: "TASK_STATE_PLAYABLE",
+            playbackSourceItemID: "selected-result"
+        )
+        let task = CacheTask.playableFixture(resultItems: [decoy, selected])
+        let client = FakeBilibiliCacheControlClient(createResponses: [.success(task)])
+        let model = BilibiliTaskViewModel(sourceText: "BV1session-context", clientFactory: { _ in client })
+        defer { model.clearTask() }
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let taskContext = try XCTUnwrap(model.playbackProgressContext(serverAddressText: "unused.local:50051"))
+        XCTAssertEqual(taskContext.hlsSession?.serverID, "fake-cache-server")
+        XCTAssertEqual(taskContext.hlsSession?.sessionID, task.playbackSession?.id)
+
+        let selectedPresentation = try XCTUnwrap(model.playableTaskResults.first { $0.id == selected.id })
+        let selectedContext = try XCTUnwrap(
+            model.playbackProgressContext(for: selectedPresentation, serverAddressText: "unused.local:50051")
+        )
+        XCTAssertEqual(selectedContext.hlsSession?.sessionID, selected.playbackSession?.id)
+        XCTAssertNotEqual(selectedContext.hlsSession?.sessionID, decoy.playbackSession?.id)
+    }
+
+    func testPlaybackProgressContextOmitsMissingSessionAndHTTPFileSession() async throws {
+        let missingSessionSource = CachePlaybackSource(
+            itemID: "bilibili-playback-1",
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/bilibili-playback-1/master.m3u8"
+        )
+        let missingSessionTask = CacheTask.fixture(
+            state: "TASK_STATE_PLAYABLE",
+            playbackSource: missingSessionSource
+        )
+        let missingClient = FakeBilibiliCacheControlClient(createResponses: [.success(missingSessionTask)])
+        let missingModel = BilibiliTaskViewModel(
+            sourceText: "BV1missing-session",
+            clientFactory: { _ in missingClient }
+        )
+        defer { missingModel.clearTask() }
+        await missingModel.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertNil(missingModel.playbackProgressContext(serverAddressText: "unused.local:50051")?.hlsSession)
+
+        let inconsistentTask = CacheTask.fixture(
+            state: "TASK_STATE_PLAYABLE",
+            playbackSource: missingSessionSource,
+            playbackSession: playbackSession(id: "wrong-variant-session", variantID: "av1")
+        )
+        let inconsistentClient = FakeBilibiliCacheControlClient(createResponses: [.success(inconsistentTask)])
+        let inconsistentModel = BilibiliTaskViewModel(
+            sourceText: "BV1inconsistent-session",
+            clientFactory: { _ in inconsistentClient }
+        )
+        defer { inconsistentModel.clearTask() }
+        await inconsistentModel.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertNil(inconsistentModel.playbackProgressContext(serverAddressText: "unused.local:50051")?.hlsSession)
+
+        let httpSource = CachePlaybackSource(
+            itemID: "bilibili-playback-1",
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HTTP_FILE",
+            uri: "http://mac-mini.local:8080/files/bilibili-playback-1.mp4"
+        )
+        let httpTask = CacheTask.fixture(
+            state: "TASK_STATE_PLAYABLE",
+            playbackSource: httpSource,
+            playbackSession: CacheBilibiliPlaybackSession(
+                id: "http-file-session",
+                title: "HTTP file",
+                contentID: "cid",
+                selectedVariantID: "h264",
+                selectedVariant: nil,
+                variants: []
+            )
+        )
+        let httpClient = FakeBilibiliCacheControlClient(createResponses: [.success(httpTask)])
+        let httpModel = BilibiliTaskViewModel(sourceText: "BV1http-file", clientFactory: { _ in httpClient })
+        defer { httpModel.clearTask() }
+        await httpModel.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertNil(httpModel.playbackProgressContext(serverAddressText: "unused.local:50051")?.hlsSession)
+    }
+
+    func testPagedPlaybackProgressContextUsesExactRawResultSession() async throws {
+        let summary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 2,
+            terminalResultCount: 2,
+            successfulResultCount: 2,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: "paged-selected"
+        )
+        let decoySource = CachePlaybackSource(
+            itemID: "paged-decoy",
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/paged-decoy/master.m3u8"
+        )
+        let selectedSource = CachePlaybackSource(
+            itemID: "paged-selected",
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/paged-selected/master.m3u8"
+        )
+        let page = CacheTaskResultsPage(
+            results: [
+                .fixture(
+                    id: "paged-decoy",
+                    title: "Decoy",
+                    state: "TASK_RESULT_STATE_PLAYABLE",
+                    playbackSource: decoySource,
+                    playbackSession: playbackSession(id: "paged-decoy-session", variantID: "h264")
+                ),
+                .fixture(
+                    id: "paged-selected",
+                    title: "Selected",
+                    state: "TASK_RESULT_STATE_PLAYABLE",
+                    playbackSource: selectedSource,
+                    playbackSession: playbackSession(id: "paged-selected-session", variantID: "h264")
+                ),
+            ],
+            pageInfo: CachePageInfo(totalSize: 2, nextPageToken: "", snapshotID: "session-snapshot"),
+            outputRevision: 1
+        )
+        let task = CacheTask.fixture(
+            state: "TASK_STATE_PLAYABLE",
+            playbackSource: CachePlaybackSource(
+                itemID: "bilibili-playback-1",
+                variantID: "h264",
+                playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+                uri: "http://mac-mini.local:8080/hls/bilibili-playback-1/master.m3u8"
+            ),
+            playbackSession: playbackSession(id: "unrelated-task-session", variantID: "h264"),
+            outputSummary: summary
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(task)],
+            taskResultPagesByTaskID: [task.id: [page]]
+        )
+        let model = BilibiliTaskViewModel(sourceText: "BV1paged-session", clientFactory: { _ in client })
+        defer { model.clearTask() }
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await waitUntil(model.taskResults.count == 2)
+
+        let selected = try XCTUnwrap(model.taskResults.first { $0.id == "paged-selected" })
+        let context = try XCTUnwrap(
+            model.playbackProgressContext(for: selected, serverAddressText: "unused.local:50051")
+        )
+        XCTAssertEqual(context.hlsSession?.sessionID, "paged-selected-session")
+        XCTAssertNotEqual(context.hlsSession?.sessionID, "paged-decoy-session")
+        XCTAssertNotEqual(context.hlsSession?.sessionID, "unrelated-task-session")
+    }
+
     func testTaskResultPlaybackIsDisabledWhileCancellationIsPending() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [
@@ -5898,6 +6060,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(unwrappedPrepared.url, source.explicitHTTPURL)
         XCTAssertEqual(unwrappedPrepared.checkpoint.identity, playbackIdentity)
         XCTAssertEqual(unwrappedPrepared.progressContext.libraryItemID, playbackIdentity.libraryItemID)
+        XCTAssertEqual(unwrappedPrepared.progressContext.hlsSession?.serverID, taskIdentity.serverID)
+        XCTAssertEqual(unwrappedPrepared.progressContext.hlsSession?.sessionID, task.playbackSession?.id)
         model.finishPreparedResumption(unwrappedPrepared, didStartPlayback: true)
         XCTAssertTrue(model.isActivePlaybackLibraryItem(id: playbackIdentity.libraryItemID))
         let taskIDs = await client.getTaskIDsSnapshot()
@@ -5913,6 +6077,50 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(resolved.isEmpty)
         XCTAssertTrue(created.isEmpty)
         XCTAssertTrue(cancelled.isEmpty)
+    }
+
+    func testSavedPlaybackSourceChangeOmitsHLSBindingButStillPreparesPlayback() async throws {
+        let (defaults, store, suiteName) = try makeResumptionStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let endpoint = try XCTUnwrap(CacheServerEndpoint.normalized(from: "mac-mini.local:50051"))
+        let taskIdentity = ClientResumptionTaskIdentity(
+            endpoint: endpoint,
+            serverID: "fake-cache-server",
+            taskID: "saved-session-source-change"
+        )
+        let playbackIdentity = ClientPlaybackIdentity(
+            task: taskIdentity,
+            libraryItemID: "saved-session-library",
+            variantID: "h264"
+        )
+        store.rememberTask(taskIdentity)
+        store.beginPlayback(playbackIdentity)
+        let task = CacheTask.playableFixture(
+            id: taskIdentity.taskID,
+            state: "TASK_STATE_COMPLETED",
+            libraryItemID: playbackIdentity.libraryItemID,
+            playbackSourceItemID: playbackIdentity.libraryItemID
+        )
+        let changedSource = CachePlaybackSource(
+            itemID: playbackIdentity.libraryItemID,
+            variantID: "h264",
+            playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+            uri: "http://mac-mini.local:8080/hls/saved-session-library/changed.m3u8"
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [],
+            getTaskResponses: [taskIdentity.taskID: [.success(task), .success(task)]],
+            playbackSourceResponses: ["saved-session-library\u{1F}h264": changedSource]
+        )
+        let model = BilibiliTaskViewModel(resumptionStore: store, clientFactory: { _ in client })
+        defer { model.clearTask() }
+
+        await model.restoreSavedTask(serverAddressText: endpoint.displayAddress)
+        let prepared = await model.prepareSavedPlayback(serverAddressText: endpoint.displayAddress)
+
+        XCTAssertEqual(prepared?.url, changedSource.explicitHTTPURL)
+        XCTAssertEqual(prepared?.progressContext.resumptionIdentity, playbackIdentity)
+        XCTAssertNil(prepared?.progressContext.hlsSession)
     }
 
     func testSucceededEmbeddedExactChildRestoresAndPreparesSavedSource() async throws {
@@ -7226,6 +7434,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
         XCTAssertFalse(fixture.model.statusMessage.hasPrefix("Playing "))
         let prepared = try fixture.prepared(source: freshSource)
+        XCTAssertNil(prepared.progressContext.hlsSession)
         let resumed = await fixture.model.resumePreparedPlayback(prepared) { true }
         XCTAssertTrue(resumed)
         XCTAssertTrue(fixture.model.isActivePlaybackLibraryItem(id: fixture.identity.libraryItemID))
@@ -8155,6 +8364,31 @@ private struct SavedPlaybackActivationFixture {
     func prepared(source: CachePlaybackSource? = nil) throws -> ClientPreparedResumption {
         let source = source ?? self.source
         let url = try XCTUnwrap(source.explicitHTTPURL)
+        let embeddedSource: CachePlaybackSource?
+        let session: CacheBilibiliPlaybackSession?
+        if let resultID = identity.resultID {
+            let result = task.resultItems.first(where: { $0.id.utf8.elementsEqual(resultID.utf8) })
+            embeddedSource = result?.playbackSource
+            session = result?.playbackSession
+        } else {
+            embeddedSource = task.playbackSource
+            session = task.playbackSession
+        }
+        let hlsSession: PlayerHLSPlaybackSessionContext? = session.flatMap { session in
+            guard let embeddedSource,
+                source.playbackProtocol == "PLAYBACK_PROTOCOL_HLS",
+                source.itemID.utf8.elementsEqual(embeddedSource.itemID.utf8),
+                source.variantID.utf8.elementsEqual(embeddedSource.variantID.utf8),
+                source.playbackProtocol.utf8.elementsEqual(embeddedSource.playbackProtocol.utf8),
+                source.uri.utf8.elementsEqual(embeddedSource.uri.utf8),
+                url.absoluteString.utf8.elementsEqual(embeddedSource.uri.utf8),
+                session.selectedVariantID.utf8.elementsEqual(source.variantID.utf8)
+            else { return nil }
+            return PlayerHLSPlaybackSessionContext(
+                serverID: identity.task.serverID,
+                sessionID: session.id
+            )
+        }
         return ClientPreparedResumption(
             url: url,
             progressContext: PlayerPlaybackProgressContext(
@@ -8162,7 +8396,8 @@ private struct SavedPlaybackActivationFixture {
                 playbackURI: url.absoluteString,
                 libraryItemID: identity.libraryItemID,
                 variantID: source.variantID,
-                resumptionIdentity: identity
+                resumptionIdentity: identity,
+                hlsSession: hlsSession
             ),
             checkpoint: try XCTUnwrap(store.record?.playback)
         )
@@ -9507,6 +9742,7 @@ private extension CacheTaskResult {
         state: String = "TASK_RESULT_STATE_COMPLETED",
         libraryItemID: String = "",
         playbackSource: CachePlaybackSource? = nil,
+        playbackSession: CacheBilibiliPlaybackSession? = nil,
         artifacts: [CacheTaskArtifact] = [],
         hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) -> Self {
@@ -9522,16 +9758,27 @@ private extension CacheTaskResult {
             artifacts: artifacts,
             createdAt: nil,
             updatedAt: nil,
-            providerDetails: hlsCacheFillStatus.map {
-                .bilibili(
+            providerDetails: playbackSession != nil || hlsCacheFillStatus != nil
+                ? .bilibili(
                     BilibiliTaskResultDetails(
                         identity: nil,
-                        playbackSession: nil,
-                        hlsCacheFillStatus: $0
+                        playbackSession: playbackSession,
+                        hlsCacheFillStatus: hlsCacheFillStatus
                     ))
-            }
+                : nil
         )
     }
+}
+
+private func playbackSession(id: String, variantID: String) -> CacheBilibiliPlaybackSession {
+    CacheBilibiliPlaybackSession(
+        id: id,
+        title: "Playback session",
+        contentID: "cid",
+        selectedVariantID: variantID,
+        selectedVariant: nil,
+        variants: []
+    )
 }
 
 private extension CacheServerSummary {

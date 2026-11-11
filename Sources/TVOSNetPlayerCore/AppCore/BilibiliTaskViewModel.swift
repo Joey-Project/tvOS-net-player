@@ -1115,12 +1115,28 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let playbackSource = currentTask.playableBilibiliPlaybackSource
         let resultID: String?
+        let playbackSession: CacheBilibiliPlaybackSession?
         if currentTask.topLevelPlayableBilibiliURL != nil {
             resultID = nil
-        } else if let result = currentTask.bilibiliTaskResults.first(where: { $0.playbackURL == playbackURL }) {
+            playbackSession = currentTask.playbackSession
+        } else if let result = currentTask.bilibiliTaskResults.first(where: {
+            $0.playbackURL == playbackURL
+        }) {
             resultID = result.id
+            playbackSession =
+                currentTask.resultItems.first(where: {
+                    $0.id.utf8.elementsEqual(result.id.utf8)
+                })?.playbackSession
         } else {
             return nil
+        }
+        let hlsSession = playbackSource.flatMap {
+            hlsPlaybackSessionContext(
+                playbackSession,
+                for: $0,
+                loadedURL: playbackURL,
+                serverID: taskIdentity.serverID
+            )
         }
         let libraryItemID = currentTask.playableBilibiliLibraryItemID ?? ""
         return PlayerPlaybackProgressContext(
@@ -1133,7 +1149,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 resultID: resultID,
                 libraryItemID: libraryItemID,
                 variantID: playbackSource?.variantID ?? ""
-            )
+            ),
+            hlsSession: hlsSession
         )
     }
 
@@ -1144,10 +1161,40 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard let currentTask,
             let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
             let taskIdentity = currentResumptionTaskIdentity(endpoint: endpoint, taskID: currentTask.id),
-            let resultItem = taskResults.first(where: { $0.id == result.id }),
+            let resultItem = taskResults.first(where: { $0.id.utf8.elementsEqual(result.id.utf8) }),
             let playbackURL = resultItem.playbackURL
         else {
             return nil
+        }
+
+        let rawSource: CachePlaybackSource?
+        let rawSession: CacheBilibiliPlaybackSession?
+        if currentTask.outputSummary != nil {
+            if let rawResult = taskResultItems.first(where: {
+                $0.id.utf8.elementsEqual(resultItem.id.utf8)
+            }) {
+                rawSource = rawResult.playbackSource
+                rawSession = rawResult.bilibiliPlaybackSession
+            } else {
+                rawSource = nil
+                rawSession = nil
+            }
+        } else if let rawResult = currentTask.resultItems.first(where: {
+            $0.id.utf8.elementsEqual(resultItem.id.utf8)
+        }) {
+            rawSource = rawResult.playbackSource
+            rawSession = rawResult.playbackSession
+        } else {
+            rawSource = nil
+            rawSession = nil
+        }
+        let hlsSession = rawSource.flatMap {
+            hlsPlaybackSessionContext(
+                rawSession,
+                for: $0,
+                loadedURL: playbackURL,
+                serverID: taskIdentity.serverID
+            )
         }
 
         return PlayerPlaybackProgressContext(
@@ -1160,7 +1207,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 resultID: resultItem.id,
                 libraryItemID: resultItem.playbackLibraryItemID,
                 variantID: resultItem.playbackVariantID
-            )
+            ),
+            hlsSession: hlsSession
         )
     }
 
@@ -1902,6 +1950,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let exactResultID = checkpoint.identity.resultID
         var embeddedSource: CachePlaybackSource?
+        var embeddedSession: CacheBilibiliPlaybackSession?
         var sourceItemID: String
         var currentLibraryItemID = ""
 
@@ -1922,6 +1971,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             embeddedSource = result.playbackSource
+            embeddedSession = result.bilibiliPlaybackSession
             currentLibraryItemID = normalizedNonEmpty(result.libraryItemID) ?? ""
             if currentLibraryItemID.isEmpty,
                 let embeddedSource,
@@ -1938,6 +1988,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 throw SavedTaskResumptionIssue.playbackUnavailable
             }
             embeddedSource = task.playbackSource
+            embeddedSession = task.playbackSession
             currentLibraryItemID = normalizedNonEmpty(task.libraryItemID) ?? ""
             if currentLibraryItemID.isEmpty,
                 let embeddedSource,
@@ -1992,7 +2043,21 @@ public final class BilibiliTaskViewModel: ObservableObject {
             playbackURI: safeURL.absoluteString,
             libraryItemID: currentLibraryItemID,
             variantID: source.variantID,
-            resumptionIdentity: checkpoint.identity
+            resumptionIdentity: checkpoint.identity,
+            hlsSession: embeddedSource.flatMap { embeddedSource in
+                guard samePlaybackSourceBytes(source, embeddedSource),
+                    let sourceURL = source.explicitHTTPURL,
+                    sourceURL.absoluteString.utf8.elementsEqual(safeURL.absoluteString.utf8)
+                else {
+                    return nil
+                }
+                return hlsPlaybackSessionContext(
+                    embeddedSession,
+                    for: source,
+                    loadedURL: safeURL,
+                    serverID: record.task.serverID
+                )
+            }
         )
         return ClientPreparedResumption(url: safeURL, progressContext: progressContext, checkpoint: checkpoint)
     }
@@ -2094,7 +2159,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
             playbackSource: item.playbackSource,
             artifacts: [],
             createdAt: nil,
-            updatedAt: nil
+            updatedAt: nil,
+            providerDetails: .bilibili(
+                BilibiliTaskResultDetails(
+                    identity: item.identity,
+                    playbackSession: item.playbackSession,
+                    hlsCacheFillStatus: item.hlsCacheFillStatus
+                ))
         )
     }
 
@@ -5510,6 +5581,46 @@ private func playableURL(for source: CachePlaybackSource, expectedItemID: String
     }
 
     return source.explicitHTTPURL
+}
+
+private extension CacheTaskResult {
+    var bilibiliPlaybackSession: CacheBilibiliPlaybackSession? {
+        guard case let .bilibili(details)? = providerDetails else {
+            return nil
+        }
+        return details.playbackSession
+    }
+}
+
+private func hlsPlaybackSessionContext(
+    _ session: CacheBilibiliPlaybackSession?,
+    for source: CachePlaybackSource,
+    loadedURL: URL,
+    serverID: String
+) -> PlayerHLSPlaybackSessionContext? {
+    let protocolName = source.playbackProtocol.lowercased().filter(\.isLetter)
+    let playbackProtocol =
+        protocolName.hasPrefix("playbackprotocol")
+        ? String(protocolName.dropFirst("playbackprotocol".count))
+        : protocolName
+    guard playbackProtocol == "hls",
+        !source.variantID.isEmpty,
+        let session,
+        session.selectedVariantID.utf8.elementsEqual(source.variantID.utf8),
+        session.selectedVariant.map({ $0.id.utf8.elementsEqual(session.selectedVariantID.utf8) }) ?? true,
+        let sourceURL = source.explicitHTTPURL,
+        sourceURL.absoluteString.utf8.elementsEqual(loadedURL.absoluteString.utf8)
+    else {
+        return nil
+    }
+    return PlayerHLSPlaybackSessionContext(serverID: serverID, sessionID: session.id)
+}
+
+private func samePlaybackSourceBytes(_ lhs: CachePlaybackSource, _ rhs: CachePlaybackSource) -> Bool {
+    lhs.itemID.utf8.elementsEqual(rhs.itemID.utf8)
+        && lhs.variantID.utf8.elementsEqual(rhs.variantID.utf8)
+        && lhs.playbackProtocol.utf8.elementsEqual(rhs.playbackProtocol.utf8)
+        && lhs.uri.utf8.elementsEqual(rhs.uri.utf8)
 }
 
 private extension BilibiliTaskViewModel {
