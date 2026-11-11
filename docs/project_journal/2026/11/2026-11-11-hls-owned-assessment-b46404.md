@@ -40,8 +40,8 @@ superseded_by:
 - This completes passive composition only. Default buffering, whole-asset fill, automatic native acceptance and the unresolved production handover decision remain unchanged.
 
 ## Next Steps
-1. Agree on a separate production target-serving/handover mechanism before any active quality change.
-2. Compare a separately implemented assisted path against the retained pure automatic baseline; continue the [latency workstream](2026-11-10-native-abr-latency-b46399.md) without relabeling metadata or ownership tests as optimization.
+1. Follow the agreed [single-player prewarm comparison](2026-11-11-single-player-prewarm-b46405.md): preserve one player/item and stable display format, and validate server preparation before a production control-plane change.
+2. Compare real decoded recovery and continuity against the retained automatic baseline; continue the [latency workstream](2026-11-10-native-abr-latency-b46399.md) without relabeling metadata, ownership or cache-readiness tests as optimization.
 
 ## Evidence
 - [Read-only catalog PR #96](https://github.com/Joey-Project/tvOS-net-player/pull/96).

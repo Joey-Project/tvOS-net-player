@@ -221,6 +221,10 @@ just test-media-network
 
 共享 AppCore 的显式评估入口把目录、就绪度和原生快照绑定到当前播放器、媒体项、endpoint 及结构化 HLS session。新评估、重载、seek、暂停、变速或停止后，旧异步结果不能被继续使用；缺少 session 元数据时保持原播放，不从 URL 猜测身份。快照年龄包含两次 RPC 的等待，调用方消费结果前仍须重新核对当前归属和新鲜度。该入口不会自动调用、预热或切源，server ID 和进程内 generation 也不是跨重启凭证。边界见 [owned assessment](docs/project_journal/2026/11/2026-11-11-hls-owned-assessment-b46404.md)。
 
+`just test-media-prewarm-comparison` 是单独选择的预热关闭/开启诊断，不属于三项原生门禁，也不启用生产预热。每轮使用一个 AVPlayer 和一个 AVPlayerItem，由同一个多画质 HLS master 提供候选；两轮顺序执行，缓存和播放器状态不共享。恢复时先记录真实播放位置及连续缓冲边界，再对尚未缓冲且不侵入约 20 秒安全窗口的高档视频和音频做有界准备。默认前向缓冲、整片下载和原有门禁保持不变；允许画质档位的分辨率变化，但首版不额外改变 HDR/SDR、帧率或编码兼容性，也不创建备用播放器。
+
+对比报告将缓存覆盖、源站总请求、真实 LAN 客户端请求与高档解码分开记录。每轮先连续观测 600 秒，再验证暂停、跳转和倍速；控制阶段的帧不能充当自然升档证据。窗口内没有恢复高档是明确的未观测结果，不作为零延迟或优化成功；帧间隔统计仅覆盖观测到的解码帧之间，不证明可见界面没有黑屏。使用固定签名产物并保持系统静音，不读取真实凭据；诊断本身不建立自动升档能力，详见 [单播放器预热对比](docs/project_journal/2026/11/2026-11-11-single-player-prewarm-b46405.md)。
+
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
 GHA 的 `Native media network acceptance` job 使用同一套严格用例和报告校验，通过显式 `--ci-unsigned` 在一次性的 runner 上编译隔离产物，不需要 Apple 签名 secrets。该模式只允许在 GitHub Actions 中使用，不作为本机固定签名验收的替代。`media-network-e2e-<run_id>` 产物保留有界日志、runner summary 和三个原始媒体报告，保留三天；媒体夹具、日常 server 状态和凭据不会上传。job 失败、取消或跳过都会阻止统一 CI 门禁通过；GHA 结果与本机签名验收分别记录，设计见 [native media CI journal](docs/project_journal/2026/11/2026-11-10-native-media-ci-b46398.md)。

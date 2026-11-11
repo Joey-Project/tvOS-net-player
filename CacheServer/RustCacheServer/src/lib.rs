@@ -37,6 +37,8 @@ mod transcoding;
 
 #[cfg(all(test, target_os = "macos"))]
 mod media_acceptance_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod media_prewarm_comparison_tests;
 
 use std::{
     collections::{HashMap, HashSet},

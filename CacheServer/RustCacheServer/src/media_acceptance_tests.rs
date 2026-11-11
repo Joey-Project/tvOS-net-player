@@ -52,6 +52,7 @@ use crate::{
     generated::tvos_net_player::v1::{BilibiliPlaybackSession, PlaybackProtocol, PlaybackSource},
     hls::{HlsPlaybackSession, mp4_initialization_length},
     hls_cache::{HlsCacheFillControl, HlsCacheStore, HlsTranscodingExecutionConfig},
+    hls_range_cache::HlsRangePriority,
     mp4_segments::{
         MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange,
         hls_peak_bandwidth_for_ranges as peak_bandwidth_bits_per_second,
@@ -66,6 +67,10 @@ const ABR_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_adaptation_and_recovery";
 const EXTENDED_DIAGNOSTIC_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_diagnostic_extended_adaptation_and_recovery";
+const PREWARM_CONTROL_CASE_FULL_NAME: &str =
+    "media_prewarm_comparison_tests::native_single_player_prewarm_control";
+const PREWARM_TREATMENT_CASE_FULL_NAME: &str =
+    "media_prewarm_comparison_tests::native_single_player_prewarm_treatment";
 const BUFFERED_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_buffered_fallback_keeps_playing";
 const TRANSCODE_CASE_FULL_NAME: &str = "media_acceptance_tests::native_transcoded_output_decodes";
@@ -114,6 +119,8 @@ enum NativeCase {
     BufferedContinuity,
     ProgressiveAbr,
     ExtendedDiagnostic,
+    SinglePlayerPrewarmControl,
+    SinglePlayerPrewarmTreatment,
     Transcoding,
 }
 
@@ -123,6 +130,8 @@ impl NativeCase {
             Self::BufferedContinuity => BUFFERED_CASE_FULL_NAME,
             Self::ProgressiveAbr => ABR_CASE_FULL_NAME,
             Self::ExtendedDiagnostic => EXTENDED_DIAGNOSTIC_CASE_FULL_NAME,
+            Self::SinglePlayerPrewarmControl => PREWARM_CONTROL_CASE_FULL_NAME,
+            Self::SinglePlayerPrewarmTreatment => PREWARM_TREATMENT_CASE_FULL_NAME,
             Self::Transcoding => TRANSCODE_CASE_FULL_NAME,
         }
     }
@@ -132,6 +141,8 @@ impl NativeCase {
             Self::BufferedContinuity => "buffered.json",
             Self::ProgressiveAbr => "abr.json",
             Self::ExtendedDiagnostic => "abr-extended-diagnostic.json",
+            Self::SinglePlayerPrewarmControl => "prewarm-control.json",
+            Self::SinglePlayerPrewarmTreatment => "prewarm-treatment.json",
             Self::Transcoding => "transcoding.json",
         }
     }
@@ -139,7 +150,10 @@ impl NativeCase {
     fn deadline(self) -> Duration {
         match self {
             Self::BufferedContinuity => ABR_CASE_TIMEOUT,
-            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_CASE_TIMEOUT,
+            Self::ProgressiveAbr
+            | Self::ExtendedDiagnostic
+            | Self::SinglePlayerPrewarmControl
+            | Self::SinglePlayerPrewarmTreatment => LONG_RECOVERY_CASE_TIMEOUT,
             Self::Transcoding => TRANSCODE_CASE_TIMEOUT,
         }
     }
@@ -149,6 +163,8 @@ impl NativeCase {
             Self::BufferedContinuity => "buffered_continuity",
             Self::ProgressiveAbr => "unbuffered_recovery",
             Self::ExtendedDiagnostic => "extended_recovery_diagnostic",
+            Self::SinglePlayerPrewarmControl => "single_player_prewarm_control",
+            Self::SinglePlayerPrewarmTreatment => "single_player_prewarm_treatment",
             Self::Transcoding => "transcoded_output",
         }
     }
@@ -156,26 +172,42 @@ impl NativeCase {
     fn source_duration_seconds(self) -> u32 {
         match self {
             Self::BufferedContinuity => BUFFERED_MEDIA_DURATION_SECONDS,
-            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_MEDIA_DURATION_SECONDS,
+            Self::ProgressiveAbr
+            | Self::ExtendedDiagnostic
+            | Self::SinglePlayerPrewarmControl
+            | Self::SinglePlayerPrewarmTreatment => LONG_RECOVERY_MEDIA_DURATION_SECONDS,
             Self::Transcoding => TRANSCODE_MEDIA_DURATION_SECONDS,
         }
     }
 
     fn uses_long_profile(self) -> bool {
-        matches!(self, Self::ProgressiveAbr | Self::ExtendedDiagnostic)
+        matches!(
+            self,
+            Self::ProgressiveAbr
+                | Self::ExtendedDiagnostic
+                | Self::SinglePlayerPrewarmControl
+                | Self::SinglePlayerPrewarmTreatment
+        )
     }
 
     fn uses_progressive_abr(self) -> bool {
         matches!(
             self,
-            Self::BufferedContinuity | Self::ProgressiveAbr | Self::ExtendedDiagnostic
+            Self::BufferedContinuity
+                | Self::ProgressiveAbr
+                | Self::ExtendedDiagnostic
+                | Self::SinglePlayerPrewarmControl
+                | Self::SinglePlayerPrewarmTreatment
         )
     }
 
     fn probe_duration_seconds(self) -> u64 {
         match self {
             Self::BufferedContinuity => ABR_PROBE_DURATION_SECONDS,
-            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_PROBE_DURATION_SECONDS,
+            Self::ProgressiveAbr
+            | Self::ExtendedDiagnostic
+            | Self::SinglePlayerPrewarmControl
+            | Self::SinglePlayerPrewarmTreatment => LONG_RECOVERY_PROBE_DURATION_SECONDS,
             Self::Transcoding => TRANSCODE_PROBE_DURATION_SECONDS,
         }
     }
@@ -183,13 +215,40 @@ impl NativeCase {
     fn probe_deadline_seconds(self) -> u64 {
         match self {
             Self::BufferedContinuity => ABR_PROBE_DEADLINE_SECONDS,
-            Self::ProgressiveAbr | Self::ExtendedDiagnostic => LONG_RECOVERY_PROBE_DEADLINE_SECONDS,
+            Self::ProgressiveAbr
+            | Self::ExtendedDiagnostic
+            | Self::SinglePlayerPrewarmControl
+            | Self::SinglePlayerPrewarmTreatment => LONG_RECOVERY_PROBE_DEADLINE_SECONDS,
             Self::Transcoding => self.probe_duration_seconds() + 15,
         }
     }
 
     fn is_diagnostic(self) -> bool {
-        matches!(self, Self::ExtendedDiagnostic)
+        matches!(
+            self,
+            Self::ExtendedDiagnostic
+                | Self::SinglePlayerPrewarmControl
+                | Self::SinglePlayerPrewarmTreatment
+        )
+    }
+
+    fn is_prewarm_diagnostic(self) -> bool {
+        matches!(
+            self,
+            Self::SinglePlayerPrewarmControl | Self::SinglePlayerPrewarmTreatment
+        )
+    }
+
+    fn prewarm_mode(self) -> Option<crate::media_prewarm_comparison_tests::PrewarmMode> {
+        match self {
+            Self::SinglePlayerPrewarmControl => {
+                Some(crate::media_prewarm_comparison_tests::PrewarmMode::Off)
+            }
+            Self::SinglePlayerPrewarmTreatment => {
+                Some(crate::media_prewarm_comparison_tests::PrewarmMode::On)
+            }
+            _ => None,
+        }
     }
 
     fn cache_limit_bytes(self) -> u64 {
@@ -217,6 +276,7 @@ struct AcceptanceReport {
     lan_body_outcomes: LanBodyOutcomeSummary,
     fault_timeline: FaultTimeline,
     transcoding_metadata: Option<TranscodingMetadata>,
+    prewarm_comparison: Option<crate::media_prewarm_comparison_tests::PrewarmComparisonReport>,
     error: Option<String>,
 }
 
@@ -237,6 +297,7 @@ impl AcceptanceReport {
             lan_body_outcomes: LanBodyOutcomeSummary::default(),
             fault_timeline: FaultTimeline::default(),
             transcoding_metadata: None,
+            prewarm_comparison: None,
             error: None,
         }
     }
@@ -441,6 +502,7 @@ struct PlaylistExpectations {
 struct ProbeMarkerPaths {
     ready: Option<PathBuf>,
     recovery_observation: Option<PathBuf>,
+    recovery_snapshot: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -893,7 +955,29 @@ async fn run_native_case(case: NativeCase) {
     );
 }
 
+pub(crate) async fn run_single_player_prewarm_case(
+    mode: crate::media_prewarm_comparison_tests::PrewarmMode,
+) {
+    let case = match mode {
+        crate::media_prewarm_comparison_tests::PrewarmMode::Off => {
+            NativeCase::SinglePlayerPrewarmControl
+        }
+        crate::media_prewarm_comparison_tests::PrewarmMode::On => {
+            NativeCase::SinglePlayerPrewarmTreatment
+        }
+    };
+    run_native_case(case).await;
+}
+
 async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
+    if case.is_prewarm_diagnostic() {
+        let selected = crate::media_prewarm_comparison_tests::PrewarmMode::parse(
+            env::var("LAN_MEDIA_ACCEPTANCE_PREWARM").ok().as_deref(),
+        )?;
+        if Some(selected) != case.prewarm_mode() {
+            return Err("explicit prewarm selector did not match this named test".to_owned());
+        }
+    }
     let probe_path = required_executable("LAN_MEDIA_ACCEPTANCE_PROBE_BINARY")?;
     let ffmpeg = find_executable("ffmpeg")?;
     let ffprobe = find_executable("ffprobe")?;
@@ -1079,7 +1163,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         Arc::clone(&origin.phase),
         Arc::clone(&origin.epoch),
     ));
-    let media_router = crate::media_router(state).layer(from_fn_with_state(
+    let media_router = crate::media_router(state.clone()).layer(from_fn_with_state(
         Arc::clone(&telemetry),
         record_lan_ingress,
     ));
@@ -1122,6 +1206,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     let expected_sizes = match case {
         NativeCase::BufferedContinuity => "640x360,320x180",
         NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => "640x360,320x180,640x360",
+        NativeCase::SinglePlayerPrewarmControl | NativeCase::SinglePlayerPrewarmTreatment => {
+            "640x360,320x180,640x360"
+        }
         NativeCase::Transcoding => "640x360",
     };
     let ready_marker_path = if case.uses_progressive_abr() {
@@ -1145,6 +1232,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     let recovery_marker_path = case
         .uses_progressive_abr()
         .then(|| temporary_root.join("recovery-observation.trigger"));
+    let recovery_snapshot_path = case
+        .is_prewarm_diagnostic()
+        .then(|| temporary_root.join("recovery-snapshot.json"));
     let minimum_steady_play_seconds =
         matches!(case, NativeCase::BufferedContinuity).then_some(MINIMUM_STEADY_PLAY_SECONDS);
     let mut probe = AbortTask(Some(tokio::spawn(run_native_probe(
@@ -1156,6 +1246,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         ProbeMarkerPaths {
             ready: ready_marker_path.clone(),
             recovery_observation: recovery_marker_path.clone(),
+            recovery_snapshot: recovery_snapshot_path.clone(),
         },
         minimum_steady_play_seconds,
     ))));
@@ -1179,6 +1270,80 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         }
     }
 
+    if case.is_prewarm_diagnostic() {
+        let snapshot_path = recovery_snapshot_path
+            .as_deref()
+            .ok_or_else(|| "diagnostic recovery snapshot path was unavailable".to_owned())?;
+        let high = &session.variant.video;
+        let audio =
+            session.variant.audio.as_ref().ok_or_else(|| {
+                "selected HLS variant lacked its shared audio resource".to_owned()
+            })?;
+        let (snapshot, plan) =
+            wait_for_recovery_plan(snapshot_path, &fixture, &report, &high.id, &audio.id).await?;
+        let mode = case
+            .prewarm_mode()
+            .ok_or_else(|| "prewarm diagnostic mode was unavailable".to_owned())?;
+        let coverage_before =
+            selected_range_coverage(&state.hls_cache, &session.id, high, audio, &plan).await?;
+        let started = Instant::now();
+        if let Ok(mut data) = report.lock() {
+            data.prewarm_comparison = Some(crate::media_prewarm_comparison_tests::report_for(
+                mode,
+                snapshot.clone(),
+                plan.clone(),
+                crate::media_prewarm_comparison_tests::PrewarmExecution {
+                    requested_bytes: 0,
+                    operation_count: 0,
+                    elapsed_seconds: 0.0,
+                    coverage_before,
+                    coverage_after: coverage_before,
+                    completed: false,
+                },
+            ));
+        }
+        let (operation_requested_bytes, operation_count) = match mode {
+            crate::media_prewarm_comparison_tests::PrewarmMode::Off => (0, 0),
+            crate::media_prewarm_comparison_tests::PrewarmMode::On => timeout(
+                Duration::from_secs(15),
+                prewarm_selected_ranges(
+                    &state.hls_cache,
+                    &state.hls_upstream_client,
+                    &session.id,
+                    high,
+                    audio,
+                    &plan,
+                ),
+            )
+            .await
+            .map_err(|_| "bounded HLS prewarm exceeded its 15-second deadline".to_owned())??,
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        let coverage_after =
+            selected_range_coverage(&state.hls_cache, &session.id, high, audio, &plan).await?;
+        if mode == crate::media_prewarm_comparison_tests::PrewarmMode::On
+            && coverage_after < plan.planned_bytes
+        {
+            return Err("prewarm did not durably cover every selected range".to_owned());
+        }
+        let comparison = crate::media_prewarm_comparison_tests::report_for(
+            mode,
+            snapshot,
+            plan,
+            crate::media_prewarm_comparison_tests::PrewarmExecution {
+                requested_bytes: operation_requested_bytes,
+                operation_count,
+                elapsed_seconds: elapsed,
+                coverage_before,
+                coverage_after,
+                completed: true,
+            },
+        );
+        if let Ok(mut data) = report.lock() {
+            data.prewarm_comparison = Some(comparison);
+        }
+    }
+
     let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
     let process = timeout(probe_timeout, probe.join()).await;
     let process = match process {
@@ -1192,13 +1357,168 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     validate_probe_result(case, probe_duration, &probe_value, &report)?;
     if case.uses_progressive_abr() {
         validate_abr_request_trace(&report, case)?;
-        validate_abr_sample_timeline(&probe_value, &report)?;
+        validate_abr_sample_timeline(case, &probe_value, &report)?;
         validate_recovery_observations(case, &probe_value, &report)?;
+        if case.is_prewarm_diagnostic()
+            && probe_value["video_size_expectations"]["entries"][2]["matched"].as_bool()
+                == Some(true)
+        {
+            let data = report
+                .lock()
+                .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+            if data.lan_ingress.count_by_phase_and_representation[2][0] == 0 {
+                return Err(
+                    "decoded recovery high lacked a corresponding LAN client high request"
+                        .to_owned(),
+                );
+            }
+        }
     }
 
     media_task.stop().await;
     origin_task.stop().await;
     Ok(())
+}
+
+async fn wait_for_recovery_plan(
+    snapshot_path: &Path,
+    fixture: &MediaFixture,
+    report: &ReportStore,
+    video_resource_id: &str,
+    audio_resource_id: &str,
+) -> Result<
+    (
+        crate::media_prewarm_comparison_tests::RecoverySnapshot,
+        crate::media_prewarm_comparison_tests::PrewarmPlan,
+    ),
+    String,
+> {
+    let (recovery_start, recovery_end) = {
+        let data = report
+            .lock()
+            .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
+        (
+            data.fault_timeline
+                .recovery_before_monotonic_seconds
+                .ok_or_else(|| "recovery pre-transition clock was missing".to_owned())?,
+            data.fault_timeline
+                .recovery_after_monotonic_seconds
+                .ok_or_else(|| "recovery post-transition clock was missing".to_owned())?,
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        let now = monotonic_clock_seconds()?;
+        match crate::media_prewarm_comparison_tests::read_recovery_snapshot(
+            snapshot_path,
+            recovery_start,
+            now,
+            f64::from(LONG_RECOVERY_MEDIA_DURATION_SECONDS),
+        ) {
+            Ok(snapshot) => break snapshot,
+            Err(error) if Instant::now() < deadline => {
+                if !error.contains("could not be inspected") {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if snapshot.observed_monotonic_seconds < recovery_start
+        || snapshot.observed_monotonic_seconds > recovery_end + 5.0
+        || snapshot.observed_monotonic_seconds > monotonic_clock_seconds()?
+    {
+        return Err("recovery snapshot was outside the recovery transition bounds".to_owned());
+    }
+    let audio = fixture.audio.record.initialization_bytes;
+    let plan = crate::media_prewarm_comparison_tests::plan_window(
+        &snapshot,
+        f64::from(LONG_RECOVERY_MEDIA_DURATION_SECONDS),
+        [
+            crate::media_prewarm_comparison_tests::PrewarmTrackInput {
+                track_index: 0,
+                resource_id: video_resource_id,
+                initialization_bytes: fixture.high_video.record.initialization_bytes,
+                fragments: &fixture.high_video.fragments,
+            },
+            crate::media_prewarm_comparison_tests::PrewarmTrackInput {
+                track_index: 1,
+                resource_id: audio_resource_id,
+                initialization_bytes: audio,
+                fragments: &fixture.audio.fragments,
+            },
+        ],
+    )?;
+    Ok((snapshot, plan))
+}
+
+async fn selected_range_coverage(
+    cache: &HlsCacheStore,
+    session_id: &str,
+    high: &crate::hls::HlsMediaResource,
+    audio: &crate::hls::HlsMediaResource,
+    plan: &crate::media_prewarm_comparison_tests::PrewarmPlan,
+) -> Result<u64, String> {
+    let mut covered = 0_u64;
+    for range in &plan.ranges {
+        let resource = match range.resource_id.as_str() {
+            id if id == high.id => high,
+            id if id == audio.id => audio,
+            _ => return Err("prewarm plan referenced an unexpected HLS resource".to_owned()),
+        };
+        let bytes = cache
+            .read_resource_range(session_id, resource, range.start..range.end)
+            .await
+            .map_err(|_| "selected durable HLS range could not be inspected".to_owned())?;
+        if bytes.is_some() {
+            covered = covered
+                .checked_add(range.byte_len()?)
+                .ok_or_else(|| "selected cache coverage count overflowed".to_owned())?;
+        }
+    }
+    Ok(covered)
+}
+
+async fn prewarm_selected_ranges(
+    cache: &HlsCacheStore,
+    client: &reqwest::Client,
+    session_id: &str,
+    high: &crate::hls::HlsMediaResource,
+    audio: &crate::hls::HlsMediaResource,
+    plan: &crate::media_prewarm_comparison_tests::PrewarmPlan,
+) -> Result<(u64, u64), String> {
+    let mut requested_bytes = 0_u64;
+    let mut operation_count = 0_u64;
+    for range in &plan.ranges {
+        let resource = match range.resource_id.as_str() {
+            id if id == high.id => high,
+            id if id == audio.id => audio,
+            _ => return Err("prewarm plan referenced an unexpected HLS resource".to_owned()),
+        };
+        let length = range.byte_len()?;
+        requested_bytes = requested_bytes
+            .checked_add(length)
+            .ok_or_else(|| "prewarm requested-byte count overflowed".to_owned())?;
+        operation_count = operation_count
+            .checked_add(1)
+            .ok_or_else(|| "prewarm operation count overflowed".to_owned())?;
+        cache
+            .ensure_resource_range(
+                client,
+                session_id,
+                resource,
+                range.start..range.end,
+                HlsRangePriority::Background,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .map_err(|_| "bounded selected HLS range prewarm failed".to_owned())?;
+    }
+    if requested_bytes != plan.planned_bytes {
+        return Err("prewarm operation byte total differed from the checked plan".to_owned());
+    }
+    Ok((requested_bytes, operation_count))
 }
 
 struct CaseDirectories {
@@ -1391,7 +1711,9 @@ fn make_abr_metadata(
     match case {
         NativeCase::BufferedContinuity
         | NativeCase::ProgressiveAbr
-        | NativeCase::ExtendedDiagnostic => {
+        | NativeCase::ExtendedDiagnostic
+        | NativeCase::SinglePlayerPrewarmControl
+        | NativeCase::SinglePlayerPrewarmTreatment => {
             let audio_peak = fixture.audio.record.peak_bandwidth_bits_per_second;
             let low_peak = aggregate_peak_bandwidth(
                 fixture
@@ -1558,7 +1880,9 @@ async fn generate_and_inspect_fixture(
     match case {
         NativeCase::BufferedContinuity
         | NativeCase::ProgressiveAbr
-        | NativeCase::ExtendedDiagnostic => {
+        | NativeCase::ExtendedDiagnostic
+        | NativeCase::SinglePlayerPrewarmControl
+        | NativeCase::SinglePlayerPrewarmTreatment => {
             push_video_output(
                 &mut arguments,
                 "high.mp4",
@@ -2870,6 +3194,12 @@ async fn run_native_probe(
             path.to_string_lossy().into_owned(),
         ]);
     }
+    if let Some(path) = marker_paths.recovery_snapshot {
+        command.env(
+            "LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH",
+            path.to_string_lossy().as_ref(),
+        );
+    }
     if let Some(seconds) = minimum_steady_play_seconds {
         command.args([
             "--minimum-steady-play-seconds".to_owned(),
@@ -2959,17 +3289,27 @@ fn validate_probe_result(
         NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => {
             &[(640, 360), (320, 180), (640, 360)][..]
         }
+        NativeCase::SinglePlayerPrewarmControl | NativeCase::SinglePlayerPrewarmTreatment => {
+            &[(640, 360), (320, 180), (640, 360)][..]
+        }
         NativeCase::Transcoding => &[(640, 360)][..],
     };
-    validate_video_size_expectations(probe, expected)
+    validate_video_size_expectations(probe, expected, case.is_prewarm_diagnostic())
 }
 
-fn validate_video_size_expectations(probe: &Value, expected: &[(u32, u32)]) -> Result<(), String> {
+fn validate_video_size_expectations(
+    probe: &Value,
+    expected: &[(u32, u32)],
+    allow_optional_recovery_high: bool,
+) -> Result<(), String> {
     let contract = probe
         .get("video_size_expectations")
         .ok_or_else(|| "native probe omitted ordered decoded-size expectations".to_owned())?;
     if contract.get("enabled").and_then(Value::as_bool) != Some(true)
-        || contract.get("complete").and_then(Value::as_bool) != Some(true)
+        || (!allow_optional_recovery_high
+            && contract.get("complete").and_then(Value::as_bool) != Some(true))
+        || (allow_optional_recovery_high
+            && contract.get("complete").and_then(Value::as_bool).is_none())
         || contract.get("semantics").and_then(Value::as_str)
             != Some("ordered_decoded_size_subsequence")
         || contract
@@ -2986,7 +3326,35 @@ fn validate_video_size_expectations(probe: &Value, expected: &[(u32, u32)]) -> R
     if entries.len() != expected.len() {
         return Err("native probe returned the wrong number of decoded-size entries".to_owned());
     }
-    for (entry, (width, height)) in entries.iter().zip(expected) {
+    for (index, (entry, (width, height))) in entries.iter().zip(expected).enumerate() {
+        if allow_optional_recovery_high && index == 2 {
+            let matched = entry.get("matched").and_then(Value::as_bool);
+            let optional = entry
+                .get("diagnostic_optional_recovery_high")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let samples = entry.get("samples").and_then(Value::as_array);
+            if entry.get("expected_width").and_then(Value::as_u64) != Some(u64::from(*width))
+                || entry.get("expected_height").and_then(Value::as_u64) != Some(u64::from(*height))
+                || !optional
+                || !matches!(samples, Some(samples) if samples.is_empty() || samples.len() == 3)
+                || (matched == Some(false)
+                    && (samples.is_none_or(|samples| !samples.is_empty())
+                        || contract.get("complete").and_then(Value::as_bool) != Some(false)))
+                || (matched == Some(true)
+                    && (samples.is_none_or(|samples| samples.len() != 3)
+                        || contract.get("complete").and_then(Value::as_bool) != Some(true)))
+                || matched.is_none()
+            {
+                return Err(
+                    "optional recovered-high evidence was neither valid nor explicitly censored"
+                        .to_owned(),
+                );
+            }
+            if matched == Some(false) {
+                continue;
+            }
+        }
         if entry.get("expected_width").and_then(Value::as_u64) != Some(u64::from(*width))
             || entry.get("expected_height").and_then(Value::as_u64) != Some(u64::from(*height))
             || entry.get("matched").and_then(Value::as_bool) != Some(true)
@@ -3091,7 +3459,10 @@ fn validate_recovery_observations(
         return Err("recovery observation was outside the controller phase window".to_owned());
     }
     match case {
-        NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic => {
+        NativeCase::ProgressiveAbr
+        | NativeCase::ExtendedDiagnostic
+        | NativeCase::SinglePlayerPrewarmControl
+        | NativeCase::SinglePlayerPrewarmTreatment => {
             if recovery_state.range_end > source_duration - 20.0 {
                 return Err(
                     "recovery observation did not prove 20 seconds of future unbuffered media"
@@ -3269,7 +3640,11 @@ fn validate_abr_request_trace(report: &ReportStore, case: NativeCase) -> Result<
     Ok(())
 }
 
-fn validate_abr_sample_timeline(probe: &Value, report: &ReportStore) -> Result<(), String> {
+fn validate_abr_sample_timeline(
+    case: NativeCase,
+    probe: &Value,
+    report: &ReportStore,
+) -> Result<(), String> {
     let timeline = report
         .lock()
         .map_err(|_| "acceptance report lock was poisoned".to_owned())?
@@ -3311,6 +3686,12 @@ fn validate_abr_sample_timeline(probe: &Value, report: &ReportStore) -> Result<(
         .as_array()
         .ok_or_else(|| "decoded-size sample entries were missing".to_owned())?;
     let samples = |index: usize| -> Result<Vec<f64>, String> {
+        if case.is_prewarm_diagnostic()
+            && index == 2
+            && entries[index]["matched"].as_bool() == Some(false)
+        {
+            return Ok(Vec::new());
+        }
         entries[index]["samples"]
             .as_array()
             .filter(|samples| samples.len() == 3)
@@ -4823,7 +5204,7 @@ mod origin_pacing_tests {
             }
         });
 
-        assert!(validate_abr_sample_timeline(&probe, &report).is_ok());
+        assert!(validate_abr_sample_timeline(NativeCase::ProgressiveAbr, &probe, &report).is_ok());
     }
 
     #[test]
