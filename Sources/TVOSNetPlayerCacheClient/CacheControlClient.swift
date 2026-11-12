@@ -30,6 +30,10 @@ public protocol CacheControlClient: Sendable {
     func getHLSCacheStatus() async throws -> HLSCacheStatus
     func getHLSPlaybackReadiness(_ request: HLSPlaybackReadinessRequest) async throws -> HLSPlaybackReadiness
     func getHLSRenditionCatalog(_ request: HLSRenditionCatalogRequest) async throws -> HLSRenditionCatalog
+    func openHLSPlaybackContext(_ request: HLSPlaybackContextOpenRequest) async throws -> HLSPlaybackContextTicket
+    func updateHLSPlaybackContext(_ request: HLSPlaybackContextUpdateRequest) async throws -> HLSPlaybackContextTicket
+    func closeHLSPlaybackContext(_ request: HLSPlaybackContextCloseRequest) async throws
+        -> HLSPlaybackContextCloseResponse
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult
     func listLibraryItemsPage(
         pageToken: String,
@@ -148,6 +152,11 @@ public struct CacheControlClientUnsupportedOperation: Error, Equatable, Sendable
         code: "hls_rendition_catalog",
         message: "HLS rendition catalogs are not supported by this cache server."
     )
+
+    public static let hlsPlaybackContext = CacheControlClientUnsupportedOperation(
+        code: "hls_playback_context",
+        message: "HLS playback contexts are not supported by this cache server."
+    )
 }
 
 public struct CacheControlClientRequestValidationError: Error, Equatable, Sendable {
@@ -188,6 +197,20 @@ public extension CacheControlClient {
 
     func getHLSRenditionCatalog(_ request: HLSRenditionCatalogRequest) async throws -> HLSRenditionCatalog {
         throw CacheControlClientUnsupportedOperation.hlsRenditionCatalog
+    }
+
+    func openHLSPlaybackContext(_ request: HLSPlaybackContextOpenRequest) async throws -> HLSPlaybackContextTicket {
+        throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
+    }
+
+    func updateHLSPlaybackContext(_ request: HLSPlaybackContextUpdateRequest) async throws -> HLSPlaybackContextTicket {
+        throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
+    }
+
+    func closeHLSPlaybackContext(_ request: HLSPlaybackContextCloseRequest) async throws
+        -> HLSPlaybackContextCloseResponse
+    {
+        throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
     }
 
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
