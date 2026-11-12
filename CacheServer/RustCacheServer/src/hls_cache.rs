@@ -86,6 +86,11 @@ const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
 const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const RANGE_MAINTENANCE_PASSES_PER_ATTEMPT: usize = 8;
+const HLS_PLAYBACK_PREPARATION_DEADLINE: Duration = Duration::from_secs(15);
+const HLS_PLAYBACK_PREPARATION_MAX_LOGICAL_BYTES: u64 = 8 * 1024 * 1024;
+const HLS_PLAYBACK_PREPARATION_MAX_SPAN_BYTES: u64 = 16 * 1024 * 1024;
+const HLS_PLAYBACK_PREPARATION_MAX_ATTEMPTS: usize = 128;
+const HLS_PLAYBACK_PREPARATION_MAX_REQUESTS: usize = 128;
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -99,6 +104,95 @@ type RangeChunkFetch = (
 );
 type HlsRangeCompletion =
     Pin<Box<dyn Future<Output = Result<HlsRangePreparation, HlsRangeError>> + Send>>;
+
+tokio::task_local! {
+    static HLS_PLAYBACK_PREPARATION_BUDGET: Arc<PlaybackPreparationBudget>;
+}
+
+#[derive(Default)]
+struct PlaybackPreparationBudget {
+    state: Mutex<PlaybackPreparationBudgetState>,
+}
+
+#[derive(Default)]
+struct PlaybackPreparationBudgetState {
+    attempted_span_bytes: u64,
+    attempts: usize,
+    exceeded: bool,
+}
+
+impl PlaybackPreparationBudget {
+    fn charge_attempt(&self, span_bytes: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("playback preparation budget lock should not be poisoned");
+        let Some(attempted_span_bytes) = state.attempted_span_bytes.checked_add(span_bytes) else {
+            state.exceeded = true;
+            return false;
+        };
+        if state.attempts >= HLS_PLAYBACK_PREPARATION_MAX_ATTEMPTS
+            || attempted_span_bytes > HLS_PLAYBACK_PREPARATION_MAX_SPAN_BYTES
+        {
+            state.exceeded = true;
+            return false;
+        }
+        state.attempts += 1;
+        state.attempted_span_bytes = attempted_span_bytes;
+        true
+    }
+
+    fn exceeded(&self) -> bool {
+        self.state
+            .lock()
+            .expect("playback preparation budget lock should not be poisoned")
+            .exceeded
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PlaybackPreparationError {
+    DeadlineExceeded,
+    LimitsExceeded,
+    Range(HlsRangeError),
+}
+
+impl From<HlsRangeError> for PlaybackPreparationError {
+    fn from(error: HlsRangeError) -> Self {
+        Self::Range(error)
+    }
+}
+
+impl std::fmt::Display for PlaybackPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadlineExceeded => {
+                formatter.write_str("HLS playback preparation deadline exceeded")
+            }
+            Self::LimitsExceeded => formatter.write_str("HLS playback preparation limits exceeded"),
+            Self::Range(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for PlaybackPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Range(error) => Some(error),
+            Self::DeadlineExceeded | Self::LimitsExceeded => None,
+        }
+    }
+}
+
+pub(crate) struct PlaybackPreparationRequest<'a> {
+    pub(crate) resource: &'a HlsMediaResource,
+    pub(crate) requested: Range<u64>,
+}
+
+pub(crate) struct PlaybackPreparationBatch<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) requests: &'a [PlaybackPreparationRequest<'a>],
+}
 
 struct RangeExtentCommitInput<'a> {
     expected: &'a PersistedRangeManifest,
@@ -455,6 +549,105 @@ impl HlsCacheStore {
     {
         self.ensure_range_inner(client, session_id, resource, requested, priority, control)
             .await
+    }
+
+    // Staged internal entrypoint until the #98 caller is integrated.
+    #[allow(dead_code)]
+    pub(crate) async fn prepare_playback_batch<F>(
+        &self,
+        client: &reqwest::Client,
+        batch: PlaybackPreparationBatch<'_>,
+        control: &F,
+    ) -> Result<Vec<HlsReadyRange>, PlaybackPreparationError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        let deadline = tokio::time::Instant::now() + HLS_PLAYBACK_PREPARATION_DEADLINE;
+        self.validate_playback_preparation_batch(&batch)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PlaybackPreparationError::DeadlineExceeded);
+        }
+        let budget = Arc::new(PlaybackPreparationBudget::default());
+        let operation = HLS_PLAYBACK_PREPARATION_BUDGET.scope(Arc::clone(&budget), async {
+            let _batch_activity = self.range_cache.enter_preparation_batch(batch.session_id)?;
+            let mut results = Vec::with_capacity(batch.requests.len());
+            for request in batch.requests {
+                match control() {
+                    HlsCacheFillControl::Continue => {}
+                    HlsCacheFillControl::Cancel => return Err(HlsRangeError::Cancelled),
+                    HlsCacheFillControl::Preempt => return Err(HlsRangeError::Preempted),
+                }
+                results.push(
+                    self.ensure_range_inner(
+                        client,
+                        batch.session_id,
+                        request.resource,
+                        request.requested.clone(),
+                        HlsRangePriority::PlaybackPreparation,
+                        control,
+                    )
+                    .await?,
+                );
+            }
+            Ok(results)
+        });
+        match tokio::time::timeout_at(deadline, operation).await {
+            Err(_) => Err(PlaybackPreparationError::DeadlineExceeded),
+            Ok(_) if budget.exceeded() => Err(PlaybackPreparationError::LimitsExceeded),
+            Ok(Ok(results)) => Ok(results),
+            Ok(Err(error)) => Err(PlaybackPreparationError::Range(error)),
+        }
+    }
+
+    fn validate_playback_preparation_batch(
+        &self,
+        batch: &PlaybackPreparationBatch<'_>,
+    ) -> Result<(), PlaybackPreparationError> {
+        if batch.requests.is_empty() || batch.requests.len() > HLS_PLAYBACK_PREPARATION_MAX_REQUESTS
+        {
+            return Err(PlaybackPreparationError::LimitsExceeded);
+        }
+        let mut logical_bytes = 0_u64;
+        let mut expanded_span_bytes = 0_u64;
+        let mut startup_resources = HashSet::new();
+        for request in batch.requests {
+            if request.requested.start >= request.requested.end {
+                return Err(PlaybackPreparationError::Range(
+                    HlsRangeError::InvalidResponse(
+                        "requested HLS preparation range is empty or reversed".to_owned(),
+                    ),
+                ));
+            }
+            let requested_bytes = request.requested.end - request.requested.start;
+            logical_bytes = logical_bytes
+                .checked_add(requested_bytes)
+                .ok_or(PlaybackPreparationError::LimitsExceeded)?;
+            expanded_span_bytes = expanded_span_bytes
+                .checked_add(requested_bytes)
+                .and_then(|bytes| bytes.checked_add(RANGE_FOREGROUND_CHUNK_BYTES.saturating_mul(2)))
+                .ok_or(PlaybackPreparationError::LimitsExceeded)?;
+            let key = self
+                .range_resource_key(batch.session_id, request.resource)
+                .map_err(PlaybackPreparationError::Range)?;
+            if startup_resources.insert(key) {
+                expanded_span_bytes = expanded_span_bytes
+                    .checked_add(
+                        request
+                            .resource
+                            .request
+                            .size
+                            .unwrap_or(RANGE_STARTUP_CHUNK_BYTES)
+                            .min(RANGE_STARTUP_CHUNK_BYTES),
+                    )
+                    .ok_or(PlaybackPreparationError::LimitsExceeded)?;
+            }
+            if logical_bytes > HLS_PLAYBACK_PREPARATION_MAX_LOGICAL_BYTES
+                || expanded_span_bytes > HLS_PLAYBACK_PREPARATION_MAX_SPAN_BYTES
+            {
+                return Err(PlaybackPreparationError::LimitsExceeded);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn seed_validated_startup_prefix<F>(
@@ -5362,7 +5555,10 @@ impl HlsCacheStore {
             .load_range_manifest_serialized(session_id, resource)
             .await?
             .ok_or(HlsRangeError::IdentityChanged)?;
-        let chunks = if priority == HlsRangePriority::Foreground {
+        let chunks = if matches!(
+            priority,
+            HlsRangePriority::Foreground | HlsRangePriority::PlaybackPreparation
+        ) {
             planned_foreground_range_chunks(total, &requested, &loaded.manifest.extents)
         } else {
             planned_range_chunks(total)
@@ -5555,6 +5751,15 @@ impl HlsCacheStore {
         {
             self.range_cache
                 .check_priority_control(&control_key, priority, control)?;
+            let _permit = if priority == HlsRangePriority::PlaybackPreparation {
+                Some(
+                    self.range_cache
+                        .acquire_chunk_permit(&control_key, priority, control)
+                        .await?,
+                )
+            } else {
+                None
+            };
             let response = match self
                 .send_range_request(
                     client,
@@ -5974,6 +6179,18 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        if priority == HlsRangePriority::PlaybackPreparation {
+            let span_bytes = range
+                .end
+                .checked_sub(range.start)
+                .ok_or(HlsRangeError::Preempted)?;
+            if !HLS_PLAYBACK_PREPARATION_BUDGET
+                .try_with(|budget| budget.charge_attempt(span_bytes))
+                .unwrap_or(false)
+            {
+                return Err(HlsRangeError::Preempted);
+            }
+        }
         let end = range.end.checked_sub(1).ok_or_else(|| {
             HlsRangeError::InvalidResponse("empty upstream byte range".to_owned())
         })?;
@@ -12344,6 +12561,13 @@ mod tests {
         body: Vec<u8>,
     }
 
+    struct DiscoveryGate {
+        started: Notify,
+        release: Notify,
+        body: Arc<Vec<u8>>,
+        request_count: AtomicUsize,
+    }
+
     #[derive(Clone)]
     struct RangeEtagFixture {
         body: Arc<Vec<u8>>,
@@ -12556,6 +12780,71 @@ mod tests {
                 Ok::<_, std::convert::Infallible>(body)
             })))
             .expect("held full-resource response should build")
+    }
+
+    async fn upstream_range_with_held_discovery(
+        State(gate): State<Arc<DiscoveryGate>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let Some((start, end)) = headers
+            .get(reqwest::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+            })
+        else {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        if start > end || end >= gate.body.len() {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("unsatisfiable response should build");
+        }
+        let request_index = gate.request_count.fetch_add(1, Ordering::SeqCst);
+        let body = gate.body[start..=end].to_vec();
+        let body_len = body.len();
+        let response_body = if request_index == 0 {
+            gate.started.notify_one();
+            let release = Arc::clone(&gate);
+            Body::from_stream(futures_util::stream::once(async move {
+                release.release.notified().await;
+                Ok::<_, std::convert::Infallible>(body)
+            }))
+        } else {
+            Body::from(body.clone())
+        };
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_LENGTH, body_len.to_string())
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", gate.body.len()),
+            )
+            .header(reqwest::header::ETAG, "\"discovery-v1\"")
+            .body(response_body)
+            .expect("held discovery range response should build")
+    }
+
+    async fn start_held_discovery_upstream(
+        body: Arc<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<DiscoveryGate>) {
+        let gate = Arc::new(DiscoveryGate {
+            started: Notify::new(),
+            release: Notify::new(),
+            body,
+            request_count: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/video.m4s", get(upstream_range_with_held_discovery))
+            .with_state(Arc::clone(&gate));
+        let (url, server) = start_hls_cache_upstream(app).await;
+        (url, server, gate)
     }
 
     #[cfg(unix)]
@@ -18820,6 +19109,394 @@ done
         assert_eq!(Ok(()), ranges.add_ranges(HLS_READINESS_MAX_RANGES));
         assert_eq!(Err(CacheWindowReason::BudgetExceeded), ranges.add_ranges(1));
         assert_eq!(HLS_READINESS_MAX_RANGES, ranges.range_count);
+    }
+
+    #[tokio::test]
+    async fn playback_preparation_batch_uses_ranges_without_foreground_quiescence() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let body = Arc::new(vec![0x5a; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, requests) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"prep-v1\"",
+            "\"prep-v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let store = temp_store(&temp).with_range_parallelism(2);
+        let mut session = sample_session("preparation-progress", &url);
+        session.variant.video.request.size = Some(body.len() as u64);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let foreground_activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("unrelated foreground activity should enter");
+        let requests_to_prepare = [PlaybackPreparationRequest {
+            resource: &session.variant.video,
+            requested: 0..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES,
+        }];
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.prepare_playback_batch(
+                &reqwest::Client::new(),
+                PlaybackPreparationBatch {
+                    session_id: &session.id,
+                    requests: &requests_to_prepare,
+                },
+                &|| HlsCacheFillControl::Continue,
+            ),
+        )
+        .await
+        .expect("preparation should make progress while foreground activity remains open")
+        .expect("bounded preparation should use the production range path");
+
+        assert_eq!(1, result.len());
+        assert!(requests.load(Ordering::Relaxed) >= 2);
+        assert_eq!(1, store.range_activity_counts().0);
+        drop(foreground_activity);
+        assert_eq!((0, 0), store.range_activity_counts());
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn size_less_preparation_discovery_waits_for_foreground_capacity() {
+        let body = Arc::new(vec![0x4b; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, requests) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"prep-capacity-v1\"",
+            "\"prep-capacity-v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(1);
+        let session = sample_session("preparation-discovery-capacity", &url);
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("resource key should be valid");
+        let foreground_permit = store
+            .range_cache
+            .acquire_chunk_permit(
+                &RangeChunkKey {
+                    resource: key,
+                    total_length: 1,
+                    range: 0..1,
+                },
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("foreground should acquire the only transfer slot");
+        let preparation_store = store.clone();
+        let preparation = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &session.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            preparation_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &session.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect_err("discovery must not reach upstream while foreground owns capacity");
+        assert_eq!(0, requests.load(Ordering::SeqCst));
+
+        drop(foreground_permit);
+        tokio::time::timeout(Duration::from_secs(5), preparation)
+            .await
+            .expect("preparation should proceed after foreground releases capacity")
+            .expect("preparation task should join")
+            .expect("size-less preparation should discover and fill ranges");
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn size_less_batches_serialize_discovery_through_response_body() {
+        let body = Arc::new(vec![0x6c; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, gate) = start_held_discovery_upstream(body).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(2);
+        let first = sample_session("preparation-discovery-first", &url);
+        let second = sample_session("preparation-discovery-second", &url);
+        let first_store = store.clone();
+        let first_task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &first.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            first_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &first.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("first discovery body should be held by the loopback server");
+
+        let second_store = store.clone();
+        let second_task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &second.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            second_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &second.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.range_activity_counts().0 < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second batch should enter preparation while first discovery body is held");
+        tokio::time::timeout(Duration::from_millis(150), async {
+            while gate.request_count.load(Ordering::SeqCst) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect_err("second discovery must wait while first response body is outstanding");
+        assert_eq!(1, gate.request_count.load(Ordering::SeqCst));
+
+        gate.release.notify_one();
+        for task in [first_task, second_task] {
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("size-less batch should finish after discovery admission is released")
+                .expect("preparation task should join")
+                .expect("size-less batch should prepare successfully");
+        }
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_size_less_discovery_releases_activity_and_transfer_capacity() {
+        let body = Arc::new(vec![0x7d; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, gate) = start_held_discovery_upstream(body).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(1);
+        let session = sample_session("preparation-discovery-drop", &url);
+        let task_store = store.clone();
+        let session_id = session.id.clone();
+        let task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &session.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            task_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &session.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("discovery response body should be stalled");
+        assert_eq!(2, store.range_activity_counts().0);
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.range_activity_counts().0 != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the batch should release preparation activity");
+
+        let foreground_key = store
+            .range_resource_key(
+                &session_id,
+                &sample_session(&session_id, &url).variant.video,
+            )
+            .expect("resource key should be valid");
+        let foreground_permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.range_cache.acquire_chunk_permit(
+                &RangeChunkKey {
+                    resource: foreground_key,
+                    total_length: 1,
+                    range: 0..1,
+                },
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            ),
+        )
+        .await
+        .expect("foreground should regain the released transfer slot")
+        .expect("foreground permit should be available");
+        drop(foreground_permit);
+        let removal = store
+            .try_begin_session_removal(&session_id)
+            .expect("removal admission should succeed")
+            .expect("dropped batch should no longer block session removal");
+        drop(removal);
+        tokio::time::timeout(Duration::from_secs(2), store.drain_range_writers())
+            .await
+            .expect("range drain should finish after dropped discovery");
+        assert_eq!((0, 0), store.range_activity_counts());
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn playback_preparation_limits_are_shared_across_resources() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session =
+            sample_session_with_audio("preparation-shared-budget", "http://127.0.0.1:1/video.m4s");
+        session.variant.video.request.size = Some(16 * 1024 * 1024);
+        session
+            .variant
+            .audio
+            .as_mut()
+            .expect("audio resource should exist")
+            .request
+            .size = Some(16 * 1024 * 1024);
+        let requests = [
+            PlaybackPreparationRequest {
+                resource: &session.variant.video,
+                requested: 0..5 * 1024 * 1024,
+            },
+            PlaybackPreparationRequest {
+                resource: session.variant.audio.as_ref().expect("audio should exist"),
+                requested: 0..4 * 1024 * 1024,
+            },
+        ];
+
+        let error = store
+            .prepare_playback_batch(
+                &reqwest::Client::new(),
+                PlaybackPreparationBatch {
+                    session_id: &session.id,
+                    requests: &requests,
+                },
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect_err("logical bytes across resources should share one limit");
+
+        assert!(matches!(error, PlaybackPreparationError::LimitsExceeded));
+        assert_eq!((0, 0), store.range_activity_counts());
+    }
+
+    #[tokio::test]
+    async fn playback_preparation_preserves_cancel_removal_and_quota_errors() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let mut session = sample_session("preparation-errors", "http://127.0.0.1:1/video.m4s");
+        session.variant.video.request.size = Some(RANGE_STARTUP_CHUNK_BYTES * 2);
+        let requests = [PlaybackPreparationRequest {
+            resource: &session.variant.video,
+            requested: 0..RANGE_STARTUP_CHUNK_BYTES,
+        }];
+        let store = temp_store(&temp).with_range_parallelism(2);
+
+        let cancelled = store
+            .prepare_playback_batch(
+                &reqwest::Client::new(),
+                PlaybackPreparationBatch {
+                    session_id: &session.id,
+                    requests: &requests,
+                },
+                &|| HlsCacheFillControl::Cancel,
+            )
+            .await
+            .expect_err("caller cancellation should retain its range error");
+        assert!(matches!(
+            cancelled,
+            PlaybackPreparationError::Range(HlsRangeError::Cancelled)
+        ));
+        assert_eq!((0, 0), store.range_activity_counts());
+
+        let removal = store
+            .try_begin_session_removal(&session.id)
+            .expect("removal admission should succeed")
+            .expect("session should be idle");
+        let removing = store
+            .prepare_playback_batch(
+                &reqwest::Client::new(),
+                PlaybackPreparationBatch {
+                    session_id: &session.id,
+                    requests: &requests,
+                },
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect_err("removing session should reject preparation");
+        assert!(matches!(
+            removing,
+            PlaybackPreparationError::Range(HlsRangeError::SessionRemoving)
+        ));
+        drop(removal);
+
+        let quota_temp = TempDir::new().expect("quota temp dir should be created");
+        let quota_store = temp_store(&quota_temp).with_range_budget(1);
+        quota_store
+            .save_session(&session)
+            .expect("quota test session should be saved");
+        let quota = quota_store
+            .prepare_playback_batch(
+                &reqwest::Client::new(),
+                PlaybackPreparationBatch {
+                    session_id: &session.id,
+                    requests: &requests,
+                },
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect_err("quota should reject preparation before network transfer");
+        assert!(matches!(
+            quota,
+            PlaybackPreparationError::Range(HlsRangeError::QuotaExceeded)
+        ));
+        assert_eq!((0, 0), quota_store.range_activity_counts());
+    }
+
+    #[test]
+    fn playback_preparation_attempt_budget_is_batch_wide_and_bounded() {
+        let budget = PlaybackPreparationBudget::default();
+        for _ in 0..HLS_PLAYBACK_PREPARATION_MAX_ATTEMPTS {
+            assert!(budget.charge_attempt(HLS_PLAYBACK_PREPARATION_MAX_SPAN_BYTES / 128));
+        }
+        assert!(!budget.charge_attempt(1));
+        assert!(budget.exceeded());
     }
 
     fn persist_complete_readiness_resource(
