@@ -1,11 +1,11 @@
 ---
 id: 20261112-b46408
 title: Stable HLS Reader Binding
-status: active
+status: completed
 created: 2026-11-12
 updated: 2026-11-12
 branch: codex/hls-playback-reader-binding
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/101
 supersedes: []
 superseded_by:
 ---
@@ -69,6 +69,7 @@ superseded_by:
   keeping its recovery-owned deadline, byte/attempt and readability limits.
 
 ## Evidence
+- [Stable reader binding PR #101](https://github.com/Joey-Project/tvOS-net-player/pull/101).
 - [Context foundation PR #100](https://github.com/Joey-Project/tvOS-net-player/pull/100).
 - [Playback urgency contract](2026-11-12-playback-urgency-context-b46407.md).
 - [Incomplete comparison PR #98](https://github.com/Joey-Project/tvOS-net-player/pull/98).
