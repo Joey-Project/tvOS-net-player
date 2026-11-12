@@ -327,6 +327,11 @@ impl HlsRangeCache {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn foreground_activity_count(&self) -> usize {
+        self.lock_state().active_foreground
+    }
+
     pub(crate) fn active_flight_count(&self, key: &RangeResourceKey) -> usize {
         self.lock_state()
             .flights
@@ -1165,6 +1170,7 @@ impl Drop for RangeActivity {
 }
 
 impl HlsRangeCache {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn enter_preparation_batch(
         self: &Arc<Self>,
         session_id: &str,
@@ -1428,6 +1434,27 @@ mod publication_state_tests {
         ] {
             assert_rejected(cache.begin_session_publication("removing", mode));
         }
+    }
+
+    #[test]
+    fn foreground_activity_count_excludes_background_activity_and_tracks_release() {
+        let cache = Arc::new(HlsRangeCache::new(1, 1024));
+        let background = cache
+            .enter("background", HlsRangePriority::Background)
+            .expect("background activity should enter");
+        assert_eq!(1, cache.range_activity_counts().0);
+        assert_eq!(0, cache.foreground_activity_count());
+
+        let foreground = cache
+            .enter("foreground", HlsRangePriority::Foreground)
+            .expect("foreground activity should enter");
+        assert_eq!(2, cache.range_activity_counts().0);
+        assert_eq!(1, cache.foreground_activity_count());
+
+        drop(foreground);
+        assert_eq!(0, cache.foreground_activity_count());
+        drop(background);
+        assert_eq!(0, cache.range_activity_counts().0);
     }
 }
 

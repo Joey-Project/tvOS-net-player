@@ -54,6 +54,219 @@ private enum RecoveryObservationTrigger {
     }
 }
 
+private enum RecoverySnapshot {
+    static let maximumBytes = 4_096
+
+    static func payload(
+        observedMonotonicSeconds: Double,
+        playheadSeconds: Double,
+        loadedEndSeconds: Double
+    ) throws -> Data {
+        guard observedMonotonicSeconds.isFinite, observedMonotonicSeconds >= 0,
+            playheadSeconds.isFinite, playheadSeconds >= 0,
+            loadedEndSeconds.isFinite, loadedEndSeconds >= 0
+        else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(EINVAL))
+        }
+        let value: [String: Any] = [
+            "schema_version": 1,
+            "observed_monotonic_seconds": observedMonotonicSeconds,
+            "playhead_seconds": playheadSeconds,
+            "loaded_end_seconds": loadedEndSeconds,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        guard data.count <= maximumBytes else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(EFBIG))
+        }
+        return data
+    }
+
+    static func publish(
+        path: String,
+        observedMonotonicSeconds: Double,
+        playheadSeconds: Double,
+        loadedEndSeconds: Double
+    ) throws {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        guard path.hasPrefix("/"), !path.hasSuffix("/"), !name.isEmpty,
+            name != ".", name != ".."
+        else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(EINVAL))
+        }
+        let data = try payload(
+            observedMonotonicSeconds: observedMonotonicSeconds,
+            playheadSeconds: playheadSeconds,
+            loadedEndSeconds: loadedEndSeconds
+        )
+        let parentPath = url.deletingLastPathComponent().path
+        let directory = parentPath.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard directory >= 0 else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(errno))
+        }
+        defer { _ = close(directory) }
+        var directoryInfo = stat()
+        guard fstat(directory, &directoryInfo) == 0, (directoryInfo.st_mode & S_IFMT) == S_IFDIR else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(ENOTDIR))
+        }
+
+        let temporaryName = ".lan-recovery-\(UUID().uuidString).tmp"
+        let descriptor = temporaryName.withCString {
+            openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        }
+        guard descriptor >= 0 else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(errno))
+        }
+        var descriptorOpen = true
+        var temporaryExists = true
+        defer {
+            if descriptorOpen { _ = close(descriptor) }
+            if temporaryExists { _ = temporaryName.withCString { unlinkat(directory, $0, 0) } }
+        }
+
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { bytes in
+                Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(errno))
+            }
+            offset += count
+        }
+        guard Darwin.close(descriptor) == 0 else {
+            descriptorOpen = false
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(errno))
+        }
+        descriptorOpen = false
+        let renameResult = temporaryName.withCString { temporary in
+            name.withCString { destination in
+                renameatx_np(directory, temporary, directory, destination, UInt32(RENAME_EXCL))
+            }
+        }
+        guard renameResult == 0 else {
+            throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(errno))
+        }
+        temporaryExists = false
+    }
+
+    static func runSelfTest() throws -> [String] {
+        let valid = try payload(
+            observedMonotonicSeconds: 1,
+            playheadSeconds: 2,
+            loadedEndSeconds: 3
+        )
+        guard valid.count <= maximumBytes,
+            let decoded = try JSONSerialization.jsonObject(with: valid) as? [String: Any],
+            decoded["schema_version"] as? Int == 1,
+            decoded["observed_monotonic_seconds"] as? Double == 1,
+            decoded["playhead_seconds"] as? Double == 2,
+            decoded["loaded_end_seconds"] as? Double == 3
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 1)
+        }
+        for values in [
+            (Double.nan, 1.0, 2.0), (Double.infinity, 1.0, 2.0), (1.0, -.infinity, 2.0),
+            (1.0, -1.0, 2.0), (1.0, 2.0, .nan), (1.0, 2.0, -1.0),
+        ] {
+            do {
+                _ = try payload(
+                    observedMonotonicSeconds: values.0,
+                    playheadSeconds: values.1,
+                    loadedEndSeconds: values.2
+                )
+                throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 2)
+            } catch let failure as ProbeFailure where failure.phase == "recovery_snapshot" {
+                continue
+            }
+        }
+        do {
+            try publish(path: "relative.json", observedMonotonicSeconds: 1, playheadSeconds: 2, loadedEndSeconds: 3)
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 3)
+        } catch let failure as ProbeFailure where failure.phase == "recovery_snapshot" {
+            guard failure.code == Int(EINVAL) else { throw failure }
+        }
+        do {
+            try publish(
+                path: "/missing-lan-probe-parent-\(UUID().uuidString)/snapshot.json",
+                observedMonotonicSeconds: 1,
+                playheadSeconds: 2,
+                loadedEndSeconds: 3
+            )
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 9)
+        } catch let failure as ProbeFailure where failure.phase == "recovery_snapshot" {
+            guard failure.code == Int(ENOENT) else { throw failure }
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lan-probe-recovery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("snapshot.json").path
+        try publish(path: path, observedMonotonicSeconds: 1, playheadSeconds: 2, loadedEndSeconds: 3)
+        let original = try Data(contentsOf: URL(fileURLWithPath: path))
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        var originalInfo = stat()
+        guard lstat(path, &originalInfo) == 0 else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 10)
+        }
+        guard original.count <= maximumBytes,
+            (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+            originalInfo.st_nlink == 1
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 8)
+        }
+        do {
+            try publish(path: path, observedMonotonicSeconds: 4, playheadSeconds: 5, loadedEndSeconds: 6)
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 4)
+        } catch let failure as ProbeFailure where failure.phase == "recovery_snapshot" && failure.code == Int(EEXIST) {
+            var retainedInfo = stat()
+            guard lstat(path, &retainedInfo) == 0,
+                retainedInfo.st_dev == originalInfo.st_dev,
+                retainedInfo.st_ino == originalInfo.st_ino,
+                try Data(contentsOf: URL(fileURLWithPath: path)) == original
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 5)
+            }
+        }
+        let target = directory.appendingPathComponent("target.json")
+        let symlinkPath = path + ".link"
+        try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: target.path)
+        var originalLinkInfo = stat()
+        guard lstat(symlinkPath, &originalLinkInfo) == 0 else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 11)
+        }
+        do {
+            try publish(
+                path: symlinkPath,
+                observedMonotonicSeconds: 1,
+                playheadSeconds: 2,
+                loadedEndSeconds: 3
+            )
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 6)
+        } catch let failure as ProbeFailure where failure.phase == "recovery_snapshot" && failure.code == Int(EEXIST) {
+            var retainedLinkInfo = stat()
+            guard lstat(symlinkPath, &retainedLinkInfo) == 0,
+                retainedLinkInfo.st_dev == originalLinkInfo.st_dev,
+                retainedLinkInfo.st_ino == originalLinkInfo.st_ino,
+                !FileManager.default.fileExists(atPath: target.path)
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshot", code: 7)
+            }
+        }
+        return [
+            "recovery_snapshot_rejects_invalid_state_and_atomically_publishes_bounded_private_single_link_json",
+            "recovery_snapshot_no_clobber_preserves_existing_object_identity_and_complete_content",
+            "recovery_snapshot_no_clobber_preserves_existing_symlink_identity",
+        ]
+    }
+}
+
 private enum LoadedTimeRangeDiagnostics {
     static let maximumObservations = 8
 
@@ -340,10 +553,14 @@ private struct ProbeOptions {
     let expectedVideoSizes: [VideoSize]
     let readyMarkerPath: String?
     let recoveryObservationTriggerPath: String?
+    let recoverySnapshotPath: String?
     let minimumSteadyPlaySeconds: TimeInterval?
     let controlsAfterVideoSizeExpectations: Bool
 
-    static func parse(_ arguments: [String]) throws -> ProbeOptions {
+    static func parse(
+        _ arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> ProbeOptions {
         var urlValue: String?
         var duration = 60.0
         var deadline = 120.0
@@ -351,6 +568,8 @@ private struct ProbeOptions {
         var expectedVideoSizes: [VideoSize]?
         var readyMarkerPath: String?
         var recoveryObservationTriggerPath: String?
+        let recoverySnapshotPath = environment["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH"]
+            .flatMap { $0.isEmpty ? nil : $0 }
         var minimumSteadyPlaySeconds: TimeInterval?
         var controlsAfterVideoSizeExpectations = false
         var index = 0
@@ -438,6 +657,20 @@ private struct ProbeOptions {
         guard recoveryObservationTriggerPath == nil || expectedVideoSizes != nil else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 11)
         }
+        if let recoverySnapshotPath {
+            guard
+                RecoverySnapshotPolicy.accepts(
+                    path: recoverySnapshotPath,
+                    triggerPath: recoveryObservationTriggerPath,
+                    expectedVideoSizes: expectedVideoSizes ?? [],
+                    controlsAfterVideoSizeExpectations: controlsAfterVideoSizeExpectations,
+                    duration: duration,
+                    deadline: deadline
+                )
+            else {
+                throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 13)
+            }
+        }
         guard
             !controlsAfterVideoSizeExpectations
                 || (expectedVideoSizes != nil && duration > 30)
@@ -460,6 +693,7 @@ private struct ProbeOptions {
             expectedVideoSizes: expectedVideoSizes ?? [],
             readyMarkerPath: readyMarkerPath,
             recoveryObservationTriggerPath: recoveryObservationTriggerPath,
+            recoverySnapshotPath: recoverySnapshotPath,
             minimumSteadyPlaySeconds: minimumSteadyPlaySeconds,
             controlsAfterVideoSizeExpectations: controlsAfterVideoSizeExpectations
         )
@@ -594,6 +828,35 @@ private struct ProbeOptions {
             throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 5)
         }
         passed.append("marker_and_minimum_steady_play_options_parse")
+        let rustRecoveryArguments = [
+            "--url", "http://192.168.1.8/live.m3u8",
+            "--duration", "600",
+            "--deadline", "720",
+            "--expect-video-sizes", "640x360,320x180,640x360",
+            "--ready-marker", "/tmp/ready.json",
+            "--recovery-observation-trigger", "/tmp/recovery.trigger",
+            "--controls-after-video-size-expectations",
+        ]
+        let rustRecoveryOptions = try parse(
+            rustRecoveryArguments,
+            environment: ["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH": "/tmp/recovery.json"]
+        )
+        guard rustRecoveryOptions.recoverySnapshotPath == "/tmp/recovery.json",
+            rustRecoveryOptions.minimumSteadyPlaySeconds == nil,
+            rustRecoveryOptions.duration == 600,
+            rustRecoveryOptions.deadline == 720
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 6)
+        }
+        passed.append("rust_recovery_snapshot_arguments_parse_without_minimum_steady_play")
+        let compatibleMinimumOptions = try parse(
+            rustRecoveryArguments + ["--minimum-steady-play-seconds", "110"],
+            environment: ["LAN_PLAYBACK_RECOVERY_SNAPSHOT_PATH": "/tmp/recovery.json"]
+        )
+        guard compatibleMinimumOptions.minimumSteadyPlaySeconds == 110 else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 7)
+        }
+        passed.append("recovery_snapshot_admission_remains_compatible_with_minimum_steady_play")
         try reject("public_ipv4", arguments: ["--url", "http://8.8.8.8/live.m3u8"], expectedCode: 6)
         try reject("public_ipv6", arguments: ["--url", "http://[2001:4860:4860::8888]/live.m3u8"], expectedCode: 6)
         try reject("userinfo", arguments: ["--url", "http://name:secret@192.168.1.8/live.m3u8"], expectedCode: 6)
@@ -711,7 +974,11 @@ private struct ProbeOptions {
 
         passed.append(contentsOf: try VideoSizeExpectationTracker.runSelfTest())
         passed.append(contentsOf: try ReadyMarker.runSelfTest())
+        passed.append(contentsOf: try RecoverySnapshotPolicy.runSelfTest())
+        passed.append(contentsOf: try RecoverySnapshot.runSelfTest())
+        passed.append(contentsOf: try DecodedFrameContinuity.runSelfTest())
         passed.append(contentsOf: try VideoSizePhasePolicy.runSelfTest())
+        passed.append(contentsOf: try DiagnosticObservationWindowPolicy.runSelfTest())
         passed.append(contentsOf: try BoundedObservations.runSelfTest())
         passed.append(contentsOf: try PlayerErrorLogDiagnostics.runSelfTest())
         passed.append(contentsOf: try LoadedTimeRangeDiagnostics.runSelfTest())
@@ -720,6 +987,138 @@ private struct ProbeOptions {
         passed.append(contentsOf: try PlaybackPolicy.runSelfTest())
         passed.append(contentsOf: try PlayerSetup.runSelfTest())
         return ["schema_version": 1, "status": "complete", "passed": passed.count, "cases": passed]
+    }
+}
+
+private enum RecoverySnapshotPolicy {
+    static let expectedSizes = [
+        VideoSize(width: 640, height: 360),
+        VideoSize(width: 320, height: 180),
+        VideoSize(width: 640, height: 360),
+    ]
+
+    static func accepts(
+        path: String,
+        triggerPath: String?,
+        expectedVideoSizes: [VideoSize],
+        controlsAfterVideoSizeExpectations: Bool,
+        duration: Double,
+        deadline: Double
+    ) -> Bool {
+        path.hasPrefix("/") && !path.hasSuffix("/") && triggerPath != nil
+            && expectedVideoSizes == expectedSizes
+            && controlsAfterVideoSizeExpectations
+            && duration == 600 && deadline == 720
+    }
+
+    static func runSelfTest() throws -> [String] {
+        let valid = accepts(
+            path: "/tmp/recovery.json",
+            triggerPath: "/tmp/recovery.trigger",
+            expectedVideoSizes: expectedSizes,
+            controlsAfterVideoSizeExpectations: true,
+            duration: 600,
+            deadline: 720
+        )
+        let invalid =
+            accepts(
+                path: "relative.json",
+                triggerPath: "/tmp/recovery.trigger",
+                expectedVideoSizes: expectedSizes,
+                controlsAfterVideoSizeExpectations: true,
+                duration: 600,
+                deadline: 720
+            )
+            || accepts(
+                path: "/tmp/recovery.json",
+                triggerPath: nil,
+                expectedVideoSizes: expectedSizes,
+                controlsAfterVideoSizeExpectations: true,
+                duration: 600,
+                deadline: 720
+            )
+            || accepts(
+                path: "/tmp/recovery.json",
+                triggerPath: "/tmp/recovery.trigger",
+                expectedVideoSizes: [VideoSize(width: 640, height: 360), VideoSize(width: 320, height: 180)],
+                controlsAfterVideoSizeExpectations: true,
+                duration: 600,
+                deadline: 720
+            )
+            || accepts(
+                path: "/tmp/recovery.json",
+                triggerPath: "/tmp/recovery.trigger",
+                expectedVideoSizes: expectedSizes,
+                controlsAfterVideoSizeExpectations: true,
+                duration: 130,
+                deadline: 175
+            )
+        guard valid, !invalid else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 1)
+        }
+        var tracker = VideoSizeExpectationTracker(expectedSizes: expectedSizes)
+        for index in 0..<6 {
+            let size = index < 3 ? expectedSizes[0] : expectedSizes[1]
+            tracker.observe(
+                width: size.width,
+                height: size.height,
+                timestampNanoseconds: Int64(index + 1),
+                observedElapsedSeconds: Double(index + 1),
+                observedMonotonicSeconds: Double(index + 1)
+            )
+        }
+        guard tracker.requiredExpectationsComplete(optionalTrailingCount: 1),
+            !tracker.isComplete,
+            tracker.diagnosticProgress[2]["matched"] as? Bool == false,
+            tracker.diagnosticProgress[2]["distinct_frame_count"] as? Int == 0,
+            (tracker.diagnosticProgress[2]["samples"] as? [[String: Any]])?.isEmpty == true,
+            tracker.diagnosticProgress[2]["diagnostic_optional_recovery_high"] as? Bool == true,
+            tracker.diagnosticProgress[0]["diagnostic_optional_recovery_high"] == nil,
+            tracker.diagnosticProgress[1]["diagnostic_optional_recovery_high"] == nil,
+            tracker.progress.allSatisfy({ $0["diagnostic_optional_recovery_high"] == nil }),
+            tracker.hasValidNumericSamplesAllowingMissingTrailingEntry
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 2)
+        }
+        tracker.observe(
+            width: expectedSizes[2].width,
+            height: expectedSizes[2].height,
+            timestampNanoseconds: 7,
+            observedElapsedSeconds: 7,
+            observedMonotonicSeconds: 7
+        )
+        guard tracker.diagnosticProgress[2]["matched"] as? Bool == false else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 3)
+        }
+        tracker.observe(
+            width: expectedSizes[2].width,
+            height: expectedSizes[2].height,
+            timestampNanoseconds: 8,
+            observedElapsedSeconds: 8,
+            observedMonotonicSeconds: 8
+        )
+        tracker.observe(
+            width: expectedSizes[2].width,
+            height: expectedSizes[2].height,
+            timestampNanoseconds: 9,
+            observedElapsedSeconds: 9,
+            observedMonotonicSeconds: 9
+        )
+        guard tracker.isComplete, tracker.hasValidNumericSamples,
+            tracker.diagnosticProgress[2]["matched"] as? Bool == true,
+            tracker.diagnosticProgress[2]["distinct_frame_count"] as? Int == 3,
+            (tracker.diagnosticProgress[2]["samples"] as? [[String: Any]])?.count == 3,
+            tracker.diagnosticProgress[2]["diagnostic_optional_recovery_high"] as? Bool == true,
+            tracker.diagnosticProgress[0]["diagnostic_optional_recovery_high"] == nil,
+            tracker.diagnosticProgress[1]["diagnostic_optional_recovery_high"] == nil
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "RecoverySnapshotPolicy", code: 4)
+        }
+        return [
+            "recovery_snapshot_admission_accepts_optional_minimum_steady_play",
+            "diagnostic_optional_recovery_high_marks_third_entry_for_matched_and_censored",
+            "diagnostic_optional_recovery_high_preserves_normal_entries_and_honest_censoring",
+        ]
     }
 }
 
@@ -926,6 +1325,49 @@ private enum VideoSizePhasePolicy {
     }
 }
 
+private enum DiagnosticObservationWindowPolicy {
+    static let durationSeconds = 600.0
+
+    static func contains(started: Double, observed: Double) -> Bool {
+        started.isFinite && observed.isFinite && observed >= started
+            && observed < started + durationSeconds
+    }
+
+    static func includesFrame(
+        diagnostic: Bool,
+        active: Bool,
+        started: Double?,
+        observed: Double?
+    ) -> Bool {
+        guard diagnostic else { return true }
+        guard active, let started, let observed else { return false }
+        return contains(started: started, observed: observed)
+    }
+
+    static func durationRemainder(requestedDuration: Double, elapsed: Double) -> Double {
+        max(1, requestedDuration - elapsed)
+    }
+
+    static func runSelfTest() throws -> [String] {
+        guard contains(started: 10, observed: 10), contains(started: 10, observed: 609.999),
+            !contains(started: 10, observed: 610),
+            includesFrame(diagnostic: false, active: false, started: nil, observed: nil),
+            includesFrame(diagnostic: true, active: true, started: 10, observed: 11),
+            !includesFrame(diagnostic: true, active: false, started: 10, observed: 11),
+            !includesFrame(diagnostic: true, active: true, started: 10, observed: 611),
+            durationRemainder(requestedDuration: 600, elapsed: 612) == 1,
+            durationRemainder(requestedDuration: 600, elapsed: 590) == 10
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "DiagnosticObservationWindow", code: 1)
+        }
+        return [
+            "diagnostic_observation_window_uses_fixed_monotonic_bounds",
+            "diagnostic_observation_window_excludes_control_and_post_window_frames",
+            "diagnostic_duration_remainder_runs_at_least_one_real_active_second",
+        ]
+    }
+}
+
 private struct VideoSizeExpectationTracker {
     private struct Sample {
         let displayTimeSeconds: Double
@@ -956,6 +1398,10 @@ private struct VideoSizeExpectationTracker {
     }
 
     var isComplete: Bool { currentIndex == entries.count }
+
+    func requiredExpectationsComplete(optionalTrailingCount: Int) -> Bool {
+        currentIndex >= max(0, entries.count - optionalTrailingCount)
+    }
 
     mutating func observe(
         width: Int,
@@ -999,32 +1445,57 @@ private struct VideoSizeExpectationTracker {
         }
     }
 
+    var diagnosticProgress: [[String: Any]] {
+        guard entries.count == 3, currentIndex >= 2 else { return progress }
+        var result = progress
+        if currentIndex == 2 {
+            result[2] = [
+                "expected_width": entries[2].size.width,
+                "expected_height": entries[2].size.height,
+                "matched": false,
+                "distinct_frame_count": 0,
+                "required_distinct_frame_count": 3,
+                "samples": [[String: Any]](),
+            ]
+        }
+        result[2]["diagnostic_optional_recovery_high"] = true
+        return result
+    }
+
     var hasValidNumericSamples: Bool {
-        entries.allSatisfy { entry in
-            guard entry.samples.count == 3 else { return false }
-            var previousElapsed: Double = -.infinity
-            var previousMonotonic: Double?
-            var monotonicSampleCount = 0
-            for sample in entry.samples {
-                guard sample.displayTimeSeconds.isFinite,
-                    let elapsed = sample.observedElapsedSeconds,
-                    elapsed.isFinite, elapsed >= 0, elapsed >= previousElapsed
+        entries.allSatisfy(isValidNumericEntry)
+    }
+
+    var hasValidNumericSamplesAllowingMissingTrailingEntry: Bool {
+        guard entries.count == 3, requiredExpectationsComplete(optionalTrailingCount: 1) else { return false }
+        return entries.prefix(2).allSatisfy(isValidNumericEntry)
+            && (entries[2].matched ? isValidNumericEntry(entries[2]) : true)
+    }
+
+    private func isValidNumericEntry(_ entry: Entry) -> Bool {
+        guard entry.samples.count == 3 else { return false }
+        var previousElapsed: Double = -.infinity
+        var previousMonotonic: Double?
+        var monotonicSampleCount = 0
+        for sample in entry.samples {
+            guard sample.displayTimeSeconds.isFinite,
+                let elapsed = sample.observedElapsedSeconds,
+                elapsed.isFinite, elapsed >= 0, elapsed >= previousElapsed
+            else {
+                return false
+            }
+            if let monotonic = sample.observedMonotonicSeconds {
+                guard monotonic.isFinite, monotonic > 0,
+                    previousMonotonic.map({ monotonic >= $0 }) ?? true
                 else {
                     return false
                 }
-                if let monotonic = sample.observedMonotonicSeconds {
-                    guard monotonic.isFinite, monotonic > 0,
-                        previousMonotonic.map({ monotonic >= $0 }) ?? true
-                    else {
-                        return false
-                    }
-                    previousMonotonic = monotonic
-                    monotonicSampleCount += 1
-                }
-                previousElapsed = elapsed
+                previousMonotonic = monotonic
+                monotonicSampleCount += 1
             }
-            return monotonicSampleCount == 0 || monotonicSampleCount == 3
+            previousElapsed = elapsed
         }
+        return monotonicSampleCount == 0 || monotonicSampleCount == 3
     }
 
     static func runSelfTest() throws -> [String] {
@@ -1117,6 +1588,106 @@ private struct VideoSizeExpectationTracker {
             "video_size_expectations_require_numeric_elapsed_times_for_completion",
             "video_size_expectations_reject_nonmonotonic_elapsed_times",
             "video_size_expectations_retain_shared_monotonic_timestamps",
+        ]
+    }
+}
+
+private struct DecodedFrameContinuity {
+    static let gapThresholdSeconds = 0.5
+
+    private(set) var decodedFrameCount = 0
+    private(set) var observedIntervalCount = 0
+    private(set) var maximumInterframeGapSeconds: Double?
+    private(set) var largeGapCount = 0
+    private(set) var observationClockAnomalyCount = 0
+    private var previousMonotonicSeconds: Double?
+
+    mutating func observe(monotonicSeconds: Double?) {
+        decodedFrameCount += 1
+        guard let monotonicSeconds, monotonicSeconds.isFinite, monotonicSeconds >= 0 else {
+            observationClockAnomalyCount += 1
+            previousMonotonicSeconds = nil
+            return
+        }
+        if let previousMonotonicSeconds {
+            let gap = monotonicSeconds - previousMonotonicSeconds
+            guard gap >= 0, gap.isFinite else {
+                observationClockAnomalyCount += 1
+                self.previousMonotonicSeconds = nil
+                return
+            }
+            observedIntervalCount += 1
+            maximumInterframeGapSeconds = max(maximumInterframeGapSeconds ?? 0, gap)
+            if gap > Self.gapThresholdSeconds {
+                largeGapCount += 1
+            }
+        }
+        previousMonotonicSeconds = monotonicSeconds
+    }
+
+    var json: [String: Any] {
+        [
+            "schema_version": 1,
+            "decoded_frame_count": decodedFrameCount,
+            "observed_interval_count": observedIntervalCount,
+            "maximum_interframe_gap_seconds": maximumInterframeGapSeconds as Any? ?? NSNull(),
+            "gap_threshold_seconds": Self.gapThresholdSeconds,
+            "large_gap_count": largeGapCount,
+            "observation_clock_anomaly_count": observationClockAnomalyCount,
+            "coverage": "between_observed_decoded_frames_only",
+            "interpretation": "decoded_frame_observation_gaps_not_visible_black_screen_acceptance",
+        ]
+    }
+
+    static func runSelfTest() throws -> [String] {
+        var single = DecodedFrameContinuity()
+        single.observe(monotonicSeconds: 1)
+        guard single.decodedFrameCount == 1, single.observedIntervalCount == 0,
+            single.maximumInterframeGapSeconds == nil
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "DecodedFrameContinuity", code: 1)
+        }
+
+        var intervals = DecodedFrameContinuity()
+        for timestamp in [1.0, 1.5, 2.2, 2.9, 3.6] {
+            intervals.observe(monotonicSeconds: timestamp)
+        }
+        guard intervals.decodedFrameCount == 5, intervals.observedIntervalCount == 4,
+            abs((intervals.maximumInterframeGapSeconds ?? 0) - 0.7) < 0.000_001,
+            intervals.largeGapCount == 3
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "DecodedFrameContinuity", code: 2)
+        }
+
+        var anomalies = DecodedFrameContinuity()
+        for timestamp in [
+            Optional(1.0), Optional(1.5), Optional(1.4), Optional(Double.nan),
+            Optional(Double.infinity), Optional(-1.0), nil, Optional(4.0), Optional(4.2),
+        ] {
+            anomalies.observe(monotonicSeconds: timestamp)
+        }
+        guard anomalies.decodedFrameCount == 9, anomalies.observedIntervalCount == 2,
+            anomalies.maximumInterframeGapSeconds == 0.5, anomalies.largeGapCount == 0,
+            anomalies.observationClockAnomalyCount == 5
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "DecodedFrameContinuity", code: 3)
+        }
+
+        let empty = DecodedFrameContinuity().json
+        guard empty["decoded_frame_count"] as? Int == 0,
+            empty["observed_interval_count"] as? Int == 0,
+            empty["maximum_interframe_gap_seconds"] is NSNull,
+            empty["gap_threshold_seconds"] as? Double == 0.5,
+            empty["coverage"] as? String == "between_observed_decoded_frames_only",
+            empty["interpretation"] as? String == "decoded_frame_observation_gaps_not_visible_black_screen_acceptance"
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "DecodedFrameContinuity", code: 4)
+        }
+        return [
+            "decoded_frame_continuity_counts_single_observation_without_interval",
+            "decoded_frame_continuity_counts_two_or_more_intervals_and_exact_threshold",
+            "decoded_frame_continuity_breaks_adjacency_for_missing_nonfinite_negative_and_backward_clock",
+            "decoded_frame_continuity_empty_summary_is_explicit_and_bounded",
         ]
     }
 }
@@ -1378,6 +1949,11 @@ private final class PlaybackProbe {
     private var player: AVPlayer?
     private var item: AVPlayerItem?
     private var decodedFrames = 0
+    private var decodedFrameContinuity = DecodedFrameContinuity()
+    private var diagnosticWindowContinuity = DecodedFrameContinuity()
+    private var diagnosticWindowStartedMonotonicSeconds: Double?
+    private var diagnosticWindowActive = false
+    private var diagnosticObservationWindow: [String: Any]?
     private var uniqueDisplayTimes = Set<Int64>()
     private var lastDecodedWidth: Int?
     private var lastDecodedHeight: Int?
@@ -1482,7 +2058,11 @@ private final class PlaybackProbe {
         let playbackStart = DispatchTime.now().uptimeNanoseconds
         try startPlayback(avPlayer, phase: "play")
         if options.controlsAfterVideoSizeExpectations {
-            try await steadyPlayUntilVideoSizeExpectations(playbackStart: playbackStart)
+            if options.recoverySnapshotPath != nil {
+                try await diagnosticObservationWindowPhase()
+            } else {
+                try await steadyPlayUntilVideoSizeExpectations(playbackStart: playbackStart)
+            }
             steadyPlayEndObservation = try playerObservation()
         } else {
             try await activePhase("play", seconds: min(8, options.duration * 0.2))
@@ -1533,15 +2113,33 @@ private final class PlaybackProbe {
         try setRate(1, player: avPlayer, phase: "rate_reset")
 
         let elapsed = TimeInterval(DispatchTime.now().uptimeNanoseconds - playbackStart) / 1_000_000_000
-        if elapsed < options.duration {
+        if options.recoverySnapshotPath != nil {
+            try startPlayback(avPlayer, phase: "duration_remainder")
+            try await activePhase(
+                "duration_remainder",
+                seconds: DiagnosticObservationWindowPolicy.durationRemainder(
+                    requestedDuration: options.duration,
+                    elapsed: elapsed
+                )
+            )
+        } else if elapsed < options.duration {
             try startPlayback(avPlayer, phase: "duration_remainder")
             try await activePhase("duration_remainder", seconds: options.duration - elapsed)
         }
 
-        guard videoSizeExpectations.isComplete else {
+        let optionalRecoveryHigh = options.recoverySnapshotPath != nil
+        let requiredSizesComplete =
+            optionalRecoveryHigh
+            ? videoSizeExpectations.requiredExpectationsComplete(optionalTrailingCount: 1)
+            : videoSizeExpectations.isComplete
+        guard requiredSizesComplete else {
             throw ProbeFailure(phase: "video_size_expectations", domain: "DecodedVideoSizeTracker", code: 1)
         }
-        guard videoSizeExpectations.hasValidNumericSamples else {
+        let validSizeSamples =
+            optionalRecoveryHigh
+            ? videoSizeExpectations.hasValidNumericSamplesAllowingMissingTrailingEntry
+            : videoSizeExpectations.hasValidNumericSamples
+        guard validSizeSamples else {
             throw ProbeFailure(phase: "video_size_expectations", domain: "DecodedVideoSizeTracker", code: 2)
         }
         guard uniqueDisplayTimes.count >= 3 else {
@@ -1658,7 +2256,9 @@ private final class PlaybackProbe {
         let phaseStart = DispatchTime.now().uptimeNanoseconds
         let mediaStart = player.map { seconds($0.currentTime()) } ?? 0
         while VideoSizePhasePolicy.shouldContinueSteadyPlay(
-            expectationsComplete: videoSizeExpectations.isComplete,
+            expectationsComplete: options.recoverySnapshotPath == nil
+                ? videoSizeExpectations.isComplete
+                : videoSizeExpectations.requiredExpectationsComplete(optionalTrailingCount: 1),
             elapsedSeconds: TimeInterval(DispatchTime.now().uptimeNanoseconds - playbackStart)
                 / 1_000_000_000,
             requestedDuration: options.duration,
@@ -1677,7 +2277,65 @@ private final class PlaybackProbe {
         let mediaAdvance = mediaEnd - mediaStart
         let rateAccepted = abs((player?.rate ?? 0) - 1) < 0.01
         let clockAdvanced = mediaAdvance >= max(0.1, wallElapsed * 0.25)
-        let complete = videoSizeExpectations.isComplete && decodedFrames > before && rateAccepted && clockAdvanced
+        let requiredExpectationsComplete =
+            options.recoverySnapshotPath == nil
+            ? videoSizeExpectations.isComplete
+            : videoSizeExpectations.requiredExpectationsComplete(optionalTrailingCount: 1)
+        let complete = requiredExpectationsComplete && decodedFrames > before && rateAccepted && clockAdvanced
+        steps.append([
+            "name": "play",
+            "status": complete ? "completed" : "failed",
+            "frames": decodedFrames - before,
+            "elapsed_seconds": wallElapsed,
+            "time_seconds": mediaEnd,
+            "media_advance_seconds": mediaAdvance,
+            "expected_rate": 1,
+            "actual_rate": player?.rate ?? 0,
+            "rate_accepted": rateAccepted,
+            "clock_advanced": clockAdvanced,
+            "video_size_expectations_complete": videoSizeExpectations.isComplete,
+        ])
+        guard complete else {
+            throw ProbeFailure(phase: "video_size_expectations", domain: "DecodedVideoSizeTracker", code: 3)
+        }
+    }
+
+    private func diagnosticObservationWindowPhase() async throws {
+        let before = decodedFrames
+        let phaseStart = DispatchTime.now().uptimeNanoseconds
+        let mediaStart = player.map { seconds($0.currentTime()) } ?? 0
+        let started = try monotonicClockSeconds()
+        diagnosticWindowStartedMonotonicSeconds = started
+        diagnosticWindowActive = true
+        while DiagnosticObservationWindowPolicy.contains(
+            started: started,
+            observed: try monotonicClockSeconds()
+        ) {
+            try checkDeadline(phase: "play")
+            if endedEarly {
+                throw ProbeFailure(phase: "play", domain: "ProbePlayback", code: 1)
+            }
+            try observeRecoveryTriggerIfReady()
+            try sampleFrame(phase: "play")
+            try await Task.sleep(for: .milliseconds(33))
+        }
+        let ended = try monotonicClockSeconds()
+        diagnosticWindowActive = false
+        diagnosticObservationWindow = [
+            "schema_version": 1,
+            "started_monotonic_seconds": started,
+            "ended_monotonic_seconds": ended,
+            "requested_duration_seconds": DiagnosticObservationWindowPolicy.durationSeconds,
+            "controls_excluded": true,
+            "decoded_frame_continuity": diagnosticWindowContinuity.json,
+        ]
+        let wallElapsed = TimeInterval(DispatchTime.now().uptimeNanoseconds - phaseStart) / 1_000_000_000
+        let mediaEnd = player.map { seconds($0.currentTime()) } ?? mediaStart
+        let mediaAdvance = mediaEnd - mediaStart
+        let rateAccepted = abs((player?.rate ?? 0) - 1) < 0.01
+        let clockAdvanced = mediaAdvance >= max(0.1, wallElapsed * 0.25)
+        let requiredExpectationsComplete = videoSizeExpectations.requiredExpectationsComplete(optionalTrailingCount: 1)
+        let complete = requiredExpectationsComplete && decodedFrames > before && rateAccepted && clockAdvanced
         steps.append([
             "name": "play",
             "status": complete ? "completed" : "failed",
@@ -1736,6 +2394,9 @@ private final class PlaybackProbe {
         guard item != nil else { return }
         captureAccessLog()
         captureTimeline()
+        if options.recoverySnapshotPath != nil && diagnosticWindowActive {
+            try observeRecoveryTriggerIfReady()
+        }
         let hostTime = CACurrentMediaTime()
         let itemTime = output.itemTime(forHostTime: hostTime)
         guard output.hasNewPixelBuffer(forItemTime: itemTime) else { return }
@@ -1747,6 +2408,17 @@ private final class PlaybackProbe {
             return
         }
         decodedFrames += 1
+        let observedMonotonicSeconds = try? monotonicClockSeconds()
+        decodedFrameContinuity.observe(monotonicSeconds: observedMonotonicSeconds)
+        let diagnosticFrameAllowed = DiagnosticObservationWindowPolicy.includesFrame(
+            diagnostic: options.recoverySnapshotPath != nil,
+            active: diagnosticWindowActive,
+            started: diagnosticWindowStartedMonotonicSeconds,
+            observed: observedMonotonicSeconds
+        )
+        if options.recoverySnapshotPath != nil && diagnosticFrameAllowed {
+            diagnosticWindowContinuity.observe(monotonicSeconds: observedMonotonicSeconds)
+        }
         let displaySeconds = CMTimeGetSeconds(displayTime)
         if displaySeconds.isFinite {
             uniqueDisplayTimes.insert(Int64((displaySeconds * 1_000).rounded()))
@@ -1761,16 +2433,29 @@ private final class PlaybackProbe {
             timestampNanoseconds > Double(Int64.min), timestampNanoseconds < Double(Int64.max)
         {
             sizeObservation["display_time_seconds"] = displaySeconds
-            videoSizeExpectations.observe(
-                width: width,
-                height: height,
-                timestampNanoseconds: Int64(timestampNanoseconds.rounded()),
-                displayTimeSeconds: displaySeconds,
-                observedElapsedSeconds: TimeInterval(DispatchTime.now().uptimeNanoseconds - start)
-                    / 1_000_000_000,
-                observedMonotonicSeconds: videoSizeExpectations.isComplete ? nil : try monotonicClockSeconds()
-            )
-            try publishReadyMarkerIfReady()
+            let waitingForRecoveryTrigger =
+                options.recoverySnapshotPath != nil
+                && videoSizeExpectations.currentIndex == 2 && recoveryObservation == nil
+            if !waitingForRecoveryTrigger && diagnosticFrameAllowed {
+                let expectationMonotonicSeconds: Double?
+                if videoSizeExpectations.isComplete {
+                    expectationMonotonicSeconds = nil
+                } else if let observedMonotonicSeconds {
+                    expectationMonotonicSeconds = observedMonotonicSeconds
+                } else {
+                    expectationMonotonicSeconds = try monotonicClockSeconds()
+                }
+                videoSizeExpectations.observe(
+                    width: width,
+                    height: height,
+                    timestampNanoseconds: Int64(timestampNanoseconds.rounded()),
+                    displayTimeSeconds: displaySeconds,
+                    observedElapsedSeconds: TimeInterval(DispatchTime.now().uptimeNanoseconds - start)
+                        / 1_000_000_000,
+                    observedMonotonicSeconds: expectationMonotonicSeconds
+                )
+                try publishReadyMarkerIfReady()
+            }
         }
         decodedVideoSizeObservations.append(sizeObservation)
         if frameSamples.count < 12 {
@@ -1911,6 +2596,8 @@ private final class PlaybackProbe {
             "ready_marker_published": readyMarkerPublished,
             "elapsed_seconds": TimeInterval(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000,
             "decoded_frame_count": decodedFrames,
+            "decoded_frame_continuity": decodedFrameContinuity.json,
+            "diagnostic_observation_window": diagnosticObservationWindow as Any? ?? NSNull(),
             "unique_display_time_count": uniqueDisplayTimes.count,
             "video_track_present": videoTrackPresent,
             "video_evidence_present": decodedFrames > 0,
@@ -1938,7 +2625,9 @@ private final class PlaybackProbe {
                 "complete": options.expectedVideoSizes.isEmpty ? NSNull() : videoSizeExpectations.isComplete as Any,
                 "semantics": "ordered_decoded_size_subsequence",
                 "minimum_distinct_display_timestamps_per_size": 3,
-                "entries": videoSizeExpectations.progress,
+                "entries": options.recoverySnapshotPath == nil
+                    ? videoSizeExpectations.progress
+                    : videoSizeExpectations.diagnosticProgress,
             ],
             "access_log_observations": [
                 "events": accessLogObservations.observations,
@@ -1957,6 +2646,16 @@ private final class PlaybackProbe {
         if let error {
             value["error"] = ["phase": error.phase, "domain": error.safeDomain, "code": error.code]
         }
+        if options.recoverySnapshotPath != nil {
+            let recoveredHighMatched = videoSizeExpectations.isComplete
+            let recoveredHighCount =
+                recoveredHighMatched
+                ? videoSizeExpectations.progress.last?["distinct_frame_count"] as? Int ?? 3
+                : 0
+            value["diagnostic_optional_recovery_high"] = true
+            value["recovered_high_distinct_frame_count"] = recoveredHighCount
+            value["recovered_high_missing"] = !recoveredHighMatched
+        }
         return value
     }
 
@@ -1971,10 +2670,30 @@ private final class PlaybackProbe {
         else {
             return
         }
-        recoveryObservation = try playerObservation()
-        if recoveryObservation != nil {
-            captureTimeline(force: true)
+        guard let observation = try playerObservation() else { return }
+        recoveryObservation = observation
+        if let snapshotPath = options.recoverySnapshotPath {
+            guard let player else {
+                throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(EINVAL))
+            }
+            let playheadSeconds = CMTimeGetSeconds(player.currentTime())
+            let ranges = item?.loadedTimeRanges.map(\.timeRangeValue) ?? []
+            guard
+                let loadedEndSeconds = PlaybackTimelineDiagnostics.loadedEndSeconds(
+                    playheadSeconds: playheadSeconds,
+                    ranges: ranges
+                )
+            else {
+                throw ProbeFailure(phase: "recovery_snapshot", domain: "RecoverySnapshot", code: Int(EINVAL))
+            }
+            try RecoverySnapshot.publish(
+                path: snapshotPath,
+                observedMonotonicSeconds: try monotonicClockSeconds(),
+                playheadSeconds: playheadSeconds,
+                loadedEndSeconds: loadedEndSeconds
+            )
         }
+        captureTimeline(force: true)
     }
 
     private func playerObservation() throws -> [String: Any]? {
@@ -2110,6 +2829,7 @@ private struct LANPlaybackProbe {
                         "status": "validated",
                         "requested_duration_seconds": options.duration,
                         "overall_deadline_seconds": options.deadline,
+                        "decoded_frame_continuity": DecodedFrameContinuity().json,
                         "decoded_video_sizes": ["observations": [[String: Any]](), "truncated": false],
                         "video_size_expectations": [
                             "enabled": !options.expectedVideoSizes.isEmpty,
@@ -2120,6 +2840,11 @@ private struct LANPlaybackProbe {
                         ],
                         "access_log_observations": ["events": [[String: Any]](), "truncated": false],
                     ]
+                    if options.recoverySnapshotPath != nil {
+                        payload["diagnostic_optional_recovery_high"] = true
+                        payload["recovered_high_distinct_frame_count"] = 0
+                        payload["recovered_high_missing"] = true
+                    }
                 } else {
                     (exitCode, payload) = await PlaybackProbe(options: options).run()
                 }
