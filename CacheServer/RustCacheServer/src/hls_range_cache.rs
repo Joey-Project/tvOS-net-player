@@ -56,6 +56,7 @@ pub(crate) struct PersistedRangeExtent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsRangePriority {
     Foreground,
+    PlaybackPreparation,
     Background,
 }
 
@@ -186,6 +187,12 @@ struct RangeState {
     active: usize,
     active_sessions: HashMap<String, usize>,
     active_foreground: usize,
+    active_foreground_permits: usize,
+    waiting_foreground: usize,
+    waiting_preparation: usize,
+    active_preparation_batches: usize,
+    active_preparation_transfers: usize,
+    active_chunk_permits: usize,
     removing: HashSet<String>,
     retired: HashSet<String>,
     unpublished: HashSet<String>,
@@ -200,6 +207,7 @@ struct FlightState {
     completion: watch::Sender<bool>,
     readiness: watch::Sender<Option<HlsRangeReadiness>>,
     foreground_interest: usize,
+    preparation_interest: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +350,8 @@ impl HlsRangeCache {
         state.active += 1;
         if priority == HlsRangePriority::Foreground {
             state.active_foreground += 1;
+        } else if priority == HlsRangePriority::PlaybackPreparation {
+            state.active_preparation_batches += 1;
         }
         *state
             .active_sessions
@@ -373,6 +383,8 @@ impl HlsRangeCache {
                 Some(flight) => {
                     if priority == HlsRangePriority::Foreground {
                         flight.foreground_interest += 1;
+                    } else if priority == HlsRangePriority::PlaybackPreparation {
+                        flight.preparation_interest += 1;
                     }
                     (
                         flight.completion.clone(),
@@ -395,6 +407,7 @@ impl HlsRangeCache {
                             } else {
                                 0
                             },
+                            preparation_interest: 0,
                         },
                     );
                     (completion, receiver, readiness, readiness_receiver, true)
@@ -409,28 +422,127 @@ impl HlsRangeCache {
             readiness_receiver,
             owner,
             foreground_interest: !owner && priority == HlsRangePriority::Foreground,
+            preparation_interest: !owner && priority == HlsRangePriority::PlaybackPreparation,
         })
     }
 
     pub(crate) async fn acquire_chunk_permit<F>(
-        &self,
+        self: &Arc<Self>,
         key: &RangeChunkKey,
         priority: HlsRangePriority,
         control: &F,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, HlsRangeError>
+    ) -> Result<HlsRangeChunkPermit, HlsRangeError>
     where
         F: Fn() -> crate::hls_cache::HlsCacheFillControl + Send + Sync,
     {
+        self.check_priority_control(key, priority, control)?;
+        if priority == HlsRangePriority::PlaybackPreparation {
+            let mut preparation_waiter = None;
+            loop {
+                self.check_priority_control(key, priority, control)?;
+                if let Some(permit) = self.try_acquire_chunk_permit(priority) {
+                    drop(preparation_waiter.take());
+                    return Ok(permit);
+                }
+                if preparation_waiter.is_none() {
+                    preparation_waiter = Some(self.register_preparation_waiter());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let mut foreground_waiter = None;
+        if priority == HlsRangePriority::Foreground {
+            if let Some(permit) = self.try_acquire_chunk_permit(priority) {
+                return Ok(permit);
+            }
+            foreground_waiter = Some(self.register_foreground_waiter());
+        }
+
         let acquire = self.chunk_permits.clone().acquire_owned();
         tokio::pin!(acquire);
         loop {
             self.check_priority_control(key, priority, control)?;
             tokio::select! {
                 permit = &mut acquire => {
-                    return permit.map_err(|_| HlsRangeError::SessionRemoving);
+                    let permit = permit.map_err(|_| HlsRangeError::SessionRemoving)?;
+                    let permit = self.track_chunk_permit(priority, permit);
+                    drop(foreground_waiter.take());
+                    return Ok(permit);
                 }
                 () = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
+        }
+    }
+
+    fn try_acquire_chunk_permit(
+        self: &Arc<Self>,
+        priority: HlsRangePriority,
+    ) -> Option<HlsRangeChunkPermit> {
+        let mut state = self.lock_state();
+        if priority == HlsRangePriority::Foreground && state.waiting_foreground > 0 {
+            return None;
+        }
+        if priority == HlsRangePriority::PlaybackPreparation {
+            let foreground_capacity = self
+                .chunk_permits
+                .available_permits()
+                .saturating_add(state.active_foreground_permits);
+            if state.waiting_foreground > 0
+                || state.active_preparation_transfers > 0
+                || (self.parallelism >= 2 && foreground_capacity <= 1)
+            {
+                return None;
+            }
+        }
+        let permit = Arc::clone(&self.chunk_permits).try_acquire_owned().ok()?;
+        state.active_chunk_permits += 1;
+        match priority {
+            HlsRangePriority::Foreground => state.active_foreground_permits += 1,
+            HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
+            HlsRangePriority::Background => {}
+        }
+        drop(state);
+        Some(HlsRangeChunkPermit {
+            _permit: permit,
+            cache: Arc::clone(self),
+            priority,
+        })
+    }
+
+    fn track_chunk_permit(
+        self: &Arc<Self>,
+        priority: HlsRangePriority,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> HlsRangeChunkPermit {
+        let mut state = self.lock_state();
+        state.active_chunk_permits += 1;
+        match priority {
+            HlsRangePriority::Foreground => state.active_foreground_permits += 1,
+            HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
+            HlsRangePriority::Background => {}
+        }
+        drop(state);
+        HlsRangeChunkPermit {
+            _permit: permit,
+            cache: Arc::clone(self),
+            priority,
+        }
+    }
+
+    fn register_foreground_waiter(self: &Arc<Self>) -> ForegroundWaiter {
+        self.lock_state().waiting_foreground += 1;
+        self.signal_change();
+        ForegroundWaiter {
+            cache: Arc::clone(self),
+        }
+    }
+
+    fn register_preparation_waiter(self: &Arc<Self>) -> PreparationWaiter {
+        self.lock_state().waiting_preparation += 1;
+        self.signal_change();
+        PreparationWaiter {
+            cache: Arc::clone(self),
         }
     }
 
@@ -455,22 +567,50 @@ impl HlsRangeCache {
             .flights
             .get(key)
             .is_some_and(|flight| flight.foreground_interest > 0);
+        let preparation_interest = state
+            .flights
+            .get(key)
+            .is_some_and(|flight| flight.preparation_interest > 0);
         if priority == HlsRangePriority::Background {
             let foreground_active = state.active_foreground > 0;
+            let foreground_waiting = state.waiting_foreground > 0;
+            let preparation_active = state.active_preparation_batches > 0;
             drop(state);
             match control() {
                 crate::hls_cache::HlsCacheFillControl::Cancel => {
                     return Err(HlsRangeError::Cancelled);
                 }
                 crate::hls_cache::HlsCacheFillControl::Preempt
-                    if !promoted || !foreground_active =>
+                    if !promoted || (!foreground_active && !preparation_active) =>
                 {
                     return Err(HlsRangeError::Preempted);
                 }
                 crate::hls_cache::HlsCacheFillControl::Continue
                 | crate::hls_cache::HlsCacheFillControl::Preempt => {}
             }
-            if foreground_active && !promoted {
+            if !promoted
+                && (foreground_active
+                    || foreground_waiting
+                    || (preparation_active && !preparation_interest))
+            {
+                return Err(HlsRangeError::Preempted);
+            }
+            return Ok(());
+        }
+        if priority == HlsRangePriority::PlaybackPreparation {
+            let foreground_waiting = state.waiting_foreground > 0;
+            drop(state);
+            match control() {
+                crate::hls_cache::HlsCacheFillControl::Cancel => {
+                    return Err(HlsRangeError::Cancelled);
+                }
+                crate::hls_cache::HlsCacheFillControl::Preempt if !promoted => {
+                    return Err(HlsRangeError::Preempted);
+                }
+                crate::hls_cache::HlsCacheFillControl::Continue
+                | crate::hls_cache::HlsCacheFillControl::Preempt => {}
+            }
+            if foreground_waiting && !promoted {
                 return Err(HlsRangeError::Preempted);
             }
             return Ok(());
@@ -629,6 +769,12 @@ impl HlsRangeCache {
         }
     }
 
+    fn release_preparation_interest(&self, key: &RangeChunkKey) {
+        if let Some(flight) = self.lock_state().flights.get_mut(key) {
+            flight.preparation_interest = flight.preparation_interest.saturating_sub(1);
+        }
+    }
+
     fn finish_activity(&self, session_id: &str, priority: HlsRangePriority) {
         let mut state = self.lock_state();
         state.active = state.active.saturating_sub(1);
@@ -640,6 +786,9 @@ impl HlsRangeCache {
         }
         if priority == HlsRangePriority::Foreground {
             state.active_foreground -= 1;
+        }
+        if priority == HlsRangePriority::PlaybackPreparation {
+            state.active_preparation_batches = state.active_preparation_batches.saturating_sub(1);
         }
         drop(state);
         self.signal_change();
@@ -687,6 +836,57 @@ pub(crate) struct RangeActivity {
     priority: HlsRangePriority,
 }
 
+pub(crate) struct HlsRangeChunkPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    cache: Arc<HlsRangeCache>,
+    priority: HlsRangePriority,
+}
+
+impl Drop for HlsRangeChunkPermit {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock_state();
+        state.active_chunk_permits = state.active_chunk_permits.saturating_sub(1);
+        match self.priority {
+            HlsRangePriority::Foreground => {
+                state.active_foreground_permits = state.active_foreground_permits.saturating_sub(1);
+            }
+            HlsRangePriority::PlaybackPreparation => {
+                state.active_preparation_transfers =
+                    state.active_preparation_transfers.saturating_sub(1);
+            }
+            HlsRangePriority::Background => {}
+        }
+        drop(state);
+        self.cache.signal_change();
+    }
+}
+
+struct ForegroundWaiter {
+    cache: Arc<HlsRangeCache>,
+}
+
+struct PreparationWaiter {
+    cache: Arc<HlsRangeCache>,
+}
+
+impl Drop for ForegroundWaiter {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock_state();
+        state.waiting_foreground = state.waiting_foreground.saturating_sub(1);
+        drop(state);
+        self.cache.signal_change();
+    }
+}
+
+impl Drop for PreparationWaiter {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock_state();
+        state.waiting_preparation = state.waiting_preparation.saturating_sub(1);
+        drop(state);
+        self.cache.signal_change();
+    }
+}
+
 pub(crate) struct SessionPublicationGuard {
     cache: Arc<HlsRangeCache>,
     session_id: String,
@@ -729,6 +929,15 @@ impl Drop for RangeActivity {
     }
 }
 
+impl HlsRangeCache {
+    pub(crate) fn enter_preparation_batch(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Result<RangeActivity, HlsRangeError> {
+        self.enter(session_id, HlsRangePriority::PlaybackPreparation)
+    }
+}
+
 pub(crate) struct RangeFlight {
     cache: Arc<HlsRangeCache>,
     key: RangeChunkKey,
@@ -738,6 +947,7 @@ pub(crate) struct RangeFlight {
     readiness_receiver: watch::Receiver<Option<HlsRangeReadiness>>,
     owner: bool,
     foreground_interest: bool,
+    preparation_interest: bool,
 }
 
 impl RangeFlight {
@@ -767,6 +977,9 @@ impl Drop for RangeFlight {
             self.cache.finish_flight(&self.key, &self.completion);
         } else if self.foreground_interest {
             self.cache.release_foreground_interest(&self.key);
+        }
+        if self.preparation_interest {
+            self.cache.release_preparation_interest(&self.key);
         }
     }
 }
@@ -979,5 +1192,377 @@ mod publication_state_tests {
         ] {
             assert_rejected(cache.begin_session_publication("removing", mode));
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_scheduler_tests {
+    use super::{HlsRangeCache, HlsRangeError, HlsRangePriority, RangeChunkKey, RangeResourceKey};
+    use crate::hls_cache::HlsCacheFillControl;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::oneshot;
+
+    fn chunk_key(session_id: &str, resource_id: &str, start: u64) -> RangeChunkKey {
+        RangeChunkKey {
+            resource: RangeResourceKey {
+                session_id: session_id.to_owned(),
+                resource_id: resource_id.to_owned(),
+                representation: "test-representation".to_owned(),
+            },
+            total_length: 4096,
+            range: start..start + 512,
+        }
+    }
+
+    fn continue_control() -> impl Fn() -> HlsCacheFillControl + Send + Sync {
+        || HlsCacheFillControl::Continue
+    }
+
+    async fn wait_for_state(
+        cache: &Arc<HlsRangeCache>,
+        predicate: impl Fn(&super::RangeState) -> bool,
+    ) {
+        let mut changed = cache.changed.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if predicate(&cache.lock_state()) {
+                    return;
+                }
+                changed
+                    .changed()
+                    .await
+                    .expect("range cache state should remain observable");
+            }
+        })
+        .await
+        .expect("range scheduler state should reach the expected value");
+    }
+
+    #[tokio::test]
+    async fn preparation_uses_spare_capacity_beside_foreground_and_preempts_when_it_waits() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let prep_key = chunk_key("session", "prep", 0);
+        let prep_permit = cache
+            .acquire_chunk_permit(
+                &prep_key,
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control(),
+            )
+            .await
+            .expect("preparation should acquire a slot while one is reserved");
+        let foreground_permit = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "foreground", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("foreground should acquire its reserved slot");
+        assert_eq!(0, cache.chunk_permits.available_permits());
+
+        let foreground_cache = Arc::clone(&cache);
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let waiting_foreground = tokio::spawn(async move {
+            let _permit = foreground_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session", "foreground-waiting", 0),
+                    HlsRangePriority::Foreground,
+                    &continue_control(),
+                )
+                .await
+                .expect("waiting foreground should acquire after preparation yields");
+            let _ = acquired_tx.send(());
+            let _ = release_rx.await;
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        assert!(matches!(
+            cache.check_priority_control(
+                &prep_key,
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control()
+            ),
+            Err(HlsRangeError::Preempted)
+        ));
+
+        drop(prep_permit);
+        acquired_rx
+            .await
+            .expect("foreground should use capacity released by preparation");
+        drop(foreground_permit);
+        let _ = release_tx.send(());
+        waiting_foreground
+            .await
+            .expect("foreground task should finish");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 0 && state.active_chunk_permits == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn only_one_preparation_transfer_runs_per_store() {
+        let cache = Arc::new(HlsRangeCache::new(3, 0));
+        let first = cache
+            .acquire_chunk_permit(
+                &chunk_key("session-a", "first", 0),
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control(),
+            )
+            .await
+            .expect("first preparation should acquire");
+
+        let second_cache = Arc::clone(&cache);
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let second = tokio::spawn(async move {
+            let _permit = second_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session-b", "second", 0),
+                    HlsRangePriority::PlaybackPreparation,
+                    &continue_control(),
+                )
+                .await
+                .expect("second preparation should acquire after the first releases");
+            let _ = acquired_tx.send(());
+        });
+        wait_for_state(&cache, |state| state.waiting_preparation == 1).await;
+        assert_eq!(1, cache.lock_state().active_preparation_transfers);
+        drop(first);
+        acquired_rx
+            .await
+            .expect("second preparation should eventually acquire");
+        second.await.expect("second preparation task should finish");
+        wait_for_state(&cache, |state| {
+            state.active_preparation_transfers == 0 && state.waiting_preparation == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn single_parallelism_preparation_yields_to_foreground_and_recovers() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let prep_key = chunk_key("session", "prep", 0);
+        let prep_permit = cache
+            .acquire_chunk_permit(
+                &prep_key,
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control(),
+            )
+            .await
+            .expect("idle single-slot store should admit preparation");
+
+        let foreground_cache = Arc::clone(&cache);
+        let foreground = tokio::spawn(async move {
+            foreground_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session", "foreground", 0),
+                    HlsRangePriority::Foreground,
+                    &continue_control(),
+                )
+                .await
+                .expect("foreground should acquire after preparation yields")
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        assert!(matches!(
+            cache.check_priority_control(
+                &prep_key,
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control()
+            ),
+            Err(HlsRangeError::Preempted)
+        ));
+        drop(prep_permit);
+        let foreground_permit = foreground
+            .await
+            .expect("foreground task should finish acquisition");
+        drop(foreground_permit);
+        let recovered = cache
+            .acquire_chunk_permit(
+                &prep_key,
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control(),
+            )
+            .await
+            .expect("preparation should recover after foreground releases");
+        drop(recovered);
+    }
+
+    #[tokio::test]
+    async fn cancelling_foreground_wait_releases_waiter_and_all_permit_counters() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let prep_permit = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "prep", 0),
+                HlsRangePriority::PlaybackPreparation,
+                &continue_control(),
+            )
+            .await
+            .expect("preparation should acquire the only slot");
+        let foreground_cache = Arc::clone(&cache);
+        let foreground = tokio::spawn(async move {
+            foreground_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session", "foreground", 0),
+                    HlsRangePriority::Foreground,
+                    &continue_control(),
+                )
+                .await
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        foreground.abort();
+        let _ = foreground.await;
+        wait_for_state(&cache, |state| state.waiting_foreground == 0).await;
+        assert_eq!(1, cache.lock_state().active_chunk_permits);
+        drop(prep_permit);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(1, cache.chunk_permits.available_permits());
+    }
+
+    #[tokio::test]
+    async fn foreground_cancellation_is_checked_before_free_permit_fast_path() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let result = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "foreground", 0),
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Cancel,
+            )
+            .await;
+
+        assert!(matches!(result, Err(HlsRangeError::Cancelled)));
+        let state = cache.lock_state();
+        assert_eq!(0, state.active_chunk_permits);
+        assert_eq!(0, state.active_foreground_permits);
+        assert_eq!(1, cache.chunk_permits.available_permits());
+    }
+
+    #[tokio::test]
+    async fn background_yields_to_foreground_waiter_despite_preparation_interest() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let background_key = chunk_key("session", "background", 0);
+        let background_flight = cache
+            .claim_chunk(background_key.clone(), HlsRangePriority::Background)
+            .expect("background flight should be admitted");
+        let preparation_flight = cache
+            .claim_chunk(
+                background_key.clone(),
+                HlsRangePriority::PlaybackPreparation,
+            )
+            .expect("preparation should join the background flight");
+        let background_permit = cache
+            .acquire_chunk_permit(
+                &background_key,
+                HlsRangePriority::Background,
+                &continue_control(),
+            )
+            .await
+            .expect("background flight should hold the only permit");
+
+        let foreground_cache = Arc::clone(&cache);
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let foreground = tokio::spawn(async move {
+            let _permit = foreground_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session", "unrelated-foreground", 0),
+                    HlsRangePriority::Foreground,
+                    &continue_control(),
+                )
+                .await
+                .expect("foreground should acquire after background yields");
+            let _ = acquired_tx.send(());
+            let _ = release_rx.await;
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+
+        assert!(matches!(
+            cache.check_priority_control(
+                &background_key,
+                HlsRangePriority::Background,
+                &continue_control()
+            ),
+            Err(HlsRangeError::Preempted)
+        ));
+        assert!(matches!(
+            cache.check_priority_control(&background_key, HlsRangePriority::Background, &|| {
+                HlsCacheFillControl::Cancel
+            }),
+            Err(HlsRangeError::Cancelled)
+        ));
+
+        let foreground_flight = cache
+            .claim_chunk(background_key.clone(), HlsRangePriority::Foreground)
+            .expect("foreground should promote the shared flight");
+        assert!(
+            cache
+                .check_priority_control(
+                    &background_key,
+                    HlsRangePriority::Background,
+                    &continue_control()
+                )
+                .is_ok()
+        );
+
+        drop(foreground_flight);
+        drop(preparation_flight);
+        drop(background_flight);
+        drop(background_permit);
+        acquired_rx
+            .await
+            .expect("waiting foreground should acquire the released permit");
+        let _ = release_tx.send(());
+        foreground.await.expect("foreground task should finish");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 0 && state.active_chunk_permits == 0
+        })
+        .await;
+    }
+
+    #[test]
+    fn foreground_same_flight_promotes_preparation_and_background_resumes_after_batch() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let key = chunk_key("session", "shared", 0);
+        let preparation = cache
+            .claim_chunk(key.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("preparation should claim its flight");
+        let foreground = cache
+            .claim_chunk(key.clone(), HlsRangePriority::Foreground)
+            .expect("foreground should join the same flight");
+        let _unrelated_waiter = cache.register_foreground_waiter();
+        assert!(
+            cache
+                .check_priority_control(
+                    &key,
+                    HlsRangePriority::PlaybackPreparation,
+                    &continue_control()
+                )
+                .is_ok()
+        );
+        drop(_unrelated_waiter);
+        drop(foreground);
+        drop(preparation);
+
+        let background_key = chunk_key("session", "background", 0);
+        let batch = cache
+            .enter_preparation_batch("session")
+            .expect("preparation batch should enter the session");
+        assert!(matches!(
+            cache.check_priority_control(
+                &background_key,
+                HlsRangePriority::Background,
+                &continue_control()
+            ),
+            Err(HlsRangeError::Preempted)
+        ));
+        drop(batch);
+        assert!(
+            cache
+                .check_priority_control(
+                    &background_key,
+                    HlsRangePriority::Background,
+                    &continue_control()
+                )
+                .is_ok()
+        );
     }
 }
