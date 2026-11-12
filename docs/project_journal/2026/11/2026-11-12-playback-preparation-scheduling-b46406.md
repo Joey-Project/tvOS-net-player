@@ -1,11 +1,11 @@
 ---
 id: 20261112-b46406
 title: Playback Preparation Scheduling
-status: active
+status: completed
 created: 2026-11-12
 updated: 2026-11-12
 branch: codex/playback-prewarm-scheduling
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/99
 supersedes: []
 superseded_by:
 ---
@@ -33,11 +33,11 @@ superseded_by:
 - Deterministic scheduling and loopback HTTP regression cases cover the internal path. Exact-head execution evidence belongs to the delivery PR and is not implied by the presence of test code. No automatic production preparation controller is enabled by this slice.
 
 ## Next Steps
-1. Complete the bounded internal admission API and production-path scheduling regressions.
-2. Validate and deliver this prerequisite independently, then integrate it into #98 without rewriting either PR's history.
-3. Evaluate fresh paired decoded-frame evidence before designing automatic preparation/retention or changing media-delivery policy.
+1. Integrate the bounded caller into #98 without rewriting either PR's history, retain its failed comparison evidence, and run a fresh paired long comparison.
+2. Evaluate fresh paired decoded-frame evidence before designing automatic preparation/retention or changing media-delivery policy.
 
 ## Evidence
+- [Playback preparation prerequisite PR #99](https://github.com/Joey-Project/tvOS-net-player/pull/99).
 - [Single-player comparison PR #98](https://github.com/Joey-Project/tvOS-net-player/pull/98), failed preparation at reviewed candidate `b0211ec0e58832613130f8a083b25806ae5feb8a`.
 - [Recovery-latency workstream](2026-11-10-native-abr-latency-b46399.md).
 - Source thread: `019e7fd0-b463-76f2-a5ab-37d7d77620f4`.
