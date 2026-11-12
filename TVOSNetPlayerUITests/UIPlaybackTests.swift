@@ -646,7 +646,8 @@ final class UIPlaybackTests: XCTestCase {
         let remote = XCUIRemote.shared
         remote.press(.select)
         let keyboard = app.keyboards.firstMatch
-        guard waitUntil(timeout: 5, condition: { field.hasFocus && keyboard.exists }) else {
+        // Remote UI focus may leave the source field when the native keyboard opens.
+        guard waitUntil(timeout: 5, condition: { keyboard.exists }) else {
             throw SourceInputError(
                 description: "Bilibili editing keyboard did not appear after selecting the source field. "
                     + sourceInputDescription(field, expected: source)

@@ -74,7 +74,9 @@ superseded_by:
   player transport mutations. Actual generated transport exercises cleanup
   after caller cancellation, while non-cooperative cleanup remains bounded.
 - tvOS UI automation confirms each source character before dismissing the
-  native keyboard. Restored-result navigation uses visible remote-control
+  native keyboard. Keyboard visibility and exact typed-value readback are
+  separate from remote UI focus on the source field after the keyboard opens.
+  Restored-result navigation uses visible remote-control
   landmarks and the result-button column rather than assuming the initial
   focus or scrolling direction. The original restoration deadline, exact
   selected result, decoy, no-resubmission and explicit-Continue assertions remain.
