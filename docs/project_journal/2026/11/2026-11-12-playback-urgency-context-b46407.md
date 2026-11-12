@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-12
 updated: 2026-11-12
 branch: codex/playback-urgency-context
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/100
 supersedes: []
 superseded_by:
 ---
@@ -48,6 +48,11 @@ superseded_by:
   entries before admission. Close is idempotent and scoped to an exact context;
   generation changes and session removal invalidate observations. Multiple live
   owners are ambiguous, not one merged safety window.
+- Withdraw local ownership before best-effort remote cleanup. Cleanup runs
+  independently of the cancelled caller, with a one-second production RPC
+  deadline and a one-second local wait. Each service permits only one outstanding
+  cleanup, including a non-cooperative client that outlives the wait; late
+  completion cannot revoke a newer owner. Server expiry remains the fallback.
 - Session generation and per-context sequence retain unsigned 64-bit protocol
   values with checked bounds and no wraparound. Ticket validity is explicitly
   bounded despite its unsigned 64-bit wire representation. UUID context and
@@ -60,12 +65,14 @@ superseded_by:
 - Deterministic Rust coverage exercises expiry, replay, sequence/challenge
   mismatch, invalid samples, bounded admission, independent-owner cleanup,
   generation/removal and conservative multi-owner lookup. Handler integration
-  must not restore sessions or fetch origins.
+  must not restore sessions or fetch origins. Completed-cache registration also
+  invalidates a full set of old-generation contexts before admitting a new one.
 - Swift DTO and generated gRPC transport tests cover exact identities, bounds,
   unsupported servers, cancellation and malformed responses. Shared AppCore
   tests capture only after ticket receipt and exercise stale clocks, delayed
   responses, owner invalidation, serial updates and old cleanup races without
-  player transport mutations.
+  player transport mutations. Actual generated transport exercises cleanup
+  after caller cancellation, while non-cooperative cleanup remains bounded.
 - Complete formatter/linter checks, local CI, the unchanged fixed-signed native
   three-case gate with verified mute, current-head GitHub CI/UI/native artifacts,
   GitHub Codex review and resolved conversations remain required. These checks
@@ -88,6 +95,9 @@ superseded_by:
   reports, exact-context cleanup and generation invalidation. Expiry is checked
   with a fresh monotonic observation after the store lock is acquired, rather
   than with a timestamp that may have aged while queued.
+- Completed-cache runtime registration invalidates old contexts in the same
+  generation-change callback as ordinary runtime registration, so obsolete
+  owners cannot consume the new generation's admission slots.
 - Shared Swift models and generated transport validate exact binding and ticket
   succession. The explicitly invoked AppCore service separates ticket receipt
   from request-start aging, rejects pre-ticket cached snapshots and rechecks the
@@ -98,6 +108,7 @@ superseded_by:
   remaining ordering and upstream admission work follows in separate slices.
 
 ## Evidence
+- [Playback context foundation PR #100](https://github.com/Joey-Project/tvOS-net-player/pull/100).
 - [Recovery-latency workstream](2026-11-10-native-abr-latency-b46399.md).
 - [Owned read-only assessment](2026-11-11-hls-owned-assessment-b46404.md).
 - [Incomplete single-player comparison PR #98](https://github.com/Joey-Project/tvOS-net-player/pull/98).

@@ -382,7 +382,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
                 let response = try await service.closeHlsPlaybackContext(
                     TvosNetPlayer_V1_CloseHlsPlaybackContextRequest(request),
-                    options: callOptions
+                    options: playbackContextCloseCallOptions
                 )
                 return HLSPlaybackContextCloseResponse(response)
             }
@@ -981,6 +981,12 @@ public final class GRPCCacheControlClient: CacheControlClient {
     private var callOptions: CallOptions {
         var options = CallOptions.defaults
         options.timeout = rpcTimeout
+        return options
+    }
+
+    private var playbackContextCloseCallOptions: CallOptions {
+        var options = CallOptions.defaults
+        options.timeout = min(rpcTimeout, .seconds(1))
         return options
     }
 

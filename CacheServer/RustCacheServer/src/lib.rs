@@ -2328,6 +2328,7 @@ impl AppState {
                 |generation| {
                     self.hls_network_policy
                         .advance_session_generation(&session.id, generation);
+                    self.hls_playback_contexts.remove_session(&session.id);
                 },
             );
 
@@ -5861,6 +5862,83 @@ mod tests {
                 .headers
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_registration_invalidates_old_playback_contexts() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let session = sample_hls_session("completion-context-generation");
+        let old_generation = state.register_hls_playback_session(session.clone());
+        let sample = crate::hls_playback_context::PlaybackTimingSample {
+            playhead_seconds: 1.0,
+            continuous_buffered_end_seconds: 4.0,
+            playback_rate: 1.0,
+        };
+        let old_tickets: Vec<_> = (0..8)
+            .map(|_| {
+                let opened = state
+                    .hls_playback_contexts
+                    .open(session.id.clone(), old_generation)
+                    .expect("old-generation context should open");
+                state
+                    .hls_playback_contexts
+                    .update(
+                        &opened.context_id,
+                        &opened.challenge,
+                        opened.next_sequence,
+                        sample,
+                    )
+                    .expect("old-generation timing sample should be recorded")
+            })
+            .collect();
+
+        assert!(matches!(
+            state
+                .hls_playback_contexts
+                .open(session.id.clone(), old_generation),
+            Err(crate::hls_playback_context::PlaybackContextStoreError::AtCapacity)
+        ));
+        assert!(state.sole_current_hls_playback_context().is_none());
+
+        state.register_completed_hls_runtime_session_with_grace(&session, Duration::from_secs(60));
+        let current_generation = state
+            .hls_sessions
+            .get_with_generation(&session.id)
+            .expect("completed session should remain registered")
+            .generation;
+        assert!(current_generation > old_generation);
+
+        for ticket in old_tickets {
+            assert_eq!(
+                Err(crate::hls_playback_context::PlaybackContextStoreError::UnknownContext),
+                state.hls_playback_contexts.update(
+                    &ticket.context_id,
+                    &ticket.challenge,
+                    ticket.next_sequence,
+                    sample,
+                )
+            );
+        }
+
+        let current_ticket = state
+            .hls_playback_contexts
+            .open(session.id.clone(), current_generation)
+            .expect("new-generation context should open after old contexts are invalidated");
+        state
+            .hls_playback_contexts
+            .update(
+                &current_ticket.context_id,
+                &current_ticket.challenge,
+                current_ticket.next_sequence,
+                sample,
+            )
+            .expect("new-generation timing sample should be recorded");
+        let current_snapshot = state
+            .sole_current_hls_playback_context()
+            .expect("obsolete contexts should not suppress the new sole context");
+        assert_eq!(current_generation, current_snapshot.session_generation);
+        assert_eq!(sample, current_snapshot.sample);
     }
 
     #[test]

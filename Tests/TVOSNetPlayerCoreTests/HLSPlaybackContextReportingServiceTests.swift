@@ -266,7 +266,45 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         await client.holdClose(for: contextA)
 
         let withdrawal = Task { @MainActor in await service.withdraw() }
-        await client.waitForCloseCount(1)
+        let closeReachedClient = await client.waitForCloseCount(1, timeout: .seconds(2))
+        XCTAssertTrue(closeReachedClient, "Expected the old context close to start.")
+        currentOwner = ownerB
+        try await service.start()
+        await client.releaseClose(for: contextA)
+        await withdrawal.value
+        try await service.update()
+
+        let counts = await client.counts()
+        XCTAssertEqual(counts.openSessionIDs, [ownerA.sessionID, ownerB.sessionID])
+        XCTAssertEqual(counts.updateContextIDs, [contextA, contextB, contextB])
+        XCTAssertEqual(counts.closeContextIDs, [contextA])
+    }
+
+    func testBoundedCloseWaitAllowsNewOwnerBeforeLateOldCloseCompletes() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let now: UInt64 = 3_500
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: now) },
+            now: { now }
+        )
+        try await service.start()
+        await client.holdClose(for: contextA)
+
+        var withdrawalReturned = false
+        let withdrawal = Task { @MainActor in
+            await service.withdraw()
+            withdrawalReturned = true
+        }
+        let closeReachedClient = await client.waitForCloseCount(1, timeout: .seconds(2))
+        XCTAssertTrue(closeReachedClient, "Expected the old context close to start.")
+        try await Task.sleep(for: .milliseconds(1_500))
+        XCTAssertTrue(withdrawalReturned, "Withdrawal must return after its bounded close wait.")
+
         currentOwner = ownerB
         try await service.start()
         await client.releaseClose(for: contextA)
@@ -552,6 +590,15 @@ private actor PlaybackContextClientProbe: CacheControlClient {
     func waitForCloseCount(_ count: Int) async {
         guard closeRequests.count < count else { return }
         await withCheckedContinuation { closeCountWaiters.append((count, $0)) }
+    }
+
+    func waitForCloseCount(_ count: Int, timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while closeRequests.count < count, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return closeRequests.count >= count
     }
 
     func releaseClose(for contextID: String) {

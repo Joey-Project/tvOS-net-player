@@ -1,10 +1,12 @@
 import Foundation
+import AVFoundation
 import GRPCCore
 import GRPCNIOTransportHTTP2Posix
 import GRPCProtobuf
 import SwiftProtobuf
 import XCTest
 @testable import TVOSNetPlayerCacheClient
+@testable import TVOSNetPlayerCore
 
 /// Exercises generated playback-context routes through the production cache client on loopback.
 @MainActor
@@ -125,6 +127,90 @@ final class HLSPlaybackContextTransportIntegrationTests: XCTestCase {
         }
     }
 
+    func testCancelledUpdateStillClosesContextThroughProductionGRPCClient() async throws {
+        let sessionID = "session-e\u{0301}"
+        let probe = HLSPlaybackContextRPCProbe(scenario: .heldUpdate)
+
+        try await withLoopbackServer(probe: probe) { endpoint in
+            let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            let owner = try XCTUnwrap(
+                HLSPlaybackContextOwner(
+                    ownerToken: UUID(),
+                    serverID: "loopback-server",
+                    sessionID: sessionID,
+                    sessionGeneration: 23
+                )
+            )
+            let now: UInt64 = 100
+            let service = HLSPlaybackContextReportingService(
+                client: client,
+                serverSummary: CacheServerSummary(
+                    id: "loopback-server",
+                    name: "Loopback",
+                    version: "test",
+                    mediaBaseURIs: [],
+                    capabilities: [CacheServerCapability.hlsPlaybackContext]
+                ),
+                ownerProvider: { owner },
+                snapshotProvider: {
+                    HLSPlaybackSnapshot.capture(
+                        timeControlStatus: .playing,
+                        playbackRate: 1,
+                        currentTime: CMTime(seconds: 5, preferredTimescale: 600),
+                        loadedTimeRanges: [
+                            CMTimeRange(
+                                start: .zero,
+                                duration: CMTime(seconds: 20, preferredTimescale: 600)
+                            )
+                        ],
+                        observedAtNanoseconds: now
+                    )
+                },
+                monotonicNowNanoseconds: { now }
+            )
+            try await service.start()
+
+            let update = Task { @MainActor in try await service.update() }
+            let updateReachedServer = await probe.waitForUpdateCount(2, timeout: .seconds(2))
+            XCTAssertTrue(updateReachedServer, "Expected the second update to reach loopback.")
+            update.cancel()
+            await probe.releaseUpdate()
+            do {
+                try await update.value
+                XCTFail("Expected cancellation to win over the late update ticket.")
+            } catch is CancellationError {
+            }
+
+            let snapshot = await probe.snapshot()
+            XCTAssertEqual(snapshot.openRequests.count, 1)
+            XCTAssertEqual(snapshot.updateRequests.count, 2)
+            XCTAssertEqual(snapshot.closeRequests.map(\.contextID), [self.contextID])
+        }
+    }
+
+    func testProductionCloseUsesBoundedGRPCDeadline() async throws {
+        let probe = HLSPlaybackContextRPCProbe(scenario: .heldClose)
+
+        try await withLoopbackServer(probe: probe) { endpoint in
+            let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            let clock = ContinuousClock()
+            let startedAt = clock.now
+            do {
+                _ = try await client.closeHLSPlaybackContext(
+                    HLSPlaybackContextCloseRequest(contextID: self.contextID)
+                )
+                XCTFail("Expected the held close route to hit its RPC deadline.")
+            } catch {
+            }
+            let elapsed = clock.now - startedAt
+            let snapshot = await probe.snapshot()
+            await probe.releaseClose()
+
+            XCTAssertLessThan(elapsed, .seconds(2))
+            XCTAssertEqual(snapshot.closeRequests.map(\.contextID), [self.contextID])
+        }
+    }
+
     private func withLoopbackServer(
         probe: HLSPlaybackContextRPCProbe,
         operation: (CacheServerEndpoint) async throws -> Void
@@ -154,6 +240,8 @@ private enum HLSPlaybackContextScenario: Sendable {
     case malformedOpenTicket
     case unimplementedOpen
     case heldOpen
+    case heldUpdate
+    case heldClose
 }
 
 private actor HLSPlaybackContextRPCProbe {
@@ -171,6 +259,10 @@ private actor HLSPlaybackContextRPCProbe {
     private var openReleaseWaiters: [CheckedContinuation<Void, Never>] = []
     private var openReached = false
     private var openReleased = false
+    private var updateReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var updateReleased = false
+    private var closeReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var closeReleased = false
 
     init(scenario: HLSPlaybackContextScenario = .normal) {
         self.scenario = scenario
@@ -206,10 +298,13 @@ private actor HLSPlaybackContextRPCProbe {
         return response
     }
 
-    func update(_ request: TvosNetPlayer_V1_UpdateHlsPlaybackContextRequest)
+    func update(_ request: TvosNetPlayer_V1_UpdateHlsPlaybackContextRequest) async throws
         -> TvosNetPlayer_V1_HlsPlaybackContextTicket
     {
         updateRequests.append(request)
+        if case .heldUpdate = scenario, updateRequests.count == 2, !updateReleased {
+            await withCheckedContinuation { updateReleaseWaiters.append($0) }
+        }
         return ticket(
             contextID: request.contextID,
             challenge: "00000000-0000-4000-8000-000000000003",
@@ -219,13 +314,39 @@ private actor HLSPlaybackContextRPCProbe {
         )
     }
 
-    func close(_ request: TvosNetPlayer_V1_CloseHlsPlaybackContextRequest)
+    func close(_ request: TvosNetPlayer_V1_CloseHlsPlaybackContextRequest) async
         -> TvosNetPlayer_V1_CloseHlsPlaybackContextResponse
     {
         closeRequests.append(request)
+        if case .heldClose = scenario, !closeReleased {
+            await withCheckedContinuation { closeReleaseWaiters.append($0) }
+        }
         var response = TvosNetPlayer_V1_CloseHlsPlaybackContextResponse()
         response.closed = true
         return response
+    }
+
+    func waitForUpdateCount(_ count: Int, timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while updateRequests.count < count, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return updateRequests.count >= count
+    }
+
+    func releaseUpdate() {
+        updateReleased = true
+        let waiters = updateReleaseWaiters
+        updateReleaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func releaseClose() {
+        closeReleased = true
+        let waiters = closeReleaseWaiters
+        closeReleaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     func waitForOpen() async {
@@ -277,7 +398,7 @@ private struct HLSPlaybackContextTestService: RegistrableRPCService {
             TvosNetPlayer_V1_CacheService.Method.UpdateHlsPlaybackContext.descriptor,
             with: &router
         ) { (request: TvosNetPlayer_V1_UpdateHlsPlaybackContextRequest) in
-            await probe.update(request)
+            try await probe.update(request)
         }
         Self.registerUnary(
             TvosNetPlayer_V1_CacheService.Method.CloseHlsPlaybackContext.descriptor,

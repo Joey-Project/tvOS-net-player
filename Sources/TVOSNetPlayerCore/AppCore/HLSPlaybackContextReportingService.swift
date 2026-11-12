@@ -77,6 +77,7 @@ public final class HLSPlaybackContextReportingService {
     }
 
     private static let maximumSnapshotAgeNanoseconds: UInt64 = 5_000_000_000
+    private static let closeWaitDuration: Duration = .seconds(1)
 
     private let client: any CacheControlClient
     private let serverSummary: CacheServerSummary
@@ -88,6 +89,7 @@ public final class HLSPlaybackContextReportingService {
     private var operationID: UUID?
     private var activeContext: ActiveContext?
     private var lastMonotonicNowNanoseconds: UInt64?
+    private var closeAttemptID: UUID?
 
     public init(
         client: any CacheControlClient,
@@ -410,7 +412,25 @@ public final class HLSPlaybackContextReportingService {
     private func closeBestEffort(_ contextID: String) async {
         let request = HLSPlaybackContextCloseRequest(contextID: contextID)
         guard (try? request.validate()) != nil else { return }
-        _ = try? await client.closeHLSPlaybackContext(request)
+        guard closeAttemptID == nil else { return }
+
+        let attemptID = UUID()
+        closeAttemptID = attemptID
+        let completion = HLSPlaybackContextCloseWaiter()
+        let client = self.client
+
+        // Keep one detached cleanup per service; a non-cooperative client cannot fan out tasks.
+        Task.detached(priority: .utility) { [weak self] in
+            _ = try? await client.closeHLSPlaybackContext(request)
+            await self?.finishCloseAttempt(attemptID)
+            await completion.finish()
+        }
+        await completion.wait(for: Self.closeWaitDuration)
+    }
+
+    private func finishCloseAttempt(_ attemptID: UUID) {
+        guard closeAttemptID == attemptID else { return }
+        closeAttemptID = nil
     }
 
     private func sanitized(_ error: any Error) -> any Error {
@@ -429,5 +449,36 @@ public final class HLSPlaybackContextReportingService {
             return HLSPlaybackContextReportingError.invalidTicket
         }
         return HLSPlaybackContextReportingError.requestFailed
+    }
+}
+
+private actor HLSPlaybackContextCloseWaiter {
+    private var isFinished = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func wait(for timeout: Duration) async {
+        await withCheckedContinuation { continuation in
+            guard !isFinished else {
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            timeoutTask = Task.detached { [weak self] in
+                try? await Task.sleep(for: timeout)
+                guard let self else { return }
+                await self.finish()
+            }
+        }
+    }
+
+    func finish() {
+        guard !isFinished else { return }
+        isFinished = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        let continuation = self.continuation
+        self.continuation = nil
+        continuation?.resume()
     }
 }
