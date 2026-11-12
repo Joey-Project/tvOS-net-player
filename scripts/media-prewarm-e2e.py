@@ -321,6 +321,19 @@ ATTEMPT_OUTCOMES = {
     "upstream_status", "network", "io", "range_unsupported", "invalid_response",
     "deadline_exceeded", "interrupted",
 }
+ROOT_FAILURE_CATEGORIES = {
+    "plan_invalid", "preempted", "cancelled", "session_removing", "identity_changed",
+    "quota_exceeded", "upstream_status", "network", "io", "range_unsupported",
+    "invalid_response", "deadline_exceeded", "attempt_limit", "byte_budget_exceeded",
+    "resource_length_changed", "cache_coverage_incomplete",
+}
+ATTEMPT_FAILURE_CATEGORIES = {
+    "preempted", "cancelled", "session_removing", "identity_changed", "quota_exceeded",
+    "upstream_status", "network", "io", "range_unsupported", "invalid_response",
+}
+REQUIRED_ATTEMPT_FAILURE_CATEGORIES = {
+    "upstream_status", "network", "io", "range_unsupported", "invalid_response",
+}
 FAILURE_KEYS = {"category", "resource_id", "start", "end", "upstream_status"}
 PROVENANCE = {
     "shared_origin_counter_scope": "playback_and_preparation",
@@ -341,7 +354,7 @@ def _validate_failure_state(failure: Any, attempted: list[dict[str, Any]],
     failure_start, failure_end = failure["start"], failure["end"]
     upstream_status = failure["upstream_status"]
     if (category is not None and (not isinstance(category, str)
-                                  or category not in ATTEMPT_OUTCOMES)
+                                  or category not in ROOT_FAILURE_CATEGORIES)
             or resource_id is not None and (not _safe_resource_id(resource_id)
                                             or resource_id not in resource_ids)
             or failure_start is not None and (not _exact_int(failure_start) or failure_start < 0)
@@ -354,12 +367,17 @@ def _validate_failure_state(failure: Any, attempted: list[dict[str, Any]],
         if any(failure[key] is not None for key in FAILURE_KEYS):
             raise PrewarmError(f"Completed prewarm report contains root failure details: {report_name}")
         return
+    if mode == "off" or category is None:
+        raise PrewarmError(f"Failed prewarm root cause does not match its attempt ledger: {report_name}")
     matches = [attempt for attempt in attempted if attempt["outcome"] == category
                and (resource_id is None or attempt["resource_id"] == resource_id)
                and (failure_start is None or attempt["start"] == failure_start)
                and (failure_end is None or attempt["end"] == failure_end)
                and (upstream_status is None or attempt["status_code"] == upstream_status)]
-    if mode == "off" or category is None or not matches:
+    has_attempt_context = any(failure[key] is not None
+                              for key in ("resource_id", "start", "end", "upstream_status"))
+    if (category in REQUIRED_ATTEMPT_FAILURE_CATEGORIES
+            or category in ATTEMPT_FAILURE_CATEGORIES and has_attempt_context) and not matches:
         raise PrewarmError(f"Failed prewarm root cause does not match its attempt ledger: {report_name}")
 
 

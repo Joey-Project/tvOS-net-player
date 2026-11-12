@@ -504,6 +504,84 @@ class PrewarmRunnerTests(unittest.TestCase):
                                             completed=False, mode="on",
                                             report_name="treatment-loopback-503.v4.json")
 
+    def test_typed_operation_failures_need_no_http_attempt_but_stay_incomplete(self) -> None:
+        for category in ("plan_invalid", "preempted", "cancelled", "session_removing",
+                         "quota_exceeded", "deadline_exceeded", "attempt_limit",
+                         "byte_budget_exceeded", "cache_coverage_incomplete"):
+            with self.subTest(category=category):
+                report = make_report("on")
+                contract = report["prewarm_comparison"]
+                contract.update(completed=False, attempt_count=0, attempted_span_bytes=0,
+                                attempted_ranges=[], cache_published_bytes=0,
+                                cache_published_spans=[],
+                                failure={"category": category, "resource_id": None,
+                                         "start": None, "end": None, "upstream_status": None})
+                diagnostic = prewarm._prewarm_diagnostic_data(
+                    report, "on", f"treatment-{category}.json")
+                self.assertIs(diagnostic, contract)
+                with self.assertRaisesRegex(prewarm.PrewarmError, "not a completed case"):
+                    prewarm._prewarm_contract(report, "on", f"treatment-{category}.json")
+
+    def test_operation_failure_can_follow_published_attempts_without_matching_outcome(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        contract.update(completed=False, failure={
+            "category": "attempt_limit", "resource_id": None, "start": None,
+            "end": None, "upstream_status": None,
+        })
+        self.assertIs(prewarm._prewarm_diagnostic_data(report, "on", "prior-publication.json"),
+                      contract)
+        with self.assertRaisesRegex(prewarm.PrewarmError, "not a completed case"):
+            prewarm._prewarm_contract(report, "on", "prior-publication.json")
+
+    def test_root_failure_categories_are_not_attempt_lifecycle_outcomes(self) -> None:
+        self.assertEqual(prewarm.ROOT_FAILURE_CATEGORIES, {
+            "plan_invalid", "preempted", "cancelled", "session_removing", "identity_changed",
+            "quota_exceeded", "upstream_status", "network", "io", "range_unsupported",
+            "invalid_response", "deadline_exceeded", "attempt_limit", "byte_budget_exceeded",
+            "resource_length_changed", "cache_coverage_incomplete",
+        })
+        ids = {"audio-id", "video-id"}
+        attempted = []
+        for category in ("in_flight", "headers_received", "headers_validated", "body_validated",
+                         "cache_published", "interrupted", "unknown", ["plan_invalid"]):
+            failure = {"category": category, "resource_id": None, "start": None,
+                       "end": None, "upstream_status": None}
+            with self.subTest(category=category), self.assertRaises(prewarm.PrewarmError):
+                prewarm._validate_failure_state(failure, attempted, ids, completed=False,
+                                                mode="on", report_name="invalid-root.json")
+
+    def test_attempt_failure_context_must_match_every_provided_field(self) -> None:
+        failed = json.loads(RUST_TYPED_503_V4)
+        attempted = failed["attempted_ranges"]
+        resource_ids = set(failed["resource_ids"].values())
+        failure = failed["failure"]
+        prewarm._validate_failure_state(failure, attempted, resource_ids, completed=False,
+                                        mode="on", report_name="typed-503.json")
+        for field, value in (("resource_id", "video.m4s"), ("start", 1), ("end", 2),
+                             ("upstream_status", 502)):
+            mismatched = copy.deepcopy(failure)
+            mismatched[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    prewarm.PrewarmError, "does not match its attempt ledger"):
+                prewarm._validate_failure_state(mismatched, attempted, resource_ids,
+                                                completed=False, mode="on",
+                                                report_name="typed-503.json")
+
+    def test_false_completion_or_missing_selected_coverage_never_passes(self) -> None:
+        report = make_report("on")
+        report["prewarm_comparison"].update(completed=False, failure={
+            "category": "plan_invalid", "resource_id": None, "start": None,
+            "end": None, "upstream_status": None,
+        })
+        with self.assertRaisesRegex(prewarm.PrewarmError, "not a completed case"):
+            prewarm._prewarm_contract(report, "on", "false-complete.json")
+        report = make_report("on")
+        report["prewarm_comparison"]["cache_covered_spans_after"] = []
+        report["prewarm_comparison"]["cache_covered_bytes_after"] = 0
+        with self.assertRaisesRegex(prewarm.PrewarmError, "actual readable coverage"):
+            prewarm._prewarm_contract(report, "on", "missing-coverage.json")
+
     def test_published_union_merges_overlapping_and_adjacent_attempts(self) -> None:
         for first_end, second_start, attempted_bytes in ((180, 100, 1080), (150, 150, 1000)):
             with self.subTest(first_end=first_end, second_start=second_start):

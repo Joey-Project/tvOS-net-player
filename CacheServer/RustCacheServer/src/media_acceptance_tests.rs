@@ -1728,8 +1728,14 @@ async fn prewarm_selected_ranges(
         || plan.ranges.len() > 128
         || plan.resource_total_lengths.video != plan.video_total_length
         || plan.resource_total_lengths.audio != plan.audio_total_length
-        || plan.video_total_length != high.request.size.unwrap_or_default()
-        || plan.audio_total_length != audio.request.size.unwrap_or_default();
+        || high
+            .request
+            .size
+            .is_some_and(|size| plan.video_total_length != size)
+        || audio
+            .request
+            .size
+            .is_some_and(|size| plan.audio_total_length != size);
     if invalid_plan {
         execution.failure = prewarm_failure_without_range(Failure::PlanInvalid);
         return Err(record_prewarm_failure(
@@ -7292,6 +7298,192 @@ mod prewarm_retry_tests {
             .expect("Rust report export should use a fresh file");
         file.write_all(&bytes)
             .expect("Rust report export should be complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_request_sizes_complete_from_loopback_content_range() {
+        const TOTAL: u64 = 512 * 1024;
+        let (base_url, upstream, server) = start_upstream(TOTAL, false, false).await;
+        let mut session = session(&base_url, TOTAL);
+        session.variant.video.request.size = None;
+        let audio = session
+            .variant
+            .audio
+            .as_mut()
+            .expect("fixture audio should exist");
+        audio.request.size = None;
+        assert_eq!(None, session.variant.video.request.size);
+        assert_eq!(None, audio.request.size);
+
+        let (_temp, cache) = fixture_cache(&session, 1);
+        let client = reqwest::Client::new();
+        let report = report_store();
+        let (result, execution) = tokio::time::timeout(
+            Duration::from_secs(7),
+            run_prewarm(
+                cache.clone(),
+                client,
+                session.clone(),
+                plan(0, 32, TOTAL),
+                report.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("unknown-length preparation should fit its deadline");
+        result.expect("Content-Range should bind the unknown request size to the plan");
+        assert!(execution.completed);
+        assert_eq!(Some(32), execution.coverage_after);
+        assert!(execution.attempted_ranges.iter().any(|attempt| {
+            attempt.resource_id == "audio.m4s"
+                && attempt.resource_total_length == Some(TOTAL)
+                && attempt.status_code == Some(206)
+                && attempt.headers_validated == Some(true)
+                && attempt.body_validated == Some(true)
+                && attempt.cache_published == Some(true)
+        }));
+        let audio = session
+            .variant
+            .audio
+            .as_ref()
+            .expect("fixture audio should exist");
+        assert_eq!(
+            Some(vec![0x5a; 32]),
+            cache
+                .read_resource_range(&session.id, audio, 0..32)
+                .await
+                .expect("prepared range should remain readable")
+        );
+        assert_eq!(None, session.variant.video.request.size);
+        assert_eq!(None, audio.request.size);
+        assert!(upstream.preparation_requests.load(Ordering::SeqCst) >= 1);
+        export_serialized_report(&report, "unknown-length-loopback.v4.json");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_request_size_mismatches_are_rejected_before_preparation_http() {
+        const TOTAL: u64 = 512 * 1024;
+        let (base_url, upstream, server) = start_upstream(TOTAL, false, false).await;
+        let base_session = session(&base_url, TOTAL);
+        let (_temp, cache) = fixture_cache(&base_session, 1);
+        let client = reqwest::Client::new();
+        let plan = plan(0, 32, TOTAL);
+
+        for (resource_id, known_size) in [
+            ("video.m4s", 0),
+            ("video.m4s", TOTAL + 1),
+            ("audio.m4s", 0),
+            ("audio.m4s", TOTAL + 1),
+        ] {
+            let mut candidate = base_session.clone();
+            if resource_id == "video.m4s" {
+                candidate.variant.video.request.size = Some(known_size);
+            } else {
+                candidate
+                    .variant
+                    .audio
+                    .as_mut()
+                    .expect("fixture audio should exist")
+                    .request
+                    .size = Some(known_size);
+            }
+            let (result, execution) = run_prewarm(
+                cache.clone(),
+                client.clone(),
+                candidate,
+                plan.clone(),
+                report_store(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "{resource_id} size {known_size} should fail"
+            );
+            assert_eq!(
+                Some(PrewarmFailureCategory::PlanInvalid),
+                execution.failure.category
+            );
+            assert!(!execution.completed);
+            assert_eq!(0, upstream.preparation_requests.load(Ordering::SeqCst));
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovered_total_mismatch_with_unknown_request_sizes_cannot_complete() {
+        const ACTUAL_TOTAL: u64 = 2 * 1024 * 1024;
+        let (base_url, upstream, server) = start_upstream(ACTUAL_TOTAL, false, false).await;
+        let mut session = session(&base_url, ACTUAL_TOTAL);
+        session.variant.video.request.size = None;
+        let audio = session
+            .variant
+            .audio
+            .as_mut()
+            .expect("fixture audio should exist");
+        audio.request.size = None;
+        assert_eq!(None, session.variant.video.request.size);
+        assert_eq!(None, audio.request.size);
+
+        let (_temp, cache) = fixture_cache(&session, 1);
+        let client = reqwest::Client::new();
+        let (result, execution) = run_prewarm(
+            cache.clone(),
+            client.clone(),
+            session.clone(),
+            plan(0, 32, ACTUAL_TOTAL + 1),
+            report_store(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!execution.completed);
+        assert_eq!(
+            Some(PrewarmFailureCategory::ResourceLengthChanged),
+            execution.failure.category
+        );
+        let audio = session
+            .variant
+            .audio
+            .as_ref()
+            .expect("fixture audio should exist");
+        let ready = tokio::time::timeout(
+            Duration::from_secs(2),
+            cache.ensure_resource_range(
+                &client,
+                &session.id,
+                audio,
+                0..32,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            ),
+        )
+        .await
+        .expect("actual cache-ready range should be available")
+        .expect("actual cache-ready range should remain valid");
+        assert_eq!(ACTUAL_TOTAL, ready.total_length);
+        assert_eq!(
+            Some(vec![0x5a; 32]),
+            cache
+                .read_resource_range(&session.id, audio, 0..32)
+                .await
+                .expect("mismatched-plan cache bytes should remain readable")
+        );
+        assert!(upstream.preparation_requests.load(Ordering::SeqCst) >= 1);
+        assert_eq!(None, session.variant.video.request.size);
+        assert_eq!(
+            None,
+            session
+                .variant
+                .audio
+                .as_ref()
+                .expect("fixture audio should exist")
+                .request
+                .size
+        );
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
