@@ -415,7 +415,7 @@ impl HlsRangeCache {
                     (completion, receiver, readiness, readiness_receiver, true)
                 }
             };
-        Ok(RangeFlight {
+        let flight = RangeFlight {
             cache: Arc::clone(self),
             key,
             completion,
@@ -425,7 +425,12 @@ impl HlsRangeCache {
             owner,
             foreground_interest: !owner && priority == HlsRangePriority::Foreground,
             preparation_interest: !owner && priority == HlsRangePriority::PlaybackPreparation,
-        })
+        };
+        drop(state);
+        if priority == HlsRangePriority::Foreground && !owner {
+            self.signal_change();
+        }
+        Ok(flight)
     }
 
     pub(crate) async fn acquire_chunk_permit<F>(
@@ -437,7 +442,22 @@ impl HlsRangeCache {
     where
         F: Fn() -> crate::hls_cache::HlsCacheFillControl + Send + Sync,
     {
-        self.check_priority_control(key, priority, control)?;
+        let owner_completion = if priority == HlsRangePriority::PlaybackPreparation {
+            self.lock_state()
+                .flights
+                .get(key)
+                .map(|flight| flight.completion.clone())
+        } else {
+            None
+        };
+        self.check_priority_control_with_waiter(
+            key,
+            priority,
+            control,
+            false,
+            owner_completion.as_ref(),
+            priority == HlsRangePriority::PlaybackPreparation,
+        )?;
         if priority == HlsRangePriority::PlaybackPreparation {
             let mut preparation_waiter = None;
             let mut foreground_waiter = None;
@@ -447,19 +467,74 @@ impl HlsRangeCache {
                     priority,
                     control,
                     foreground_waiter.is_some(),
+                    owner_completion.as_ref(),
+                    true,
                 )?;
-                if let Some(permit) =
-                    self.try_acquire_preparation_chunk_permit(key, foreground_waiter.is_some())
-                {
+                if let Some(permit) = self.try_acquire_preparation_chunk_permit_for_owner(
+                    key,
+                    owner_completion.as_ref(),
+                    foreground_waiter.is_some(),
+                ) {
                     drop(preparation_waiter.take());
                     drop(foreground_waiter.take());
                     return Ok(permit);
                 }
-                if self.flight_has_foreground_interest(key) {
+                if self.flight_has_foreground_interest_for_owner(key, owner_completion.as_ref()) {
                     drop(preparation_waiter.take());
                     if foreground_waiter.is_none() {
                         foreground_waiter = Some(self.register_foreground_waiter());
                     }
+                    let promoted_permit = {
+                        let mut changed = self.changed.subscribe();
+                        let acquire = self.chunk_permits.clone().acquire_owned();
+                        tokio::pin!(acquire);
+                        loop {
+                            self.check_priority_control_with_waiter(
+                                key,
+                                priority,
+                                control,
+                                true,
+                                owner_completion.as_ref(),
+                                true,
+                            )?;
+                            if !self.flight_has_foreground_interest_for_owner(
+                                key,
+                                owner_completion.as_ref(),
+                            ) {
+                                break None;
+                            }
+                            tokio::select! {
+                                permit = &mut acquire => {
+                                    let permit = permit.map_err(|_| HlsRangeError::SessionRemoving)?;
+                                    self.check_priority_control_with_waiter(
+                                        key,
+                                        priority,
+                                        control,
+                                        true,
+                                        owner_completion.as_ref(),
+                                        true,
+                                    )?;
+                                    break self.track_promoted_preparation_chunk_permit(
+                                        key,
+                                        owner_completion.as_ref(),
+                                        permit,
+                                    );
+                                }
+                                changed_result = changed.changed() => {
+                                    if changed_result.is_err() {
+                                        return Err(HlsRangeError::SessionRemoving);
+                                    }
+                                }
+                                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                        }
+                    };
+                    if let Some(permit) = promoted_permit {
+                        drop(foreground_waiter.take());
+                        return Ok(permit);
+                    }
+                    drop(foreground_waiter.take());
+                    continue;
                 } else {
                     drop(foreground_waiter.take());
                     if preparation_waiter.is_none() {
@@ -530,24 +605,25 @@ impl HlsRangeCache {
         })
     }
 
-    fn try_acquire_preparation_chunk_permit(
+    fn try_acquire_preparation_chunk_permit_for_owner(
         self: &Arc<Self>,
         key: &RangeChunkKey,
+        owner_completion: Option<&watch::Sender<bool>>,
         owns_foreground_waiter: bool,
     ) -> Option<HlsRangeChunkPermit> {
         let mut state = self.lock_state();
         let owned_foreground_waiters = if owns_foreground_waiter { 1 } else { 0 };
-        if state
+        let flight_matches = |flight: &FlightState| {
+            owner_completion.is_some_and(|completion| flight.completion.same_channel(completion))
+        };
+        let matching_flight = state
             .flights
             .get(key)
-            .is_some_and(|flight| flight.promoted_preparation_permit)
-        {
+            .filter(|flight| flight_matches(flight));
+        if matching_flight.is_some_and(|flight| flight.promoted_preparation_permit) {
             return None;
         }
-        let promoted = state
-            .flights
-            .get(key)
-            .is_some_and(|flight| flight.foreground_interest > 0);
+        let promoted = matching_flight.is_some_and(|flight| flight.foreground_interest > 0);
         let priority = if promoted {
             if state.waiting_foreground > owned_foreground_waiters {
                 return None;
@@ -577,6 +653,7 @@ impl HlsRangeCache {
             let flight = state
                 .flights
                 .get_mut(key)
+                .filter(|flight| flight_matches(flight))
                 .expect("promoted preparation flight should remain registered");
             flight.promoted_preparation_permit = true;
             Some((key.clone(), flight.completion.clone()))
@@ -592,11 +669,41 @@ impl HlsRangeCache {
         })
     }
 
-    fn flight_has_foreground_interest(&self, key: &RangeChunkKey) -> bool {
-        self.lock_state()
-            .flights
-            .get(key)
-            .is_some_and(|flight| flight.foreground_interest > 0)
+    fn track_promoted_preparation_chunk_permit(
+        self: &Arc<Self>,
+        key: &RangeChunkKey,
+        owner_completion: Option<&watch::Sender<bool>>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Option<HlsRangeChunkPermit> {
+        let mut state = self.lock_state();
+        let flight = state.flights.get_mut(key).filter(|flight| {
+            owner_completion.is_some_and(|completion| flight.completion.same_channel(completion))
+                && flight.foreground_interest > 0
+                && !flight.promoted_preparation_permit
+        })?;
+        flight.promoted_preparation_permit = true;
+        let promoted_preparation_flight = Some((key.clone(), flight.completion.clone()));
+        state.active_chunk_permits += 1;
+        state.active_foreground_permits += 1;
+        drop(state);
+        Some(HlsRangeChunkPermit {
+            _permit: permit,
+            cache: Arc::clone(self),
+            priority: HlsRangePriority::Foreground,
+            promoted_preparation_flight,
+        })
+    }
+
+    fn flight_has_foreground_interest_for_owner(
+        &self,
+        key: &RangeChunkKey,
+        owner_completion: Option<&watch::Sender<bool>>,
+    ) -> bool {
+        self.lock_state().flights.get(key).is_some_and(|flight| {
+            owner_completion.is_some_and(|completion| {
+                flight.completion.same_channel(completion) && flight.foreground_interest > 0
+            })
+        })
     }
 
     fn track_chunk_permit(
@@ -645,7 +752,7 @@ impl HlsRangeCache {
     where
         F: Fn() -> crate::hls_cache::HlsCacheFillControl + Send + Sync,
     {
-        self.check_priority_control_with_waiter(key, priority, control, false)
+        self.check_priority_control_with_waiter(key, priority, control, false, None, false)
     }
 
     fn check_priority_control_with_waiter<F>(
@@ -654,6 +761,8 @@ impl HlsRangeCache {
         priority: HlsRangePriority,
         control: &F,
         owns_foreground_waiter: bool,
+        owner_completion: Option<&watch::Sender<bool>>,
+        require_owner_identity: bool,
     ) -> Result<(), HlsRangeError>
     where
         F: Fn() -> crate::hls_cache::HlsCacheFillControl + Send + Sync,
@@ -666,18 +775,15 @@ impl HlsRangeCache {
         {
             return Err(HlsRangeError::SessionRemoving);
         }
-        let promoted = state
-            .flights
-            .get(key)
-            .is_some_and(|flight| flight.foreground_interest > 0);
-        let preparation_interest = state
-            .flights
-            .get(key)
-            .is_some_and(|flight| flight.preparation_interest > 0);
-        let promoted_preparation_permit = state
-            .flights
-            .get(key)
-            .is_some_and(|flight| flight.promoted_preparation_permit);
+        let flight = state.flights.get(key).filter(|flight| {
+            !require_owner_identity
+                || owner_completion
+                    .is_some_and(|completion| flight.completion.same_channel(completion))
+        });
+        let promoted = flight.is_some_and(|flight| flight.foreground_interest > 0);
+        let preparation_interest = flight.is_some_and(|flight| flight.preparation_interest > 0);
+        let promoted_preparation_permit =
+            flight.is_some_and(|flight| flight.promoted_preparation_permit);
         if priority == HlsRangePriority::Background {
             let foreground_active = state.active_foreground > 0;
             let foreground_waiting = state.waiting_foreground > 0;
@@ -871,9 +977,23 @@ impl HlsRangeCache {
         }
     }
 
-    pub(crate) fn release_foreground_interest(&self, key: &RangeChunkKey) {
-        if let Some(flight) = self.lock_state().flights.get_mut(key) {
-            flight.foreground_interest = flight.foreground_interest.saturating_sub(1);
+    pub(crate) fn release_foreground_interest(
+        &self,
+        key: &RangeChunkKey,
+        completion: &watch::Sender<bool>,
+    ) {
+        let mut state = self.lock_state();
+        let released = state
+            .flights
+            .get_mut(key)
+            .filter(|flight| flight.completion.same_channel(completion))
+            .is_some_and(|flight| {
+                flight.foreground_interest = flight.foreground_interest.saturating_sub(1);
+                true
+            });
+        drop(state);
+        if released {
+            self.signal_change();
         }
     }
 
@@ -1091,7 +1211,8 @@ impl Drop for RangeFlight {
         if self.owner {
             self.cache.finish_flight(&self.key, &self.completion);
         } else if self.foreground_interest {
-            self.cache.release_foreground_interest(&self.key);
+            self.cache
+                .release_foreground_interest(&self.key, &self.completion);
         }
         if self.preparation_interest {
             self.cache.release_preparation_interest(&self.key);
@@ -1314,8 +1435,14 @@ mod publication_state_tests {
 mod preparation_scheduler_tests {
     use super::{HlsRangeCache, HlsRangeError, HlsRangePriority, RangeChunkKey, RangeResourceKey};
     use crate::hls_cache::HlsCacheFillControl;
-    use std::{sync::Arc, time::Duration};
-    use tokio::sync::oneshot;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::{mpsc, oneshot};
 
     fn chunk_key(session_id: &str, resource_id: &str, start: u64) -> RangeChunkKey {
         RangeChunkKey {
@@ -1329,8 +1456,45 @@ mod preparation_scheduler_tests {
         }
     }
 
-    fn continue_control() -> impl Fn() -> HlsCacheFillControl + Send + Sync {
+    fn continue_control() -> impl Fn() -> HlsCacheFillControl + Send + Sync + 'static {
         || HlsCacheFillControl::Continue
+    }
+
+    fn cancel_control(
+        cancelled: Arc<AtomicBool>,
+    ) -> impl Fn() -> HlsCacheFillControl + Send + Sync + 'static {
+        move || {
+            if cancelled.load(Ordering::SeqCst) {
+                HlsCacheFillControl::Cancel
+            } else {
+                HlsCacheFillControl::Continue
+            }
+        }
+    }
+
+    fn spawn_preparation_waiter<F>(
+        cache: Arc<HlsRangeCache>,
+        key: RangeChunkKey,
+        id: usize,
+        control: F,
+        acquired: mpsc::UnboundedSender<usize>,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), HlsRangeError>>,
+    )
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync + 'static,
+    {
+        let (release_tx, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _permit = cache
+                .acquire_chunk_permit(&key, HlsRangePriority::PlaybackPreparation, &control)
+                .await?;
+            let _ = acquired.send(id);
+            let _ = release_rx.await;
+            Ok(())
+        });
+        (release_tx, task)
     }
 
     async fn wait_for_state(
@@ -1826,7 +1990,11 @@ mod preparation_scheduler_tests {
         drop(foreground_permit);
         assert!(
             cache
-                .try_acquire_preparation_chunk_permit(&promoted_key, false)
+                .try_acquire_preparation_chunk_permit_for_owner(
+                    &promoted_key,
+                    Some(&preparation_flight.completion),
+                    false,
+                )
                 .is_none(),
             "retracted promotion must not bypass the preparation cap"
         );
@@ -1922,5 +2090,599 @@ mod preparation_scheduler_tests {
             .expect("promoted transfer task should finish");
         wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
         drop(preparation_flight);
+    }
+
+    #[tokio::test]
+    async fn two_promoted_preparations_use_parallel_foreground_slots() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let holding_permit0 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "holding-foreground-0", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground should occupy a slot");
+        let holding_permit1 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "holding-foreground-1", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground should occupy a slot");
+
+        let key0 = chunk_key("session", "promoted-parallel-0", 0);
+        let key1 = chunk_key("session", "promoted-parallel-1", 512);
+        let preparation_flight0 = cache
+            .claim_chunk(key0.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("first preparation should own its flight");
+        let preparation_flight1 = cache
+            .claim_chunk(key1.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("second preparation should own its flight");
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let (release_tx0, task0) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key0.clone(),
+            0,
+            continue_control(),
+            acquired_tx.clone(),
+        );
+        let (release_tx1, task1) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key1.clone(),
+            1,
+            continue_control(),
+            acquired_tx,
+        );
+        wait_for_state(&cache, |state| state.waiting_preparation == 2).await;
+        let foreground_follower0 = cache
+            .claim_chunk(key0, HlsRangePriority::Foreground)
+            .expect("first foreground should promote its preparation flight");
+        let foreground_follower1 = cache
+            .claim_chunk(key1, HlsRangePriority::Foreground)
+            .expect("second foreground should promote its preparation flight");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 2 && state.waiting_preparation == 0
+        })
+        .await;
+
+        drop(holding_permit0);
+        let first = tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+            .await
+            .expect("one promoted preparation should acquire the released slot")
+            .expect("a promoted preparation should report acquisition");
+        assert!(first < 2);
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(1, state.waiting_foreground);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+
+        drop(holding_permit1);
+        let second = tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+            .await
+            .expect("the other promoted preparation should acquire the next slot")
+            .expect("the other promoted preparation should report acquisition");
+        assert_ne!(first, second);
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+
+        let mut release = [Some(release_tx0), Some(release_tx1)];
+        let _ = release[first]
+            .take()
+            .expect("first release sender")
+            .send(());
+        let _ = release[second]
+            .take()
+            .expect("second release sender")
+            .send(());
+        for task in [task0, task1] {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("promoted preparation should finish")
+                .expect("promoted preparation task should not panic")
+                .expect("promoted preparation should complete");
+        }
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(2, cache.chunk_permits.available_permits());
+        drop(foreground_follower0);
+        drop(foreground_follower1);
+        drop(preparation_flight0);
+        drop(preparation_flight1);
+    }
+
+    #[tokio::test]
+    async fn two_promoted_preparations_progress_sequentially_at_parallelism_one() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let holding_permit = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "single-slot-holder", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("foreground should occupy the only slot");
+        let key0 = chunk_key("session", "promoted-single-0", 0);
+        let key1 = chunk_key("session", "promoted-single-1", 512);
+        let preparation_flight0 = cache
+            .claim_chunk(key0.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("first preparation should own its flight");
+        let preparation_flight1 = cache
+            .claim_chunk(key1.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("second preparation should own its flight");
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let (release_tx0, task0) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key0.clone(),
+            0,
+            continue_control(),
+            acquired_tx.clone(),
+        );
+        let (release_tx1, task1) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key1.clone(),
+            1,
+            continue_control(),
+            acquired_tx,
+        );
+        wait_for_state(&cache, |state| state.waiting_preparation == 2).await;
+        let foreground_follower0 = cache
+            .claim_chunk(key0, HlsRangePriority::Foreground)
+            .expect("first foreground should promote its preparation flight");
+        let foreground_follower1 = cache
+            .claim_chunk(key1, HlsRangePriority::Foreground)
+            .expect("second foreground should promote its preparation flight");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 2 && state.waiting_preparation == 0
+        })
+        .await;
+
+        drop(holding_permit);
+        let first = tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+            .await
+            .expect("one promoted preparation should acquire the only slot")
+            .expect("a promoted preparation should report acquisition");
+        assert!(first < 2);
+        {
+            let state = cache.lock_state();
+            assert_eq!(1, state.active_chunk_permits);
+            assert_eq!(1, state.active_foreground_permits);
+            assert_eq!(1, state.waiting_foreground);
+        }
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut release = [Some(release_tx0), Some(release_tx1)];
+        let _ = release[first]
+            .take()
+            .expect("first release sender")
+            .send(());
+        let second = tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+            .await
+            .expect("the other promoted preparation should acquire after release")
+            .expect("the other promoted preparation should report acquisition");
+        assert_ne!(first, second);
+        {
+            let state = cache.lock_state();
+            assert_eq!(1, state.active_chunk_permits);
+            assert_eq!(1, state.active_foreground_permits);
+            assert_eq!(0, state.waiting_foreground);
+        }
+        let _ = release[second]
+            .take()
+            .expect("second release sender")
+            .send(());
+        for task in [task0, task1] {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("promoted preparation should finish")
+                .expect("promoted preparation task should not panic")
+                .expect("promoted preparation should complete");
+        }
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(1, cache.chunk_permits.available_permits());
+        drop(foreground_follower0);
+        drop(foreground_follower1);
+        drop(preparation_flight0);
+        drop(preparation_flight1);
+    }
+
+    #[tokio::test]
+    async fn queued_ordinary_foreground_stays_ahead_of_promoted_preparation() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let holding_permit0 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "fairness-holder-0", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground should occupy a slot");
+        let holding_permit1 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "fairness-holder-1", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground should occupy a slot");
+
+        let ordinary_cache = Arc::clone(&cache);
+        let (ordinary_acquired_tx, ordinary_acquired_rx) = oneshot::channel();
+        let (ordinary_release_tx, ordinary_release_rx) = oneshot::channel();
+        let ordinary = tokio::spawn(async move {
+            let _permit = ordinary_cache
+                .acquire_chunk_permit(
+                    &chunk_key("session", "ordinary-foreground", 0),
+                    HlsRangePriority::Foreground,
+                    &continue_control(),
+                )
+                .await
+                .expect("ordinary foreground should acquire its queued slot");
+            let _ = ordinary_acquired_tx.send(());
+            let _ = ordinary_release_rx.await;
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+
+        let promoted_key = chunk_key("session", "fairness-promoted", 512);
+        let preparation_flight = cache
+            .claim_chunk(promoted_key.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("preparation should own the promoted flight");
+        let (promoted_acquired_tx, mut promoted_acquired_rx) = mpsc::unbounded_channel();
+        let (promoted_release_tx, promoted_task) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            promoted_key.clone(),
+            0,
+            continue_control(),
+            promoted_acquired_tx,
+        );
+        let foreground_follower = cache
+            .claim_chunk(promoted_key, HlsRangePriority::Foreground)
+            .expect("foreground should promote the preparation flight");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 2 && state.waiting_preparation == 0
+        })
+        .await;
+
+        drop(holding_permit0);
+        tokio::time::timeout(Duration::from_secs(2), ordinary_acquired_rx)
+            .await
+            .expect("the earlier ordinary foreground should acquire first")
+            .expect("ordinary foreground should report acquisition");
+        assert!(matches!(
+            promoted_acquired_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(1, state.waiting_foreground);
+        }
+
+        let _ = ordinary_release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), promoted_acquired_rx.recv())
+            .await
+            .expect("promoted preparation should acquire after ordinary foreground")
+            .expect("promoted preparation should report acquisition");
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+
+        let _ = promoted_release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), promoted_task)
+            .await
+            .expect("promoted preparation should finish")
+            .expect("promoted preparation task should not panic")
+            .expect("promoted preparation should complete");
+        ordinary
+            .await
+            .expect("ordinary foreground task should not panic");
+        drop(holding_permit1);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        drop(foreground_follower);
+        drop(preparation_flight);
+    }
+
+    #[tokio::test]
+    async fn preparation_without_original_flight_keeps_discovery_admission() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let holding_permit0 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "discovery-holder-0", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground should occupy a slot");
+        let holding_permit1 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "discovery-holder-1", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground should occupy a slot");
+
+        let key = chunk_key("session", "discovery-with-later-flight", 0);
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let (release_tx, task) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key.clone(),
+            0,
+            continue_control(),
+            acquired_tx,
+        );
+        wait_for_state(&cache, |state| state.waiting_preparation == 1).await;
+
+        let later_flight = cache
+            .claim_chunk(key.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("later discovery should claim a new flight");
+        let foreground_follower = cache
+            .claim_chunk(key.clone(), HlsRangePriority::Foreground)
+            .expect("foreground should promote the later flight");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(1, state.waiting_preparation);
+            assert_eq!(0, state.waiting_foreground);
+            assert!(
+                !state
+                    .flights
+                    .get(&key)
+                    .expect("later flight should remain registered")
+                    .promoted_preparation_permit
+            );
+        }
+
+        drop(holding_permit0);
+        assert_eq!(
+            Some(0),
+            tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+                .await
+                .expect("no-flight discovery preparation should use spare capacity")
+        );
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(1, state.active_preparation_transfers);
+            assert_eq!(1, state.active_foreground_permits);
+            assert_eq!(0, state.waiting_preparation);
+            assert_eq!(0, state.waiting_foreground);
+            assert!(
+                !state
+                    .flights
+                    .get(&key)
+                    .expect("later flight should remain registered")
+                    .promoted_preparation_permit
+            );
+        }
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("discovery preparation should finish")
+            .expect("discovery preparation task should not panic")
+            .expect("discovery preparation should complete");
+        drop(holding_permit1);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(2, cache.chunk_permits.available_permits());
+        drop(foreground_follower);
+        drop(later_flight);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_promoted_waiter_does_not_strand_another() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let holding_permit0 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "cancel-holder-0", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground should occupy a slot");
+        let holding_permit1 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "cancel-holder-1", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground should occupy a slot");
+
+        let key0 = chunk_key("session", "cancel-promoted-0", 0);
+        let key1 = chunk_key("session", "cancel-promoted-1", 512);
+        let preparation_flight0 = cache
+            .claim_chunk(key0.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("first preparation should own its flight");
+        let preparation_flight1 = cache
+            .claim_chunk(key1.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("second preparation should own its flight");
+        let cancelled0 = Arc::new(AtomicBool::new(false));
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let (_release_tx0, task0) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key0.clone(),
+            0,
+            cancel_control(Arc::clone(&cancelled0)),
+            acquired_tx.clone(),
+        );
+        let (release_tx1, task1) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key1.clone(),
+            1,
+            continue_control(),
+            acquired_tx,
+        );
+        wait_for_state(&cache, |state| state.waiting_preparation == 2).await;
+        let foreground_follower0 = cache
+            .claim_chunk(key0, HlsRangePriority::Foreground)
+            .expect("first foreground should promote its preparation flight");
+        let foreground_follower1 = cache
+            .claim_chunk(key1, HlsRangePriority::Foreground)
+            .expect("second foreground should promote its preparation flight");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 2 && state.waiting_preparation == 0
+        })
+        .await;
+
+        cancelled0.store(true, Ordering::SeqCst);
+        let cancelled_result = tokio::time::timeout(Duration::from_secs(2), task0)
+            .await
+            .expect("cancelled promoted owner should stop waiting")
+            .expect("cancelled promoted owner should not panic");
+        assert!(matches!(cancelled_result, Err(HlsRangeError::Cancelled)));
+        drop(foreground_follower0);
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_preparation);
+        }
+
+        drop(holding_permit0);
+        assert_eq!(
+            Some(1),
+            tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+                .await
+                .expect("remaining promoted owner should acquire the released slot")
+        );
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+        let _ = release_tx1.send(());
+        tokio::time::timeout(Duration::from_secs(2), task1)
+            .await
+            .expect("remaining promoted owner should finish")
+            .expect("remaining promoted owner should not panic")
+            .expect("remaining promoted owner should complete");
+        drop(holding_permit1);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        {
+            let state = cache.lock_state();
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(0, state.waiting_preparation);
+            assert_eq!(0, state.active_foreground_permits);
+        }
+        assert_eq!(2, cache.chunk_permits.available_permits());
+        drop(foreground_follower1);
+        drop(preparation_flight0);
+        drop(preparation_flight1);
+    }
+
+    #[tokio::test]
+    async fn retracting_one_promoted_waiter_does_not_strand_another() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let holding_permit0 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "retract-holder-0", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground should occupy a slot");
+        let holding_permit1 = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "retract-holder-1", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground should occupy a slot");
+
+        let key0 = chunk_key("session", "retract-promoted-0", 0);
+        let key1 = chunk_key("session", "retract-promoted-1", 512);
+        let preparation_flight0 = cache
+            .claim_chunk(key0.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("first preparation should own its flight");
+        let preparation_flight1 = cache
+            .claim_chunk(key1.clone(), HlsRangePriority::PlaybackPreparation)
+            .expect("second preparation should own its flight");
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let (_release_tx0, task0) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key0.clone(),
+            0,
+            continue_control(),
+            acquired_tx.clone(),
+        );
+        let (release_tx1, task1) = spawn_preparation_waiter(
+            Arc::clone(&cache),
+            key1.clone(),
+            1,
+            continue_control(),
+            acquired_tx,
+        );
+        wait_for_state(&cache, |state| state.waiting_preparation == 2).await;
+        let foreground_follower0 = cache
+            .claim_chunk(key0, HlsRangePriority::Foreground)
+            .expect("first foreground should promote its preparation flight");
+        let foreground_follower1 = cache
+            .claim_chunk(key1, HlsRangePriority::Foreground)
+            .expect("second foreground should promote its preparation flight");
+        wait_for_state(&cache, |state| {
+            state.waiting_foreground == 2 && state.waiting_preparation == 0
+        })
+        .await;
+
+        drop(foreground_follower0);
+        let retracted_result = tokio::time::timeout(Duration::from_secs(2), task0)
+            .await
+            .expect("retracted promoted owner should stop waiting")
+            .expect("retracted promoted owner should not panic");
+        assert!(matches!(retracted_result, Err(HlsRangeError::Preempted)));
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_preparation);
+        }
+
+        drop(holding_permit0);
+        assert_eq!(
+            Some(1),
+            tokio::time::timeout(Duration::from_secs(2), acquired_rx.recv())
+                .await
+                .expect("remaining promoted owner should acquire the released slot")
+        );
+        {
+            let state = cache.lock_state();
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+        let _ = release_tx1.send(());
+        tokio::time::timeout(Duration::from_secs(2), task1)
+            .await
+            .expect("remaining promoted owner should finish")
+            .expect("remaining promoted owner should not panic")
+            .expect("remaining promoted owner should complete");
+        drop(holding_permit1);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        {
+            let state = cache.lock_state();
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(0, state.waiting_preparation);
+            assert_eq!(0, state.active_foreground_permits);
+        }
+        assert_eq!(2, cache.chunk_permits.available_permits());
+        drop(foreground_follower1);
+        drop(preparation_flight0);
+        drop(preparation_flight1);
     }
 }

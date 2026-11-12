@@ -31,10 +31,11 @@ superseded_by:
 - The internal `prepare_playback_batch` entrypoint accepts a single session and borrowed resource/range requests under one deadline and shared logical/expanded-span/attempt budgets. Deadline, limit and ordinary range failures are distinct; no public control-plane contract changes.
 - Preparation uses existing startup validation and fine-grained range fetching, not an unbounded Full GET. Non-FIFO admission tracks foreground waiting, preparation transfers and shared-flight interest with cancellation-safe guards. Foreground admission still checks control/session state before its free-permit fast path.
 - Unknown-size range discovery uses the same preparation admission and range-attempt budget as later data transfers; acquiring response headers alone does not release the permit.
+- Multiple foreground-promoted preparation owners use ordered foreground semaphore admission rather than mutually excluding polling counters; withdrawing promotion must also cancel its queued admission and restore waiter accounting.
 - Deterministic scheduling and loopback HTTP regression cases cover the internal path. Exact-head execution evidence belongs to the delivery PR and is not implied by the presence of test code. No automatic production preparation controller is enabled by this slice.
 
 ## Next Steps
-1. Integrate the bounded caller into #98 without rewriting either PR's history, retain its failed comparison evidence, and run a fresh paired long comparison.
+1. Integrate the bounded caller into #98 without rewriting either PR's history, retain its failed comparison evidence, and run a fresh paired long comparison. Preserve real attempted-span and completed-coverage evidence rather than inferring transfers from the logical requested ranges.
 2. Evaluate fresh paired decoded-frame evidence before designing automatic preparation/retention or changing media-delivery policy.
 
 ## Evidence
