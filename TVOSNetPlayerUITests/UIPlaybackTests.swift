@@ -416,9 +416,76 @@ final class UIPlaybackTests: XCTestCase {
             XCTFail("The cached task summary was not restored after relaunch. " + accessibilityDescription(taskStatus))
             return
         }
-        guard moveFocus(until: selectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline) else {
+
+        let addressField = app.textFields["cache-server-address"]
+        guard moveFocus(until: addressField, direction: .up, limit: 50, deadline: restoredResultsDeadline) else {
             XCTFail(
-                "Remote navigation could not materialize and focus the exact selected result without activating it. "
+                "Remote focus could not recover the cache-server address landmark before restoring the result view. "
+                    + taskWatchFocusDescription(target: addressField)
+            )
+            return
+        }
+
+        let continueButton = app.buttons["bilibili-resumption-continue"]
+        let retryRestoreButton = app.buttons["bilibili-resumption-retry"]
+        let forgetButton = app.buttons["bilibili-resumption-forget"]
+        guard
+            focusContinueFromResumptionRow(
+                continueButton: continueButton,
+                retryRestoreButton: retryRestoreButton,
+                forgetButton: forgetButton,
+                limit: 100
+            )
+        else {
+            XCTFail(
+                "Remote focus could not descend from the address landmark to enabled Continue. "
+                    + taskWatchFocusDescription(target: continueButton)
+            )
+            return
+        }
+        guard
+            moveFocus(until: forgetButton, direction: .right, limit: 8, deadline: restoredResultsDeadline),
+            waitUntil(
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
+                condition: {
+                    forgetButton.exists && forgetButton.hasFocus && forgetButton.isHittable && forgetButton.isEnabled
+                }
+            )
+        else {
+            XCTFail(
+                "Remote focus could not align with Forget without activating the resumption row. "
+                    + taskWatchFocusDescription(target: forgetButton)
+            )
+            return
+        }
+        guard
+            moveFocus(until: decoyPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline),
+            waitUntil(
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
+                condition: {
+                    decoyPlay.exists && decoyPlay.hasFocus && decoyPlay.isHittable && decoyPlay.isEnabled
+                }
+            )
+        else {
+            XCTFail(
+                "Remote focus could not enter the visible result Play column at the decoy without activating it. "
+                    + taskWatchFocusDescription(target: decoyPlay)
+                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
+                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
+            )
+            return
+        }
+        guard
+            moveFocus(until: selectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline),
+            waitUntil(
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
+                condition: {
+                    selectedPlay.exists && selectedPlay.hasFocus && selectedPlay.isHittable && selectedPlay.isEnabled
+                }
+            )
+        else {
+            XCTFail(
+                "Remote navigation could not focus the exact selected result after the decoy without activating it. "
                     + taskWatchFocusDescription(target: selectedPlay)
                     + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
                     + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
@@ -451,14 +518,10 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
         XCTAssertNotEqual(playbackState.value as? String, "playing")
 
-        let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(
             moveFocus(until: addressField, direction: .up, limit: 50),
             "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
         )
-        let continueButton = app.buttons["bilibili-resumption-continue"]
-        let retryRestoreButton = app.buttons["bilibili-resumption-retry"]
-        let forgetButton = app.buttons["bilibili-resumption-forget"]
         guard
             focusContinueFromResumptionRow(
                 continueButton: continueButton,
@@ -583,17 +646,29 @@ final class UIPlaybackTests: XCTestCase {
         let remote = XCUIRemote.shared
         remote.press(.select)
         let keyboard = app.keyboards.firstMatch
-        guard waitUntil(timeout: 5, condition: { keyboard.exists }) else {
+        guard waitUntil(timeout: 5, condition: { field.hasFocus && keyboard.exists }) else {
             throw SourceInputError(
                 description: "Bilibili editing keyboard did not appear after selecting the source field. "
                     + sourceInputDescription(field, expected: source)
             )
         }
-        field.typeText(source)
-        let valueWhileEditing = field.value as? String
-        if valueWhileEditing == source {
-            try requireSourceValue(source, in: field, phase: "while editing, before keyboard dismissal")
+
+        var expectedPrefix = ""
+        for character in source {
+            expectedPrefix.append(character)
+            field.typeText(String(character))
+            guard waitUntil(timeout: 2, condition: { field.value as? String == expectedPrefix }) else {
+                throw SourceInputError(
+                    description: "Bilibili source input stopped before accepting the next character. "
+                        + sourceInputDescription(
+                            field, expected: source, valueWhileEditing: field.value as? String
+                        )
+                )
+            }
         }
+
+        let valueWhileEditing = field.value as? String
+        try requireSourceValue(source, in: field, phase: "while editing, before keyboard dismissal")
 
         remote.press(.menu)
         guard waitUntil(timeout: 10, condition: { !keyboard.exists }) else {

@@ -73,6 +73,11 @@ superseded_by:
   responses, owner invalidation, serial updates and old cleanup races without
   player transport mutations. Actual generated transport exercises cleanup
   after caller cancellation, while non-cooperative cleanup remains bounded.
+- tvOS UI automation confirms each source character before dismissing the
+  native keyboard. Restored-result navigation uses visible remote-control
+  landmarks and the result-button column rather than assuming the initial
+  focus or scrolling direction. The original restoration deadline, exact
+  selected result, decoy, no-resubmission and explicit-Continue assertions remain.
 - Complete formatter/linter checks, local CI, the unchanged fixed-signed native
   three-case gate with verified mute, current-head GitHub CI/UI/native artifacts,
   GitHub Codex review and resolved conversations remain required. These checks
@@ -106,6 +111,10 @@ superseded_by:
   timing/ownership failures without player transport actions. This foundation
   enables no automatic reporter, reader binding or scheduler consumer. The
   remaining ordering and upstream admission work follows in separate slices.
+- The tvOS five-case UI fixture covers the unchanged playback, recovery and
+  explicit-resumption contracts with synchronized native input and bounded
+  remote navigation. It does not inject app state or activate a result while
+  checking that restoration has not automatically started playback.
 
 ## Evidence
 - [Playback context foundation PR #100](https://github.com/Joey-Project/tvOS-net-player/pull/100).
