@@ -23,13 +23,14 @@ superseded_by:
 
 ## Validation
 - Prove preparation progresses with sustained unrelated foreground activity when capacity is spare, and prove current foreground admission retains capacity under preparation pressure.
-- Cover concurrent preparation admission, exact-flight promotion, parallelism one, cancellation/drop, background preemption/recovery, removal/drain and preserved content/quota failures with deterministic unit and real loopback-HTTP tests.
+- Cover concurrent preparation admission, exact-flight promotion in both permit admission and control checks, promotion retraction, parallelism one, cancellation/drop, background preemption/recovery, removal/drain and preserved content/quota failures with deterministic unit and real loopback-HTTP tests. Unknown-size discovery must retain its preparation permit through response-body consumption and release it before nested startup/chunk work.
 - Run complete repository checks and the unchanged three-case native media gate with fixed signed executables and verified system mute. Keep current-head GitHub CI/UI/native artifacts, Codex review and all conversation resolution as separate delivery gates.
 - This foundation does not prove faster decoded upshift or visible/audible continuity. Re-run a fresh bounded OFF/ON comparison only after integrating the prerequisite into #98; do not reuse old-head positive evidence or relax the existing long high-low-high case.
 
 ## Current State
 - The internal `prepare_playback_batch` entrypoint accepts a single session and borrowed resource/range requests under one deadline and shared logical/expanded-span/attempt budgets. Deadline, limit and ordinary range failures are distinct; no public control-plane contract changes.
 - Preparation uses existing startup validation and fine-grained range fetching, not an unbounded Full GET. Non-FIFO admission tracks foreground waiting, preparation transfers and shared-flight interest with cancellation-safe guards. Foreground admission still checks control/session state before its free-permit fast path.
+- Unknown-size range discovery uses the same preparation admission and range-attempt budget as later data transfers; acquiring response headers alone does not release the permit.
 - Deterministic scheduling and loopback HTTP regression cases cover the internal path. Exact-head execution evidence belongs to the delivery PR and is not implied by the presence of test code. No automatic production preparation controller is enabled by this slice.
 
 ## Next Steps

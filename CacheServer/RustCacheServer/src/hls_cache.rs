@@ -5751,6 +5751,15 @@ impl HlsCacheStore {
         {
             self.range_cache
                 .check_priority_control(&control_key, priority, control)?;
+            let _permit = if priority == HlsRangePriority::PlaybackPreparation {
+                Some(
+                    self.range_cache
+                        .acquire_chunk_permit(&control_key, priority, control)
+                        .await?,
+                )
+            } else {
+                None
+            };
             let response = match self
                 .send_range_request(
                     client,
@@ -12552,6 +12561,13 @@ mod tests {
         body: Vec<u8>,
     }
 
+    struct DiscoveryGate {
+        started: Notify,
+        release: Notify,
+        body: Arc<Vec<u8>>,
+        request_count: AtomicUsize,
+    }
+
     #[derive(Clone)]
     struct RangeEtagFixture {
         body: Arc<Vec<u8>>,
@@ -12764,6 +12780,71 @@ mod tests {
                 Ok::<_, std::convert::Infallible>(body)
             })))
             .expect("held full-resource response should build")
+    }
+
+    async fn upstream_range_with_held_discovery(
+        State(gate): State<Arc<DiscoveryGate>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let Some((start, end)) = headers
+            .get(reqwest::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+            })
+        else {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        if start > end || end >= gate.body.len() {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("unsatisfiable response should build");
+        }
+        let request_index = gate.request_count.fetch_add(1, Ordering::SeqCst);
+        let body = gate.body[start..=end].to_vec();
+        let body_len = body.len();
+        let response_body = if request_index == 0 {
+            gate.started.notify_one();
+            let release = Arc::clone(&gate);
+            Body::from_stream(futures_util::stream::once(async move {
+                release.release.notified().await;
+                Ok::<_, std::convert::Infallible>(body)
+            }))
+        } else {
+            Body::from(body.clone())
+        };
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_LENGTH, body_len.to_string())
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", gate.body.len()),
+            )
+            .header(reqwest::header::ETAG, "\"discovery-v1\"")
+            .body(response_body)
+            .expect("held discovery range response should build")
+    }
+
+    async fn start_held_discovery_upstream(
+        body: Arc<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<DiscoveryGate>) {
+        let gate = Arc::new(DiscoveryGate {
+            started: Notify::new(),
+            release: Notify::new(),
+            body,
+            request_count: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/video.m4s", get(upstream_range_with_held_discovery))
+            .with_state(Arc::clone(&gate));
+        let (url, server) = start_hls_cache_upstream(app).await;
+        (url, server, gate)
     }
 
     #[cfg(unix)]
@@ -19076,6 +19157,221 @@ done
         assert!(requests.load(Ordering::Relaxed) >= 2);
         assert_eq!(1, store.range_activity_counts().0);
         drop(foreground_activity);
+        assert_eq!((0, 0), store.range_activity_counts());
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn size_less_preparation_discovery_waits_for_foreground_capacity() {
+        let body = Arc::new(vec![0x4b; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, requests) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"prep-capacity-v1\"",
+            "\"prep-capacity-v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(1);
+        let session = sample_session("preparation-discovery-capacity", &url);
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("resource key should be valid");
+        let foreground_permit = store
+            .range_cache
+            .acquire_chunk_permit(
+                &RangeChunkKey {
+                    resource: key,
+                    total_length: 1,
+                    range: 0..1,
+                },
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("foreground should acquire the only transfer slot");
+        let preparation_store = store.clone();
+        let preparation = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &session.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            preparation_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &session.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect_err("discovery must not reach upstream while foreground owns capacity");
+        assert_eq!(0, requests.load(Ordering::SeqCst));
+
+        drop(foreground_permit);
+        tokio::time::timeout(Duration::from_secs(5), preparation)
+            .await
+            .expect("preparation should proceed after foreground releases capacity")
+            .expect("preparation task should join")
+            .expect("size-less preparation should discover and fill ranges");
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn size_less_batches_serialize_discovery_through_response_body() {
+        let body = Arc::new(vec![0x6c; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, gate) = start_held_discovery_upstream(body).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(2);
+        let first = sample_session("preparation-discovery-first", &url);
+        let second = sample_session("preparation-discovery-second", &url);
+        let first_store = store.clone();
+        let first_task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &first.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            first_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &first.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("first discovery body should be held by the loopback server");
+
+        let second_store = store.clone();
+        let second_task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &second.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            second_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &second.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.range_activity_counts().0 < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second batch should enter preparation while first discovery body is held");
+        tokio::time::timeout(Duration::from_millis(150), async {
+            while gate.request_count.load(Ordering::SeqCst) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect_err("second discovery must wait while first response body is outstanding");
+        assert_eq!(1, gate.request_count.load(Ordering::SeqCst));
+
+        gate.release.notify_one();
+        for task in [first_task, second_task] {
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("size-less batch should finish after discovery admission is released")
+                .expect("preparation task should join")
+                .expect("size-less batch should prepare successfully");
+        }
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_size_less_discovery_releases_activity_and_transfer_capacity() {
+        let body = Arc::new(vec![0x7d; (2 * RANGE_STARTUP_CHUNK_BYTES) as usize]);
+        let (url, upstream, gate) = start_held_discovery_upstream(body).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_parallelism(1);
+        let session = sample_session("preparation-discovery-drop", &url);
+        let task_store = store.clone();
+        let session_id = session.id.clone();
+        let task = tokio::spawn(async move {
+            let requests = [PlaybackPreparationRequest {
+                resource: &session.variant.video,
+                requested: 0..32 * 1024,
+            }];
+            task_store
+                .prepare_playback_batch(
+                    &reqwest::Client::new(),
+                    PlaybackPreparationBatch {
+                        session_id: &session.id,
+                        requests: &requests,
+                    },
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("discovery response body should be stalled");
+        assert_eq!(2, store.range_activity_counts().0);
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.range_activity_counts().0 != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the batch should release preparation activity");
+
+        let foreground_key = store
+            .range_resource_key(
+                &session_id,
+                &sample_session(&session_id, &url).variant.video,
+            )
+            .expect("resource key should be valid");
+        let foreground_permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.range_cache.acquire_chunk_permit(
+                &RangeChunkKey {
+                    resource: foreground_key,
+                    total_length: 1,
+                    range: 0..1,
+                },
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            ),
+        )
+        .await
+        .expect("foreground should regain the released transfer slot")
+        .expect("foreground permit should be available");
+        drop(foreground_permit);
+        let removal = store
+            .try_begin_session_removal(&session_id)
+            .expect("removal admission should succeed")
+            .expect("dropped batch should no longer block session removal");
+        drop(removal);
+        tokio::time::timeout(Duration::from_secs(2), store.drain_range_writers())
+            .await
+            .expect("range drain should finish after dropped discovery");
         assert_eq!((0, 0), store.range_activity_counts());
         upstream.abort();
     }
