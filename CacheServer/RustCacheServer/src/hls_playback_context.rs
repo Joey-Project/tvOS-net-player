@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use uuid::Uuid;
+use uuid::{Uuid, Variant, Version};
 
 const CONTEXT_VALIDITY: Duration = Duration::from_secs(5);
 const MAX_CONTEXTS: usize = 256;
@@ -44,6 +44,7 @@ pub(crate) struct PlaybackContextTicket {
     pub(crate) session_generation: u64,
     pub(crate) next_sequence: u64,
     pub(crate) validity_millis: u64,
+    pub(crate) http_reader_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +77,7 @@ pub(crate) struct HlsPlaybackContextStore {
 struct PlaybackContext {
     session_id: String,
     session_generation: u64,
+    http_reader_id: String,
     challenge: String,
     next_sequence: u64,
     challenge_deadline: Instant,
@@ -94,7 +96,16 @@ impl HlsPlaybackContextStore {
         session_id: String,
         session_generation: u64,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.open_with_clock(session_id, session_generation, Instant::now)
+        self.open_with_reader_id(session_id, session_generation, String::new())
+    }
+
+    pub(crate) fn open_with_reader_id(
+        &self,
+        session_id: String,
+        session_generation: u64,
+        http_reader_id: String,
+    ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
+        self.open_with_clock(session_id, session_generation, http_reader_id, Instant::now)
     }
 
     #[cfg(test)]
@@ -104,15 +115,30 @@ impl HlsPlaybackContextStore {
         session_generation: u64,
         now: Instant,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.open_with_clock(session_id, session_generation, || now)
+        self.open_with_clock(session_id, session_generation, String::new(), || now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_reader_id_at(
+        &self,
+        session_id: String,
+        session_generation: u64,
+        http_reader_id: String,
+        now: Instant,
+    ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
+        self.open_with_clock(session_id, session_generation, http_reader_id, || now)
     }
 
     fn open_with_clock(
         &self,
         session_id: String,
         session_generation: u64,
+        http_reader_id: String,
         clock: impl FnOnce() -> Instant,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
+        if !http_reader_id.is_empty() && !is_canonical_uuid_v4(&http_reader_id) {
+            return Err(PlaybackContextStoreError::InvalidIdentifier);
+        }
         if session_generation == 0 {
             return Err(PlaybackContextStoreError::InvalidBinding);
         }
@@ -139,6 +165,7 @@ impl HlsPlaybackContextStore {
         let context = PlaybackContext {
             session_id,
             session_generation,
+            http_reader_id,
             challenge: new_challenge(None),
             next_sequence: 1,
             challenge_deadline: deadline,
@@ -289,9 +316,25 @@ impl HlsPlaybackContextStore {
         self.sole_live_snapshot_with_clock(Instant::now)
     }
 
+    pub(crate) fn sole_live_snapshot_for_reader(
+        &self,
+        http_reader_id: &str,
+    ) -> Option<PlaybackContextSnapshot> {
+        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, Instant::now)
+    }
+
     #[cfg(test)]
     pub(crate) fn sole_live_snapshot_at(&self, now: Instant) -> Option<PlaybackContextSnapshot> {
         self.sole_live_snapshot_with_clock(|| now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sole_live_snapshot_for_reader_at(
+        &self,
+        http_reader_id: &str,
+        now: Instant,
+    ) -> Option<PlaybackContextSnapshot> {
+        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, || now)
     }
 
     fn sole_live_snapshot_with_clock(
@@ -319,10 +362,52 @@ impl HlsPlaybackContextStore {
             sample: sample.value,
         })
     }
+
+    fn sole_live_snapshot_for_reader_with_clock(
+        &self,
+        http_reader_id: &str,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<PlaybackContextSnapshot> {
+        if !is_canonical_uuid_v4(http_reader_id) {
+            return None;
+        }
+        let mut contexts = self
+            .contexts
+            .lock()
+            .expect("HLS playback context store lock poisoned");
+        let now = clock();
+        prune_expired(&mut contexts, now);
+        let mut matching = contexts
+            .iter()
+            .filter(|(_, context)| context.http_reader_id == http_reader_id);
+        let (context_id, context) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let sample = context.sample.as_ref()?;
+        if sample.expires_at <= now {
+            return None;
+        }
+        Some(PlaybackContextSnapshot {
+            context_id: context_id.clone(),
+            session_id: context.session_id.clone(),
+            session_generation: context.session_generation,
+            sample: sample.value,
+        })
+    }
 }
 
 pub(crate) fn is_uuid_syntax(value: &str) -> bool {
     Uuid::parse_str(value).is_ok()
+}
+
+pub(crate) fn is_canonical_uuid_v4(value: &str) -> bool {
+    let Ok(uuid) = Uuid::parse_str(value) else {
+        return false;
+    };
+    uuid.to_string() == value
+        && uuid.get_version() == Some(Version::Random)
+        && uuid.get_variant() == Variant::RFC4122
 }
 
 fn ticket(context_id: &str, context: &PlaybackContext) -> PlaybackContextTicket {
@@ -333,6 +418,7 @@ fn ticket(context_id: &str, context: &PlaybackContext) -> PlaybackContextTicket 
         session_generation: context.session_generation,
         next_sequence: context.next_sequence,
         validity_millis: CONTEXT_VALIDITY.as_millis() as u64,
+        http_reader_id: context.http_reader_id.clone(),
     }
 }
 
@@ -675,6 +761,97 @@ mod tests {
         assert!(
             store
                 .binding_for_update_at(&second.context_id, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reader_ids_must_be_canonical_lowercase_rfc4122_v4() {
+        let valid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert!(is_canonical_uuid_v4(valid));
+        for invalid in [
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-3aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-0aaa-aaaaaaaaaaaa",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa",
+            "{aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa}",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(!is_canonical_uuid_v4(invalid), "accepted {invalid}");
+        }
+        assert_eq!(
+            Err(PlaybackContextStoreError::InvalidIdentifier),
+            HlsPlaybackContextStore::default().open_with_reader_id_at(
+                "session-a".to_owned(),
+                1,
+                "aaaaaaaa-aaaa-3aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+                Instant::now(),
+            )
+        );
+    }
+
+    #[test]
+    fn reader_snapshots_are_independent_and_duplicate_live_contexts_are_ambiguous() {
+        let store = HlsPlaybackContextStore::default();
+        let now = Instant::now();
+        let reader_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let reader_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let first = store
+            .open_with_reader_id_at("session-a".to_owned(), 2, reader_a.to_owned(), now)
+            .expect("reader A context should open");
+        let second = store
+            .open_with_reader_id_at("session-b".to_owned(), 7, reader_b.to_owned(), now)
+            .expect("reader B context should open");
+        assert_eq!(reader_a, first.http_reader_id);
+        assert_eq!(reader_b, second.http_reader_id);
+        store
+            .update_at(&first.context_id, &first.challenge, 1, sample(1.0), now)
+            .expect("reader A sample should be accepted");
+        store
+            .update_at(&second.context_id, &second.challenge, 1, sample(4.0), now)
+            .expect("reader B sample should be accepted");
+        assert_eq!(
+            Some(sample(1.0)),
+            store
+                .sole_live_snapshot_for_reader_at(reader_a, now)
+                .map(|snapshot| snapshot.sample)
+        );
+        assert_eq!(
+            Some(sample(4.0)),
+            store
+                .sole_live_snapshot_for_reader_at(reader_b, now)
+                .map(|snapshot| snapshot.sample)
+        );
+
+        let duplicate = store
+            .open_with_reader_id_at("session-c".to_owned(), 1, reader_a.to_owned(), now)
+            .expect("second live reader A context should open");
+        assert!(
+            store
+                .sole_live_snapshot_for_reader_at(reader_a, now)
+                .is_none()
+        );
+        store.close(&duplicate.context_id);
+        assert_eq!(
+            Some(sample(1.0)),
+            store
+                .sole_live_snapshot_for_reader_at(reader_a, now)
+                .map(|snapshot| snapshot.sample)
+        );
+        store.remove_session("session-a");
+        assert!(
+            store
+                .sole_live_snapshot_for_reader_at(reader_a, now)
+                .is_none()
+        );
+        assert!(
+            store
+                .sole_live_snapshot_for_reader_at(reader_b, now)
+                .is_some()
+        );
+        assert!(
+            store
+                .sole_live_snapshot_for_reader_at(reader_b, now + CONTEXT_VALIDITY)
                 .is_none()
         );
     }

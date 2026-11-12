@@ -29,6 +29,7 @@ final class HLSPlaybackContextTransportIntegrationTests: XCTestCase {
             XCTAssertEqual(opened.contextID, self.contextID)
             XCTAssertEqual(opened.challenge, self.challenge1)
             XCTAssertEqual(opened.nextSequence, 1)
+            XCTAssertNil(opened.httpReaderID)
             XCTAssertTrue(opened.sessionID.utf8.elementsEqual(sessionID.utf8))
 
             let updateRequest = HLSPlaybackContextUpdateRequest(
@@ -47,6 +48,7 @@ final class HLSPlaybackContextTransportIntegrationTests: XCTestCase {
             XCTAssertEqual(updated.contextID, opened.contextID)
             XCTAssertEqual(updated.challenge, self.challenge2)
             XCTAssertEqual(updated.nextSequence, 2)
+            XCTAssertNil(updated.httpReaderID)
 
             let closed = try await client.closeHLSPlaybackContext(
                 HLSPlaybackContextCloseRequest(contextID: opened.contextID)
@@ -65,6 +67,111 @@ final class HLSPlaybackContextTransportIntegrationTests: XCTestCase {
             XCTAssertEqual(snapshot.updateRequests[0].sample.continuousBufferedEndSeconds, 17.5)
             XCTAssertEqual(snapshot.updateRequests[0].sample.playbackRate, 1.25)
             XCTAssertEqual(snapshot.closeRequests.map(\.contextID), [opened.contextID])
+        }
+    }
+
+    func testProductionClientTransportsBoundOpenAndValidatesSuccessorEcho() async throws {
+        let readerID = "00000000-0000-4000-8000-0000000000a1"
+        let probe = HLSPlaybackContextRPCProbe()
+
+        try await withLoopbackServer(probe: probe) { endpoint in
+            let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            let openRequest = HLSPlaybackContextOpenRequest(
+                sessionID: "loopback-session",
+                expectedSessionGeneration: 23,
+                httpReaderID: readerID
+            )
+            let opened = try await client.openHLSPlaybackContext(openRequest)
+            XCTAssertEqual(opened.httpReaderID, readerID)
+
+            let updateRequest = HLSPlaybackContextUpdateRequest(
+                contextID: opened.contextID,
+                challenge: opened.challenge,
+                sessionID: "loopback-session",
+                expectedSessionGeneration: 23,
+                sequence: opened.nextSequence,
+                sample: HLSPlaybackContextTimingSample(
+                    playheadSeconds: 1,
+                    continuousBufferedEndSeconds: 2,
+                    playbackRate: 1
+                ),
+                expectedHTTPReaderID: opened.httpReaderID
+            )
+            let updated = try await client.updateHLSPlaybackContext(updateRequest)
+            XCTAssertEqual(updated.httpReaderID, readerID)
+
+            let snapshot = await probe.snapshot()
+            XCTAssertEqual(snapshot.openRequests.map(\.httpReaderID), [readerID])
+            XCTAssertEqual(snapshot.updateRequests.count, 1)
+            XCTAssertEqual(snapshot.closeRequests.count, 0)
+        }
+    }
+
+    func testProductionClientRejectsUnexpectedOrMismatchedOpenBinding() async throws {
+        for (scenario, request) in [
+            (
+                HLSPlaybackContextScenario.unexpectedOpenReader,
+                HLSPlaybackContextOpenRequest(sessionID: "loopback-session", expectedSessionGeneration: 23)
+            ),
+            (
+                HLSPlaybackContextScenario.mismatchedOpenReader,
+                HLSPlaybackContextOpenRequest(
+                    sessionID: "loopback-session",
+                    expectedSessionGeneration: 23,
+                    httpReaderID: "00000000-0000-4000-8000-0000000000a1"
+                )
+            ),
+        ] {
+            let probe = HLSPlaybackContextRPCProbe(scenario: scenario)
+            try await withLoopbackServer(probe: probe) { endpoint in
+                let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+                do {
+                    _ = try await client.openHLSPlaybackContext(request)
+                    XCTFail("Expected a non-exact reader binding echo to be rejected.")
+                } catch let error as HLSPlaybackContextValidationError {
+                    XCTAssertEqual(error, .invalidResponse)
+                }
+                let snapshot = await probe.snapshot()
+                XCTAssertEqual(snapshot.openRequests.count, 1)
+            }
+        }
+    }
+
+    func testProductionClientRejectsMismatchedSuccessorReaderBinding() async throws {
+        let probe = HLSPlaybackContextRPCProbe(scenario: .mismatchedUpdateReader)
+
+        try await withLoopbackServer(probe: probe) { endpoint in
+            let client = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            let readerID = "00000000-0000-4000-8000-0000000000a1"
+            let opened = try await client.openHLSPlaybackContext(
+                HLSPlaybackContextOpenRequest(
+                    sessionID: "loopback-session",
+                    expectedSessionGeneration: 23,
+                    httpReaderID: readerID
+                )
+            )
+            let update = HLSPlaybackContextUpdateRequest(
+                contextID: opened.contextID,
+                challenge: opened.challenge,
+                sessionID: "loopback-session",
+                expectedSessionGeneration: 23,
+                sequence: opened.nextSequence,
+                sample: HLSPlaybackContextTimingSample(
+                    playheadSeconds: 1,
+                    continuousBufferedEndSeconds: 2,
+                    playbackRate: 1
+                ),
+                expectedHTTPReaderID: opened.httpReaderID
+            )
+
+            do {
+                _ = try await client.updateHLSPlaybackContext(update)
+                XCTFail("Expected a mismatched successor reader binding to be rejected.")
+            } catch let error as HLSPlaybackContextValidationError {
+                XCTAssertEqual(error, .invalidResponse)
+            }
+            let snapshot = await probe.snapshot()
+            XCTAssertEqual(snapshot.updateRequests.count, 1)
         }
     }
 
@@ -239,6 +346,9 @@ private enum HLSPlaybackContextScenario: Sendable {
     case normal
     case malformedOpenTicket
     case unimplementedOpen
+    case unexpectedOpenReader
+    case mismatchedOpenReader
+    case mismatchedUpdateReader
     case heldOpen
     case heldUpdate
     case heldClose
@@ -255,6 +365,9 @@ private actor HLSPlaybackContextRPCProbe {
     private var openRequests: [TvosNetPlayer_V1_OpenHlsPlaybackContextRequest] = []
     private var updateRequests: [TvosNetPlayer_V1_UpdateHlsPlaybackContextRequest] = []
     private var closeRequests: [TvosNetPlayer_V1_CloseHlsPlaybackContextRequest] = []
+    private var httpReaderID: String?
+    private var sessionID: String?
+    private var sessionGeneration: UInt64?
     private var openWaiters: [CheckedContinuation<Void, Never>] = []
     private var openReleaseWaiters: [CheckedContinuation<Void, Never>] = []
     private var openReached = false
@@ -272,6 +385,9 @@ private actor HLSPlaybackContextRPCProbe {
         -> TvosNetPlayer_V1_HlsPlaybackContextTicket
     {
         openRequests.append(request)
+        httpReaderID = request.httpReaderID.isEmpty ? nil : request.httpReaderID
+        sessionID = request.sessionID
+        sessionGeneration = request.expectedSessionGeneration
         if case .heldOpen = scenario {
             openReached = true
             let waiters = openWaiters
@@ -285,12 +401,20 @@ private actor HLSPlaybackContextRPCProbe {
             throw RPCError(code: .unimplemented, message: "Private route detail.")
         }
 
+        var responseReaderID = request.httpReaderID.isEmpty ? nil : request.httpReaderID
+        if case .unexpectedOpenReader = scenario {
+            responseReaderID = "00000000-0000-4000-8000-0000000000a2"
+        }
+        if case .mismatchedOpenReader = scenario {
+            responseReaderID = "00000000-0000-4000-8000-0000000000a2"
+        }
         var response = ticket(
             contextID: "00000000-0000-4000-8000-000000000001",
             challenge: "00000000-0000-4000-8000-000000000002",
             sessionID: request.sessionID,
             generation: request.expectedSessionGeneration,
-            sequence: 1
+            sequence: 1,
+            httpReaderID: responseReaderID
         )
         if case .malformedOpenTicket = scenario {
             response.nextSequence = 0
@@ -305,12 +429,17 @@ private actor HLSPlaybackContextRPCProbe {
         if case .heldUpdate = scenario, updateRequests.count == 2, !updateReleased {
             await withCheckedContinuation { updateReleaseWaiters.append($0) }
         }
+        var responseReaderID = httpReaderID
+        if case .mismatchedUpdateReader = scenario {
+            responseReaderID = "00000000-0000-4000-8000-0000000000a2"
+        }
         return ticket(
             contextID: request.contextID,
             challenge: "00000000-0000-4000-8000-000000000003",
-            sessionID: "session-e\u{0301}",
-            generation: 23,
-            sequence: request.sequence + 1
+            sessionID: sessionID ?? "session-e\u{0301}",
+            generation: sessionGeneration ?? 23,
+            sequence: request.sequence + 1,
+            httpReaderID: responseReaderID
         )
     }
 
@@ -370,7 +499,8 @@ private actor HLSPlaybackContextRPCProbe {
         challenge: String,
         sessionID: String,
         generation: UInt64,
-        sequence: UInt64
+        sequence: UInt64,
+        httpReaderID: String? = nil
     ) -> TvosNetPlayer_V1_HlsPlaybackContextTicket {
         var response = TvosNetPlayer_V1_HlsPlaybackContextTicket()
         response.contextID = contextID
@@ -379,6 +509,7 @@ private actor HLSPlaybackContextRPCProbe {
         response.sessionGeneration = generation
         response.nextSequence = sequence
         response.validityMillis = 5_000
+        response.httpReaderID = httpReaderID ?? ""
         return response
     }
 }

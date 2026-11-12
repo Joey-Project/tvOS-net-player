@@ -137,7 +137,8 @@ public final class HLSPlaybackContextReportingService {
 
         let openRequest = HLSPlaybackContextOpenRequest(
             sessionID: owner.sessionID,
-            expectedSessionGeneration: owner.sessionGeneration
+            expectedSessionGeneration: owner.sessionGeneration,
+            httpReaderID: httpReaderID(for: owner)
         )
         try openRequest.validate()
         try requireCurrent(owner, revision: operation, operation: operation)
@@ -165,7 +166,8 @@ public final class HLSPlaybackContextReportingService {
                 sessionID: owner.sessionID,
                 expectedSessionGeneration: owner.sessionGeneration,
                 sequence: ticket.nextSequence,
-                sample: sample
+                sample: sample,
+                expectedHTTPReaderID: ticket.httpReaderID
             )
             try updateRequest.validate()
 
@@ -240,7 +242,8 @@ public final class HLSPlaybackContextReportingService {
                 sessionID: context.owner.sessionID,
                 expectedSessionGeneration: context.owner.sessionGeneration,
                 sequence: context.ticket.nextSequence,
-                sample: sample
+                sample: sample,
+                expectedHTTPReaderID: context.ticket.httpReaderID
             )
             try request.validate()
 
@@ -407,6 +410,11 @@ public final class HLSPlaybackContextReportingService {
     private func ownerMatchesServer(_ owner: HLSPlaybackContextOwner) -> Bool {
         owner.serverID.utf8.elementsEqual(serverSummary.id.utf8)
             && owner.sessionGeneration > 0
+    }
+
+    private func httpReaderID(for owner: HLSPlaybackContextOwner) -> String? {
+        guard serverSummary.supportsHLSPlaybackReaderBinding else { return nil }
+        return owner.ownerToken.uuidString.lowercased()
     }
 
     private func closeBestEffort(_ contextID: String) async {

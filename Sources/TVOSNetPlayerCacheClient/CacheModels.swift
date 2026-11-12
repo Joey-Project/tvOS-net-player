@@ -290,6 +290,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsHLSPlaybackContext: Bool {
         capabilities.contains(CacheServerCapability.hlsPlaybackContext)
     }
+
+    public var supportsHLSPlaybackReaderBinding: Bool {
+        capabilities.contains(CacheServerCapability.hlsPlaybackReaderBinding)
+    }
 }
 
 public struct ResolverRegion: RawRepresentable, CaseIterable, Equatable, Hashable, Identifiable, Sendable {
@@ -417,6 +421,7 @@ public enum CacheServerCapability {
     public static let hlsPlaybackReadiness = "hlsPlaybackReadiness"
     public static let hlsRenditionCatalog = "hlsRenditionCatalog"
     public static let hlsPlaybackContext = "hlsPlaybackContext"
+    public static let hlsPlaybackReaderBinding = "hlsPlaybackReaderBinding"
 }
 
 public enum BilibiliCredentialReadiness: String, Equatable, Sendable {

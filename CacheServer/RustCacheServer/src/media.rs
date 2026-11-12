@@ -13,7 +13,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
             IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
@@ -31,13 +31,14 @@ use crate::{
     AppState,
     cdn_history::{CdnObservation, CdnObservationOutcome, CdnObservationSource},
     hls::{
-        HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, mp4_initialization_length,
-        resource_has_upstream, should_forward_media_request_header,
+        HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, HlsPlaylistUriOptions, HlsVariant,
+        mp4_initialization_length, resource_has_upstream, should_forward_media_request_header,
     },
     hls_cache::{
         HlsCacheFillControl, HlsRangeEnsure, HlsStartupProbeEvidence, OpenedPrewarmedHlsResource,
     },
     hls_media_refresh::is_expired_range_error,
+    hls_playback_context::is_canonical_uuid_v4,
     hls_range_cache::{
         HlsRangeError, HlsRangePriority, HlsReadyRange, RANGE_FOREGROUND_CHUNK_BYTES,
         RANGE_MAX_CHUNK_BYTES,
@@ -52,8 +53,28 @@ use crate::{
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
 const HLS_MEDIA_STREAM_CHUNK_BYTES: u64 = RANGE_MAX_CHUNK_BYTES;
 const HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES: u64 = RANGE_FOREGROUND_CHUNK_BYTES;
+const MAX_PLAYBACK_READER_QUERY_BYTES: usize = 1024;
+const PLAYBACK_READER_QUERY_KEY: &str = "playback_reader";
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 static HLS_MEDIA_404_DIAGNOSTIC_BUDGET: AtomicUsize = AtomicUsize::new(32);
+
+fn playback_reader_id_from_uri(uri: &Uri) -> Option<String> {
+    playback_reader_id_from_query(uri.query()?)
+}
+
+fn playback_reader_id_from_query(raw_query: &str) -> Option<String> {
+    if raw_query.len() > MAX_PLAYBACK_READER_QUERY_BYTES {
+        return None;
+    }
+    let mut values = url::form_urlencoded::parse(raw_query.as_bytes())
+        .filter(|(key, _)| key.as_ref() == PLAYBACK_READER_QUERY_KEY);
+    let (_, value) = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.into_owned();
+    is_canonical_uuid_v4(&value).then_some(value)
+}
 
 #[derive(Clone, Copy)]
 enum HlsMediaNotFoundBranch {
@@ -151,14 +172,32 @@ pub async fn hls_master_playlist_get(
     State(state): State<MediaState>,
     Path(session_id): Path<String>,
 ) -> Response<Body> {
-    hls_master_playlist_response(state, session_id, false)
+    hls_master_playlist_response(state, session_id, false, None)
 }
 
 pub async fn hls_master_playlist_head(
     State(state): State<MediaState>,
     Path(session_id): Path<String>,
 ) -> Response<Body> {
-    hls_master_playlist_response(state, session_id, true)
+    hls_master_playlist_response(state, session_id, true, None)
+}
+
+pub async fn hls_master_playlist_get_with_uri(
+    State(state): State<MediaState>,
+    Path(session_id): Path<String>,
+    uri: Uri,
+) -> Response<Body> {
+    let http_reader_id = playback_reader_id_from_uri(&uri);
+    hls_master_playlist_response(state, session_id, false, http_reader_id.as_deref())
+}
+
+pub async fn hls_master_playlist_head_with_uri(
+    State(state): State<MediaState>,
+    Path(session_id): Path<String>,
+    uri: Uri,
+) -> Response<Body> {
+    let http_reader_id = playback_reader_id_from_uri(&uri);
+    hls_master_playlist_response(state, session_id, true, http_reader_id.as_deref())
 }
 
 pub async fn hls_segment_get(
@@ -166,7 +205,7 @@ pub async fn hls_segment_get(
     Path((session_id, segment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    hls_segment_response(state, session_id, segment_id, headers, false).await
+    hls_segment_response(state, session_id, segment_id, headers, None, false).await
 }
 
 pub async fn hls_segment_head(
@@ -174,7 +213,41 @@ pub async fn hls_segment_head(
     Path((session_id, segment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    hls_segment_response(state, session_id, segment_id, headers, true).await
+    hls_segment_response(state, session_id, segment_id, headers, None, true).await
+}
+
+pub async fn hls_segment_get_with_uri(
+    State(state): State<MediaState>,
+    Path((session_id, segment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    hls_segment_response(
+        state,
+        session_id,
+        segment_id,
+        headers,
+        playback_reader_id_from_uri(&uri),
+        false,
+    )
+    .await
+}
+
+pub async fn hls_segment_head_with_uri(
+    State(state): State<MediaState>,
+    Path((session_id, segment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    hls_segment_response(
+        state,
+        session_id,
+        segment_id,
+        headers,
+        playback_reader_id_from_uri(&uri),
+        true,
+    )
+    .await
 }
 
 async fn media_response(
@@ -306,6 +379,7 @@ fn hls_master_playlist_response(
     state: MediaState,
     session_id: String,
     head_only: bool,
+    http_reader_id: Option<&str>,
 ) -> Response<Body> {
     let session_was_registered = state.state.hls_sessions.get(&session_id).is_some();
     let Some(handle) = state.state.hls_playback_session_for_serving(&session_id) else {
@@ -338,19 +412,25 @@ fn hls_master_playlist_response(
     let body = if head_only {
         Body::empty()
     } else {
-        Body::from(
-            playlist_session.master_playlist_with_variant_filter(|variant| {
-                state
-                    .state
-                    .hls_network_policy
-                    .variant_is_advertisable_for_policy(
-                        weak_network_preference,
-                        &session_id,
-                        generation,
-                        &variant.id,
-                    )
-            }),
-        )
+        let is_variant_advertisable = |variant: &HlsVariant| {
+            state
+                .state
+                .hls_network_policy
+                .variant_is_advertisable_for_policy(
+                    weak_network_preference,
+                    &session_id,
+                    generation,
+                    &variant.id,
+                )
+        };
+        let playlist = match http_reader_id {
+            Some(reader_id) => playlist_session.master_playlist_with_uri_options(
+                is_variant_advertisable,
+                HlsPlaylistUriOptions::new(Some(reader_id)),
+            ),
+            None => playlist_session.master_playlist_with_variant_filter(is_variant_advertisable),
+        };
+        Body::from(playlist)
     };
 
     Response::builder()
@@ -366,6 +446,7 @@ async fn hls_segment_response(
     session_id: String,
     segment_id: String,
     headers: HeaderMap,
+    http_reader_id: Option<String>,
     head_only: bool,
 ) -> Response<Body> {
     let session_was_registered = state.state.hls_sessions.get(&session_id).is_some();
@@ -454,20 +535,39 @@ async fn hls_segment_response(
             };
             initialization
         };
-        let playlist = if advertised_resource {
-            session.servable_media_playlist(
+        let playlist = match http_reader_id.as_deref() {
+            Some(reader_id) => {
+                let uri_options = HlsPlaylistUriOptions::new(Some(reader_id));
+                if advertised_resource {
+                    session.servable_media_playlist_with_uri_options(
+                        &segment_id,
+                        initialization.length,
+                        initialization.total_length,
+                        &initialization.segments,
+                        uri_options,
+                    )
+                } else {
+                    session.lookup_media_playlist_with_uri_options(
+                        &segment_id,
+                        initialization.length,
+                        initialization.total_length,
+                        &initialization.segments,
+                        uri_options,
+                    )
+                }
+            }
+            None if advertised_resource => session.servable_media_playlist(
                 &segment_id,
                 initialization.length,
                 initialization.total_length,
                 &initialization.segments,
-            )
-        } else {
-            session.lookup_media_playlist(
+            ),
+            None => session.lookup_media_playlist(
                 &segment_id,
                 initialization.length,
                 initialization.total_length,
                 &initialization.segments,
-            )
+            ),
         };
         let Some(playlist) = playlist else {
             return text_response(
@@ -3586,6 +3686,30 @@ mod tests {
             .and_then(|value| value.parse().ok())
     }
 
+    #[test]
+    fn playback_reader_query_is_bounded_unique_and_canonical() {
+        let reader_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            Some(reader_id.to_owned()),
+            playback_reader_id_from_query(&format!("source=local&playback_reader={reader_id}"))
+        );
+        assert!(playback_reader_id_from_query("source=local").is_none());
+        assert!(
+            playback_reader_id_from_query(&format!(
+                "playback_reader={reader_id}&playback_reader={reader_id}"
+            ))
+            .is_none()
+        );
+        assert!(playback_reader_id_from_query("playback_reader=%ZZ").is_none());
+        assert!(
+            playback_reader_id_from_query(&format!(
+                "playback_reader={reader_id}&padding={}",
+                "x".repeat(MAX_PLAYBACK_READER_QUERY_BYTES)
+            ))
+            .is_none()
+        );
+    }
+
     struct TaskResourceFixture {
         temp: TempDir,
         state: MediaState,
@@ -4920,6 +5044,166 @@ mod tests {
         assert!(playlist.contains(&format!(
             "#EXT-X-BYTERANGE:{media_length}@{initialization_length}"
         )));
+    }
+
+    #[tokio::test]
+    async fn hls_reader_binding_propagates_through_playlists_without_changing_media_requests() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut session = hls_session("session-1", &upstream_url);
+        let mut audio_request = media_request(&upstream_url, Vec::new());
+        audio_request.kind = BilibiliMediaRequestKind::Audio;
+        audio_request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio_request.mime_type = Some("audio/mp4".to_owned());
+        audio_request.codecs = Some("mp4a.40.2".to_owned());
+        audio_request.bandwidth = Some(128_000);
+        audio_request.width = None;
+        audio_request.height = None;
+        audio_request.frame_rate = None;
+        session.variant.audio = Some(HlsMediaResource {
+            id: "audio.m4s".to_owned(),
+            request: audio_request,
+        });
+        insert_authorized_hls_session(&state, session);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("media fixture should bind");
+        let address = listener.local_addr().unwrap();
+        let router_state = state.clone();
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, crate::media_router(router_state))
+                .await
+                .expect("production media router should serve");
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        let reader_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let master_url =
+            format!("{base_url}/hls/session-1/master.m3u8?playback_reader={reader_id}");
+        let master_response = client
+            .get(&master_url)
+            .send()
+            .await
+            .expect("bound master request should succeed");
+        assert_eq!(200, master_response.status().as_u16());
+        let master = master_response
+            .text()
+            .await
+            .expect("master playlist should be valid text");
+        assert!(master.contains(&format!(
+            "URI=\"segments/audio.m3u8?playback_reader={reader_id}\""
+        )));
+        assert!(master.contains(&format!(
+            "segments/video.m3u8?playback_reader={reader_id}\n"
+        )));
+
+        let legacy_master = client
+            .get(format!("{base_url}/hls/session-1/master.m3u8"))
+            .send()
+            .await
+            .expect("legacy master request should succeed")
+            .text()
+            .await
+            .expect("legacy master playlist should be valid text");
+        let fallback_uris = [
+            format!("{base_url}/hls/session-1/master.m3u8"),
+            format!("{base_url}/hls/session-1/master.m3u8?playback_reader=not-a-reader-id"),
+            format!(
+                "{base_url}/hls/session-1/master.m3u8?playback_reader={reader_id}&playback_reader={reader_id}"
+            ),
+            format!(
+                "{base_url}/hls/session-1/master.m3u8?playback_reader={reader_id}&padding={}",
+                "x".repeat(MAX_PLAYBACK_READER_QUERY_BYTES)
+            ),
+        ];
+        for url in fallback_uris {
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .expect("invalid correlation must not reject the media request");
+            assert_eq!(200, response.status().as_u16());
+            assert_eq!(
+                legacy_master,
+                response
+                    .text()
+                    .await
+                    .expect("fallback master playlist should be valid text")
+            );
+        }
+
+        for (playlist_id, resource_id) in [("video.m3u8", "video.m4s"), ("audio.m3u8", "audio.m4s")]
+        {
+            let response = client
+                .get(format!(
+                    "{base_url}/hls/session-1/segments/{playlist_id}?playback_reader={reader_id}"
+                ))
+                .send()
+                .await
+                .expect("bound child playlist request should succeed");
+            assert_eq!(200, response.status().as_u16());
+            let playlist = response
+                .text()
+                .await
+                .expect("child playlist should be valid text");
+            assert!(playlist.contains(&format!(
+                "#EXT-X-MAP:URI=\"{resource_id}?playback_reader={reader_id}\""
+            )));
+            assert!(playlist.contains(&format!("\n{resource_id}?playback_reader={reader_id}\n")));
+        }
+
+        let ranged = client
+            .get(format!(
+                "{base_url}/hls/session-1/segments/video.m4s?playback_reader={reader_id}"
+            ))
+            .header(RANGE, "bytes=1-3")
+            .send()
+            .await
+            .expect("bound ranged media request should succeed");
+        assert_eq!(206, ranged.status().as_u16());
+        assert_eq!(
+            format!("bytes 1-3/{}", fake_mp4().len()),
+            ranged
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .expect("content-range should be present")
+        );
+        let ranged_body = ranged.bytes().await.unwrap();
+        assert_eq!(&fake_mp4()[1..4], &ranged_body[..]);
+
+        let head = client
+            .head(format!(
+                "{base_url}/hls/session-1/segments/video.m4s?playback_reader={reader_id}"
+            ))
+            .send()
+            .await
+            .expect("bound HEAD media request should succeed");
+        assert_eq!(200, head.status().as_u16());
+        assert_eq!(
+            Some(fake_mp4().len() as u64),
+            head.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+        );
+        assert!(head.bytes().await.unwrap().is_empty());
+        assert!(
+            state
+                .current_hls_playback_context_for_reader(reader_id)
+                .is_none(),
+            "an unknown valid reader ID must not create context state"
+        );
+        router_task.abort();
+        assert!(router_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

@@ -75,6 +75,8 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         XCTAssertEqual(counts.openCount, 1)
         XCTAssertEqual(counts.updateCount, 1)
         XCTAssertEqual(counts.closeCount, 0)
+        XCTAssertEqual(counts.openHTTPReaderIDs, [nil])
+        XCTAssertEqual(counts.updateTicketHTTPReaderIDs, [nil])
         XCTAssertEqual(snapshotCalls, 1)
         XCTAssertEqual(counts.openSessionIDs, [owner.sessionID])
         XCTAssertEqual(counts.updateContextIDs, [contextA])
@@ -83,6 +85,58 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         XCTAssertEqual(counts.updateSamples[0].playheadSeconds, 5, accuracy: 0.01)
         XCTAssertGreaterThanOrEqual(counts.updateSamples[0].continuousBufferedEndSeconds, 5)
         XCTAssertEqual(counts.updateSamples[0].playbackRate, 1)
+    }
+
+    func testCapability22KeepsOwnerReaderIDAcrossContextRotationsAndOwnerChanges() async throws {
+        let ownerTokenA = try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-8000-0000000000a1"))
+        let ownerTokenB = try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-8000-0000000000a2"))
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8, ownerToken: ownerTokenA)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11, ownerToken: ownerTokenB)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let now: UInt64 = 10_000
+        let client = PlaybackContextClientProbe()
+        let service = makeService(
+            client: client,
+            summary: serverSummary(supportsContext: true, supportsReaderBinding: true),
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: now) },
+            now: { now }
+        )
+
+        try await service.start()
+        try await service.update()
+        try await service.start()
+        currentOwner = ownerB
+        try await service.start()
+
+        let counts = await client.counts()
+        let readerA = ownerTokenA.uuidString.lowercased()
+        let readerB = ownerTokenB.uuidString.lowercased()
+        XCTAssertEqual(counts.openHTTPReaderIDs, [readerA, readerA, readerB])
+        XCTAssertEqual(counts.updateTicketHTTPReaderIDs, [readerA, readerA, readerA, readerB])
+    }
+
+    func testCapability21KeepsExplicitReportsUnbound() async throws {
+        let owner = try makeOwner(
+            sessionID: "session-A",
+            generation: 8,
+            ownerToken: try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-8000-0000000000a1"))
+        )
+        let client = PlaybackContextClientProbe()
+        let now: UInt64 = 10_000
+        let service = makeService(
+            client: client,
+            summary: serverSummary(supportsContext: true),
+            ownerProvider: { owner },
+            snapshotProvider: { self.snapshot(observedAt: now) },
+            now: { now }
+        )
+
+        try await service.start()
+
+        let counts = await client.counts()
+        XCTAssertEqual(counts.openHTTPReaderIDs, [nil])
+        XCTAssertEqual(counts.updateTicketHTTPReaderIDs, [nil])
     }
 
     func testOpenTicketIsAgedFromRequestStartAndClockRollbackIsRejected() async throws {
@@ -388,10 +442,14 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         }
     }
 
-    private func makeOwner(sessionID: String, generation: UInt64) throws -> HLSPlaybackContextOwner {
+    private func makeOwner(
+        sessionID: String,
+        generation: UInt64,
+        ownerToken: UUID = UUID()
+    ) throws -> HLSPlaybackContextOwner {
         try XCTUnwrap(
             HLSPlaybackContextOwner(
-                ownerToken: UUID(),
+                ownerToken: ownerToken,
                 serverID: "server",
                 sessionID: sessionID,
                 sessionGeneration: generation
@@ -415,13 +473,20 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         )
     }
 
-    private func serverSummary(supportsContext: Bool) -> CacheServerSummary {
-        CacheServerSummary(
+    private func serverSummary(supportsContext: Bool, supportsReaderBinding: Bool = false) -> CacheServerSummary {
+        var capabilities: [String] = []
+        if supportsContext {
+            capabilities.append(CacheServerCapability.hlsPlaybackContext)
+        }
+        if supportsReaderBinding {
+            capabilities.append(CacheServerCapability.hlsPlaybackReaderBinding)
+        }
+        return CacheServerSummary(
             id: "server",
             name: "Cache",
             version: "1",
             mediaBaseURIs: [],
-            capabilities: supportsContext ? [CacheServerCapability.hlsPlaybackContext] : []
+            capabilities: capabilities
         )
     }
 
@@ -456,19 +521,23 @@ private actor PlaybackContextClientProbe: CacheControlClient {
         let updateCount: Int
         let closeCount: Int
         let openSessionIDs: [String]
+        let openHTTPReaderIDs: [String?]
         let updateContextIDs: [String]
         let updateSequences: [UInt64]
         let updateSamples: [HLSPlaybackContextTimingSample]
+        let updateTicketHTTPReaderIDs: [String?]
         let closeContextIDs: [String]
     }
 
     private struct ContextRecord {
         let sessionID: String
         let generation: UInt64
+        let httpReaderID: String?
     }
 
     private var openRequests: [HLSPlaybackContextOpenRequest] = []
     private var updateRequests: [HLSPlaybackContextUpdateRequest] = []
+    private var updateTicketHTTPReaderIDs: [String?] = []
     private var closeRequests: [HLSPlaybackContextCloseRequest] = []
     private var contexts: [String: ContextRecord] = [:]
     private var heldOpenSessions: Set<String> = []
@@ -613,9 +682,11 @@ private actor PlaybackContextClientProbe: CacheControlClient {
             updateCount: updateRequests.count,
             closeCount: closeRequests.count,
             openSessionIDs: openRequests.map(\.sessionID),
+            openHTTPReaderIDs: openRequests.map(\.httpReaderID),
             updateContextIDs: updateRequests.map(\.contextID),
             updateSequences: updateRequests.map(\.sequence),
             updateSamples: updateRequests.map(\.sample),
+            updateTicketHTTPReaderIDs: updateTicketHTTPReaderIDs,
             closeContextIDs: closeRequests.map(\.contextID)
         )
     }
@@ -626,7 +697,8 @@ private actor PlaybackContextClientProbe: CacheControlClient {
         let challenge = isB ? "00000000-0000-4000-8000-000000000022" : "00000000-0000-4000-8000-000000000021"
         contexts[contextID] = ContextRecord(
             sessionID: request.sessionID,
-            generation: request.expectedSessionGeneration
+            generation: request.expectedSessionGeneration,
+            httpReaderID: request.httpReaderID
         )
         return HLSPlaybackContextTicket(
             contextID: contextID,
@@ -634,7 +706,8 @@ private actor PlaybackContextClientProbe: CacheControlClient {
             sessionID: request.sessionID,
             sessionGeneration: request.expectedSessionGeneration,
             nextSequence: 1,
-            validityMillis: 5_000
+            validityMillis: 5_000,
+            httpReaderID: request.httpReaderID
         )
     }
 
@@ -643,17 +716,20 @@ private actor PlaybackContextClientProbe: CacheControlClient {
             contexts[request.contextID]
             ?? ContextRecord(
                 sessionID: request.sessionID,
-                generation: request.expectedSessionGeneration
+                generation: request.expectedSessionGeneration,
+                httpReaderID: request.expectedHTTPReaderID
             )
         let nextSequence = request.sequence + 1
         let suffix = String(format: "%012llx", nextSequence + 100)
+        updateTicketHTTPReaderIDs.append(context.httpReaderID)
         return HLSPlaybackContextTicket(
             contextID: request.contextID,
             challenge: "00000000-0000-4000-8000-\(suffix)",
             sessionID: context.sessionID,
             sessionGeneration: context.generation,
             nextSequence: nextSequence,
-            validityMillis: updateTicketValidityMillis
+            validityMillis: updateTicketValidityMillis,
+            httpReaderID: context.httpReaderID
         )
     }
 

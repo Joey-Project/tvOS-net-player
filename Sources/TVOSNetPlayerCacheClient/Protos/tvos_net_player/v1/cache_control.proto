@@ -53,7 +53,9 @@ service CacheService {
   // This does not restore sources, fetch media or authorize a quality switch.
   rpc GetHlsRenditionCatalog(GetHlsRenditionCatalogRequest) returns (HlsRenditionCatalog);
   // Ephemeral playback timing only. Tickets do not reserve media, authorize
-  // switching, identify HTTP readers or establish delivery capacity.
+  // switching or establish delivery capacity. Context/challenge IDs are not
+  // HTTP reader IDs; an optional separately negotiated reader binding may
+  // correlate requests without granting authentication or scheduling rights.
   rpc OpenHlsPlaybackContext(OpenHlsPlaybackContextRequest) returns (HlsPlaybackContextTicket);
   rpc UpdateHlsPlaybackContext(UpdateHlsPlaybackContextRequest) returns (HlsPlaybackContextTicket);
   rpc CloseHlsPlaybackContext(CloseHlsPlaybackContextRequest) returns (CloseHlsPlaybackContextResponse);
@@ -94,6 +96,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_HLS_PLAYBACK_READINESS = 19;
   SERVER_CAPABILITY_HLS_RENDITION_CATALOG = 20;
   SERVER_CAPABILITY_HLS_PLAYBACK_CONTEXT = 21;
+  SERVER_CAPABILITY_HLS_PLAYBACK_READER_BINDING = 22;
 }
 
 message GetResolverSettingsRequest {}
@@ -1045,6 +1048,10 @@ enum HlsWeakNetworkState {
 message OpenHlsPlaybackContextRequest {
   string session_id = 1;
   uint64 expected_session_generation = 2;
+  // Capability 22 only. Empty preserves legacy unbound reporting. Otherwise a
+  // canonical lowercase UUIDv4, stable for one loaded player item, independent
+  // of short-lived context/challenge rotation. This is not authentication.
+  string http_reader_id = 3;
 }
 
 message HlsPlaybackContextTicket {
@@ -1058,6 +1065,9 @@ message HlsPlaybackContextTicket {
   // Clients conservatively age this from their request start. A timing sample
   // must be captured after receipt of the challenge it consumes.
   uint64 validity_millis = 6;
+  // Exact echo of the optional Open binding; immutable across ticket updates.
+  // Unknown, expired or ambiguous HTTP associations remain protected.
+  string http_reader_id = 7;
 }
 
 message HlsPlaybackTimingSample {
