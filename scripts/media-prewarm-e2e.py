@@ -27,11 +27,18 @@ CASE_BUDGET_SECONDS = 840
 COMMAND_LOG_BYTES = 8 * 1024 * 1024
 ARTIFACT_BYTES = 32 * 1024 * 1024
 REPORT_BYTES = 64 * 1024
+PREWARM_REPORT_BYTES = 256 * 1024
+PREWARM_OBJECT_BYTES = 192 * 1024
 PREWARM_BYTES = 8 * 1024 * 1024
 PREWARM_TRANSFER_BYTES = 16 * 1024 * 1024
 MAX_PREWARM_RANGES = 128
-MAX_RESOURCE_ID_LENGTH = 256
+MAX_RESOURCE_ID_LENGTH = 128
 U64_MAX = 2**64 - 1
+STARTUP_PREFIX_BYTES = 512 * 1024
+PREPARATION_SPAN_BYTES = 64 * 1024
+MIN_PARENT_BYTES = 512 * 1024
+MAX_PARENT_BYTES = 8 * 1024 * 1024
+MAX_PARENT_COUNT = 8192
 WINDOW_MAX_SECONDS = 22.0
 TESTS = {
     "off": "media_prewarm_comparison_tests::native_single_player_prewarm_control",
@@ -95,15 +102,30 @@ def _work_deadline(configured: str | None, *, started: float) -> float:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > REPORT_BYTES:
-        raise PrewarmError(f"Report is missing, non-regular, or over 64 KiB: {path.name}")
+    if path.is_symlink() or not path.is_file():
+        raise PrewarmError(f"Report is missing or non-regular: {path.name}")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=normal._unique_object,
+        with path.open("rb") as report_file:
+            raw = report_file.read(PREWARM_REPORT_BYTES + 1)
+        if len(raw) > PREWARM_REPORT_BYTES:
+            raise PrewarmError(f"Explicit prewarm report exceeds 256 KiB: {path.name}")
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=normal._unique_object,
                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    except PrewarmError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
         raise PrewarmError(f"Report JSON is invalid: {path.name}") from error
     if not isinstance(value, dict):
         raise PrewarmError(f"Report must be an object: {path.name}")
+    prewarm = value.get("prewarm_comparison")
+    if isinstance(prewarm, dict):
+        try:
+            encoded = json.dumps(prewarm, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=True, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as error:
+            raise PrewarmError(f"Prewarm comparison object cannot be serialized: {path.name}") from error
+        if len(encoded) > PREWARM_OBJECT_BYTES:
+            raise PrewarmError(f"Prewarm comparison object exceeds 192 KiB: {path.name}")
     return value
 
 
@@ -168,24 +190,31 @@ def _diagnostic_window(probe: dict[str, Any], report_name: str) -> dict[str, Any
             "decoded_frame_continuity": continuity}
 
 
-def _range_list(value: Any, resource_ids: set[str], name: str, report_name: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not 1 <= len(value) <= MAX_PREWARM_RANGES:
-        raise PrewarmError(f"{name} must contain 1-128 canonical ranges: {report_name}")
+def _safe_resource_id(value: Any) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= MAX_RESOURCE_ID_LENGTH
+            and value not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9._-]+", value) is not None)
+
+
+def _range_list(value: Any, resource_ids: set[str], name: str, report_name: str,
+                *, totals: dict[str, int] | None = None,
+                allow_empty: bool = False) -> list[dict[str, Any]]:
+    minimum = 0 if allow_empty else 1
+    if not isinstance(value, list) or not minimum <= len(value) <= MAX_PREWARM_RANGES:
+        raise PrewarmError(f"{name} must contain {minimum}-128 canonical ranges: {report_name}")
     ranges: list[dict[str, Any]] = []
     previous: tuple[str, int, int] | None = None
     for item in value:
         if (not isinstance(item, dict) or set(item) != {"resource_id", "start", "end"}
-                or not isinstance(item.get("resource_id"), str)
-                or not item["resource_id"] or len(item["resource_id"]) > MAX_RESOURCE_ID_LENGTH
-                or item["resource_id"].strip() != item["resource_id"]
+                or not _safe_resource_id(item.get("resource_id"))
                 or item["resource_id"] not in resource_ids
                 or not _exact_int(item.get("start")) or not _exact_int(item.get("end"))
-                or item["start"] < 0 or item["end"] > U64_MAX or item["end"] <= item["start"]):
+                or item["start"] < 0 or item["end"] > U64_MAX or item["end"] <= item["start"]
+                or (totals is not None and item["end"] > totals[item["resource_id"]])):
             raise PrewarmError(f"{name} contains an invalid range: {report_name}")
         current = (item["resource_id"], item["start"], item["end"])
-        if previous is not None:
-            if current < previous or (current[0] == previous[0] and current[1] < previous[2]):
-                raise PrewarmError(f"{name} is overlapping or not canonically ordered: {report_name}")
+        if previous is not None and (
+                current < previous or (current[0] == previous[0] and current[1] < previous[2])):
+            raise PrewarmError(f"{name} is overlapping or not canonically ordered: {report_name}")
         previous = current
         ranges.append(item)
     return ranges
@@ -200,38 +229,156 @@ def _range_bytes(ranges: list[dict[str, Any]], name: str, report_name: str) -> i
     return total
 
 
-def _selected_ranges_covered(selected: list[dict[str, Any]], transfer: list[dict[str, Any]]) -> bool:
-    by_resource: dict[str, list[dict[str, Any]]] = {}
-    for item in transfer:
-        by_resource.setdefault(item["resource_id"], []).append(item)
-    for wanted in selected:
-        cursor = wanted["start"]
-        for item in by_resource.get(wanted["resource_id"], []):
-            if item["end"] <= cursor:
-                continue
-            if item["start"] > cursor:
-                break
-            cursor = item["end"]
-            if cursor >= wanted["end"]:
-                break
-        if cursor < wanted["end"]:
+def _normalized_union(ranges: list[dict[str, Any]]) -> list[tuple[str, int, int]]:
+    normalized: list[tuple[str, int, int]] = []
+    spans = sorted((item["resource_id"], item["start"], item["end"]) for item in ranges)
+    for resource_id, start, end in spans:
+        if normalized and normalized[-1][0] == resource_id and start <= normalized[-1][2]:
+            previous_id, previous_start, previous_end = normalized[-1]
+            normalized[-1] = (previous_id, previous_start, max(previous_end, end))
+        else:
+            normalized.append((resource_id, start, end))
+    return normalized
+
+
+def _range_is_covered(wanted: tuple[str, int, int], ranges: list[dict[str, Any]]) -> bool:
+    resource_id, start, end = wanted
+    cursor = start
+    for item in ranges:
+        if item["resource_id"] != resource_id or item["end"] <= cursor:
+            continue
+        if item["start"] > cursor:
             return False
-    return True
+        cursor = max(cursor, item["end"])
+        if cursor >= end:
+            return True
+    return cursor >= end
 
 
-def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> dict[str, Any]:
+def _parent_span(total: int, offset: int) -> tuple[int, int] | None:
+    startup_end = min(total, STARTUP_PREFIX_BYTES)
+    if offset < startup_end:
+        return 0, startup_end
+    if offset >= total:
+        return None
+    remaining = total - startup_end
+    parent_count = max(MAX_PARENT_COUNT - 1, 1)
+    parent_size = min(MAX_PARENT_BYTES, max(MIN_PARENT_BYTES,
+                         (remaining + parent_count - 1) // parent_count))
+    parent_index = (offset - startup_end) // parent_size
+    parent_start = startup_end + parent_index * parent_size
+    return parent_start, min(total, parent_start + parent_size)
+
+
+def _expected_transfer_plan(selected: list[dict[str, Any]], totals: dict[str, int],
+                            report_name: str) -> list[dict[str, Any]]:
+    planned: set[tuple[str, int, int]] = set()
+    selected_ids = {item["resource_id"] for item in selected}
+    for resource_id in selected_ids:
+        planned.add((resource_id, 0, min(totals[resource_id], STARTUP_PREFIX_BYTES)))
+    for item in selected:
+        resource_id, total = item["resource_id"], totals[item["resource_id"]]
+        cursor = max(item["start"], min(total, STARTUP_PREFIX_BYTES))
+        while cursor < item["end"]:
+            parent = _parent_span(total, cursor)
+            if parent is None or parent[1] <= cursor:
+                raise PrewarmError(f"Selected range cannot be mapped to a preparation span: {report_name}")
+            parent_start, parent_end = parent
+            chunk_start = parent_start
+            while chunk_start < parent_end:
+                chunk_end = min(parent_end, chunk_start + PREPARATION_SPAN_BYTES)
+                if chunk_start < item["end"] and cursor < chunk_end:
+                    planned.add((resource_id, chunk_start, chunk_end))
+                chunk_start = chunk_end
+            cursor = parent_end
+    expected = [{"resource_id": resource_id, "start": start, "end": end}
+                for resource_id, start, end in sorted(planned)]
+    if (not expected or len(expected) > MAX_PREWARM_RANGES
+            or _range_bytes(expected, "transfer_plan", report_name) > PREWARM_TRANSFER_BYTES):
+        raise PrewarmError(f"Expected preparation plan exceeds its named bounds: {report_name}")
+    return expected
+
+
+PREWARM_KEYS = {
+    "schema_version", "mode", "boundary_policy", "recovery_snapshot",
+    "target_window_start_seconds", "target_window_end_seconds", "byte_budget",
+    "planned_bytes", "transfer_byte_budget", "planned_transfer_bytes", "attempt_count",
+    "attempted_span_bytes", "attempted_ranges", "cache_published_bytes",
+    "cache_published_spans", "preempted_operation_count", "foreground_defer_count",
+    "elapsed_seconds", "coverage_semantics", "cache_covered_bytes_before",
+    "cache_covered_spans_before", "cache_covered_bytes_after",
+    "cache_covered_spans_after", "selected_ranges", "transfer_plan", "resource_ids",
+    "resource_total_lengths", "completed", "failure", "provenance",
+}
+ATTEMPT_KEYS = {
+    "resource_id", "resource_total_length", "start", "end", "purpose", "status_code",
+    "headers_validated", "body_validated", "identity_validated", "cache_published", "outcome",
+}
+ATTEMPT_PURPOSES = {"cache_fill", "resource_discovery", "identity_probe"}
+ATTEMPT_OUTCOMES = {
+    "in_flight", "headers_received", "headers_validated", "body_validated", "cache_published",
+    "preempted", "cancelled", "session_removing", "identity_changed", "quota_exceeded",
+    "upstream_status", "network", "io", "range_unsupported", "invalid_response",
+    "deadline_exceeded", "interrupted",
+}
+FAILURE_KEYS = {"category", "resource_id", "start", "end", "upstream_status"}
+PROVENANCE = {
+    "shared_origin_counter_scope": "playback_and_preparation",
+    "attempt_bytes_semantics": "sum_of_requested_range_lengths_not_wire_bytes",
+    "identity_probe_attempts_included": True,
+    "transfer_plan_semantics": "empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans",
+    "expanded_transfer_may_overlap_buffered_media": True,
+}
+
+
+def _validate_failure_state(failure: Any, attempted: list[dict[str, Any]],
+                           resource_ids: set[str], *, completed: bool,
+                           mode: str, report_name: str) -> None:
+    if not isinstance(failure, dict) or set(failure) != FAILURE_KEYS:
+        raise PrewarmError(f"Prewarm root failure fields are invalid: {report_name}")
+    category = failure["category"]
+    resource_id = failure["resource_id"]
+    failure_start, failure_end = failure["start"], failure["end"]
+    upstream_status = failure["upstream_status"]
+    if (category is not None and (not isinstance(category, str)
+                                  or category not in ATTEMPT_OUTCOMES)
+            or resource_id is not None and (not _safe_resource_id(resource_id)
+                                            or resource_id not in resource_ids)
+            or failure_start is not None and (not _exact_int(failure_start) or failure_start < 0)
+            or failure_end is not None and (not _exact_int(failure_end) or failure_start is None
+                                            or failure_end <= failure_start or failure_end > U64_MAX)
+            or upstream_status is not None and (not _exact_int(upstream_status)
+                                                or not 100 <= upstream_status <= 599)):
+        raise PrewarmError(f"Prewarm root failure values are invalid: {report_name}")
+    if completed:
+        if any(failure[key] is not None for key in FAILURE_KEYS):
+            raise PrewarmError(f"Completed prewarm report contains root failure details: {report_name}")
+        return
+    matches = [attempt for attempt in attempted if attempt["outcome"] == category
+               and (resource_id is None or attempt["resource_id"] == resource_id)
+               and (failure_start is None or attempt["start"] == failure_start)
+               and (failure_end is None or attempt["end"] == failure_end)
+               and (upstream_status is None or attempt["status_code"] == upstream_status)]
+    if mode == "off" or category is None or not matches:
+        raise PrewarmError(f"Failed prewarm root cause does not match its attempt ledger: {report_name}")
+
+
+def _prewarm_diagnostic_data(report: dict[str, Any], mode: str,
+                             report_name: str) -> dict[str, Any]:
     value = report.get("prewarm_comparison")
     expected_mode = "off" if mode == "off" else "on"
-    if (not isinstance(value, dict) or not _exact_int(value.get("schema_version"), 3)
+    if (not isinstance(value, dict) or set(value) != PREWARM_KEYS
+            or not _exact_int(value.get("schema_version"), 4)
             or value.get("mode") != expected_mode
             or value.get("boundary_policy") != "unbuffered_after_20s_safety"):
-        raise PrewarmError(f"Prewarm comparison identity is invalid: {report_name}")
+        raise PrewarmError(f"Prewarm comparison identity or exact v4 keys are invalid: {report_name}")
     snapshot = value.get("recovery_snapshot")
     if (not isinstance(snapshot, dict) or not _exact_int(snapshot.get("schema_version"), 1)
             or any(not _finite(snapshot.get(key)) for key in
                    ("observed_monotonic_seconds", "playhead_seconds", "loaded_end_seconds"))
             or snapshot["observed_monotonic_seconds"] <= 0 or snapshot["playhead_seconds"] < 0
-            or snapshot["playhead_seconds"] > 3600 or snapshot["loaded_end_seconds"] < snapshot["playhead_seconds"]
+            or snapshot["playhead_seconds"] > 3600
+            or snapshot["loaded_end_seconds"] < snapshot["playhead_seconds"]
             or snapshot["loaded_end_seconds"] > 3600):
         raise PrewarmError(f"Recovery snapshot is invalid: {report_name}")
     start, end = value.get("target_window_start_seconds"), value.get("target_window_end_seconds")
@@ -239,101 +386,170 @@ def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> di
     if (not _finite(start) or not _finite(end) or start < safe_start or end <= start or end > 3600
             or end - start > WINDOW_MAX_SECONDS):
         raise PrewarmError(f"Target window violates the unbuffered 20-second safety boundary: {report_name}")
-    budget, planned = value.get("byte_budget"), value.get("planned_bytes")
-    transfer_budget, planned_transfer = value.get("transfer_byte_budget"), value.get("planned_transfer_bytes")
-    requested, operations = value.get("operation_requested_bytes"), value.get("operation_count")
-    attempted = value.get("attempted_ranges")
-    completed_bytes, completed_count = (value.get("completed_transfer_bytes"),
-                                        value.get("completed_transfer_count"))
-    preempted_count, defer_count = (value.get("preempted_operation_count"),
-                                    value.get("foreground_defer_count"))
-    elapsed = value.get("elapsed_seconds")
-    failure = value.get("failure")
-    provenance = value.get("provenance")
-    id_map = value.get("resource_ids")
-    if (not isinstance(id_map, dict) or set(id_map) != {"video", "audio"}
-            or any(not isinstance(item, str) or not item or len(item) > MAX_RESOURCE_ID_LENGTH
-                   or item.strip() != item for item in id_map.values())
-            or id_map["video"] == id_map["audio"]):
-        raise PrewarmError(f"Prewarm resource identities are invalid: {report_name}")
-    ids = set(id_map.values())
-    selected = _range_list(value.get("selected_ranges"), ids, "selected_ranges", report_name)
-    transfer = _range_list(value.get("transfer_plan"), ids, "transfer_plan", report_name)
-    selected_sum = _range_bytes(selected, "selected_ranges", report_name)
-    transfer_sum = _range_bytes(transfer, "transfer_plan", report_name)
-    if (not _exact_int(budget, PREWARM_BYTES) or not _exact_int(planned) or planned <= 0 or planned > budget
-            or planned != selected_sum
-            or not _exact_int(transfer_budget, PREWARM_TRANSFER_BYTES)
-            or not _exact_int(planned_transfer) or planned_transfer <= 0 or planned_transfer > transfer_budget
-            or planned_transfer != transfer_sum
-            or not _selected_ranges_covered(selected, transfer)
-            or any(not any(r["resource_id"] == resource_id and r["start"] == 0 for r in transfer)
-                   for resource_id in ids)
-            or value.get("coverage_semantics") != "sum_of_fully_readable_selected_ranges"
-            or not _exact_int(requested) or requested > transfer_budget
-            or not _exact_int(operations) or operations > MAX_PREWARM_RANGES
-            or not isinstance(attempted, list) or len(attempted) != operations
-            or not _exact_int(completed_bytes) or not _exact_int(completed_count)
-            or not _exact_int(preempted_count) or not _exact_int(defer_count)
-            or not _finite(elapsed) or elapsed < 0 or elapsed > 15
-            or value.get("completed") is not True
-            or not isinstance(provenance, dict)
-            or provenance.get("origin_counters_include_playback_and_prewarm") is not True
-            or provenance.get("transfer_accounting") != "planned_background_parent_chunks_and_startup_not_wire_bytes"
-            or provenance.get("expanded_transfer_may_overlap_buffered_media") is not True
-            or any(key in value for key in ("source_url", "url", "credentials", "headers", "cookies"))):
-        raise PrewarmError(f"Prewarm bounds, completion, or provenance are invalid: {report_name}")
-    if (not isinstance(failure, dict)
-            or set(failure) != {"category", "resource_id", "start", "end", "upstream_status"}
-            or any(failure[key] is not None for key in
-                   ("category", "resource_id", "start", "end", "upstream_status"))):
-        raise PrewarmError(f"Successful prewarm report contains failure details: {report_name}")
 
-    plan_by_span = {(item["resource_id"], item["start"], item["end"]): item for item in transfer}
-    attempted_bytes = 0
-    preempted = 0
-    completed_spans: set[tuple[str, int, int]] = set()
-    span_states: dict[tuple[str, int, int], str] = {}
+    id_map = value.get("resource_ids")
+    lengths = value.get("resource_total_lengths")
+    if (not isinstance(id_map, dict) or set(id_map) != {"video", "audio"}
+            or any(not _safe_resource_id(item) for item in id_map.values())
+            or id_map["video"] == id_map["audio"]
+            or not isinstance(lengths, dict) or set(lengths) != {"video", "audio"}
+            or any(not _exact_int(lengths.get(kind)) or not 1 <= lengths[kind] <= U64_MAX
+                   for kind in ("video", "audio"))):
+        raise PrewarmError(f"Prewarm resource identities or total lengths are invalid: {report_name}")
+    resource_ids = set(id_map.values())
+    totals = {id_map[kind]: lengths[kind] for kind in ("video", "audio")}
+
+    selected = _range_list(value.get("selected_ranges"), resource_ids, "selected_ranges", report_name,
+                           totals=totals)
+    selected_bytes = _range_bytes(selected, "selected_ranges", report_name)
+    budget, planned = value.get("byte_budget"), value.get("planned_bytes")
+    if (not _exact_int(budget, PREWARM_BYTES) or not _exact_int(planned)
+            or planned <= 0 or planned > PREWARM_BYTES or planned != selected_bytes):
+        raise PrewarmError(f"Selected logical byte budget is invalid: {report_name}")
+
+    transfer = _range_list(value.get("transfer_plan"), resource_ids, "transfer_plan", report_name,
+                           totals=totals)
+    transfer_bytes = _range_bytes(transfer, "transfer_plan", report_name)
+    expected_plan = _expected_transfer_plan(selected, totals, report_name)
+    if (not _exact_int(value.get("transfer_byte_budget"), PREWARM_TRANSFER_BYTES)
+            or not _exact_int(value.get("planned_transfer_bytes"))
+            or value["planned_transfer_bytes"] <= 0
+            or value["planned_transfer_bytes"] > PREWARM_TRANSFER_BYTES
+            or value["planned_transfer_bytes"] != transfer_bytes
+            or transfer != expected_plan):
+        raise PrewarmError(f"Transfer plan does not match the empty-cache preparation policy: {report_name}")
+
+    if value.get("coverage_semantics") != "sum_of_fully_readable_selected_ranges":
+        raise PrewarmError(f"Selected-range coverage semantics are invalid: {report_name}")
+    selected_set = {(item["resource_id"], item["start"], item["end"]) for item in selected}
+    for count_key, spans_key in (("cache_covered_bytes_before", "cache_covered_spans_before"),
+                                 ("cache_covered_bytes_after", "cache_covered_spans_after")):
+        count, spans = value.get(count_key), value.get(spans_key)
+        if count is None and spans is None:
+            continue
+        if count is None or spans is None:
+            raise PrewarmError(f"{count_key} and {spans_key} must be null together: {report_name}")
+        coverage = _range_list(spans, resource_ids, spans_key, report_name,
+                               totals=totals, allow_empty=True)
+        if (not _exact_int(count) or count < 0 or count > planned
+                or _range_bytes(coverage, spans_key, report_name) != count
+                or any((item["resource_id"], item["start"], item["end"]) not in selected_set
+                       for item in coverage)):
+            raise PrewarmError(f"{count_key} does not match exact readable selected ranges: {report_name}")
+
+    attempted = value.get("attempted_ranges")
+    attempt_count = value.get("attempt_count")
+    attempted_bytes = value.get("attempted_span_bytes")
+    if (not isinstance(attempted, list) or len(attempted) > MAX_PREWARM_RANGES
+            or not _exact_int(attempt_count) or attempt_count != len(attempted)
+            or not _exact_int(attempted_bytes) or attempted_bytes < 0
+            or attempted_bytes > PREWARM_TRANSFER_BYTES):
+        raise PrewarmError(f"Attempt counters exceed bounds or disagree with the ledger: {report_name}")
+    measured_attempted_bytes = 0
+    published_attempts: list[dict[str, Any]] = []
     for attempt in attempted:
-        if (not isinstance(attempt, dict) or set(attempt) != {"resource_id", "start", "end", "outcome"}
-                or not isinstance(attempt.get("resource_id"), str)
+        if not isinstance(attempt, dict) or set(attempt) != ATTEMPT_KEYS:
+            raise PrewarmError(f"Attempt ledger entry has unexpected or missing fields: {report_name}")
+        resource_id = attempt.get("resource_id")
+        purpose = attempt.get("purpose")
+        total_length = attempt.get("resource_total_length")
+        status_code = attempt.get("status_code")
+        headers = attempt.get("headers_validated")
+        body = attempt.get("body_validated")
+        identity = attempt.get("identity_validated")
+        cache_published = attempt.get("cache_published")
+        outcome = attempt.get("outcome")
+        if (not _safe_resource_id(resource_id) or resource_id not in resource_ids
+                or purpose not in ATTEMPT_PURPOSES or outcome not in ATTEMPT_OUTCOMES
                 or not _exact_int(attempt.get("start")) or not _exact_int(attempt.get("end"))
                 or attempt["start"] < 0 or attempt["end"] <= attempt["start"]
                 or attempt["end"] > U64_MAX
-                or not isinstance(attempt.get("outcome"), str)
-                or attempt["outcome"] not in ("completed", "preempted")):
-            raise PrewarmError(f"Attempted range is invalid or has an unsupported outcome: {report_name}")
-        span = (attempt["resource_id"], attempt["start"], attempt["end"])
-        if span not in plan_by_span or span_states.get(span) == "completed":
-            raise PrewarmError(f"Attempted range is unplanned or retries a completed span: {report_name}")
-        span_length = attempt["end"] - attempt["start"]
-        attempted_bytes += span_length
-        if attempted_bytes > transfer_budget:
-            raise PrewarmError(f"Cumulative attempted range bytes exceed the transfer budget: {report_name}")
-        outcome = attempt["outcome"]
-        if outcome == "preempted":
-            preempted += 1
-            span_states[span] = "preempted"
-        else:
-            completed_spans.add(span)
-            span_states[span] = "completed"
-    if (requested != attempted_bytes or operations != len(attempted)
-            or preempted_count != preempted or defer_count > preempted):
-        raise PrewarmError(f"Prewarm attempt counters do not match attempted ranges: {report_name}")
-    completed_sum = sum(end - start for _, start, end in completed_spans)
-    if completed_bytes != completed_sum or completed_count != len(completed_spans):
-        raise PrewarmError(f"Unique completed transfer counters do not match completed spans: {report_name}")
+                or (total_length is not None and
+                    (not _exact_int(total_length) or not 1 <= total_length <= U64_MAX))
+                or (purpose != "resource_discovery" and total_length != totals[resource_id])
+                or (purpose == "resource_discovery" and total_length not in (None, totals[resource_id]))
+                or (total_length is not None and attempt["end"] > total_length)
+                or (status_code is not None and
+                    (not _exact_int(status_code) or not 100 <= status_code <= 599))
+                or any(flag is not None and type(flag) is not bool
+                       for flag in (headers, body, identity, cache_published))):
+            raise PrewarmError(f"Attempt ledger entry has invalid identity, range, or scalar fields: {report_name}")
+        measured_attempted_bytes += attempt["end"] - attempt["start"]
+        if measured_attempted_bytes > PREWARM_TRANSFER_BYTES:
+            raise PrewarmError(f"Attempted span-byte total exceeds 16 MiB: {report_name}")
+        if (status_code is None and headers is not None
+                or status_code is not None and headers is False and body is not None
+                or body is not None and headers is not True
+                or headers is True and (status_code is None or total_length is None)
+                or purpose != "cache_fill" and cache_published is not None
+                or cache_published is True and (
+                    headers is not True or body is not True or outcome != "cache_published")):
+            raise PrewarmError(f"Attempt validation and publication flags are inconsistent: {report_name}")
+        if outcome == "headers_received" and (status_code is None or headers is not None or body is not None):
+            raise PrewarmError(f"headers_received outcome has impossible validation flags: {report_name}")
+        if outcome == "headers_validated" and (headers is not True or body is not None):
+            raise PrewarmError(f"headers_validated outcome has impossible validation flags: {report_name}")
+        if outcome == "body_validated" and (headers is not True or body is not True):
+            raise PrewarmError(f"body_validated outcome lacks validated headers and body: {report_name}")
+        if outcome == "cache_published" and (
+                purpose != "cache_fill" or headers is not True or body is not True
+                or cache_published is not True):
+            raise PrewarmError(f"cache_published outcome lacks a confirmed durable publication: {report_name}")
+        if outcome == "identity_changed" and identity is not False:
+            raise PrewarmError(f"identity_changed outcome lacks a failed identity validation: {report_name}")
+        if outcome == "upstream_status" and (status_code is None or headers is not False):
+            raise PrewarmError(f"upstream_status outcome lacks a rejected HTTP status: {report_name}")
+        span = {"resource_id": resource_id, "start": attempt["start"], "end": attempt["end"]}
+        if purpose == "cache_fill" and not _range_is_covered(
+                (resource_id, attempt["start"], attempt["end"]), transfer):
+            raise PrewarmError(f"Cache-fill attempt is outside the declared transfer-plan union: {report_name}")
+        if cache_published is True:
+            published_attempts.append(span)
+    if measured_attempted_bytes != attempted_bytes:
+        raise PrewarmError(f"Attempted span-byte counter does not match the send ledger: {report_name}")
+
+    published = _range_list(value.get("cache_published_spans"), resource_ids,
+                             "cache_published_spans", report_name, totals=totals, allow_empty=True)
+    published_bytes = value.get("cache_published_bytes")
+    expected_published_union = _normalized_union(published_attempts)
+    observed_published_union = _normalized_union(published)
+    if (not _exact_int(published_bytes) or published_bytes < 0
+            or published_bytes != _range_bytes(published, "cache_published_spans", report_name)
+            or observed_published_union != expected_published_union):
+        raise PrewarmError(f"Published-span union or byte count does not match confirmed cache fills: {report_name}")
+
+    preempted_count = value.get("preempted_operation_count")
+    defer_count = value.get("foreground_defer_count")
+    elapsed = value.get("elapsed_seconds")
+    if (not _exact_int(preempted_count) or preempted_count < 0
+            or not _exact_int(defer_count) or defer_count < 0
+            or not _finite(elapsed) or elapsed < 0 or elapsed > 15
+            or type(value.get("completed")) is not bool):
+        raise PrewarmError(f"Prewarm completion flag, retry counters, or elapsed bound is invalid: {report_name}")
+    failure = value.get("failure")
+    _validate_failure_state(failure, attempted, resource_ids, completed=value["completed"],
+                            mode=mode, report_name=report_name)
+    if value.get("provenance") != PROVENANCE:
+        raise PrewarmError(f"Prewarm provenance is missing, changed, or has unknown fields: {report_name}")
+
     if mode == "off":
-        if any((requested, operations, completed_bytes, completed_count, preempted_count, defer_count)):
-            raise PrewarmError("Control report claims prewarm operations or transfers.")
-    elif (set(completed_spans) != set(plan_by_span) or completed_bytes != planned_transfer
-          or completed_count != len(transfer)):
-        raise PrewarmError("Treatment report does not uniquely complete the full transfer plan.")
-    coverage = value.get("cache_covered_bytes_before"), value.get("cache_covered_bytes_after")
-    if any(not _exact_int(item) or item < 0 or item > planned for item in coverage):
-        raise PrewarmError(f"Selected-window cache coverage is invalid: {report_name}")
-    if mode == "on" and coverage[1] != planned:
-        raise PrewarmError("Treatment cache does not fully cover the selected planned ranges.")
+        if (attempt_count != 0 or attempted_bytes != 0 or published_bytes != 0 or published
+                or preempted_count != 0 or defer_count != 0):
+            raise PrewarmError("Control report claims prewarm sends, publication, or admission activity.")
+    return value
+
+
+def _prewarm_contract(report: dict[str, Any], mode: str, report_name: str) -> dict[str, Any]:
+    value = _prewarm_diagnostic_data(report, mode, report_name)
+    if value["completed"] is not True:
+        raise PrewarmError(f"Prewarm preparation is not a completed case: {report_name}")
+    if mode == "on":
+        selected = {(item["resource_id"], item["start"], item["end"])
+                    for item in value["selected_ranges"]}
+        after = value["cache_covered_spans_after"]
+        if (after is None or
+                {(item["resource_id"], item["start"], item["end"]) for item in after} != selected):
+            raise PrewarmError("Treatment did not prove actual readable coverage of every selected range.")
     return value
 
 
@@ -529,7 +745,8 @@ def _comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
             "upper_bound_seconds": off_latency["upper_bound_seconds"] - on_latency["lower_bound_seconds"],
         }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "prewarm_report_schema_version": 4,
         "diagnostic_only": True,
         "status": "valid_comparison" if recovered else "negative_diagnostic",
         "interpretation": "raw observed latency comparison only; no causal proof or optimization gate",
@@ -560,22 +777,26 @@ def _comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
                                 "timeline_waiting_sample_count": waiting_samples},
         "prewarm_readiness": {
             "coverage_semantics": "sum_of_fully_readable_selected_ranges",
-            "transfer_accounting": "planned_background_parent_chunks_and_startup_not_wire_bytes",
+            "attempt_bytes_semantics": "sum_of_requested_range_lengths_not_wire_bytes",
+            "transfer_plan_semantics": "empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans",
             "expanded_transfer_may_overlap_buffered_media": True,
             "control": {"planned_logical_selected_bytes": off["prewarm"]["planned_bytes"],
                         "planned_expanded_transfer_bytes": off["prewarm"]["planned_transfer_bytes"],
-            "actual_attempt_count": off["prewarm"]["operation_count"],
-                        "actual_attempted_span_bytes": off["prewarm"]["operation_requested_bytes"],
+                        "actual_attempt_count": off["prewarm"]["attempt_count"],
+                        "actual_attempted_span_bytes": off["prewarm"]["attempted_span_bytes"],
                         "preempted_operation_count": off["prewarm"]["preempted_operation_count"],
-                        "completed_plan_span_count": off["prewarm"]["completed_transfer_count"],
-                        "completed_plan_span_bytes": off["prewarm"]["completed_transfer_bytes"]},
+                        "foreground_defer_count": off["prewarm"]["foreground_defer_count"],
+                        "cache_published_span_count": len(off["prewarm"]["cache_published_spans"]),
+                        "cache_published_bytes": off["prewarm"]["cache_published_bytes"],
+                        "covered_logical_selected_bytes": off["prewarm"]["cache_covered_bytes_after"]},
             "treatment": {"planned_logical_selected_bytes": on["prewarm"]["planned_bytes"],
                           "planned_expanded_transfer_bytes": on["prewarm"]["planned_transfer_bytes"],
-                          "actual_attempt_count": on["prewarm"]["operation_count"],
-                          "actual_attempted_span_bytes": on["prewarm"]["operation_requested_bytes"],
+                          "actual_attempt_count": on["prewarm"]["attempt_count"],
+                          "actual_attempted_span_bytes": on["prewarm"]["attempted_span_bytes"],
                           "preempted_operation_count": on["prewarm"]["preempted_operation_count"],
-                          "completed_plan_span_count": on["prewarm"]["completed_transfer_count"],
-                          "completed_plan_span_bytes": on["prewarm"]["completed_transfer_bytes"],
+                          "foreground_defer_count": on["prewarm"]["foreground_defer_count"],
+                          "cache_published_span_count": len(on["prewarm"]["cache_published_spans"]),
+                          "cache_published_bytes": on["prewarm"]["cache_published_bytes"],
                           "covered_logical_selected_bytes": on["prewarm"]["cache_covered_bytes_after"]}},
         "acceptance_passed": False,
     }
@@ -640,6 +861,13 @@ def _run_command(argv: list[str], *, log: Path, env: dict[str, str], deadline: f
     timeout = min(timeout, normal.remaining_work(deadline))
     normal._run_command(argv, log_path=log, env=env, timeout=timeout,
                         artifact_dir=artifact_dir, cargo_artifact_monitor=True)
+
+
+def _encode_summary(summary: dict[str, Any]) -> bytes:
+    raw = (json.dumps(summary, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    if len(raw) > REPORT_BYTES:
+        raise PrewarmError("Scalar-only summary exceeds 64 KiB.")
+    return raw
 
 
 def run(artifact_arg: str | None = None, local_config_arg: str | None = None) -> int:
@@ -724,8 +952,8 @@ def run(artifact_arg: str | None = None, local_config_arg: str | None = None) ->
                            "elapsed_seconds": round(time.monotonic() - started, 3)}
                 if comparison is not None:
                     summary["prewarm_comparison"] = comparison
-                raw = (json.dumps(summary, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
-                if len(raw) > REPORT_BYTES or normal._artifact_size(artifacts) + len(raw) > ARTIFACT_BYTES:
+                raw = _encode_summary(summary)
+                if normal._artifact_size(artifacts) + len(raw) > ARTIFACT_BYTES:
                     raise PrewarmError("Bounded summary exceeds report/artifact limit.")
                 (artifacts / "summary.json").write_bytes(raw)
             except (OSError, PrewarmError) as error:

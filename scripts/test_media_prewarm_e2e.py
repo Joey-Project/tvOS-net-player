@@ -10,6 +10,9 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("media-prewarm-e2e.py")
+# Exact complete Rust-serde exports, kept inline so this test is checkout-portable.
+RUST_CACHE_HIT_V4 = r'''{"schema_version":4,"mode":"on","boundary_policy":"unbuffered_after_20s_safety","recovery_snapshot":{"schema_version":1,"observed_monotonic_seconds":100.0,"playhead_seconds":60.0,"loaded_end_seconds":80.0},"target_window_start_seconds":80.0,"target_window_end_seconds":100.0,"byte_budget":8388608,"planned_bytes":32,"transfer_byte_budget":16777216,"planned_transfer_bytes":524288,"attempt_count":0,"attempted_span_bytes":0,"attempted_ranges":[],"cache_published_bytes":0,"cache_published_spans":[],"preempted_operation_count":0,"foreground_defer_count":0,"elapsed_seconds":0.050900833,"coverage_semantics":"sum_of_fully_readable_selected_ranges","cache_covered_bytes_before":32,"cache_covered_spans_before":[{"resource_id":"audio.m4s","start":0,"end":32}],"cache_covered_bytes_after":32,"cache_covered_spans_after":[{"resource_id":"audio.m4s","start":0,"end":32}],"selected_ranges":[{"resource_id":"audio.m4s","start":0,"end":32}],"transfer_plan":[{"resource_id":"audio.m4s","start":0,"end":524288}],"resource_ids":{"video":"video.m4s","audio":"audio.m4s"},"resource_total_lengths":{"video":1048576,"audio":1048576},"completed":true,"failure":{"category":null,"resource_id":null,"start":null,"end":null,"upstream_status":null},"provenance":{"shared_origin_counter_scope":"playback_and_preparation","attempt_bytes_semantics":"sum_of_requested_range_lengths_not_wire_bytes","identity_probe_attempts_included":true,"transfer_plan_semantics":"empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans","expanded_transfer_may_overlap_buffered_media":true}}'''
+RUST_TYPED_503_V4 = r'''{"schema_version":4,"mode":"on","boundary_policy":"unbuffered_after_20s_safety","recovery_snapshot":{"schema_version":1,"observed_monotonic_seconds":100.0,"playhead_seconds":60.0,"loaded_end_seconds":80.0},"target_window_start_seconds":80.0,"target_window_end_seconds":100.0,"byte_budget":8388608,"planned_bytes":32,"transfer_byte_budget":16777216,"planned_transfer_bytes":524288,"attempt_count":1,"attempted_span_bytes":524288,"attempted_ranges":[{"resource_id":"audio.m4s","resource_total_length":1048576,"start":0,"end":524288,"purpose":"cache_fill","status_code":503,"headers_validated":false,"body_validated":null,"identity_validated":null,"cache_published":false,"outcome":"upstream_status"}],"cache_published_bytes":0,"cache_published_spans":[],"preempted_operation_count":0,"foreground_defer_count":0,"elapsed_seconds":0.022279917,"coverage_semantics":"sum_of_fully_readable_selected_ranges","cache_covered_bytes_before":0,"cache_covered_spans_before":[],"cache_covered_bytes_after":0,"cache_covered_spans_after":[],"selected_ranges":[{"resource_id":"audio.m4s","start":0,"end":32}],"transfer_plan":[{"resource_id":"audio.m4s","start":0,"end":524288}],"resource_ids":{"video":"video.m4s","audio":"audio.m4s"},"resource_total_lengths":{"video":1048576,"audio":1048576},"completed":false,"failure":{"category":"upstream_status","resource_id":"audio.m4s","start":0,"end":524288,"upstream_status":503},"provenance":{"shared_origin_counter_scope":"playback_and_preparation","attempt_bytes_semantics":"sum_of_requested_range_lengths_not_wire_bytes","identity_probe_attempts_included":true,"transfer_plan_semantics":"empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans","expanded_transfer_may_overlap_buffered_media":true}}'''
 SPEC = importlib.util.spec_from_file_location("media_prewarm_e2e_under_test", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 prewarm = importlib.util.module_from_spec(SPEC)
@@ -42,41 +45,49 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
             "playhead_seconds": elapsed + 1, "loaded_end_seconds": elapsed + 10,
             "buffered_ahead_seconds": 9, "decoded_width": 640, "decoded_height": 360,
             "time_control_status": "playing", "indicated_bitrate": 1000000})
+    resource_totals = {"video": 2_000_000, "audio": 2_000_000}
+    resource_ids = {"video": "video-id", "audio": "audio-id"}
+    selected_ranges = [{"resource_id": "audio-id", "start": 50, "end": 250},
+                       {"resource_id": "video-id", "start": 700_000, "end": 700_800}]
+    transfer_plan = [{"resource_id": "audio-id", "start": 0, "end": prewarm.STARTUP_PREFIX_BYTES},
+                     {"resource_id": "video-id", "start": 0, "end": prewarm.STARTUP_PREFIX_BYTES},
+                     {"resource_id": "video-id", "start": 655_360, "end": 720_896}]
+    attempt_templates = [
+        {"resource_id": span["resource_id"], "resource_total_length": resource_totals[
+            "audio" if span["resource_id"] == "audio-id" else "video"],
+         "start": span["start"], "end": span["end"], "purpose": "cache_fill",
+         "status_code": 206, "headers_validated": True, "body_validated": True,
+         "identity_validated": None, "cache_published": True, "outcome": "cache_published"}
+        for span in selected_ranges
+    ]
     prewarm_contract = {
-        "schema_version": 3, "mode": "off" if mode == "off" else "on",
+        "schema_version": 4, "mode": "off" if mode == "off" else "on",
         "boundary_policy": "unbuffered_after_20s_safety",
         "recovery_snapshot": {"schema_version": 1, "observed_monotonic_seconds": 135,
                               "playhead_seconds": 100, "loaded_end_seconds": 110},
         "target_window_start_seconds": 130, "target_window_end_seconds": 150,
         "byte_budget": prewarm.PREWARM_BYTES, "planned_bytes": 1000,
-        "transfer_byte_budget": prewarm.PREWARM_TRANSFER_BYTES, "planned_transfer_bytes": 1250,
-        "resource_ids": {"video": "video-id", "audio": "audio-id"},
-        "selected_ranges": [{"resource_id": "audio-id", "start": 50, "end": 250},
-                            {"resource_id": "video-id", "start": 100, "end": 900}],
-        "transfer_plan": [{"resource_id": "audio-id", "start": 0, "end": 250},
-                          {"resource_id": "video-id", "start": 0, "end": 500},
-                          {"resource_id": "video-id", "start": 500, "end": 1000}],
+        "transfer_byte_budget": prewarm.PREWARM_TRANSFER_BYTES,
+        "planned_transfer_bytes": sum(span["end"] - span["start"] for span in transfer_plan),
+        "resource_ids": resource_ids, "resource_total_lengths": resource_totals,
+        "selected_ranges": selected_ranges, "transfer_plan": transfer_plan,
         "coverage_semantics": "sum_of_fully_readable_selected_ranges",
-        "operation_requested_bytes": 0 if mode == "off" else 1250,
-        "operation_count": 0 if mode == "off" else 3,
-        "attempted_ranges": [] if mode == "off" else [
-            {**span, "outcome": "completed"} for span in (
-                {"resource_id": "audio-id", "start": 0, "end": 250},
-                {"resource_id": "video-id", "start": 0, "end": 500},
-                {"resource_id": "video-id", "start": 500, "end": 1000})],
-        "completed_transfer_bytes": 0 if mode == "off" else 1250,
-        "completed_transfer_count": 0 if mode == "off" else 3,
+        "attempt_count": 0 if mode == "off" else len(attempt_templates),
+        "attempted_span_bytes": 0 if mode == "off" else 1000,
+        "attempted_ranges": [] if mode == "off" else attempt_templates,
+        "cache_published_bytes": 0 if mode == "off" else 1000,
+        "cache_published_spans": [] if mode == "off" else copy.deepcopy(selected_ranges),
         "preempted_operation_count": 0,
         "foreground_defer_count": 0,
         "failure": {"category": None, "resource_id": None, "start": None, "end": None,
                     "upstream_status": None},
         "elapsed_seconds": 0 if mode == "off" else 1.5,
         "cache_covered_bytes_before": 0,
+        "cache_covered_spans_before": [],
         "cache_covered_bytes_after": 0 if mode == "off" else 1000,
+        "cache_covered_spans_after": [] if mode == "off" else copy.deepcopy(selected_ranges),
         "completed": True,
-        "provenance": {"origin_counters_include_playback_and_prewarm": True,
-                        "transfer_accounting": "planned_background_parent_chunks_and_startup_not_wire_bytes",
-                        "expanded_transfer_may_overlap_buffered_media": True},
+        "provenance": copy.deepcopy(prewarm.PROVENANCE),
     }
     return {
         "schema_version": 1, "status": "passed", "case_full_name": case,
@@ -137,6 +148,16 @@ def make_report(mode: str, *, recovered: bool = True) -> dict:
 
 
 class PrewarmRunnerTests(unittest.TestCase):
+    def validate_fixture(self, report: dict, mode: str) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps(report, allow_nan=True))
+            return prewarm.validate_report(path, mode)
+
+    def assert_report_rejected(self, report: dict, mode: str = "on") -> None:
+        with self.assertRaises(prewarm.PrewarmError):
+            self.validate_fixture(report, mode)
+
     def test_exact_single_case_commands(self) -> None:
         binary = Path("/signed/media-tests")
         for mode, name in prewarm.TESTS.items():
@@ -150,6 +171,8 @@ class PrewarmRunnerTests(unittest.TestCase):
     def test_normal_three_case_contract_is_not_mutated(self) -> None:
         self.assertEqual(len(prewarm.normal.EXPECTED_TESTS), 3)
         self.assertEqual(len(prewarm.normal.EXPECTED_CASES), 3)
+        self.assertEqual(prewarm.normal.REPORT_BYTES, 64 * 1024)
+        self.assertEqual(prewarm.normal.ARTIFACT_BYTES, 32 * 1024 * 1024)
         self.assertNotIn(prewarm.TESTS["off"], prewarm.normal.EXPECTED_TESTS)
         self.assertNotIn(prewarm.TESTS["on"], prewarm.normal.EXPECTED_CASES)
 
@@ -201,49 +224,51 @@ class PrewarmRunnerTests(unittest.TestCase):
                 self.assertEqual(validated[mode]["mode"], mode)
             comparison = prewarm._comparison(validated["off"], validated["on"])
         self.assertEqual(comparison["status"], "valid_comparison")
+        self.assertEqual(comparison["schema_version"], 2)
+        self.assertEqual(comparison["prewarm_report_schema_version"], 4)
         self.assertIsNotNone(comparison["recovery_high"]["raw_observed_latency_delta_seconds"])
         self.assertFalse(comparison["acceptance_passed"])
         self.assertIn("not_origin_prewarm", comparison["client_high_request_count"]["source"])
         self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_logical_selected_bytes"], 1000)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_expanded_transfer_bytes"], 1250)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempt_count"], 3)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempted_span_bytes"], 1250)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["completed_plan_span_count"], 3)
-        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["completed_plan_span_bytes"], 1250)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["planned_expanded_transfer_bytes"],
+                         2 * prewarm.STARTUP_PREFIX_BYTES + prewarm.PREPARATION_SPAN_BYTES)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempt_count"], 2)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["actual_attempted_span_bytes"], 1000)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["cache_published_span_count"], 2)
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["cache_published_bytes"], 1000)
         self.assertEqual(comparison["prewarm_readiness"]["treatment"]["preempted_operation_count"], 0)
-        self.assertIn("not_wire_bytes", comparison["prewarm_readiness"]["transfer_accounting"])
+        self.assertEqual(comparison["prewarm_readiness"]["treatment"]["covered_logical_selected_bytes"], 1000)
+        self.assertEqual(comparison["prewarm_readiness"]["attempt_bytes_semantics"],
+                         "sum_of_requested_range_lengths_not_wire_bytes")
 
-    def test_schema_three_accepts_selection_spanning_adjacent_parent_chunks(self) -> None:
+    def test_v4_plan_is_exact_and_optional_spans_need_not_be_filled(self) -> None:
         report = make_report("on")
         comparison = report["prewarm_comparison"]
-        self.assertEqual(comparison["selected_ranges"][1]["start"], 100)
-        self.assertEqual(comparison["transfer_plan"][1]["end"], comparison["transfer_plan"][2]["start"])
+        self.assertEqual(comparison["selected_ranges"][1]["start"], 700_000)
+        self.assertEqual(comparison["transfer_plan"][2],
+                         {"resource_id": "video-id", "start": 655_360, "end": 720_896})
+        self.assertGreater(comparison["planned_transfer_bytes"], comparison["cache_published_bytes"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "treatment.json"
             path.write_text(json.dumps(report))
             validated = prewarm.validate_report(path, "on")
         self.assertEqual(validated["prewarm"]["planned_bytes"], 1000)
-        self.assertEqual(validated["prewarm"]["planned_transfer_bytes"], 1250)
+        self.assertEqual(validated["prewarm"]["cache_covered_bytes_after"], 1000)
 
-    def test_schema_three_accepts_repeated_preemption_then_unique_completion(self) -> None:
+    def test_attempt_failure_can_be_followed_by_successful_cache_coverage(self) -> None:
         report = make_report("on")
         contract = report["prewarm_comparison"]
-        plan = contract["transfer_plan"]
-        contract["attempted_ranges"] = [
-            {**plan[0], "outcome": "preempted"},
-            {**plan[0], "outcome": "preempted"},
-            {**plan[0], "outcome": "completed"},
-            {**plan[1], "outcome": "completed"},
-            {**plan[2], "outcome": "completed"},
-        ]
-        contract.update(operation_count=5, operation_requested_bytes=1750,
-                        preempted_operation_count=2, foreground_defer_count=2)
+        failed = copy.deepcopy(contract["attempted_ranges"][0])
+        failed.update(status_code=503, headers_validated=False, body_validated=None,
+                      cache_published=None, outcome="upstream_status")
+        contract["attempted_ranges"].insert(0, failed)
+        contract.update(attempt_count=3, attempted_span_bytes=1200)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "treatment.json"
             path.write_text(json.dumps(report))
             validated = prewarm.validate_report(path, "on")
-        self.assertEqual(validated["prewarm"]["completed_transfer_bytes"], 1250)
-        self.assertEqual(validated["prewarm"]["completed_transfer_count"], 3)
+        self.assertEqual(validated["prewarm"]["attempt_count"], 3)
+        self.assertEqual(validated["prewarm"]["cache_published_bytes"], 1000)
 
     def test_schema_one_selected_only_reports_are_refused(self) -> None:
         report = make_report("on")
@@ -260,6 +285,45 @@ class PrewarmRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "schema-two.json"
             path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+    def test_schema_three_is_never_reinterpreted_as_v4(self) -> None:
+        report = make_report("on")
+        report["prewarm_comparison"]["schema_version"] = 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema-three.json"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm.validate_report(path, "on")
+
+    def test_v4_exact_keys_enums_and_exact_integer_types(self) -> None:
+        mutations = [
+            lambda c: c.update(unexpected="value"),
+            lambda c: c.pop("resource_total_lengths"),
+            lambda c: c.update(schema_version=True),
+            lambda c: c.update(attempt_count=True),
+            lambda c: c.update(preempted_operation_count=True),
+            lambda c: c["attempted_ranges"][0].update(purpose="download"),
+            lambda c: c["attempted_ranges"][0].update(outcome="success"),
+            lambda c: c["attempted_ranges"][0].update(headers_validated=1),
+            lambda c: c["attempted_ranges"][0].update(status_code=True),
+            lambda c: c["attempted_ranges"][0].update(start=prewarm.U64_MAX + 1),
+        ]
+        for mutate in mutations:
+            report = make_report("on")
+            mutate(report["prewarm_comparison"])
+            with self.subTest(mutation=mutate):
+                self.assert_report_rejected(report)
+
+        report = make_report("on")
+        report["prewarm_comparison"]["elapsed_seconds"] = float("nan")
+        self.assert_report_rejected(report)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nan.json"
+            path.write_text(json.dumps(make_report("on"), allow_nan=True).replace(
+                '"elapsed_seconds": 1.5', '"elapsed_seconds": NaN', 1))
             with self.assertRaises(prewarm.PrewarmError):
                 prewarm.validate_report(path, "on")
 
@@ -301,86 +365,48 @@ class PrewarmRunnerTests(unittest.TestCase):
                 with self.subTest(mutation=mutation), self.assertRaises(prewarm.PrewarmError):
                     prewarm.validate_report(path, "on")
 
-    def test_control_keeps_zero_intervention_and_full_transfer_plan(self) -> None:
+    def test_control_keeps_zero_attempts_and_publications_with_policy_plan(self) -> None:
         report = make_report("off")
         contract = report["prewarm_comparison"]
-        self.assertEqual(contract["operation_requested_bytes"], 0)
-        self.assertEqual(contract["operation_count"], 0)
-        self.assertEqual(contract["planned_transfer_bytes"], 1250)
+        self.assertEqual(contract["attempted_span_bytes"], 0)
+        self.assertEqual(contract["attempt_count"], 0)
+        self.assertEqual(contract["cache_published_bytes"], 0)
+        self.assertEqual(contract["cache_published_spans"], [])
+        self.assertEqual(contract["planned_transfer_bytes"],
+                         2 * prewarm.STARTUP_PREFIX_BYTES + prewarm.PREPARATION_SPAN_BYTES)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "control.json"
             path.write_text(json.dumps(report))
             validated = prewarm.validate_report(path, "off")
         self.assertEqual(len(validated["prewarm"]["transfer_plan"]), 3)
-        self.assertEqual(validated["prewarm"]["completed_transfer_bytes"], 0)
-        self.assertEqual(validated["prewarm"]["completed_transfer_count"], 0)
+        self.assertEqual(validated["prewarm"]["attempted_span_bytes"], 0)
+        self.assertEqual(validated["prewarm"]["cache_published_bytes"], 0)
 
-    def test_schema_three_rejects_attempt_budget_and_accounting_forgery(self) -> None:
-        cases = []
-        cases.append(("attempt bytes undercharged", lambda c: c.update(operation_requested_bytes=1249)))
-        cases.append(("attempt count forged", lambda c: c.update(operation_count=4)))
-        cases.append(("unplanned retry", lambda c: c["attempted_ranges"].append(
-            {"resource_id": "unknown", "start": 0, "end": 1, "outcome": "preempted"})))
-        cases.append(("duplicate completion", lambda c: c["attempted_ranges"].append(
-            {**c["transfer_plan"][0], "outcome": "completed"})))
-        cases.append(("missing completed span", lambda c: c["attempted_ranges"].pop()))
-        cases.append(("unknown outcome", lambda c: c["attempted_ranges"][0].update(outcome="retry")))
-        cases.append(("nonretryable outcome on passed report",
-                      lambda c: c["attempted_ranges"][0].update(outcome="network")))
-        cases.append(("preemption counter forged", lambda c: c.update(preempted_operation_count=1)))
-        cases.append(("defer exceeds preemption", lambda c: c.update(foreground_defer_count=1)))
-        cases.append(("completed byte counter forged", lambda c: c.update(completed_transfer_bytes=1249)))
-        cases.append(("completed count forged", lambda c: c.update(completed_transfer_count=2)))
-        cases.append(("failure on passed report", lambda c: c["failure"].update(category="network")))
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "treatment.json"
-            for label, mutate in cases:
-                report = make_report("on")
-                mutate(report["prewarm_comparison"])
-                path.write_text(json.dumps(report))
-                with self.subTest(case=label), self.assertRaises(prewarm.PrewarmError):
-                    prewarm.validate_report(path, "on")
-
+    def test_v4_rejects_attempt_ledger_and_byte_accounting_forgery(self) -> None:
+        cases = [
+            ("attempt bytes undercharged", lambda c: c.update(attempted_span_bytes=999)),
+            ("attempt count forged", lambda c: c.update(attempt_count=3)),
+            ("cache fill outside plan union", lambda c: c["attempted_ranges"][0].update(
+                start=1_500_000, end=1_500_200)),
+            ("unknown resource", lambda c: c["attempted_ranges"][0].update(resource_id="unknown")),
+            ("unknown outcome", lambda c: c["attempted_ranges"][0].update(outcome="retry")),
+            ("failed outcome claims publication", lambda c: c["attempted_ranges"][0].update(
+                outcome="network")),
+            ("missing attempt field", lambda c: c["attempted_ranges"][0].pop("status_code")),
+            ("published byte counter forged", lambda c: c.update(cache_published_bytes=999)),
+            ("negative preemption counter", lambda c: c.update(preempted_operation_count=-1)),
+            ("negative admission counter", lambda c: c.update(foreground_defer_count=-1)),
+            ("root failure on completed report", lambda c: c["failure"].update(category="network")),
+        ]
+        for label, mutate in cases:
             report = make_report("on")
-            contract = report["prewarm_comparison"]
-            contract["transfer_plan"] = [
-                {"resource_id": "audio-id", "start": 0, "end": prewarm.PREWARM_TRANSFER_BYTES // 2},
-                {"resource_id": "video-id", "start": 0, "end": prewarm.PREWARM_TRANSFER_BYTES // 2},
-            ]
-            contract["planned_transfer_bytes"] = prewarm.PREWARM_TRANSFER_BYTES
-            contract["attempted_ranges"] = [
-                {**contract["transfer_plan"][0], "outcome": "preempted"},
-                {**contract["transfer_plan"][0], "outcome": "preempted"},
-                {**contract["transfer_plan"][0], "outcome": "completed"},
-                {**contract["transfer_plan"][1], "outcome": "completed"},
-            ]
-            contract.update(operation_count=4, operation_requested_bytes=2 * prewarm.PREWARM_TRANSFER_BYTES,
-                            preempted_operation_count=2, foreground_defer_count=2)
-            contract["completed_transfer_bytes"] = prewarm.PREWARM_TRANSFER_BYTES
-            contract["completed_transfer_count"] = 2
-            path.write_text(json.dumps(report))
-            with self.assertRaises(prewarm.PrewarmError):
-                prewarm.validate_report(path, "on")
-
-            report = make_report("on")
-            contract = report["prewarm_comparison"]
-            plan = contract["transfer_plan"]
-            contract["attempted_ranges"] = [
-                {**plan[0], "outcome": "preempted"} for _ in range(prewarm.MAX_PREWARM_RANGES)
-            ] + [{**plan[0], "outcome": "completed"},
-                 {**plan[1], "outcome": "completed"}, {**plan[2], "outcome": "completed"}]
-            contract.update(operation_count=prewarm.MAX_PREWARM_RANGES + 3,
-                            operation_requested_bytes=prewarm.MAX_PREWARM_RANGES * 250 + 1250,
-                            preempted_operation_count=prewarm.MAX_PREWARM_RANGES,
-                            foreground_defer_count=prewarm.MAX_PREWARM_RANGES)
-            path.write_text(json.dumps(report))
-            with self.assertRaises(prewarm.PrewarmError):
-                prewarm.validate_report(path, "on")
+            mutate(report["prewarm_comparison"])
+            with self.subTest(case=label):
+                self.assert_report_rejected(report)
 
     def test_control_rejects_each_nonzero_intervention_or_transfer_field(self) -> None:
-        fields = ("operation_requested_bytes", "operation_count", "completed_transfer_bytes",
-                  "completed_transfer_count", "preempted_operation_count", "foreground_defer_count")
+        fields = ("attempt_count", "attempted_span_bytes", "cache_published_bytes",
+                  "preempted_operation_count", "foreground_defer_count")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "control.json"
             for field in fields:
@@ -390,13 +416,284 @@ class PrewarmRunnerTests(unittest.TestCase):
                 with self.subTest(field=field), self.assertRaises(prewarm.PrewarmError):
                     prewarm.validate_report(path, "off")
             report = make_report("off")
-            report["prewarm_comparison"]["attempted_ranges"] = [
-                {**report["prewarm_comparison"]["transfer_plan"][0], "outcome": "completed"}]
-            report["prewarm_comparison"].update(operation_count=1, operation_requested_bytes=250,
-                                                 completed_transfer_count=1, completed_transfer_bytes=250)
+            contract = report["prewarm_comparison"]
+            contract["attempted_ranges"] = copy.deepcopy(make_report("on")["prewarm_comparison"]["attempted_ranges"])
+            contract["attempt_count"] = 2
+            contract["attempted_span_bytes"] = 1000
             path.write_text(json.dumps(report))
             with self.assertRaises(prewarm.PrewarmError):
                 prewarm.validate_report(path, "off")
+
+    def test_attempt_ledger_counts_discovery_and_identity_probe_sends(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        contract["attempted_ranges"].extend([
+            {"resource_id": "audio-id", "resource_total_length": 2_000_000,
+             "start": 0, "end": 1, "purpose": "resource_discovery", "status_code": 206,
+             "headers_validated": True, "body_validated": True,
+             "identity_validated": None, "cache_published": None, "outcome": "body_validated"},
+            {"resource_id": "video-id", "resource_total_length": 2_000_000,
+             "start": 1_500_000, "end": 1_500_001, "purpose": "identity_probe", "status_code": 206,
+             "headers_validated": True, "body_validated": True,
+             "identity_validated": True, "cache_published": None, "outcome": "body_validated"},
+        ])
+        contract.update(attempt_count=4, attempted_span_bytes=1002)
+        validated = self.validate_fixture(report, "on")
+        self.assertEqual(validated["prewarm"]["attempt_count"], 4)
+        self.assertEqual(validated["prewarm"]["attempted_span_bytes"], 1002)
+
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        probe = {"resource_id": "video-id", "resource_total_length": 2_000_000,
+                 "start": 2_000_000, "end": 2_000_001, "purpose": "identity_probe",
+                 "status_code": 206, "headers_validated": True, "body_validated": True,
+                 "identity_validated": True, "cache_published": None, "outcome": "body_validated"}
+        contract["attempted_ranges"].append(probe)
+        contract.update(attempt_count=3, attempted_span_bytes=1001)
+        self.assert_report_rejected(report)
+
+        report = make_report("on")
+        report["prewarm_comparison"]["attempted_ranges"][0]["resource_total_length"] += 1
+        self.assert_report_rejected(report)
+
+    def test_zero_send_cache_hit_and_admission_deferrals_do_not_invent_attempts(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        contract.update(attempt_count=0, attempted_span_bytes=0, attempted_ranges=[],
+                        cache_published_bytes=0, cache_published_spans=[],
+                        preempted_operation_count=4, foreground_defer_count=3)
+        validated = self.validate_fixture(report, "on")
+        self.assertEqual(validated["prewarm"]["attempted_ranges"], [])
+        self.assertEqual(validated["prewarm"]["cache_published_spans"], [])
+        self.assertEqual(validated["prewarm"]["cache_covered_bytes_after"], 1000)
+
+    def test_actual_rust_serde_failure_state_matches_typed_attempt_ledger(self) -> None:
+        cache_hit = json.loads(RUST_CACHE_HIT_V4)
+        failed = json.loads(RUST_TYPED_503_V4)
+        old_cache_hit = copy.deepcopy(cache_hit)
+        old_cache_hit.update(target_window_start_seconds=60.0,
+                             target_window_end_seconds=80.0)
+        cache_failure = cache_hit["failure"]
+        prewarm._validate_failure_state(cache_failure, cache_hit["attempted_ranges"],
+                                        set(cache_hit["resource_ids"].values()),
+                                        completed=cache_hit["completed"], mode="on",
+                                        report_name="treatment-cache-hit.v4.json")
+        self.assertIs(prewarm._prewarm_contract({"prewarm_comparison": cache_hit}, "on",
+                                                "treatment-cache-hit.v4.json"), cache_hit)
+        with self.assertRaisesRegex(prewarm.PrewarmError, "20-second safety boundary"):
+            prewarm._prewarm_contract({"prewarm_comparison": old_cache_hit}, "on",
+                                      "old-treatment-cache-hit.v4.json")
+        failure = failed["failure"]
+        prewarm._validate_failure_state(failure, failed["attempted_ranges"],
+                                        set(failed["resource_ids"].values()),
+                                        completed=failed["completed"], mode="on",
+                                        report_name="treatment-loopback-503.v4.json")
+        self.assertEqual(failure, {"category": "upstream_status", "resource_id": "audio.m4s",
+                                   "start": 0, "end": 524288, "upstream_status": 503})
+        self.assertFalse(failed["completed"])
+        self.assertEqual(failed["cache_published_spans"], [])
+        self.assertEqual(failed["cache_published_bytes"], 0)
+        with self.assertRaisesRegex(prewarm.PrewarmError, "not a completed case"):
+            prewarm._prewarm_contract({"prewarm_comparison": failed}, "on",
+                                      "treatment-loopback-503.v4.json")
+        malformed_failure = copy.deepcopy(failure)
+        malformed_failure["category"] = ["upstream_status"]
+        with self.assertRaises(prewarm.PrewarmError):
+            prewarm._validate_failure_state(malformed_failure, failed["attempted_ranges"],
+                                            set(failed["resource_ids"].values()),
+                                            completed=False, mode="on",
+                                            report_name="treatment-loopback-503.v4.json")
+
+    def test_published_union_merges_overlapping_and_adjacent_attempts(self) -> None:
+        for first_end, second_start, attempted_bytes in ((180, 100, 1080), (150, 150, 1000)):
+            with self.subTest(first_end=first_end, second_start=second_start):
+                report = make_report("on")
+                contract = report["prewarm_comparison"]
+                original = contract["attempted_ranges"][0]
+                first, second = copy.deepcopy(original), copy.deepcopy(original)
+                first["end"] = first_end
+                second["start"] = second_start
+                contract["attempted_ranges"] = [first, second, contract["attempted_ranges"][1]]
+                contract.update(attempt_count=3, attempted_span_bytes=attempted_bytes)
+                validated = self.validate_fixture(report, "on")
+                self.assertEqual(validated["prewarm"]["cache_published_bytes"], 1000)
+
+    def test_published_spans_must_equal_union_not_double_count_or_infer(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        duplicate = copy.deepcopy(contract["cache_published_spans"][0])
+        duplicate["start"] = 100
+        contract["cache_published_spans"].insert(1, duplicate)
+        contract["cache_published_bytes"] = 1100
+        self.assert_report_rejected(report)
+
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        contract["attempted_ranges"][0]["cache_published"] = False
+        contract["attempted_ranges"][0]["outcome"] = "io"
+        contract["cache_published_spans"] = [contract["cache_published_spans"][1]]
+        contract["cache_published_bytes"] = 800
+        validated = self.validate_fixture(report, "on")
+        self.assertEqual(validated["prewarm"]["cache_published_bytes"], 800)
+
+    def test_validation_flags_and_lifecycle_outcomes_are_consistent(self) -> None:
+        mutations = [
+            lambda a: a.update(headers_validated=False, body_validated=True),
+            lambda a: a.update(status_code=None, headers_validated=True),
+            lambda a: a.update(body_validated=1),
+            lambda a: a.update(cache_published=True, body_validated=False),
+            lambda a: a.update(outcome="cache_published", cache_published=False),
+            lambda a: a.update(outcome="identity_changed", identity_validated=None),
+            lambda a: a.update(outcome="upstream_status", status_code=None,
+                               headers_validated=None, body_validated=None,
+                               cache_published=None),
+            lambda a: a.update(purpose="unknown"),
+            lambda a: a.update(outcome="unknown"),
+            lambda a: a.update(status_code=True),
+            lambda a: a.update(resource_total_length=prewarm.U64_MAX + 1),
+        ]
+        for mutate in mutations:
+            report = make_report("on")
+            mutate(report["prewarm_comparison"]["attempted_ranges"][0])
+            with self.subTest(mutation=mutate):
+                self.assert_report_rejected(report)
+
+    def test_discovery_total_may_be_unknown_only_before_validation(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        discovery = {"resource_id": "video-id", "resource_total_length": None,
+                     "start": 0, "end": 1, "purpose": "resource_discovery", "status_code": 503,
+                     "headers_validated": False, "body_validated": None,
+                     "identity_validated": None, "cache_published": None, "outcome": "upstream_status"}
+        contract["attempted_ranges"].append(discovery)
+        contract.update(attempt_count=3, attempted_span_bytes=1001)
+        self.validate_fixture(report, "on")
+
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        discovery["headers_validated"] = True
+        discovery["outcome"] = "headers_validated"
+        contract["attempted_ranges"].append(discovery)
+        contract.update(attempt_count=3, attempted_span_bytes=1001)
+        self.assert_report_rejected(report)
+
+    def test_coverage_is_observed_exact_selected_ranges_and_nulls_pair(self) -> None:
+        invalid_reports = []
+        report = make_report("on")
+        report["prewarm_comparison"].update(cache_covered_bytes_after=None,
+                                             cache_covered_spans_after=None)
+        invalid_reports.append(report)
+        report = make_report("on")
+        report["prewarm_comparison"]["cache_covered_spans_after"] = None
+        invalid_reports.append(report)
+        report = make_report("on")
+        report["prewarm_comparison"]["cache_covered_spans_after"] = [
+            {"resource_id": "video-id", "start": 700_000, "end": 700_799},
+            {"resource_id": "audio-id", "start": 50, "end": 250}]
+        invalid_reports.append(report)
+        report = make_report("on")
+        report["prewarm_comparison"]["cache_covered_bytes_after"] = 999
+        invalid_reports.append(report)
+        report = make_report("on")
+        report["prewarm_comparison"]["cache_covered_spans_after"] = [
+            {"resource_id": "audio-id", "start": 50, "end": 250},
+            {"resource_id": "audio-id", "start": 100, "end": 200}]
+        invalid_reports.append(report)
+        for invalid in invalid_reports:
+            with self.subTest(report=invalid["prewarm_comparison"]["cache_covered_spans_after"]):
+                self.assert_report_rejected(invalid)
+
+        report = make_report("on")
+        report["prewarm_comparison"].update(cache_covered_bytes_before=None,
+                                             cache_covered_spans_before=None)
+        self.validate_fixture(report, "on")
+
+    def test_resource_ids_lengths_and_total_bounds_are_strict(self) -> None:
+        invalid_ids = (".", "..", "video/track", "video\\track", "video id",
+                       "https://example.invalid/a", "é", "x" * 129)
+        for resource_id in invalid_ids:
+            report = make_report("on")
+            report["prewarm_comparison"]["resource_ids"]["video"] = resource_id
+            with self.subTest(resource_id=resource_id):
+                self.assert_report_rejected(report)
+        for invalid_total in (0, True, prewarm.U64_MAX + 1):
+            report = make_report("on")
+            report["prewarm_comparison"]["resource_total_lengths"]["video"] = invalid_total
+            with self.subTest(total=invalid_total):
+                self.assert_report_rejected(report)
+        report = make_report("on")
+        report["prewarm_comparison"]["resource_total_lengths"].pop("audio")
+        self.assert_report_rejected(report)
+
+    def test_attempt_and_elapsed_limits_are_independent_from_logical_plans(self) -> None:
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        template = copy.deepcopy(contract["attempted_ranges"][0])
+        template.update(start=0, end=prewarm.STARTUP_PREFIX_BYTES,
+                        status_code=None, headers_validated=None, body_validated=None,
+                        identity_validated=None, cache_published=None, outcome="network")
+        contract["attempted_ranges"] = [copy.deepcopy(template) for _ in range(33)]
+        contract.update(attempt_count=33,
+                        attempted_span_bytes=33 * prewarm.STARTUP_PREFIX_BYTES,
+                        cache_published_bytes=0, cache_published_spans=[])
+        self.assert_report_rejected(report)
+
+        report = make_report("on")
+        contract = report["prewarm_comparison"]
+        contract["attempted_ranges"] *= 65
+        contract["attempt_count"] = len(contract["attempted_ranges"])
+        contract["attempted_span_bytes"] = sum(
+            item["end"] - item["start"] for item in contract["attempted_ranges"])
+        self.assert_report_rejected(report)
+
+        for key, value in (("attempt_count", True), ("preempted_operation_count", -1),
+                           ("foreground_defer_count", -1), ("elapsed_seconds", 15.001),
+                           ("elapsed_seconds", float("nan"))):
+            report = make_report("on")
+            report["prewarm_comparison"][key] = value
+            with self.subTest(key=key, value=value):
+                self.assert_report_rejected(report)
+
+    def test_explicit_diagnostic_and_summary_caps_are_separate(self) -> None:
+        self.assertEqual(prewarm.REPORT_BYTES, 64 * 1024)
+        self.assertEqual(prewarm.normal.REPORT_BYTES, 64 * 1024)
+        self.assertEqual(prewarm.normal.ARTIFACT_BYTES, 32 * 1024 * 1024)
+        self.assertEqual(prewarm.PREWARM_OBJECT_BYTES, 192 * 1024)
+        self.assertEqual(prewarm.PREWARM_REPORT_BYTES, 256 * 1024)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            report = make_report("on")
+            report["padding"] = ""
+            base_size = len(json.dumps(report).encode("utf-8"))
+            padding = prewarm.PREWARM_REPORT_BYTES - base_size
+            report["padding"] = "x" * padding
+            path.write_text(json.dumps(report))
+            self.assertEqual(path.stat().st_size, prewarm.PREWARM_REPORT_BYTES)
+            prewarm._read_json(path)
+            report["padding"] += "x"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm._read_json(path)
+
+            report = make_report("on")
+            contract = report["prewarm_comparison"]
+            contract["padding"] = ""
+            encoded = lambda: json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=True, allow_nan=False).encode("utf-8")
+            contract["padding"] = "x" * (prewarm.PREWARM_OBJECT_BYTES - len(encoded()))
+            path.write_text(json.dumps(report))
+            prewarm._read_json(path)
+            contract["padding"] += "x"
+            path.write_text(json.dumps(report))
+            with self.assertRaises(prewarm.PrewarmError):
+                prewarm._read_json(path)
+
+        base = prewarm._encode_summary({"padding": ""})
+        exact_summary = {"padding": "x" * (prewarm.REPORT_BYTES - len(base))}
+        self.assertEqual(len(prewarm._encode_summary(exact_summary)), prewarm.REPORT_BYTES)
+        with self.assertRaises(prewarm.PrewarmError):
+            prewarm._encode_summary({"padding": exact_summary["padding"] + "x"})
 
     def test_failed_diagnostic_is_not_accepted_as_a_censored_success(self) -> None:
         report = make_report("on", recovered=False)

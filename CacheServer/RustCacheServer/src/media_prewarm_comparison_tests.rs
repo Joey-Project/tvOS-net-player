@@ -7,11 +7,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::hls_cache::PlaybackPreparationAttemptObservation;
 use crate::mp4_segments::Mp4SegmentRange;
 
 pub(super) const PREWARM_BYTE_BUDGET: u64 = 8 * 1024 * 1024;
 pub(super) const PREWARM_TRANSFER_BYTE_BUDGET: u64 = 16 * 1024 * 1024;
 const PREWARM_TRANSFER_RANGE_LIMIT: usize = 128;
+pub(super) const PREWARM_COMPARISON_REPORT_MAX_BYTES: usize = 192 * 1024;
 const SAFETY_SECONDS: f64 = 20.0;
 const WINDOW_SECONDS: f64 = 20.0;
 const SNAPSHOT_MAX_BYTES: u64 = 4096;
@@ -78,6 +80,7 @@ pub(super) struct PrewarmPlan {
     pub planned_bytes: u64,
     pub ranges: Vec<SelectedRange>,
     pub resource_ids: PrewarmResourceIds,
+    pub resource_total_lengths: PrewarmResourceLengths,
     pub transfer_ranges: Vec<SelectedRange>,
     pub planned_transfer_bytes: u64,
     pub video_total_length: u64,
@@ -88,6 +91,12 @@ pub(super) struct PrewarmPlan {
 pub(super) struct PrewarmResourceIds {
     pub video: String,
     pub audio: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct PrewarmResourceLengths {
+    pub video: u64,
+    pub audio: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,20 +111,23 @@ pub(super) struct PrewarmComparisonReport {
     pub planned_bytes: u64,
     pub transfer_byte_budget: u64,
     pub planned_transfer_bytes: u64,
-    pub operation_requested_bytes: u64,
-    pub operation_count: u64,
+    pub attempt_count: u64,
+    pub attempted_span_bytes: u64,
     pub attempted_ranges: Vec<PrewarmAttempt>,
-    pub completed_transfer_bytes: u64,
-    pub completed_transfer_count: u64,
+    pub cache_published_bytes: u64,
+    pub cache_published_spans: Vec<SelectedRange>,
     pub preempted_operation_count: u64,
     pub foreground_defer_count: u64,
     pub elapsed_seconds: f64,
     pub coverage_semantics: &'static str,
-    pub cache_covered_bytes_before: u64,
+    pub cache_covered_bytes_before: Option<u64>,
+    pub cache_covered_spans_before: Option<Vec<SelectedRange>>,
     pub cache_covered_bytes_after: Option<u64>,
+    pub cache_covered_spans_after: Option<Vec<SelectedRange>>,
     pub selected_ranges: Vec<SelectedRange>,
     pub transfer_plan: Vec<SelectedRange>,
     pub resource_ids: PrewarmResourceIds,
+    pub resource_total_lengths: PrewarmResourceLengths,
     pub completed: bool,
     pub failure: PrewarmFailure,
     pub provenance: PrewarmProvenance,
@@ -123,27 +135,9 @@ pub(super) struct PrewarmComparisonReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum PrewarmOutcome {
-    InProgress,
-    Completed,
-    Preempted,
-    Cancelled,
-    SessionRemoving,
-    IdentityChanged,
-    QuotaExceeded,
-    UpstreamStatus,
-    Network,
-    Io,
-    RangeUnsupported,
-    InvalidResponse,
-    DeadlineExceeded,
-    ResourceLengthChanged,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub(super) enum PrewarmFailureCategory {
     PlanInvalid,
+    Preempted,
     Cancelled,
     SessionRemoving,
     IdentityChanged,
@@ -160,13 +154,7 @@ pub(super) enum PrewarmFailureCategory {
     CacheCoverageIncomplete,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(super) struct PrewarmAttempt {
-    pub resource_id: String,
-    pub start: u64,
-    pub end: u64,
-    pub outcome: PrewarmOutcome,
-}
+pub(super) type PrewarmAttempt = PlaybackPreparationAttemptObservation;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(super) struct PrewarmFailure {
@@ -179,8 +167,10 @@ pub(super) struct PrewarmFailure {
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct PrewarmProvenance {
-    pub origin_counters_include_playback_and_prewarm: bool,
-    pub transfer_accounting: &'static str,
+    pub shared_origin_counter_scope: &'static str,
+    pub attempt_bytes_semantics: &'static str,
+    pub identity_probe_attempts_included: bool,
+    pub transfer_plan_semantics: &'static str,
     pub expanded_transfer_may_overlap_buffered_media: bool,
 }
 
@@ -194,33 +184,40 @@ pub(super) struct PrewarmTrackInput<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct PrewarmExecution {
-    pub operation_requested_bytes: u64,
-    pub operation_count: u64,
+    pub attempt_count: u64,
+    pub attempted_span_bytes: u64,
     pub attempted_ranges: Vec<PrewarmAttempt>,
-    pub completed_transfer_bytes: u64,
-    pub completed_transfer_count: u64,
+    pub cache_published_bytes: u64,
+    pub cache_published_spans: Vec<SelectedRange>,
     pub preempted_operation_count: u64,
     pub foreground_defer_count: u64,
     pub elapsed_seconds: f64,
-    pub coverage_before: u64,
+    pub coverage_before: Option<u64>,
+    pub coverage_spans_before: Option<Vec<SelectedRange>>,
     pub coverage_after: Option<u64>,
+    pub coverage_spans_after: Option<Vec<SelectedRange>>,
     pub completed: bool,
     pub failure: PrewarmFailure,
 }
 
 impl PrewarmExecution {
-    pub(super) fn initial(coverage: u64) -> Self {
+    pub(super) fn initial(coverage_spans: Option<Vec<SelectedRange>>) -> Self {
+        let coverage = coverage_spans
+            .as_ref()
+            .map(|ranges| ranges.iter().map(|range| range.end - range.start).sum());
         Self {
-            operation_requested_bytes: 0,
-            operation_count: 0,
+            attempt_count: 0,
+            attempted_span_bytes: 0,
             attempted_ranges: Vec::new(),
-            completed_transfer_bytes: 0,
-            completed_transfer_count: 0,
+            cache_published_bytes: 0,
+            cache_published_spans: Vec::new(),
             preempted_operation_count: 0,
             foreground_defer_count: 0,
             elapsed_seconds: 0.0,
             coverage_before: coverage,
+            coverage_spans_before: coverage_spans,
             coverage_after: None,
+            coverage_spans_after: None,
             completed: false,
             failure: PrewarmFailure::default(),
         }
@@ -325,6 +322,9 @@ pub(super) fn plan_window(
             return Err("prewarm resource lacked initialization or media fragments".to_owned());
         }
         let resource_id = track.resource_id.to_owned();
+        if !crate::hls_cache::is_safe_preparation_resource_id(&resource_id) {
+            return Err("prewarm resource identifier was not a bounded safe identifier".to_owned());
+        }
         let resource_id_slot = if track.track_index == 0 {
             &mut resource_ids.video
         } else if track.track_index == 1 {
@@ -390,11 +390,11 @@ pub(super) fn plan_window(
             .filter(|range| range.resource_id == resource_id)
             .map(|range| range.start..range.end)
             .collect::<Vec<_>>();
-        let parents = crate::hls_cache::planned_background_ranges_for_test(
+        let spans = crate::hls_cache::planned_playback_preparation_ranges(
             track.actual_total_length,
             &requested,
         )?;
-        transfer_ranges.extend(parents.into_iter().map(|range| SelectedRange {
+        transfer_ranges.extend(spans.into_iter().map(|range| SelectedRange {
             resource_id: resource_id.clone(),
             start: range.start,
             end: range.end,
@@ -429,19 +429,6 @@ pub(super) fn plan_window(
     transfer_ranges.sort_by(|left, right| {
         (&left.resource_id, left.start, left.end).cmp(&(&right.resource_id, right.start, right.end))
     });
-    let mut canonical_transfer_ranges: Vec<SelectedRange> =
-        Vec::with_capacity(transfer_ranges.len());
-    for range in transfer_ranges {
-        if let Some(previous) = canonical_transfer_ranges.last_mut()
-            && previous.resource_id == range.resource_id
-            && previous.end == range.start
-        {
-            previous.end = range.end;
-        } else {
-            canonical_transfer_ranges.push(range);
-        }
-    }
-    let transfer_ranges = canonical_transfer_ranges;
     if transfer_ranges.len() > PREWARM_TRANSFER_RANGE_LIMIT {
         return Err("expanded prewarm plan exceeded the 128-range limit".to_owned());
     }
@@ -454,12 +441,7 @@ pub(super) fn plan_window(
         return Err("expanded prewarm ranges exceeded the 16 MiB transfer budget".to_owned());
     }
     for selected in &ranges {
-        let contained = transfer_ranges.iter().any(|transfer| {
-            transfer.resource_id == selected.resource_id
-                && transfer.start <= selected.start
-                && selected.end <= transfer.end
-        });
-        if !contained {
+        if !transfer_spans_cover(&transfer_ranges, selected) {
             return Err("expanded prewarm plan did not contain every selected range".to_owned());
         }
     }
@@ -469,6 +451,10 @@ pub(super) fn plan_window(
         planned_bytes,
         ranges,
         resource_ids,
+        resource_total_lengths: PrewarmResourceLengths {
+            video: video_total_length,
+            audio: audio_total_length,
+        },
         transfer_ranges,
         planned_transfer_bytes,
         video_total_length,
@@ -483,7 +469,7 @@ pub(super) fn report_for(
     execution: PrewarmExecution,
 ) -> PrewarmComparisonReport {
     PrewarmComparisonReport {
-        schema_version: 3,
+        schema_version: 4,
         mode: mode.label(),
         boundary_policy: "unbuffered_after_20s_safety",
         recovery_snapshot: snapshot,
@@ -493,28 +479,50 @@ pub(super) fn report_for(
         planned_bytes: plan.planned_bytes,
         transfer_byte_budget: PREWARM_TRANSFER_BYTE_BUDGET,
         planned_transfer_bytes: plan.planned_transfer_bytes,
-        operation_requested_bytes: execution.operation_requested_bytes,
-        operation_count: execution.operation_count,
+        attempt_count: execution.attempt_count,
+        attempted_span_bytes: execution.attempted_span_bytes,
         attempted_ranges: execution.attempted_ranges,
-        completed_transfer_bytes: execution.completed_transfer_bytes,
-        completed_transfer_count: execution.completed_transfer_count,
+        cache_published_bytes: execution.cache_published_bytes,
+        cache_published_spans: execution.cache_published_spans,
         preempted_operation_count: execution.preempted_operation_count,
         foreground_defer_count: execution.foreground_defer_count,
         elapsed_seconds: execution.elapsed_seconds,
         coverage_semantics: "sum_of_fully_readable_selected_ranges",
         cache_covered_bytes_before: execution.coverage_before,
+        cache_covered_spans_before: execution.coverage_spans_before,
         cache_covered_bytes_after: execution.coverage_after,
+        cache_covered_spans_after: execution.coverage_spans_after,
         selected_ranges: plan.ranges,
         transfer_plan: plan.transfer_ranges,
         resource_ids: plan.resource_ids,
+        resource_total_lengths: plan.resource_total_lengths,
         completed: execution.completed,
         failure: execution.failure,
         provenance: PrewarmProvenance {
-            origin_counters_include_playback_and_prewarm: true,
-            transfer_accounting: "planned_background_parent_chunks_and_startup_not_wire_bytes",
+            shared_origin_counter_scope: "playback_and_preparation",
+            attempt_bytes_semantics: "sum_of_requested_range_lengths_not_wire_bytes",
+            identity_probe_attempts_included: true,
+            transfer_plan_semantics: "empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans",
             expanded_transfer_may_overlap_buffered_media: true,
         },
     }
+}
+
+fn transfer_spans_cover(spans: &[SelectedRange], selected: &SelectedRange) -> bool {
+    let mut cursor = selected.start;
+    for span in spans {
+        if span.resource_id != selected.resource_id || span.end <= cursor {
+            continue;
+        }
+        if span.start > cursor {
+            return false;
+        }
+        cursor = cursor.max(span.end);
+        if cursor >= selected.end {
+            return true;
+        }
+    }
+    false
 }
 
 async fn run_native_single_player_prewarm_control() {
@@ -540,7 +548,17 @@ async fn native_single_player_prewarm_treatment() {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::io::Write;
+
+    fn json_keys(value: &serde_json::Value) -> BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
 
     fn fragments(count: usize, size: u64) -> Vec<Mp4SegmentRange> {
         (0..count)
@@ -583,32 +601,6 @@ mod unit_tests {
                 fragments: audio_fragments,
             },
         ]
-    }
-
-    fn completed_execution(
-        plan: &PrewarmPlan,
-        coverage_before: u64,
-        coverage_after: u64,
-    ) -> PrewarmExecution {
-        let mut execution = PrewarmExecution::initial(coverage_before);
-        execution.operation_requested_bytes = plan.planned_transfer_bytes;
-        execution.operation_count = plan.transfer_ranges.len() as u64;
-        execution.attempted_ranges = plan
-            .transfer_ranges
-            .iter()
-            .map(|range| PrewarmAttempt {
-                resource_id: range.resource_id.clone(),
-                start: range.start,
-                end: range.end,
-                outcome: PrewarmOutcome::Completed,
-            })
-            .collect();
-        execution.completed_transfer_bytes = plan.planned_transfer_bytes;
-        execution.completed_transfer_count = plan.transfer_ranges.len() as u64;
-        execution.elapsed_seconds = 1.25;
-        execution.coverage_after = Some(coverage_after);
-        execution.completed = true;
-        execution
     }
 
     #[test]
@@ -718,21 +710,25 @@ mod unit_tests {
             PrewarmExecution {
                 elapsed_seconds: 0.0,
                 completed: true,
-                ..PrewarmExecution::initial(4)
+                ..PrewarmExecution::initial(Some(plan.ranges.clone()))
             },
         );
+        let mut cached_execution = PrewarmExecution::initial(Some(plan.ranges.clone()));
+        cached_execution.coverage_after = Some(plan.planned_bytes);
+        cached_execution.coverage_spans_after = Some(plan.ranges.clone());
+        cached_execution.completed = true;
         let treatment = report_for(
             PrewarmMode::On,
             snapshot(40.0, 48.0),
             plan.clone(),
-            completed_execution(&plan, 4, 100),
+            cached_execution,
         );
-        assert_eq!(control.operation_requested_bytes, 0);
-        assert_eq!(control.operation_count, 0);
-        assert_eq!(control.schema_version, 3);
+        assert_eq!(control.attempted_span_bytes, 0);
+        assert_eq!(control.attempt_count, 0);
+        assert_eq!(control.schema_version, 4);
         assert!(control.attempted_ranges.is_empty());
-        assert_eq!(control.completed_transfer_bytes, 0);
-        assert_eq!(control.completed_transfer_count, 0);
+        assert_eq!(control.cache_published_bytes, 0);
+        assert!(control.cache_published_spans.is_empty());
         assert_eq!(control.preempted_operation_count, 0);
         assert_eq!(control.foreground_defer_count, 0);
         assert!(control.failure.category.is_none());
@@ -745,39 +741,36 @@ mod unit_tests {
             treatment.planned_transfer_bytes,
             plan.planned_transfer_bytes
         );
+        assert_eq!(treatment.attempt_count, 0);
+        assert!(treatment.attempted_ranges.is_empty());
+        assert_eq!(treatment.attempted_span_bytes, 0);
         assert_eq!(
-            treatment.transfer_plan.len() as u64,
-            treatment.operation_count
+            treatment.cache_covered_bytes_after,
+            Some(plan.planned_bytes)
         );
         assert_eq!(
-            treatment.operation_requested_bytes,
-            treatment.planned_transfer_bytes
+            treatment.cache_covered_spans_after.as_deref(),
+            Some(plan.ranges.as_slice())
         );
-        assert_eq!(
-            treatment.completed_transfer_bytes,
-            treatment.planned_transfer_bytes
-        );
-        assert_eq!(
-            treatment.completed_transfer_count,
-            treatment.transfer_plan.len() as u64
-        );
-        assert_eq!(
-            treatment.operation_count,
-            treatment.attempted_ranges.len() as u64
-        );
+        assert_eq!(treatment.cache_published_bytes, 0);
+        assert!(treatment.cache_published_spans.is_empty());
         assert_eq!(treatment.failure.category, None);
         assert_eq!(
             treatment.coverage_semantics,
             "sum_of_fully_readable_selected_ranges"
         );
-        assert!(
-            treatment
-                .provenance
-                .origin_counters_include_playback_and_prewarm
+        assert_eq!(
+            treatment.provenance.shared_origin_counter_scope,
+            "playback_and_preparation"
         );
         assert_eq!(
-            treatment.provenance.transfer_accounting,
-            "planned_background_parent_chunks_and_startup_not_wire_bytes"
+            treatment.provenance.attempt_bytes_semantics,
+            "sum_of_requested_range_lengths_not_wire_bytes"
+        );
+        assert!(treatment.provenance.identity_probe_attempts_included);
+        assert_eq!(
+            treatment.provenance.transfer_plan_semantics,
+            "empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans"
         );
         assert!(
             treatment
@@ -791,10 +784,165 @@ mod unit_tests {
                 plan,
                 PrewarmExecution {
                     completed: false,
-                    ..PrewarmExecution::initial(0)
+                    ..PrewarmExecution::initial(Some(Vec::new()))
                 }
             )
             .completed
+        );
+    }
+
+    #[test]
+    fn schema_four_serializes_exact_keys_and_attempt_enums() {
+        let plan = plan_window(
+            &snapshot(40.0, 48.0),
+            3600.0,
+            tracks(64, &fragments(100, 20), 32, &fragments(100, 10)),
+        )
+        .unwrap();
+        let mut execution = PrewarmExecution::initial(None);
+        execution.attempt_count = 1;
+        execution.attempted_span_bytes = 524_288;
+        execution.attempted_ranges = vec![PlaybackPreparationAttemptObservation {
+            resource_id: plan.resource_ids.audio.clone(),
+            resource_total_length: Some(plan.audio_total_length),
+            start: 0,
+            end: 524_288,
+            purpose: crate::hls_cache::PlaybackPreparationAttemptPurpose::CacheFill,
+            status_code: Some(503),
+            headers_validated: Some(false),
+            body_validated: None,
+            identity_validated: None,
+            cache_published: Some(false),
+            outcome: crate::hls_cache::PlaybackPreparationAttemptOutcome::UpstreamStatus,
+        }];
+        execution.failure = PrewarmFailure {
+            category: Some(PrewarmFailureCategory::UpstreamStatus),
+            resource_id: Some(plan.resource_ids.audio.clone()),
+            start: Some(0),
+            end: Some(524_288),
+            upstream_status: Some(503),
+        };
+        let report = report_for(PrewarmMode::On, snapshot(40.0, 48.0), plan, execution);
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            json_keys(&value),
+            [
+                "schema_version",
+                "mode",
+                "boundary_policy",
+                "recovery_snapshot",
+                "target_window_start_seconds",
+                "target_window_end_seconds",
+                "byte_budget",
+                "planned_bytes",
+                "transfer_byte_budget",
+                "planned_transfer_bytes",
+                "attempt_count",
+                "attempted_span_bytes",
+                "attempted_ranges",
+                "cache_published_bytes",
+                "cache_published_spans",
+                "preempted_operation_count",
+                "foreground_defer_count",
+                "elapsed_seconds",
+                "coverage_semantics",
+                "cache_covered_bytes_before",
+                "cache_covered_spans_before",
+                "cache_covered_bytes_after",
+                "cache_covered_spans_after",
+                "selected_ranges",
+                "transfer_plan",
+                "resource_ids",
+                "resource_total_lengths",
+                "completed",
+                "failure",
+                "provenance",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            json_keys(&value["recovery_snapshot"]),
+            [
+                "schema_version",
+                "observed_monotonic_seconds",
+                "playhead_seconds",
+                "loaded_end_seconds",
+            ]
+            .into_iter()
+            .collect()
+        );
+        for key in ["resource_ids", "resource_total_lengths"] {
+            assert_eq!(
+                json_keys(&value[key]),
+                ["video", "audio"].into_iter().collect()
+            );
+        }
+        assert_eq!(
+            json_keys(&value["failure"]),
+            ["category", "resource_id", "start", "end", "upstream_status"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            json_keys(&value["provenance"]),
+            [
+                "shared_origin_counter_scope",
+                "attempt_bytes_semantics",
+                "identity_probe_attempts_included",
+                "transfer_plan_semantics",
+                "expanded_transfer_may_overlap_buffered_media",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            json_keys(&value["selected_ranges"][0]),
+            ["resource_id", "start", "end"].into_iter().collect()
+        );
+        assert_eq!(
+            json_keys(&value["attempted_ranges"][0]),
+            [
+                "resource_id",
+                "resource_total_length",
+                "start",
+                "end",
+                "purpose",
+                "status_code",
+                "headers_validated",
+                "body_validated",
+                "identity_validated",
+                "cache_published",
+                "outcome",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(value["attempted_ranges"][0]["purpose"], "cache_fill");
+        assert_eq!(value["attempted_ranges"][0]["outcome"], "upstream_status");
+        assert_eq!(
+            value["coverage_semantics"],
+            "sum_of_fully_readable_selected_ranges"
+        );
+        assert_eq!(
+            value["provenance"]["shared_origin_counter_scope"],
+            "playback_and_preparation"
+        );
+        assert_eq!(
+            value["provenance"]["attempt_bytes_semantics"],
+            "sum_of_requested_range_lengths_not_wire_bytes"
+        );
+        assert_eq!(
+            value["provenance"]["identity_probe_attempts_included"],
+            true
+        );
+        assert_eq!(
+            value["provenance"]["transfer_plan_semantics"],
+            "empty_cache_upper_bound_startup_prefix_and_64k_playback_preparation_spans"
+        );
+        assert_eq!(
+            value["provenance"]["expanded_transfer_may_overlap_buffered_media"],
+            true
         );
     }
 
@@ -806,7 +954,7 @@ mod unit_tests {
             tracks(64, &fragments(100, 20), 32, &fragments(100, 10)),
         )
         .unwrap();
-        let mut execution = PrewarmExecution::initial(4);
+        let mut execution = PrewarmExecution::initial(Some(Vec::new()));
         let unknown = report_for(
             PrewarmMode::On,
             snapshot(40.0, 48.0),
@@ -817,47 +965,83 @@ mod unit_tests {
             serde_json::to_value(unknown).unwrap()["cache_covered_bytes_after"],
             serde_json::Value::Null
         );
+        let unknown = report_for(
+            PrewarmMode::On,
+            snapshot(40.0, 48.0),
+            plan.clone(),
+            execution.clone(),
+        );
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap()["cache_covered_spans_after"],
+            serde_json::Value::Null
+        );
 
-        execution.coverage_after = Some(100);
-        let observed = report_for(PrewarmMode::On, snapshot(40.0, 48.0), plan, execution);
+        execution.coverage_after = Some(plan.planned_bytes);
+        execution.coverage_spans_after = Some(plan.ranges.clone());
+        let observed = report_for(
+            PrewarmMode::On,
+            snapshot(40.0, 48.0),
+            plan.clone(),
+            execution,
+        );
         assert_eq!(
             serde_json::to_value(observed).unwrap()["cache_covered_bytes_after"],
-            serde_json::json!(100)
+            serde_json::json!(plan.planned_bytes)
         );
+
+        let partial_spans = plan.ranges[..1].to_vec();
+        let partial_bytes = partial_spans
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum();
+        let partial = report_for(
+            PrewarmMode::On,
+            snapshot(40.0, 48.0),
+            plan,
+            PrewarmExecution {
+                coverage_after: Some(partial_bytes),
+                coverage_spans_after: Some(partial_spans),
+                ..PrewarmExecution::initial(None)
+            },
+        );
+        assert!(!partial.completed);
+        assert_eq!(partial.cache_covered_bytes_after, Some(partial_bytes));
     }
 
     #[test]
-    fn background_transfer_expansion_uses_real_parent_chunks_and_deduplicates() {
-        let plan = crate::hls_cache::planned_background_ranges_for_test(
+    fn preparation_transfer_upper_bound_uses_startup_and_fine_spans() {
+        let plan = crate::hls_cache::planned_playback_preparation_ranges(
             1_300_000,
             &[700_000..710_000, 700_000..710_000, 1_200_000..1_250_000],
         )
         .unwrap();
         assert_eq!(
             plan,
-            vec![0..524_288, 524_288..1_048_576, 1_048_576..1_300_000]
+            vec![
+                0..524_288,
+                655_360..720_896,
+                1_179_648..1_245_184,
+                1_245_184..1_300_000
+            ]
         );
         assert_eq!(
             plan.iter()
                 .map(|range| range.end - range.start)
                 .sum::<u64>(),
-            1_300_000
+            710_176
         );
-        assert!(crate::hls_cache::planned_background_ranges_for_test(0, &[]).is_err());
-        let overflow = std::ops::Range {
-            start: u64::MAX - 1,
-            end: u64::MAX,
-        };
+        assert!(crate::hls_cache::planned_playback_preparation_ranges(0, &[]).is_err());
+        let overflow = u64::MAX - 1..u64::MAX;
         let inverted = std::ops::Range { start: 9, end: 8 };
         assert!(
-            crate::hls_cache::planned_background_ranges_for_test(
+            crate::hls_cache::planned_playback_preparation_ranges(
                 100,
                 std::slice::from_ref(&overflow)
             )
             .is_err()
         );
         assert!(
-            crate::hls_cache::planned_background_ranges_for_test(
+            crate::hls_cache::planned_playback_preparation_ranges(
                 100,
                 std::slice::from_ref(&inverted)
             )

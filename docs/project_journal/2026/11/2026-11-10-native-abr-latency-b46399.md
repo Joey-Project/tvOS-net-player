@@ -3,7 +3,7 @@ id: 20261110-b46399
 title: Native ABR Recovery Latency
 status: active
 created: 2026-11-10
-updated: 2026-11-11
+updated: 2026-11-12
 branch: codex/native-abr-recovery-latency
 pr: https://github.com/Joey-Project/tvOS-net-player/pull/92
 supersedes: []
@@ -47,7 +47,8 @@ superseded_by:
 1. Keep the bounded diagnostic slice in the native gate and retain exact-run raw evidence for baseline comparison.
 2. Use the [read-only server readiness evidence](2026-11-10-hls-readiness-b46400.md) and [shared upshift assessment](2026-11-10-hls-upshift-policy-b46401.md) to distinguish a cached-window opportunity from an origin-dependent prewarm estimate. Neither is a playback safety guarantee.
 3. Use the [owned assessment](2026-11-11-hls-owned-assessment-b46404.md) for bound observations and the agreed [single-player prewarm comparison](2026-11-11-single-player-prewarm-b46405.md) for the next validation slice. Preserve one player/item, default buffering and the pure AVPlayer-managed long gate. Cache readiness alone is not decoded recovery or a serving/continuity guarantee; do not introduce dual players or forced replacement without a new discussion.
-4. Continue the remaining native cache lifecycle/offline and home LAN roadmap work after recovery optimization.
+4. Integrate the delivered [bounded playback-preparation scheduling prerequisite](2026-11-12-playback-preparation-scheduling-b46406.md) into the separate OFF/ON comparison in PR #98. Retain the recovery-owned deadline and real attempt/coverage evidence without requiring global foreground quiescence; a failed preparation is not evidence that preparation does or does not improve decoded recovery latency.
+5. Continue the remaining native cache lifecycle/offline and home LAN roadmap work after recovery optimization.
 
 ## Evidence
 - [Passive diagnostics PR #92](https://github.com/Joey-Project/tvOS-net-player/pull/92).
