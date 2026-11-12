@@ -52,6 +52,11 @@ service CacheService {
   // Bounded metadata for variants advertised by the ordinary HLS master path.
   // This does not restore sources, fetch media or authorize a quality switch.
   rpc GetHlsRenditionCatalog(GetHlsRenditionCatalogRequest) returns (HlsRenditionCatalog);
+  // Ephemeral playback timing only. Tickets do not reserve media, authorize
+  // switching, identify HTTP readers or establish delivery capacity.
+  rpc OpenHlsPlaybackContext(OpenHlsPlaybackContextRequest) returns (HlsPlaybackContextTicket);
+  rpc UpdateHlsPlaybackContext(UpdateHlsPlaybackContextRequest) returns (HlsPlaybackContextTicket);
+  rpc CloseHlsPlaybackContext(CloseHlsPlaybackContextRequest) returns (CloseHlsPlaybackContextResponse);
   rpc ReportPlaybackProgress(ReportPlaybackProgressRequest) returns (ReportPlaybackProgressResponse);
   rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
 }
@@ -88,6 +93,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_READINESS = 18;
   SERVER_CAPABILITY_HLS_PLAYBACK_READINESS = 19;
   SERVER_CAPABILITY_HLS_RENDITION_CATALOG = 20;
+  SERVER_CAPABILITY_HLS_PLAYBACK_CONTEXT = 21;
 }
 
 message GetResolverSettingsRequest {}
@@ -1034,6 +1040,52 @@ enum HlsWeakNetworkState {
   HLS_WEAK_NETWORK_STATE_DEGRADED = 3;
   HLS_WEAK_NETWORK_STATE_CACHE_ONLY = 4;
   HLS_WEAK_NETWORK_STATE_UPSTREAM_FAILED = 5;
+}
+
+message OpenHlsPlaybackContextRequest {
+  string session_id = 1;
+  uint64 expected_session_generation = 2;
+}
+
+message HlsPlaybackContextTicket {
+  // Server-issued process-local identifiers. Neither is an authentication token.
+  string context_id = 1;
+  string challenge = 2;
+  string session_id = 3;
+  uint64 session_generation = 4;
+  uint64 next_sequence = 5;
+  // At most 5000 ms from server issuance, not from receipt by the client.
+  // Clients conservatively age this from their request start. A timing sample
+  // must be captured after receipt of the challenge it consumes.
+  uint64 validity_millis = 6;
+}
+
+message HlsPlaybackTimingSample {
+  double playhead_seconds = 1;
+  // End of the continuous loaded interval containing the playhead, not the
+  // farthest disjoint buffered range. No buffer window is inferred when absent.
+  double continuous_buffered_end_seconds = 2;
+  double playback_rate = 3;
+}
+
+message UpdateHlsPlaybackContextRequest {
+  string context_id = 1;
+  string challenge = 2;
+  uint64 sequence = 3;
+  HlsPlaybackTimingSample sample = 4;
+}
+
+// Only active playing samples are accepted. Pause, seek, reload, stop and owner
+// changes withdraw their old context instead. Updates consume one challenge and
+// return its successor. A sample expires at its consumed challenge's original
+// deadline; issuing the next challenge does not refresh the accepted sample.
+message CloseHlsPlaybackContextRequest {
+  string context_id = 1;
+}
+
+message CloseHlsPlaybackContextResponse {
+  // Idempotent withdrawal. Expired or already closed context IDs also succeed.
+  bool closed = 1;
 }
 
 message ReportPlaybackProgressRequest {

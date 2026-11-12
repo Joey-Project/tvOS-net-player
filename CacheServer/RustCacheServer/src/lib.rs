@@ -18,6 +18,7 @@ mod hls_catalog;
 mod hls_fill_scheduler;
 mod hls_media_refresh;
 mod hls_network_policy;
+mod hls_playback_context;
 mod hls_playback_progress;
 mod hls_range_cache;
 mod hls_readiness;
@@ -86,6 +87,7 @@ use crate::{
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
+    hls_playback_context::{HlsPlaybackContextStore, PlaybackContextSnapshot},
     hls_playback_progress::{
         HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressIntent,
         PlaybackProgressRecordOutcome, PlaybackProgressReport, session_id_from_report,
@@ -147,6 +149,7 @@ pub struct AppState {
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_media_refresh: hls_media_refresh::HlsMediaRefreshCoordinator,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
+    pub(crate) hls_playback_contexts: HlsPlaybackContextStore,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
     pub(crate) resolver_settings: Arc<resolver_settings::ResolverSettingsStore>,
@@ -815,6 +818,7 @@ impl AppState {
         let lan_transcoding_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
+        let hls_playback_contexts = HlsPlaybackContextStore::default();
         let hls_playback_progress = HlsPlaybackProgressTracker::default();
         let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
             restored_hls_sessions
@@ -860,6 +864,7 @@ impl AppState {
             hls_fill_scheduler,
             hls_media_refresh: hls_media_refresh::HlsMediaRefreshCoordinator::default(),
             hls_network_policy,
+            hls_playback_contexts,
             hls_playback_progress,
             bilibili_login: bilibili_login::BilibiliLoginManager::default(),
             resolver_settings,
@@ -944,6 +949,7 @@ impl AppState {
         let hls_cache = self.hls_cache.clone();
         let hls_fill_scheduler = self.hls_fill_scheduler.clone();
         let hls_network_policy = self.hls_network_policy.clone();
+        let hls_playback_contexts = self.hls_playback_contexts.clone();
         let hls_playback_progress = self.hls_playback_progress.clone();
         let hls_cache_quota_enforcement_lock = Arc::clone(&self.hls_cache_quota_enforcement_lock);
         let completed_hls_deletion_lock = Arc::clone(&self.completed_hls_deletion_lock);
@@ -1030,6 +1036,7 @@ impl AppState {
                                     |generation| {
                                         hls_network_policy
                                             .remove_session_generation(&session.id, generation);
+                                        hls_playback_contexts.remove_session(&session.id);
                                     },
                                 );
                                 hls_media_refresh.remove_session(&session.id);
@@ -2086,6 +2093,7 @@ impl AppState {
             .insert_with_generation_update(session, |generation| {
                 self.hls_network_policy
                     .advance_session_generation(&session_id, generation);
+                self.hls_playback_contexts.remove_session(&session_id);
             })
     }
 
@@ -2094,9 +2102,30 @@ impl AppState {
             .remove_with_generation_update(session_id, |generation| {
                 self.hls_network_policy
                     .remove_session_generation(session_id, generation);
+                self.hls_playback_contexts.remove_session(session_id);
             });
         self.hls_media_refresh.remove_session(session_id);
         self.hls_playback_progress.remove_session(session_id);
+    }
+
+    /// Returns timing only when one live context has a fresh sample and its session generation is current.
+    /// This does not prove that any HTTP request belongs to the returned owner.
+    #[allow(dead_code)]
+    pub(crate) fn sole_current_hls_playback_context(&self) -> Option<PlaybackContextSnapshot> {
+        let snapshot = self.hls_playback_contexts.sole_live_snapshot()?;
+        let generation_is_current = self
+            .hls_sessions
+            .get_with_generation(&snapshot.session_id)
+            .is_some_and(|current| current.generation == snapshot.session_generation);
+        if !generation_is_current {
+            self.hls_playback_contexts.remove_context_if_binding(
+                &snapshot.context_id,
+                &snapshot.session_id,
+                snapshot.session_generation,
+            );
+            return None;
+        }
+        Some(snapshot)
     }
 
     pub(crate) async fn refresh_hls_media_requests<F>(

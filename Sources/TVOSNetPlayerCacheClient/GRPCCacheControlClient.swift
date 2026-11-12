@@ -293,6 +293,112 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func openHLSPlaybackContext(
+        _ request: HLSPlaybackContextOpenRequest
+    ) async throws -> HLSPlaybackContextTicket {
+        try Task.checkCancellation()
+        try request.validate()
+        do {
+            let ticket = try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                let response = try await service.openHlsPlaybackContext(
+                    TvosNetPlayer_V1_OpenHlsPlaybackContextRequest(request),
+                    options: callOptions
+                )
+                let ticket = HLSPlaybackContextTicket(response)
+                try ticket.validate(matching: request)
+                return ticket
+            }
+            try Task.checkCancellation()
+            return ticket
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let rpcError = error as? RPCError, rpcError.code == .unimplemented {
+                throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
+            }
+            if let validationError = error as? HLSPlaybackContextValidationError {
+                throw validationError
+            }
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
+        }
+    }
+
+    public func updateHLSPlaybackContext(
+        _ request: HLSPlaybackContextUpdateRequest
+    ) async throws -> HLSPlaybackContextTicket {
+        try Task.checkCancellation()
+        try request.validate()
+        do {
+            let ticket = try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                let response = try await service.updateHlsPlaybackContext(
+                    TvosNetPlayer_V1_UpdateHlsPlaybackContextRequest(request),
+                    options: callOptions
+                )
+                let ticket = HLSPlaybackContextTicket(response)
+                try ticket.validate(matching: request)
+                return ticket
+            }
+            try Task.checkCancellation()
+            return ticket
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let rpcError = error as? RPCError, rpcError.code == .unimplemented {
+                throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
+            }
+            if let validationError = error as? HLSPlaybackContextValidationError {
+                throw validationError
+            }
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
+        }
+    }
+
+    public func closeHLSPlaybackContext(
+        _ request: HLSPlaybackContextCloseRequest
+    ) async throws -> HLSPlaybackContextCloseResponse {
+        try Task.checkCancellation()
+        try request.validate()
+        do {
+            let response = try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                let response = try await service.closeHlsPlaybackContext(
+                    TvosNetPlayer_V1_CloseHlsPlaybackContextRequest(request),
+                    options: callOptions
+                )
+                return HLSPlaybackContextCloseResponse(response)
+            }
+            try Task.checkCancellation()
+            return response
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let rpcError = error as? RPCError, rpcError.code == .unimplemented {
+                throw CacheControlClientUnsupportedOperation.hlsPlaybackContext
+            }
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
+        }
+    }
+
     public func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
         do {
             return try await withGRPCClient(

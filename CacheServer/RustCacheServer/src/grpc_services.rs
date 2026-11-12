@@ -55,7 +55,8 @@ use crate::{
         BilibiliResolutionSession, BilibiliResolveResult,
         BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliSubtitleAiPolicy,
         BilibiliTaskResultItem, BilibiliTaskSelection, BilibiliVideoCodec, CacheRoot,
-        CancelTaskRequest, CheckHealthRequest, CreateBilibiliPlaybackTaskRequest,
+        CancelTaskRequest, CheckHealthRequest, CloseHlsPlaybackContextRequest,
+        CloseHlsPlaybackContextResponse, CreateBilibiliPlaybackTaskRequest,
         CreateBilibiliPlaybackTaskV2Request, CreateBilibiliTaskRequest,
         CreateBilibiliTaskV2Request, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
         GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
@@ -65,22 +66,24 @@ use crate::{
         HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheFillFailureKind,
         HlsCacheFillState, HlsCacheFillStatus, HlsCacheStatus, HlsOriginSupplyEvidence,
         HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackCacheReason,
-        HlsPlaybackCacheState, HlsPlaybackProgressStatus, HlsPlaybackReadiness,
-        HlsRenditionCatalog, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
-        LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
-        LanTranscodingStatus, LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
+        HlsPlaybackCacheState, HlsPlaybackContextTicket, HlsPlaybackProgressStatus,
+        HlsPlaybackReadiness, HlsRenditionCatalog, HlsWeakNetworkState, HlsWeakNetworkStatus,
+        LanTranscodingPlan, LanTranscodingPlanState,
+        LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
+        LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListBilibiliResolutionCandidatesRequest,
         ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
-        ListLibraryItemsResponse, ListTaskResultsRequest, ListTaskResultsResponse, PageInfo,
+        ListLibraryItemsResponse, ListTaskResultsRequest, ListTaskResultsResponse,
+        OpenHlsPlaybackContextRequest, PageInfo,
         PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
         ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
         RescanLibraryResponse, ResolveBilibiliInputRequest, ResolverCustomEndpoint,
         ResolverEndpoint, ResolverSettingsSnapshot as ProtoResolverSettingsSnapshot,
         ServerCapability, ServerInfo, StartBilibiliLoginSessionRequest,
         StartBilibiliResolutionRequest, Task, TaskEvent, TaskKind, TaskState,
-        UpdateResolverSettingsRequest, WatchTasksRequest, cache_service_server::CacheService,
-        library_service_server::LibraryService, server_service_server::ServerService,
-        task_service_server::TaskService,
+        UpdateHlsPlaybackContextRequest, UpdateResolverSettingsRequest, WatchTasksRequest,
+        cache_service_server::CacheService, library_service_server::LibraryService,
+        server_service_server::ServerService, task_service_server::TaskService,
     },
     hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
@@ -92,6 +95,9 @@ use crate::{
     hls_media_refresh::{is_expired_cache_error, same_hls_media_refresh_binding},
     hls_network_policy::{
         HlsWeakNetworkSnapshot, HlsWeakNetworkState as RuntimeHlsWeakNetworkState,
+    },
+    hls_playback_context::{
+        PlaybackContextStoreError, PlaybackContextTicket, PlaybackTimingSample, is_uuid_syntax,
     },
     hls_playback_progress::{
         HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
@@ -219,6 +225,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::Hls.into(),
                 ServerCapability::HlsPlaybackReadiness.into(),
                 ServerCapability::HlsRenditionCatalog.into(),
+                ServerCapability::HlsPlaybackContext.into(),
                 ServerCapability::ResolverSettingsWrite.into(),
             ],
         };
@@ -2866,6 +2873,139 @@ impl CacheService for CacheGrpcService {
         Ok(Response::new(catalog))
     }
 
+    async fn open_hls_playback_context(
+        &self,
+        request: Request<OpenHlsPlaybackContextRequest>,
+    ) -> Result<Response<HlsPlaybackContextTicket>, Status> {
+        let request = request.into_inner();
+        validate_readiness_id(&request.session_id, "session")?;
+        if request.expected_session_generation == 0 {
+            return Err(Status::invalid_argument(
+                "Expected HLS session generation must be positive.",
+            ));
+        }
+        let handle = self
+            .state
+            .hls_sessions
+            .get_with_generation(&request.session_id)
+            .ok_or_else(|| Status::not_found("HLS playback session was not found."))?;
+        if handle.generation != request.expected_session_generation {
+            return Err(Status::aborted(
+                "The HLS playback session generation changed.",
+            ));
+        }
+
+        let ticket = self
+            .state
+            .hls_playback_contexts
+            .open(request.session_id, handle.generation)
+            .map_err(playback_context_store_status)?;
+        let still_current = self
+            .state
+            .hls_sessions
+            .get_with_generation(&ticket.session_id)
+            .is_some_and(|current| current.generation == ticket.session_generation);
+        if !still_current {
+            self.state.hls_playback_contexts.remove_context_if_binding(
+                &ticket.context_id,
+                &ticket.session_id,
+                ticket.session_generation,
+            );
+            return Err(Status::aborted(
+                "The HLS playback session changed while the context was opened.",
+            ));
+        }
+        Ok(Response::new(proto_playback_context_ticket(ticket)))
+    }
+
+    async fn update_hls_playback_context(
+        &self,
+        request: Request<UpdateHlsPlaybackContextRequest>,
+    ) -> Result<Response<HlsPlaybackContextTicket>, Status> {
+        let request = request.into_inner();
+        if !is_uuid_syntax(&request.context_id) || !is_uuid_syntax(&request.challenge) {
+            return Err(Status::invalid_argument(
+                "Playback context and challenge identifiers must be UUIDs.",
+            ));
+        }
+        if request.sequence == 0 {
+            return Err(Status::invalid_argument(
+                "Playback context sequence must be positive.",
+            ));
+        }
+        let sample = request
+            .sample
+            .ok_or_else(|| Status::invalid_argument("Playback timing sample is required."))?;
+        let sample = PlaybackTimingSample {
+            playhead_seconds: sample.playhead_seconds,
+            continuous_buffered_end_seconds: sample.continuous_buffered_end_seconds,
+            playback_rate: sample.playback_rate,
+        };
+        let binding = self
+            .state
+            .hls_playback_contexts
+            .binding_for_update(&request.context_id)
+            .ok_or_else(|| Status::not_found("Playback context was not found or expired."))?;
+        let current_generation = self
+            .state
+            .hls_sessions
+            .get_with_generation(&binding.session_id)
+            .map(|current| current.generation);
+        if current_generation != Some(binding.session_generation) {
+            self.state.hls_playback_contexts.remove_context_if_binding(
+                &request.context_id,
+                &binding.session_id,
+                binding.session_generation,
+            );
+            return Err(Status::aborted(
+                "The HLS playback session generation changed.",
+            ));
+        }
+
+        let ticket = self
+            .state
+            .hls_playback_contexts
+            .update(
+                &request.context_id,
+                &request.challenge,
+                request.sequence,
+                sample,
+            )
+            .map_err(playback_context_store_status)?;
+        let still_current = self
+            .state
+            .hls_sessions
+            .get_with_generation(&ticket.session_id)
+            .is_some_and(|current| current.generation == ticket.session_generation);
+        if !still_current {
+            self.state.hls_playback_contexts.remove_context_if_binding(
+                &ticket.context_id,
+                &ticket.session_id,
+                ticket.session_generation,
+            );
+            return Err(Status::aborted(
+                "The HLS playback session changed while the context was updated.",
+            ));
+        }
+        Ok(Response::new(proto_playback_context_ticket(ticket)))
+    }
+
+    async fn close_hls_playback_context(
+        &self,
+        request: Request<CloseHlsPlaybackContextRequest>,
+    ) -> Result<Response<CloseHlsPlaybackContextResponse>, Status> {
+        let request = request.into_inner();
+        if !is_uuid_syntax(&request.context_id) {
+            return Err(Status::invalid_argument(
+                "Playback context identifier must be a UUID.",
+            ));
+        }
+        self.state.hls_playback_contexts.close(&request.context_id);
+        Ok(Response::new(CloseHlsPlaybackContextResponse {
+            closed: true,
+        }))
+    }
+
     async fn report_playback_progress(
         &self,
         request: Request<ReportPlaybackProgressRequest>,
@@ -2927,6 +3067,43 @@ impl CacheService for CacheGrpcService {
 
         let deleted = self.state.delete_local_library_item(id).await?;
         Ok(Response::new(DeleteLibraryItemResponse { deleted }))
+    }
+}
+
+fn proto_playback_context_ticket(ticket: PlaybackContextTicket) -> HlsPlaybackContextTicket {
+    HlsPlaybackContextTicket {
+        context_id: ticket.context_id,
+        challenge: ticket.challenge,
+        session_id: ticket.session_id,
+        session_generation: ticket.session_generation,
+        next_sequence: ticket.next_sequence,
+        validity_millis: ticket.validity_millis,
+    }
+}
+
+fn playback_context_store_status(error: PlaybackContextStoreError) -> Status {
+    match error {
+        PlaybackContextStoreError::InvalidIdentifier
+        | PlaybackContextStoreError::InvalidBinding
+        | PlaybackContextStoreError::InvalidSequence
+        | PlaybackContextStoreError::InvalidSample => {
+            Status::invalid_argument("Playback context request is invalid.")
+        }
+        PlaybackContextStoreError::AtCapacity => {
+            Status::resource_exhausted("Playback context capacity is full.")
+        }
+        PlaybackContextStoreError::UnknownContext => {
+            Status::not_found("Playback context was not found or expired.")
+        }
+        PlaybackContextStoreError::StaleTicket => {
+            Status::failed_precondition("Playback context challenge or sequence is stale.")
+        }
+        PlaybackContextStoreError::SequenceExhausted => {
+            Status::out_of_range("Playback context sequence is exhausted.")
+        }
+        PlaybackContextStoreError::DeadlineOverflow => {
+            Status::internal("Playback context deadline could not be represented.")
+        }
     }
 }
 
@@ -14464,6 +14641,197 @@ mod tests {
             "No active HLS playback position reported.",
             playback.message
         );
+    }
+
+    #[tokio::test]
+    async fn hls_playback_context_generated_grpc_flow_is_ephemeral_and_generation_bound() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let (origin_url, origin_task, origin_requests) =
+            start_counted_readiness_mp4_upstream().await;
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let metadata = playback_task_metadata_with_options(
+            "playback-context-session",
+            sample_playback_plan_with_video_url(&origin_url),
+            &state.options,
+        )
+        .expect("playback context session should be valid");
+        let session = metadata.hls_session;
+
+        let first_generation = state.register_hls_playback_session(session.clone());
+        let stale_context = state
+            .hls_playback_contexts
+            .open_at(session.id.clone(), first_generation, StdInstant::now())
+            .expect("context for the first generation should open");
+        let second_generation = state.register_hls_playback_session(session.clone());
+        assert!(second_generation > first_generation);
+        assert!(
+            state
+                .hls_playback_contexts
+                .binding_for_update_at(&stale_context.context_id, StdInstant::now())
+                .is_none()
+        );
+
+        let removed_context = state
+            .hls_playback_contexts
+            .open_at(session.id.clone(), second_generation, StdInstant::now())
+            .expect("context for the second generation should open");
+        state.remove_hls_playback_session(&session.id);
+        assert!(
+            state
+                .hls_playback_contexts
+                .binding_for_update_at(&removed_context.context_id, StdInstant::now())
+                .is_none()
+        );
+        let generation = state.register_hls_playback_session(session.clone());
+
+        let server_info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should load")
+            .into_inner();
+        assert!(
+            server_info
+                .capabilities
+                .contains(&ServerCapability::HlsPlaybackContext.into())
+        );
+
+        let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gRPC fixture should bind");
+        let grpc_address = grpc_listener.local_addr().unwrap();
+        let grpc_state = state.clone();
+        let grpc_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::generated::tvos_net_player::v1::cache_service_server::CacheServiceServer::new(
+                        CacheGrpcService::new(grpc_state),
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    grpc_listener,
+                ))
+                .await
+                .expect("gRPC fixture should serve");
+        });
+        let mut client = crate::generated::tvos_net_player::v1::cache_service_client::CacheServiceClient::connect(
+            format!("http://{grpc_address}"),
+        )
+        .await
+        .expect("generated gRPC client should connect");
+        let open = |generation| OpenHlsPlaybackContextRequest {
+            session_id: session.id.clone(),
+            expected_session_generation: generation,
+        };
+        let first = client
+            .open_hls_playback_context(open(generation))
+            .await
+            .expect("first context should open over generated gRPC")
+            .into_inner();
+        let second = client
+            .open_hls_playback_context(open(generation))
+            .await
+            .expect("second context should open over generated gRPC")
+            .into_inner();
+        assert_eq!(generation, first.session_generation);
+        assert_eq!(1, first.next_sequence);
+        assert_eq!(5_000, first.validity_millis);
+
+        let sample =
+            |playhead_seconds| crate::generated::tvos_net_player::v1::HlsPlaybackTimingSample {
+                playhead_seconds,
+                continuous_buffered_end_seconds: playhead_seconds + 3.0,
+                playback_rate: 1.0,
+            };
+        let first_update = client
+            .update_hls_playback_context(UpdateHlsPlaybackContextRequest {
+                context_id: first.context_id.clone(),
+                challenge: first.challenge.clone(),
+                sequence: first.next_sequence,
+                sample: Some(sample(1.0)),
+            })
+            .await
+            .expect("first timing sample should be accepted")
+            .into_inner();
+        assert_eq!(2, first_update.next_sequence);
+        assert_ne!(first.challenge, first_update.challenge);
+
+        let replay = client
+            .update_hls_playback_context(UpdateHlsPlaybackContextRequest {
+                context_id: first.context_id.clone(),
+                challenge: first.challenge.clone(),
+                sequence: first.next_sequence,
+                sample: Some(sample(50.0)),
+            })
+            .await
+            .expect_err("replayed challenge must be rejected");
+        assert_eq!(tonic::Code::FailedPrecondition, replay.code());
+
+        let second_update = client
+            .update_hls_playback_context(UpdateHlsPlaybackContextRequest {
+                context_id: first.context_id.clone(),
+                challenge: first_update.challenge,
+                sequence: first_update.next_sequence,
+                sample: Some(sample(2.0)),
+            })
+            .await
+            .expect("current challenge should still be usable after replay")
+            .into_inner();
+        assert_eq!(3, second_update.next_sequence);
+
+        for _ in 0..2 {
+            let closed = client
+                .close_hls_playback_context(CloseHlsPlaybackContextRequest {
+                    context_id: first.context_id.clone(),
+                })
+                .await
+                .expect("close should be idempotent over generated gRPC")
+                .into_inner();
+            assert!(closed.closed);
+        }
+        let surviving_update = client
+            .update_hls_playback_context(UpdateHlsPlaybackContextRequest {
+                context_id: second.context_id.clone(),
+                challenge: second.challenge,
+                sequence: second.next_sequence,
+                sample: Some(sample(3.0)),
+            })
+            .await
+            .expect("closing one context must not remove another")
+            .into_inner();
+        assert_eq!(2, surviving_update.next_sequence);
+        assert_eq!(
+            Some(session.id.clone()),
+            state
+                .sole_current_hls_playback_context()
+                .map(|snapshot| snapshot.session_id)
+        );
+        let closed = client
+            .close_hls_playback_context(CloseHlsPlaybackContextRequest {
+                context_id: second.context_id,
+            })
+            .await
+            .expect("surviving context should close")
+            .into_inner();
+        assert!(closed.closed);
+        assert!(state.sole_current_hls_playback_context().is_none());
+        assert_eq!(0, origin_requests.load(AtomicOrdering::SeqCst));
+
+        grpc_task.abort();
+        let grpc_join = grpc_task
+            .await
+            .expect_err("aborted gRPC server should stop");
+        assert!(grpc_join.is_cancelled());
+        origin_task.abort();
+        let origin_join = origin_task
+            .await
+            .expect_err("aborted origin server should stop");
+        assert!(origin_join.is_cancelled());
     }
 
     #[tokio::test]
