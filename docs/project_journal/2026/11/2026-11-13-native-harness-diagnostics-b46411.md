@@ -5,7 +5,7 @@ status: active
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/native-harness-diagnostics
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/105
 supersedes: []
 superseded_by:
 ---
