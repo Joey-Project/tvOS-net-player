@@ -20,7 +20,7 @@ superseded_by:
   deadlines, and playback code are unchanged.
 
 ## Current State
-- This prerequisite is based on updated master at `fee2d0cc5ba1cf6ae048303209bf63a32bc86f0a`, merged as artifact-control PR #103.
+- This prerequisite is based on updated master at `232e2b7314403eb56bc50484d66d01da166cceb9`, including the accepted artifact-control API from PR #103 and PR #105's merged harness diagnostics. Those diagnostics do not establish or fix the cause of the earlier PR #104 native preprobe timeout.
 - A fresh `waitid(P_PID, ..., WEXITED | WNOHANG | WNOWAIT)` result for the same
   child preserves its reservation after exit. Identity mismatch requires fresh
   exit proof; external reap, failed revalidation, or a mismatched live group
@@ -37,5 +37,7 @@ superseded_by:
 ## Evidence
 - [Artifact verification boundaries](../../../architecture/artifact-verification.md).
 - Reference implementation: `160462a26fa6758200c236e0556c3afbe42dd174`.
-- `ProcessSupervisorTests`: 12 tests passed on Darwin; journal validation
-  passed. Complete delivery evidence belongs to the associated PR.
+- Renewal checkpoint: `ProcessSupervisorTests` passed all 12 tests on Darwin;
+  the new private frozen-runner port passed all 27 control tests. These focused
+  checks do not establish full PR #104 acceptance. Journal validation passed.
+- Complete delivery evidence belongs to the associated PR.
