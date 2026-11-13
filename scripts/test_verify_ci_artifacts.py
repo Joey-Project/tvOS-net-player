@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from test_media_network_e2e import media as producer_media, report_payload
 
@@ -199,7 +200,7 @@ class Harness:
 
     def _git(self, *args: str) -> str:
         result = subprocess.run(
-            ["git", "-C", str(self.checkout), *args], capture_output=True, text=True,
+            ["git", "-c", "commit.gpgsign=false", "-C", str(self.checkout), *args], capture_output=True, text=True,
             check=False, timeout=10,
         )
         if result.returncode != 0:
@@ -412,6 +413,41 @@ class VerifyCIArtifactsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((output / "proof.json").exists())
         self.assertTrue((output / "failure.json").is_file())
+
+    def test_synthetic_git_fixtures_ignore_hostile_global_signing_config(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="artifact-hostile-git-config-") as directory:
+            root = Path(directory)
+            global_config = root / "gitconfig"
+            gnupg_home = root / "gnupg"
+            gnupg_home.mkdir()
+            gpg_marker = root / "gpg-was-called"
+            gpg_program = root / "invalid-gpg"
+            gpg_program.write_text(
+                "#!/bin/sh\nprintf called > \"$ARTIFACT_GPG_MARKER\"\nexit 1\n",
+                encoding="utf-8",
+            )
+            gpg_program.chmod(0o755)
+            global_config.write_text(
+                f"[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {gpg_program}\n",
+                encoding="utf-8",
+            )
+            original_config = global_config.read_bytes()
+            hostile_environment = {
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "GNUPGHOME": str(gnupg_home),
+                "ARTIFACT_GPG_MARKER": str(gpg_marker),
+            }
+            harness = None
+            try:
+                with patch.dict(os.environ, hostile_environment):
+                    harness = Harness()
+                    result = harness.run()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(gpg_marker.exists())
+                self.assertEqual(global_config.read_bytes(), original_config)
+            finally:
+                if harness is not None:
+                    harness.close()
 
     def test_entrypoint_loads_core_bytes_captured_during_bundle_hashing(self) -> None:
         entrypoint_path = SCRIPTS / "verify_ci_artifacts.py"

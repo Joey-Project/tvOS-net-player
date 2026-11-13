@@ -44,6 +44,9 @@ superseded_by:
 - Cover ordinary/migration route separation, exact source scope, control bundle
   substitution, path escapes, candidate import canaries, malformed evidence,
   missing/skipped cases and failure without accepted proof.
+- Keep synthetic Git fixture commits independent of host signing configuration
+  and private keys; cover forced signing with an intentionally failing GPG
+  program while preserving real project commit signing and native certificates.
 - Require complete local format/lint/tests, fixed-signed muted native acceptance,
   current-head GitHub CI/UI artifact verification under prior controls, GitHub
   Codex review and all conversations resolved before normal protected merge.

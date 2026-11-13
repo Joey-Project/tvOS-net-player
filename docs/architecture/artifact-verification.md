@@ -153,3 +153,13 @@ The reusable Python API is `artifact_validation.validate_all` with keyword-only
 `control_manifest_sha256`, `input_root` and `output_root`. This API has the same
 trust boundary as the command line; importing it from a candidate does not make
 it an independently released acceptance control.
+
+## Synthetic Git Fixtures
+
+Artifact unit tests create disposable Git repositories without borrowing the
+operator's signing identity. Their Git invocations disable commit signing only
+for synthetic fixture commands, including when inherited global configuration
+requires signing and the test environment has no private key. A hostile-config
+regression checks that the GPG executable is never called and that inherited
+configuration is not modified. Real project commits retain their required GPG
+signatures; this is separate from fixed Apple signing for native media tests.
