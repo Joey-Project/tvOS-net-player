@@ -26,6 +26,24 @@ const AUDIO_SEGMENT_ID: &str = "audio.m4s";
 const DEFAULT_BANDWIDTH: u64 = 1_000_000;
 const DEFAULT_DURATION_SECONDS: u32 = 1;
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HlsPlaylistUriOptions<'a> {
+    playback_reader_id: Option<&'a str>,
+}
+
+impl<'a> HlsPlaylistUriOptions<'a> {
+    pub(crate) const fn new(playback_reader_id: Option<&'a str>) -> Self {
+        Self { playback_reader_id }
+    }
+
+    fn child_uri(self, path: &str) -> String {
+        match self.playback_reader_id {
+            Some(reader_id) => format!("{path}?playback_reader={reader_id}"),
+            None => path.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct HlsPlaybackRegistry {
     inner: Arc<RwLock<HlsPlaybackRegistryInner>>,
@@ -408,6 +426,17 @@ impl HlsPlaybackSession {
         &self,
         is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
     ) -> String {
+        self.master_playlist_with_uri_options(
+            is_variant_advertisable,
+            HlsPlaylistUriOptions::default(),
+        )
+    }
+
+    pub(crate) fn master_playlist_with_uri_options(
+        &self,
+        is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
+        uri_options: HlsPlaylistUriOptions<'_>,
+    ) -> String {
         let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
         let variants = self.advertised_variants_with_filter(is_variant_advertisable);
         for (index, variant) in variants.iter().enumerate() {
@@ -416,11 +445,12 @@ impl HlsPlaybackSession {
             };
             let group_id = audio_group_id(index);
             let name = "Default";
+            let audio_uri = uri_options.child_uri(&format!("segments/{audio_playlist_id}"));
             playlist.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/{}\"\n",
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"{}\"\n",
                 escape_quoted(&group_id),
                 escape_quoted(name),
-                escape_quoted(&audio_playlist_id)
+                escape_quoted(&audio_uri)
             ));
         }
 
@@ -439,10 +469,9 @@ impl HlsPlaybackSession {
                     escape_quoted(&audio_group_id(index))
                 ));
             }
-            playlist.push_str(&format!(
-                "\nsegments/{}\n",
-                escape_quoted(&variant.video_playlist_id())
-            ));
+            let video_uri =
+                uri_options.child_uri(&format!("segments/{}", variant.video_playlist_id()));
+            playlist.push_str(&format!("\n{}\n", escape_quoted(&video_uri)));
         }
         playlist
     }
@@ -509,6 +538,7 @@ impl HlsPlaybackSession {
             initialization_length,
             total_length,
             &[],
+            HlsPlaylistUriOptions::default(),
         )
     }
 
@@ -527,6 +557,7 @@ impl HlsPlaybackSession {
             initialization_length,
             total_length,
             segments,
+            HlsPlaylistUriOptions::default(),
         )
     }
 
@@ -552,6 +583,26 @@ impl HlsPlaybackSession {
             initialization_length,
             total_length,
             segments,
+            HlsPlaylistUriOptions::default(),
+        )
+    }
+
+    pub(crate) fn servable_media_playlist_with_uri_options(
+        &self,
+        playlist_id: &str,
+        initialization_length: u64,
+        total_length: u64,
+        segments: &[HlsMediaSegment],
+        uri_options: HlsPlaylistUriOptions<'_>,
+    ) -> Option<String> {
+        let (variant, resource) = self.servable_media_playlist_resource_ref(playlist_id)?;
+        Self::media_playlist_for_resource(
+            variant,
+            resource,
+            initialization_length,
+            total_length,
+            segments,
+            uri_options,
         )
     }
 
@@ -577,6 +628,26 @@ impl HlsPlaybackSession {
             initialization_length,
             total_length,
             segments,
+            HlsPlaylistUriOptions::default(),
+        )
+    }
+
+    pub(crate) fn lookup_media_playlist_with_uri_options(
+        &self,
+        playlist_id: &str,
+        initialization_length: u64,
+        total_length: u64,
+        segments: &[HlsMediaSegment],
+        uri_options: HlsPlaylistUriOptions<'_>,
+    ) -> Option<String> {
+        let (variant, resource) = self.media_playlist_resource_ref(playlist_id)?;
+        Self::media_playlist_for_resource(
+            variant,
+            resource,
+            initialization_length,
+            total_length,
+            segments,
+            uri_options,
         )
     }
 
@@ -586,6 +657,7 @@ impl HlsPlaybackSession {
         initialization_length: u64,
         total_length: u64,
         segments: &[HlsMediaSegment],
+        uri_options: HlsPlaylistUriOptions<'_>,
     ) -> Option<String> {
         let media_length = total_length.checked_sub(initialization_length)?;
         if initialization_length == 0 || media_length == 0 {
@@ -603,12 +675,14 @@ impl HlsPlaybackSession {
                 resource,
                 initialization_length,
                 segments,
+                uri_options,
             ));
         }
 
+        let resource_uri = uri_options.child_uri(&resource.id);
         Some(format!(
             "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{duration}\n#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{initialization_length}@0\"\n#EXTINF:{duration}.000,\n#EXT-X-BYTERANGE:{media_length}@{initialization_length}\n{}\n#EXT-X-ENDLIST\n",
-            resource.id, resource.id
+            resource_uri, resource_uri
         ))
     }
 
@@ -866,6 +940,7 @@ fn split_media_playlist_for_resource(
     resource: &HlsMediaResource,
     initialization_length: u64,
     segments: &[HlsMediaSegment],
+    uri_options: HlsPlaylistUriOptions<'_>,
 ) -> String {
     let target_duration = segments
         .iter()
@@ -873,9 +948,10 @@ fn split_media_playlist_for_resource(
         .max()
         .unwrap_or(1)
         .max(1);
+    let resource_uri = uri_options.child_uri(&resource.id);
     let mut playlist = format!(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{initialization_length}@0\"\n",
-        resource.id,
+        resource_uri,
     );
     for segment in segments {
         playlist.push_str(&format!(
@@ -883,7 +959,7 @@ fn split_media_playlist_for_resource(
             format_duration_millis(segment.duration_millis),
             segment.byte_range_length,
             segment.byte_range_offset,
-            resource.id
+            resource_uri
         ));
     }
     playlist.push_str("#EXT-X-ENDLIST\n");
@@ -1823,6 +1899,37 @@ mod tests {
         assert!(playlist.contains("#EXTINF:10.000,\n#EXT-X-BYTERANGE:1000@128\nvideo.m4s"));
         assert!(playlist.contains("#EXTINF:20.000,\n#EXT-X-BYTERANGE:2000@1128\nvideo.m4s"));
         assert!(playlist.contains("#EXTINF:31.000,\n#EXT-X-BYTERANGE:3000@3128\nvideo.m4s"));
+
+        let unbound_options = session
+            .servable_media_playlist_with_uri_options(
+                "video.m3u8",
+                128,
+                6_128,
+                &segments,
+                HlsPlaylistUriOptions::default(),
+            )
+            .expect("unbound media playlist should be created");
+        assert_eq!(playlist, unbound_options);
+
+        let reader_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let bound = session
+            .servable_media_playlist_with_uri_options(
+                "video.m3u8",
+                128,
+                6_128,
+                &segments,
+                HlsPlaylistUriOptions::new(Some(reader_id)),
+            )
+            .expect("bound media playlist should be created");
+        assert!(bound.contains(&format!(
+            "#EXT-X-MAP:URI=\"video.m4s?playback_reader={reader_id}\",BYTERANGE=\"128@0\""
+        )));
+        assert_eq!(
+            3,
+            bound
+                .matches(&format!("\nvideo.m4s?playback_reader={reader_id}\n"))
+                .count()
+        );
     }
 
     #[test]

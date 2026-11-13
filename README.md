@@ -223,6 +223,8 @@ just test-media-network
 
 播放状态上下文通过能力 21 的显式 Open/Update/Close RPC 上报，绑定已注册的 session/generation；共享 AppCore 收到服务器短期票据后才采集当前位置、连续缓冲边界和实际播放速度。每次更新消费一次性 challenge，旧状态仍按原 challenge 的五秒期限过期，不会因返回下一张票据而续命。多个播放实例、过期状态或迟到结果不能被当成一个安全缓冲；上下文不是媒体 HTTP 请求的身份绑定、缓存租约、带宽保证或切档许可。本阶段不自动上报、不调整下载优先级，也不触发预热或切源；后续按“近期补缺优先、源站带宽允许时高清优先于远期低清”的顺序接入。边界与分 PR 计划见 [playback context foundation](docs/project_journal/2026/11/2026-11-12-playback-urgency-context-b46407.md)。
 
+能力 22 为显式上下文增加独立的 HTTP 读者关联：一个已加载播放项使用稳定的 `http_reader_id`，不随短期票据轮换；服务器在生成的 master、视频/音频 playlist、初始化和媒体 URI 中显式传递 `playback_reader`。缺失、格式错误、重复、未知、过期或代际不符的关联不能降低普通播放请求的保护优先级；该 ID 不是认证凭证或缓存租约。兼容的 URL helper 仅在调用方显式协商后构造绑定地址，不自动修改已保存源地址、续接身份或播放器项。本片仍不自动上报、不启用下载调度或升档；后续消费这些信息前还需完成休眠后的新鲜度校验和 seek/pause 的服务端失效时序。见 [stable HLS reader binding](docs/project_journal/2026/11/2026-11-12-hls-reader-binding-b46408.md)。
+
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
 GHA 的 `Native media network acceptance` job 使用同一套严格用例和报告校验，通过显式 `--ci-unsigned` 在一次性的 runner 上编译隔离产物，不需要 Apple 签名 secrets。该模式只允许在 GitHub Actions 中使用，不作为本机固定签名验收的替代。`media-network-e2e-<run_id>` 产物保留有界日志、runner summary 和三个原始媒体报告，保留三天；媒体夹具、日常 server 状态和凭据不会上传。job 失败、取消或跳过都会阻止统一 CI 门禁通过；GHA 结果与本机签名验收分别记录，设计见 [native media CI journal](docs/project_journal/2026/11/2026-11-10-native-media-ci-b46398.md)。

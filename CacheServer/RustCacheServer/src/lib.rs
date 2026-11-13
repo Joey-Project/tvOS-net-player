@@ -94,8 +94,9 @@ use crate::{
     },
     library::{LibraryPublicationGate, LocalMediaLibrary},
     media::{
-        MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
-        hls_segment_head, media_get, media_head, resource_get, resource_head,
+        MediaState, hls_master_playlist_get_with_uri, hls_master_playlist_head_with_uri,
+        hls_segment_get_with_uri, hls_segment_head_with_uri, media_get, media_head, resource_get,
+        resource_head,
     },
     playback::PlaybackUriFactory,
     task_registry::{BilibiliTaskCancellation, BilibiliTaskRegistry},
@@ -2128,6 +2129,29 @@ impl AppState {
         Some(snapshot)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn current_hls_playback_context_for_reader(
+        &self,
+        http_reader_id: &str,
+    ) -> Option<PlaybackContextSnapshot> {
+        let snapshot = self
+            .hls_playback_contexts
+            .sole_live_snapshot_for_reader(http_reader_id)?;
+        let generation_is_current = self
+            .hls_sessions
+            .get_with_generation(&snapshot.session_id)
+            .is_some_and(|current| current.generation == snapshot.session_generation);
+        if !generation_is_current {
+            self.hls_playback_contexts.remove_context_if_binding(
+                &snapshot.context_id,
+                &snapshot.session_id,
+                snapshot.session_generation,
+            );
+            return None;
+        }
+        Some(snapshot)
+    }
+
     pub(crate) async fn refresh_hls_media_requests<F>(
         &self,
         failed: &HlsPlaybackSession,
@@ -3693,11 +3717,11 @@ pub(crate) fn media_router(state: AppState) -> Router {
         )
         .route(
             "/hls/{session_id}/master.m3u8",
-            get(hls_master_playlist_get).head(hls_master_playlist_head),
+            get(hls_master_playlist_get_with_uri).head(hls_master_playlist_head_with_uri),
         )
         .route(
             "/hls/{session_id}/segments/{segment_id}",
-            get(hls_segment_get).head(hls_segment_head),
+            get(hls_segment_get_with_uri).head(hls_segment_head_with_uri),
         )
         .with_state(MediaState::new(state))
 }

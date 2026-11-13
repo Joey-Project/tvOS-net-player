@@ -4,6 +4,8 @@ import XCTest
 final class HLSPlaybackContextTests: XCTestCase {
     private let contextID = "00000000-0000-4000-8000-000000000001"
     private let challenge = "00000000-0000-4000-8000-000000000002"
+    private let readerID = "00000000-0000-4000-8000-0000000000a1"
+    private let otherReaderID = "00000000-0000-4000-8000-0000000000a2"
 
     func testOpenRequestAndTicketPreserveExactUTF8Identity() throws {
         let sessionID = "session-e\u{0301}"
@@ -38,6 +40,37 @@ final class HLSPlaybackContextTests: XCTestCase {
         }
     }
 
+    func testOpenRequestRequiresCanonicalLowercaseUUIDv4ReaderID() {
+        let invalidReaderIDs = [
+            "00000000-0000-4000-8000-0000000000A1",
+            "00000000-0000-3000-8000-0000000000a1",
+            "00000000-0000-4000-7000-0000000000a1",
+            "000000000000400080000000000000a1",
+            " 00000000-0000-4000-8000-0000000000a1",
+            String(repeating: "a", count: 37),
+            "",
+        ]
+
+        for httpReaderID in invalidReaderIDs {
+            let request = HLSPlaybackContextOpenRequest(
+                sessionID: "session",
+                expectedSessionGeneration: 1,
+                httpReaderID: httpReaderID
+            )
+            XCTAssertThrowsError(try request.validate()) { error in
+                XCTAssertEqual(error as? HLSPlaybackContextValidationError, .invalidRequest)
+            }
+        }
+
+        XCTAssertNoThrow(
+            try HLSPlaybackContextOpenRequest(
+                sessionID: "session",
+                expectedSessionGeneration: 1,
+                httpReaderID: readerID
+            ).validate()
+        )
+    }
+
     func testUpdateRejectsMalformedUUIDSequenceAndTimingValues() {
         let validSample = HLSPlaybackContextTimingSample(
             playheadSeconds: 4,
@@ -70,6 +103,10 @@ final class HLSPlaybackContextTests: XCTestCase {
             HLSPlaybackContextUpdateRequest(
                 contextID: contextID, challenge: challenge, sessionID: "session",
                 expectedSessionGeneration: 0, sequence: 1, sample: validSample),
+            HLSPlaybackContextUpdateRequest(
+                contextID: contextID, challenge: challenge, sessionID: "session",
+                expectedSessionGeneration: 3, sequence: 1, sample: validSample,
+                expectedHTTPReaderID: "00000000-0000-4000-8000-0000000000A1"),
             HLSPlaybackContextUpdateRequest(
                 contextID: contextID, challenge: challenge, sessionID: "session",
                 expectedSessionGeneration: 3, sequence: 1,
@@ -119,6 +156,37 @@ final class HLSPlaybackContextTests: XCTestCase {
         }
     }
 
+    func testOpenTicketRequiresExactOptionalReaderBinding() throws {
+        let request = HLSPlaybackContextOpenRequest(
+            sessionID: "session",
+            expectedSessionGeneration: 7,
+            httpReaderID: readerID
+        )
+        try makeTicket(sessionID: "session", generation: 7, httpReaderID: readerID)
+            .validate(matching: request)
+
+        let invalidTickets = [
+            makeTicket(sessionID: "session", generation: 7),
+            makeTicket(sessionID: "session", generation: 7, httpReaderID: otherReaderID),
+            makeTicket(
+                sessionID: "session",
+                generation: 7,
+                httpReaderID: "00000000-0000-4000-8000-0000000000A1"
+            ),
+        ]
+        for ticket in invalidTickets {
+            XCTAssertThrowsError(try ticket.validate(matching: request)) { error in
+                XCTAssertEqual(error as? HLSPlaybackContextValidationError, .invalidResponse)
+            }
+        }
+
+        let unboundRequest = HLSPlaybackContextOpenRequest(sessionID: "session", expectedSessionGeneration: 7)
+        let unexpectedBinding = makeTicket(sessionID: "session", generation: 7, httpReaderID: readerID)
+        XCTAssertThrowsError(try unexpectedBinding.validate(matching: unboundRequest)) { error in
+            XCTAssertEqual(error as? HLSPlaybackContextValidationError, .invalidResponse)
+        }
+    }
+
     func testUpdateTicketRequiresExactOwnerNextSequenceAndRotatedChallenge() throws {
         let request = HLSPlaybackContextUpdateRequest(
             contextID: contextID,
@@ -140,6 +208,40 @@ final class HLSPlaybackContextTests: XCTestCase {
             sequence: 13
         )
         try valid.validate(matching: request)
+
+        let boundTicket = makeTicket(
+            contextID: contextID,
+            challenge: "00000000-0000-4000-8000-000000000003",
+            sessionID: "session",
+            generation: 4,
+            sequence: 13,
+            httpReaderID: readerID
+        )
+        let boundRequest = HLSPlaybackContextUpdateRequest(
+            contextID: request.contextID,
+            challenge: request.challenge,
+            sessionID: request.sessionID,
+            expectedSessionGeneration: request.expectedSessionGeneration,
+            sequence: request.sequence,
+            sample: request.sample,
+            expectedHTTPReaderID: readerID
+        )
+        try boundTicket.validate(matching: boundRequest)
+        XCTAssertThrowsError(
+            try makeTicket(
+                contextID: contextID,
+                challenge: "00000000-0000-4000-8000-000000000003",
+                sessionID: "session",
+                generation: 4,
+                sequence: 13,
+                httpReaderID: otherReaderID
+            ).validate(matching: boundRequest)
+        ) { error in
+            XCTAssertEqual(error as? HLSPlaybackContextValidationError, .invalidResponse)
+        }
+        XCTAssertThrowsError(try valid.validate(matching: boundRequest)) { error in
+            XCTAssertEqual(error as? HLSPlaybackContextValidationError, .invalidResponse)
+        }
 
         let invalidTickets = [
             makeTicket(
@@ -228,6 +330,37 @@ final class HLSPlaybackContextTests: XCTestCase {
             capabilities: [CacheServerCapability.hlsPlaybackContext]
         )
         XCTAssertTrue(summary.supportsHLSPlaybackContext)
+
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.hlsPlaybackReaderBinding),
+            CacheServerCapability.hlsPlaybackReaderBinding
+        )
+        let bindingSummary = CacheServerSummary(
+            id: "server",
+            name: "Cache",
+            version: "1",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.hlsPlaybackReaderBinding]
+        )
+        XCTAssertTrue(bindingSummary.supportsHLSPlaybackReaderBinding)
+    }
+
+    func testEmptyWireReaderIDMapsToNilAndLegacyInitializersRemainUnbound() throws {
+        let legacyRequest = HLSPlaybackContextOpenRequest(sessionID: "session", expectedSessionGeneration: 7)
+        XCTAssertNil(legacyRequest.httpReaderID)
+        XCTAssertEqual(TvosNetPlayer_V1_OpenHlsPlaybackContextRequest(legacyRequest).httpReaderID, "")
+
+        var proto = TvosNetPlayer_V1_HlsPlaybackContextTicket()
+        proto.contextID = contextID
+        proto.challenge = challenge
+        proto.sessionID = "session"
+        proto.sessionGeneration = 7
+        proto.nextSequence = 1
+        proto.validityMillis = 5_000
+        proto.httpReaderID = ""
+        let ticket = HLSPlaybackContextTicket(proto)
+        XCTAssertNil(ticket.httpReaderID)
+        try ticket.validate(matching: legacyRequest)
     }
 
     private func makeTicket(
@@ -236,7 +369,8 @@ final class HLSPlaybackContextTests: XCTestCase {
         sessionID: String,
         generation: UInt64,
         sequence: UInt64 = 1,
-        validity: UInt64 = 5_000
+        validity: UInt64 = 5_000,
+        httpReaderID: String? = nil
     ) -> HLSPlaybackContextTicket {
         HLSPlaybackContextTicket(
             contextID: contextID ?? self.contextID,
@@ -244,7 +378,8 @@ final class HLSPlaybackContextTests: XCTestCase {
             sessionID: sessionID,
             sessionGeneration: generation,
             nextSequence: sequence,
-            validityMillis: validity
+            validityMillis: validity,
+            httpReaderID: httpReaderID
         )
     }
 }

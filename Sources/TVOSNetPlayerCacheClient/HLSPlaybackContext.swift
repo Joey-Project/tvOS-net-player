@@ -3,14 +3,23 @@ import Foundation
 public struct HLSPlaybackContextOpenRequest: Equatable, Sendable {
     public let sessionID: String
     public let expectedSessionGeneration: UInt64
+    public let httpReaderID: String?
 
-    public init(sessionID: String, expectedSessionGeneration: UInt64) {
+    public init(
+        sessionID: String,
+        expectedSessionGeneration: UInt64,
+        httpReaderID: String? = nil
+    ) {
         self.sessionID = sessionID
         self.expectedSessionGeneration = expectedSessionGeneration
+        self.httpReaderID = httpReaderID
     }
 
     public func validate() throws {
         guard Self.isValidIdentifier(sessionID), expectedSessionGeneration > 0 else {
+            throw HLSPlaybackContextValidationError.invalidRequest
+        }
+        if let httpReaderID, !HLSPlaybackContextUUID.isCanonicalVersion4(httpReaderID) {
             throw HLSPlaybackContextValidationError.invalidRequest
         }
     }
@@ -66,6 +75,7 @@ public struct HLSPlaybackContextUpdateRequest: Equatable, Sendable {
     public let expectedSessionGeneration: UInt64
     public let sequence: UInt64
     public let sample: HLSPlaybackContextTimingSample
+    public let expectedHTTPReaderID: String?
 
     public init(
         contextID: String,
@@ -73,7 +83,8 @@ public struct HLSPlaybackContextUpdateRequest: Equatable, Sendable {
         sessionID: String,
         expectedSessionGeneration: UInt64,
         sequence: UInt64,
-        sample: HLSPlaybackContextTimingSample
+        sample: HLSPlaybackContextTimingSample,
+        expectedHTTPReaderID: String? = nil
     ) {
         self.contextID = contextID
         self.challenge = challenge
@@ -81,6 +92,7 @@ public struct HLSPlaybackContextUpdateRequest: Equatable, Sendable {
         self.expectedSessionGeneration = expectedSessionGeneration
         self.sequence = sequence
         self.sample = sample
+        self.expectedHTTPReaderID = expectedHTTPReaderID
     }
 
     public func validate() throws {
@@ -89,7 +101,8 @@ public struct HLSPlaybackContextUpdateRequest: Equatable, Sendable {
             HLSPlaybackContextOpenRequest.isValidIdentifier(sessionID),
             expectedSessionGeneration > 0,
             sequence > 0,
-            sequence < UInt64.max
+            sequence < UInt64.max,
+            expectedHTTPReaderID.map({ HLSPlaybackContextUUID.isCanonicalVersion4($0) }) ?? true
         else {
             throw HLSPlaybackContextValidationError.invalidRequest
         }
@@ -118,6 +131,7 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
     public let sessionGeneration: UInt64
     public let nextSequence: UInt64
     public let validityMillis: UInt64
+    public let httpReaderID: String?
 
     public init(
         contextID: String,
@@ -125,7 +139,8 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
         sessionID: String,
         sessionGeneration: UInt64,
         nextSequence: UInt64,
-        validityMillis: UInt64
+        validityMillis: UInt64,
+        httpReaderID: String? = nil
     ) {
         self.contextID = contextID
         self.challenge = challenge
@@ -133,6 +148,7 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
         self.sessionGeneration = sessionGeneration
         self.nextSequence = nextSequence
         self.validityMillis = validityMillis
+        self.httpReaderID = httpReaderID
     }
 
     public func validate(matching request: HLSPlaybackContextOpenRequest) throws {
@@ -142,7 +158,9 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
             sessionID.utf8.elementsEqual(request.sessionID.utf8),
             sessionGeneration == request.expectedSessionGeneration,
             nextSequence == 1,
-            (1...5_000).contains(validityMillis)
+            (1...5_000).contains(validityMillis),
+            httpReaderID == request.httpReaderID,
+            httpReaderID.map({ HLSPlaybackContextUUID.isCanonicalVersion4($0) }) ?? true
         else {
             throw HLSPlaybackContextValidationError.invalidResponse
         }
@@ -159,7 +177,8 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
             sessionID.utf8.elementsEqual(request.sessionID.utf8),
             sessionGeneration == request.expectedSessionGeneration,
             nextSequence == expectedSequence,
-            (1...5_000).contains(validityMillis)
+            (1...5_000).contains(validityMillis),
+            httpReaderID == request.expectedHTTPReaderID
         else {
             throw HLSPlaybackContextValidationError.invalidResponse
         }
@@ -172,7 +191,8 @@ public struct HLSPlaybackContextTicket: Equatable, Sendable {
             sessionID: proto.sessionID,
             sessionGeneration: proto.sessionGeneration,
             nextSequence: proto.nextSequence,
-            validityMillis: proto.validityMillis
+            validityMillis: proto.validityMillis,
+            httpReaderID: proto.httpReaderID.isEmpty ? nil : proto.httpReaderID
         )
     }
 }
@@ -211,6 +231,10 @@ private enum HLSPlaybackContextUUID {
         return version == 4 && (variant & 0b1100) == 0b1000
     }
 
+    static func isCanonicalVersion4(_ value: String) -> Bool {
+        value == value.lowercased() && isVersion4(value)
+    }
+
     private static func hasCanonicalShape(_ value: String) -> Bool {
         let bytes = Array(value.utf8)
         guard bytes.count == 36 else { return false }
@@ -238,6 +262,7 @@ extension TvosNetPlayer_V1_OpenHlsPlaybackContextRequest {
         self.init()
         sessionID = request.sessionID
         expectedSessionGeneration = request.expectedSessionGeneration
+        httpReaderID = request.httpReaderID ?? ""
     }
 }
 

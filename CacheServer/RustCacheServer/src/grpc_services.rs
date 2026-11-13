@@ -97,7 +97,8 @@ use crate::{
         HlsWeakNetworkSnapshot, HlsWeakNetworkState as RuntimeHlsWeakNetworkState,
     },
     hls_playback_context::{
-        PlaybackContextStoreError, PlaybackContextTicket, PlaybackTimingSample, is_uuid_syntax,
+        PlaybackContextStoreError, PlaybackContextTicket, PlaybackTimingSample,
+        is_canonical_uuid_v4, is_uuid_syntax,
     },
     hls_playback_progress::{
         HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
@@ -226,6 +227,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::HlsPlaybackReadiness.into(),
                 ServerCapability::HlsRenditionCatalog.into(),
                 ServerCapability::HlsPlaybackContext.into(),
+                ServerCapability::HlsPlaybackReaderBinding.into(),
                 ServerCapability::ResolverSettingsWrite.into(),
             ],
         };
@@ -2884,6 +2886,11 @@ impl CacheService for CacheGrpcService {
                 "Expected HLS session generation must be positive.",
             ));
         }
+        if !request.http_reader_id.is_empty() && !is_canonical_uuid_v4(&request.http_reader_id) {
+            return Err(Status::invalid_argument(
+                "HTTP playback reader identifier must be a canonical lowercase UUIDv4.",
+            ));
+        }
         let handle = self
             .state
             .hls_sessions
@@ -2895,11 +2902,18 @@ impl CacheService for CacheGrpcService {
             ));
         }
 
-        let ticket = self
-            .state
-            .hls_playback_contexts
-            .open(request.session_id, handle.generation)
-            .map_err(playback_context_store_status)?;
+        let ticket = if request.http_reader_id.is_empty() {
+            self.state
+                .hls_playback_contexts
+                .open(request.session_id, handle.generation)
+        } else {
+            self.state.hls_playback_contexts.open_with_reader_id(
+                request.session_id,
+                handle.generation,
+                request.http_reader_id,
+            )
+        }
+        .map_err(playback_context_store_status)?;
         let still_current = self
             .state
             .hls_sessions
@@ -3078,6 +3092,7 @@ fn proto_playback_context_ticket(ticket: PlaybackContextTicket) -> HlsPlaybackCo
         session_generation: ticket.session_generation,
         next_sequence: ticket.next_sequence,
         validity_millis: ticket.validity_millis,
+        http_reader_id: ticket.http_reader_id,
     }
 }
 
@@ -14666,7 +14681,12 @@ mod tests {
         let first_generation = state.register_hls_playback_session(session.clone());
         let stale_context = state
             .hls_playback_contexts
-            .open_at(session.id.clone(), first_generation, StdInstant::now())
+            .open_with_reader_id_at(
+                session.id.clone(),
+                first_generation,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+                StdInstant::now(),
+            )
             .expect("context for the first generation should open");
         let second_generation = state.register_hls_playback_session(session.clone());
         assert!(second_generation > first_generation);
@@ -14679,7 +14699,12 @@ mod tests {
 
         let removed_context = state
             .hls_playback_contexts
-            .open_at(session.id.clone(), second_generation, StdInstant::now())
+            .open_with_reader_id_at(
+                session.id.clone(),
+                second_generation,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+                StdInstant::now(),
+            )
             .expect("context for the second generation should open");
         state.remove_hls_playback_session(&session.id);
         assert!(
@@ -14699,6 +14724,11 @@ mod tests {
             server_info
                 .capabilities
                 .contains(&ServerCapability::HlsPlaybackContext.into())
+        );
+        assert!(
+            server_info
+                .capabilities
+                .contains(&ServerCapability::HlsPlaybackReaderBinding.into())
         );
 
         let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -14724,23 +14754,60 @@ mod tests {
         )
         .await
         .expect("generated gRPC client should connect");
-        let open = |generation| OpenHlsPlaybackContextRequest {
+        let open = |generation, http_reader_id: &str| OpenHlsPlaybackContextRequest {
             session_id: session.id.clone(),
             expected_session_generation: generation,
+            http_reader_id: http_reader_id.to_owned(),
         };
+        let legacy = client
+            .open_hls_playback_context(open(generation, ""))
+            .await
+            .expect("legacy unbound context should open over generated gRPC")
+            .into_inner();
+        assert!(legacy.http_reader_id.is_empty());
+        client
+            .close_hls_playback_context(CloseHlsPlaybackContextRequest {
+                context_id: legacy.context_id,
+            })
+            .await
+            .expect("legacy context should close");
+
+        for invalid_reader_id in [
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "aaaaaaaa-aaaa-3aaa-8aaa-aaaaaaaaaaaa",
+            "aaaaaaaa-aaaa-4aaa-0aaa-aaaaaaaaaaaa",
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa",
+        ] {
+            let invalid = client
+                .open_hls_playback_context(open(generation, invalid_reader_id))
+                .await
+                .expect_err("noncanonical reader IDs must be rejected");
+            assert_eq!(tonic::Code::InvalidArgument, invalid.code());
+        }
+
+        let reader_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let reader_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let first = client
-            .open_hls_playback_context(open(generation))
+            .open_hls_playback_context(open(generation, reader_a))
             .await
             .expect("first context should open over generated gRPC")
             .into_inner();
         let second = client
-            .open_hls_playback_context(open(generation))
+            .open_hls_playback_context(open(generation, reader_b))
             .await
             .expect("second context should open over generated gRPC")
+            .into_inner();
+        let duplicate_reader_a = client
+            .open_hls_playback_context(open(generation, reader_a))
+            .await
+            .expect("second live context for reader A should open")
             .into_inner();
         assert_eq!(generation, first.session_generation);
         assert_eq!(1, first.next_sequence);
         assert_eq!(5_000, first.validity_millis);
+        assert_eq!(reader_a, first.http_reader_id);
+        assert_eq!(reader_b, second.http_reader_id);
+        assert_eq!(reader_a, duplicate_reader_a.http_reader_id);
 
         let sample =
             |playhead_seconds| crate::generated::tvos_net_player::v1::HlsPlaybackTimingSample {
@@ -14760,6 +14827,7 @@ mod tests {
             .into_inner();
         assert_eq!(2, first_update.next_sequence);
         assert_ne!(first.challenge, first_update.challenge);
+        assert_eq!(reader_a, first_update.http_reader_id);
 
         let replay = client
             .update_hls_playback_context(UpdateHlsPlaybackContextRequest {
@@ -14783,6 +14851,31 @@ mod tests {
             .expect("current challenge should still be usable after replay")
             .into_inner();
         assert_eq!(3, second_update.next_sequence);
+        assert_eq!(reader_a, second_update.http_reader_id);
+        assert!(
+            state
+                .current_hls_playback_context_for_reader(reader_a)
+                .is_none(),
+            "an uninitialized duplicate context makes reader A ambiguous"
+        );
+        assert!(
+            state
+                .current_hls_playback_context_for_reader(reader_b)
+                .is_none(),
+            "reader B has no timing sample yet"
+        );
+        client
+            .close_hls_playback_context(CloseHlsPlaybackContextRequest {
+                context_id: duplicate_reader_a.context_id,
+            })
+            .await
+            .expect("duplicate reader A context should close");
+        assert_eq!(
+            Some(2.0),
+            state
+                .current_hls_playback_context_for_reader(reader_a)
+                .map(|snapshot| snapshot.sample.playhead_seconds)
+        );
 
         for _ in 0..2 {
             let closed = client
@@ -14805,6 +14898,13 @@ mod tests {
             .expect("closing one context must not remove another")
             .into_inner();
         assert_eq!(2, surviving_update.next_sequence);
+        assert_eq!(reader_b, surviving_update.http_reader_id);
+        assert_eq!(
+            Some(3.0),
+            state
+                .current_hls_playback_context_for_reader(reader_b)
+                .map(|snapshot| snapshot.sample.playhead_seconds)
+        );
         assert_eq!(
             Some(session.id.clone()),
             state
