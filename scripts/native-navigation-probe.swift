@@ -358,6 +358,7 @@ private final class ProbeApplicationDelegate: NSObject, NSApplicationDelegate, N
     private var window: ProbeWindow?
     private var localMonitor: Any?
     private var itemEndObserver: NSObjectProtocol?
+    private var timeJumpObserver: NSObjectProtocol?
     private var sampleTimer: Timer?
     private var durationTimer: Timer?
     private var pendingGateTasks: [String: Task<Void, Never>] = [:]
@@ -471,6 +472,37 @@ private final class ProbeApplicationDelegate: NSObject, NSApplicationDelegate, N
                     return
                 }
                 self.stop(reason: "item_ended", at: endedAt)
+            }
+        }
+
+        timeJumpObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.timeJumpedNotification,
+            object: newItem,
+            queue: .main
+        ) { [weak self, weak newItem] _ in
+            let observedAt = rawMonotonicNanoseconds()
+            let positionObservedAt = rawMonotonicNanoseconds()
+            let seconds = newItem?.currentTime().seconds
+            let position = seconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard !self.isShuttingDown else { return }
+                guard let observedAt, observedAt > 0,
+                    let positionObservedAt, positionObservedAt > 0
+                else {
+                    self.stopWithoutClock()
+                    return
+                }
+                self.record(
+                    "native_time_jump", at: observedAt,
+                    fields: [
+                        "source": "AVPlayerItem.timeJumpedNotification",
+                        "observation_point": "notification_callback_entry_main_queue",
+                        "to_position_seconds": position as Any? ?? NSNull(),
+                        "to_position_clock_ns": positionObservedAt,
+                        "to_position_offset_ns": positionObservedAt - observedAt,
+                        "to_position_timing": "sampled_in_notification_callback_before_actor_hop",
+                    ])
             }
         }
 
@@ -858,6 +890,10 @@ private final class ProbeApplicationDelegate: NSObject, NSApplicationDelegate, N
         if let itemEndObserver {
             NotificationCenter.default.removeObserver(itemEndObserver)
             self.itemEndObserver = nil
+        }
+        if let timeJumpObserver {
+            NotificationCenter.default.removeObserver(timeJumpObserver)
+            self.timeJumpObserver = nil
         }
         invalidatePendingGates()
         player?.pause()

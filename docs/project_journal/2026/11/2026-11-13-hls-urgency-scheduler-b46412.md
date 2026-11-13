@@ -49,9 +49,9 @@ superseded_by:
   remaining native-control causality gap. Unknown routes remain protected.
 
 ## Next Steps
-1. After manual host unlock, complete the macOS mouse/keyboard experiments and
-   unbuffered-seek ordering coverage. Keep broad PR/merge readiness separate;
-   do not silently promote native-control smoke coverage to a scheduling gate.
+1. Finish physical mouse-drag and external/system transport coverage, and close
+   the missing native-handler-entry observation. Keep broad PR/merge readiness
+   separate; a working key-release experiment is not an all-route seek fence.
 2. Use measured native-control boundaries to choose the smallest reliable bridge
    or a narrowly scoped custom control. Integrate real exact-ID Close only after
    the input boundary is sound. Do not claim a late callback is a pre-seek barrier.
@@ -82,6 +82,12 @@ superseded_by:
   fallback. `prepare --print-path` returns the bundle; `run` uses its executable.
 - Full CI, remote PR review and production native media acceptance are separate
   gates. No production scheduler authority follows from these results.
+- The preceding Python/tvOS results cover implementation checkpoint `26a3b7a`.
+  The subsequent macOS-only native-notification observer passed Swift 6 strict
+  concurrency, warnings-as-errors typecheck and strict Swift formatting. It
+  records `native_time_jump` separately from periodic `time_jump`; callback entry
+  and the pre-actor-hop position read have separate raw clock markers. No
+  production source, buffering or transport schema changed.
 
 ## Prototype Commands
 - Start `python3 scripts/native-navigation-fixture.py --output-root
@@ -120,11 +126,41 @@ superseded_by:
   macOS bare-executable attempt was not controllable through Computer Use;
   after forced shutdown it lacked a cleanup report, and its owned media was
   removed separately after process quiescence. It is not a passing UI case.
-- The subsequent bundled macOS app built and started, but Computer Use spent
+- An initial bundled macOS attempt built and started, but Computer Use spent
   approximately 71 minutes in host lock detection before reporting that manual
-  unlock was required. No mouse, unbuffered-seek or keyboard-gate UI acceptance
-  is claimed. Do not retry locked UI access or interpret the stalled call as a
-  successful long playback test; keep the remaining work explicitly pending.
+  unlock was required. That attempt has no UI acceptance and is not a successful
+  long playback test. The unlocked runs below are separate cases.
+- After manual unlock, `mac-observe-03` exercised the native timeline through
+  Computer Use at 300 and 480 seconds. Prechecks had not seen the target segment
+  indices 150 and 240, respectively; both positions rendered and resumed. The
+  window closed normally after approximately 233 seconds. These are specific
+  native timeline/AX paths, not proof that every input is intercepted.
+- Coordinate drag attempts did not establish successful physical timeline
+  dragging. Floating controls were absent from the captured image; OCR entries
+  also appeared on keyboard pause and do not establish which region was hit.
+  Keep physical mouse dragging explicitly unverified.
+- In `mac-gate-01`, Right and Left each obtained their matching simulated fixture
+  acknowledgment and were released after approximately 515 and 509 ms. No
+  `native_player_view` callback was recorded, so native-handler entry and full
+  keyUp/repeat semantics remain unproven. This is not real gRPC Close.
+- An AX timeline change to an unrequested 480-second position in keyboard-gate
+  mode rendered and resumed without increasing the two keyboard gate requests.
+  That entry is outside the measured key-only gate; retain continuity protection
+  for unknown/native bypass routes.
+- Periodic-position versus HTTP receipt ordering from those first two runs does
+  not establish actual AVPlayerItem notification timing. The subsequent
+  `mac-native-notification-01` case uses the distinct real-notification observer.
+  Before its AX seek to 480 seconds, the precheck had seen only segment index 37
+  and had not seen target index 240; the target frame rendered and resumed.
+- In that single synthetic loopback case, the target HTTP request receipt
+  preceded the probe's main-queue native-notification callback entry by
+  16.427 ms, and its periodic position sample by 78.596 ms. These are separate
+  measured observation points. They are not native emission timestamps,
+  client request-issue timestamps or an all-case ordering guarantee.
+- Production AppCore currently uses a Combine notification publisher followed by
+  a MainActor task. The diagnostic's explicit main-queue observer is not the
+  identical Combine sink or AppCore-handler entry point. No production handler
+  timing claim or permission to demote ambiguous requests follows from this test.
 
 ## Evidence
 - [Freshness and withdrawal PR #102](https://github.com/Joey-Project/tvOS-net-player/pull/102).
