@@ -56,6 +56,9 @@ superseded_by:
 - Keep a pending Open distinct from a genuinely lost outcome: its eventual
   valid ticket and acknowledged exact-ID removal can discharge that pending
   operation, but cannot clear unrelated unresolved or unknown authority.
+- Preserve the bounded legacy cleanup wait under caller cancellation while
+  explicit confirmation remains cancellable and never treats cancellation as
+  a server acknowledgment. Exercise the actual generated gRPC close route.
 - Require complete format/lint/local CI, fixed-signed native3 with verified
   system mute, current-head GitHub CI/UI and GitHub Codex review, plus every
   conversation resolved before normal SHA-bound protected squash merge.

@@ -1301,7 +1301,7 @@ public final class HLSPlaybackContextReportingService {
                 )
                 return
             }
-            let outcome = await closeAttempt.waiter.wait(for: Self.closeWaitDuration)
+            let outcome = await closeAttempt.waiter.waitForLegacyCleanup(for: Self.closeWaitDuration)
             if closeAttempt.retirementID == nil {
                 legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
             }
@@ -1338,7 +1338,7 @@ public final class HLSPlaybackContextReportingService {
             waiter: waiter,
             task: task
         )
-        let outcome = await waiter.wait(for: Self.closeWaitDuration)
+        let outcome = await waiter.waitForLegacyCleanup(for: Self.closeWaitDuration)
         if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true,
             closeAttempt?.retirementID == nil
         {
@@ -1414,30 +1414,43 @@ private actor HLSPlaybackContextCloseWaiter {
     func wait(for timeout: Duration) async -> HLSPlaybackContextWithdrawalOutcome {
         let waiterID = UUID()
         return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: .unconfirmed(.cancelled))
-                    return
-                }
-                if let deliveryOutcome {
-                    continuation.resume(returning: deliveryOutcome)
-                    return
-                }
-
-                continuations[waiterID] = continuation
-                if timeoutTask == nil {
-                    timeoutTask = Task.detached { [weak self] in
-                        do {
-                            try await Task.sleep(for: timeout)
-                        } catch {
-                            return
-                        }
-                        await self?.finish(.unconfirmed(.timedOut))
-                    }
-                }
-            }
+            await wait(waiterID, for: timeout, ignoringCancellation: false)
         } onCancel: {
             Task { await self.cancel(waiterID) }
+        }
+    }
+
+    /// Legacy cleanup remains bounded, but caller cancellation does not end its wait early.
+    func waitForLegacyCleanup(for timeout: Duration) async -> HLSPlaybackContextWithdrawalOutcome {
+        await wait(UUID(), for: timeout, ignoringCancellation: true)
+    }
+
+    private func wait(
+        _ waiterID: UUID,
+        for timeout: Duration,
+        ignoringCancellation: Bool
+    ) async -> HLSPlaybackContextWithdrawalOutcome {
+        await withCheckedContinuation { continuation in
+            if !ignoringCancellation, Task.isCancelled {
+                continuation.resume(returning: .unconfirmed(.cancelled))
+                return
+            }
+            if let deliveryOutcome {
+                continuation.resume(returning: deliveryOutcome)
+                return
+            }
+
+            continuations[waiterID] = continuation
+            if timeoutTask == nil {
+                timeoutTask = Task.detached { [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    await self?.finish(.unconfirmed(.timedOut))
+                }
+            }
         }
     }
 

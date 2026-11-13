@@ -600,6 +600,38 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         await client.waitForCompletedCloseCount(1)
     }
 
+    func testCancelledLegacyWithdrawalWaitsForBestEffortClose() async throws {
+        let client = PlaybackContextClientProbe()
+        let owner = try makeOwner(sessionID: "session-A", generation: 8)
+        let service = makeService(
+            client: client,
+            ownerProvider: { owner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        try await service.start()
+        await client.holdClose(for: contextA)
+
+        var withdrawalReturned = false
+        let withdrawal = Task { @MainActor in
+            await service.withdraw()
+            withdrawalReturned = true
+        }
+        let closeReachedClient = await client.waitForCloseCount(1, timeout: .seconds(2))
+        XCTAssertTrue(closeReachedClient)
+        withdrawal.cancel()
+        try await Task.sleep(for: .milliseconds(25))
+        XCTAssertFalse(withdrawalReturned)
+
+        await client.releaseClose(for: contextA)
+        await withdrawal.value
+        XCTAssertTrue(withdrawalReturned)
+
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextA])
+        XCTAssertEqual(counts.completedCloseCount, 1)
+    }
+
     func testStartOpensBeforeCapturingAndSendsOneExplicitInitialSample() async throws {
         let client = PlaybackContextClientProbe()
         let owner = try makeOwner(sessionID: "session-A", generation: 8)
