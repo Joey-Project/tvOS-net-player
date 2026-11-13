@@ -60,6 +60,7 @@ use crate::{
         hls_target_duration_for_ranges, mp4_fragment_ranges,
     },
     playback_policy::PlaybackPolicy,
+    suspend_clock::{SuspendClock, SystemSuspendClock},
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
         LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
@@ -4597,6 +4598,8 @@ impl HlsCacheStore {
             self.range_cache
                 .check_priority_control(&control_key, priority, control)?;
             let started = Instant::now();
+            let suspend_clock = SystemSuspendClock;
+            let suspend_started_at = suspend_clock.now();
             let mut request = client.get(&url);
             for header in &resource.request.headers {
                 if header.name.eq_ignore_ascii_case("range")
@@ -4715,6 +4718,8 @@ impl HlsCacheStore {
             let mut stream = response.bytes_stream();
             let mut total = 0_u64;
             let mut candidate_error = None;
+            let mut suspend_first_byte_observed = false;
+            let mut suspend_first_byte_at = None;
             loop {
                 self.range_cache
                     .check_priority_control(&control_key, priority, control)?;
@@ -4730,6 +4735,10 @@ impl HlsCacheStore {
                         break;
                     }
                 };
+                if !chunk.is_empty() && !suspend_first_byte_observed {
+                    suspend_first_byte_observed = true;
+                    suspend_first_byte_at = suspend_clock.now();
+                }
                 total = total.saturating_add(chunk.len() as u64);
                 if total > expected_length {
                     candidate_error = Some(HlsRangeError::InvalidResponse(
@@ -4741,6 +4750,7 @@ impl HlsCacheStore {
                 self.range_cache
                     .note_file_length(key, current_length.saturating_add(total));
             }
+            let suspend_completed_at = suspend_clock.now();
             if candidate_error.is_none() && total != expected_length {
                 candidate_error = Some(HlsRangeError::InvalidResponse(
                     "full-resource body length was incomplete".to_owned(),
@@ -4759,6 +4769,11 @@ impl HlsCacheStore {
                         Some(started.elapsed()),
                         Some(first_byte_latency),
                         Some(false),
+                    )
+                    .with_fresh_timing(
+                        suspend_started_at,
+                        suspend_first_byte_at,
+                        suspend_completed_at,
                     ),
                 );
                 if matches!(error, HlsRangeError::Network(_))
@@ -4786,6 +4801,11 @@ impl HlsCacheStore {
                             Some(started.elapsed()),
                             Some(first_byte_latency),
                             Some(false),
+                        )
+                        .with_fresh_timing(
+                            suspend_started_at,
+                            suspend_first_byte_at,
+                            suspend_completed_at,
                         ),
                     );
                     last_error = Some(HlsRangeError::InvalidResponse(
@@ -4809,6 +4829,11 @@ impl HlsCacheStore {
                             Some(started.elapsed()),
                             Some(first_byte_latency),
                             Some(false),
+                        )
+                        .with_fresh_timing(
+                            suspend_started_at,
+                            suspend_first_byte_at,
+                            suspend_completed_at,
                         ),
                     );
                     last_error = Some(HlsRangeError::InvalidResponse(
@@ -4889,6 +4914,11 @@ impl HlsCacheStore {
                     Some(started.elapsed()),
                     Some(first_byte_latency),
                     Some(false),
+                )
+                .with_fresh_timing(
+                    suspend_started_at,
+                    suspend_first_byte_at,
+                    suspend_completed_at,
                 ),
             );
             progress(total);
@@ -9146,7 +9176,10 @@ fn passive_cache_observation(
         elapsed,
         first_byte_latency,
         range_supported,
-        observed_at: std::time::Instant::now(),
+        fresh_elapsed: None,
+        fresh_first_byte_latency: None,
+        observed_at: SystemSuspendClock.now(),
+        fresh_timing_invalid: false,
     }
 }
 

@@ -4,16 +4,39 @@ import TVOSNetPlayerCacheClient
 public struct HLSUpshiftAssessmentService: Sendable {
     private let client: any CacheControlClient
     private let serverSummary: CacheServerSummary
-    private let monotonicNowNanoseconds: @Sendable () -> UInt64
+    private let monotonicNowNanoseconds: @Sendable () -> UInt64?
+
+    public init(
+        client: any CacheControlClient,
+        serverSummary: CacheServerSummary
+    ) {
+        self.init(
+            client: client,
+            serverSummary: serverSummary,
+            monotonicNowNanosecondsProvider: { HLSPlaybackMonotonicClock.shared.nowNanoseconds() }
+        )
+    }
 
     public init(
         client: any CacheControlClient,
         serverSummary: CacheServerSummary,
-        monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        monotonicNowNanoseconds: @escaping @Sendable () -> UInt64
+    ) {
+        self.init(
+            client: client,
+            serverSummary: serverSummary,
+            monotonicNowNanosecondsProvider: { monotonicNowNanoseconds() }
+        )
+    }
+
+    init(
+        client: any CacheControlClient,
+        serverSummary: CacheServerSummary,
+        monotonicNowNanosecondsProvider: @escaping @Sendable () -> UInt64?
     ) {
         self.client = client
         self.serverSummary = serverSummary
-        self.monotonicNowNanoseconds = monotonicNowNanoseconds
+        self.monotonicNowNanoseconds = monotonicNowNanosecondsProvider
     }
 
     /// Returns sanitized holds for cancellation and transport failures; client errors are not exposed.
@@ -31,14 +54,18 @@ public struct HLSUpshiftAssessmentService: Sendable {
             return HLSUpshiftPolicy.holdRecommendation(for: context, reason: .cancelled)
         }
 
-        let requestStarted = monotonicNowNanoseconds()
+        guard let requestStarted = monotonicNowNanoseconds() else {
+            return HLSUpshiftPolicy.holdRecommendation(for: context, reason: .clockAnomaly)
+        }
         if Task.isCancelled {
             return HLSUpshiftPolicy.holdRecommendation(for: context, reason: .cancelled)
         }
 
         do {
             let readiness = try await client.getHLSPlaybackReadiness(context.request)
-            let assessmentTime = monotonicNowNanoseconds()
+            guard let assessmentTime = monotonicNowNanoseconds() else {
+                return HLSUpshiftPolicy.holdRecommendation(for: context, reason: .clockAnomaly)
+            }
             if Task.isCancelled {
                 return cancellationRecommendation(context, readiness: readiness)
             }

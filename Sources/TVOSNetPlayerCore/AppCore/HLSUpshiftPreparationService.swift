@@ -26,12 +26,12 @@ struct HLSUpshiftPreparationService: Sendable {
 
     private let client: any CacheControlClient
     private let serverSummary: CacheServerSummary
-    private let monotonicNowNanoseconds: @Sendable () -> UInt64
+    private let monotonicNowNanoseconds: @Sendable () -> UInt64?
 
     init(
         client: any CacheControlClient,
         serverSummary: CacheServerSummary,
-        monotonicNowNanoseconds: @escaping @Sendable () -> UInt64
+        monotonicNowNanoseconds: @escaping @Sendable () -> UInt64?
     ) {
         self.client = client
         self.serverSummary = serverSummary
@@ -78,7 +78,7 @@ struct HLSUpshiftPreparationService: Sendable {
             return nil
         }
 
-        let now = monotonicNowNanoseconds()
+        guard let now = monotonicNowNanoseconds() else { return nil }
         guard
             let context = snapshot.context(
                 for: request,
@@ -98,7 +98,7 @@ struct HLSUpshiftPreparationService: Sendable {
             return nil
         }
 
-        guard
+        guard let readinessNow = monotonicNowNanoseconds(),
             let readinessContext = snapshot.context(
                 for: request,
                 targetVideoBitrateBitsPerSecond: rendition.videoResourceBandwidthBitsPerSecond,
@@ -106,14 +106,14 @@ struct HLSUpshiftPreparationService: Sendable {
                 requiresAudio: rendition.hasSeparateAudio,
                 targetDecoderSupported: targetDecoderSupported,
                 expectedSessionGeneration: catalog.sessionGeneration,
-                nowNanoseconds: monotonicNowNanoseconds()
+                nowNanoseconds: readinessNow
             ), Self.contextAgeIsValid(readinessContext)
         else { return nil }
 
         let readinessService = HLSUpshiftAssessmentService(
             client: client,
             serverSummary: serverSummary,
-            monotonicNowNanoseconds: monotonicNowNanoseconds
+            monotonicNowNanosecondsProvider: monotonicNowNanoseconds
         )
         let recommendation = await readinessService.assess(readinessContext)
         guard !Task.isCancelled, !isCancelled(), await isCurrent() else {

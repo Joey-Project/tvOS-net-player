@@ -131,6 +131,23 @@ final class PlayerHLSPlaybackSnapshotTests: XCTestCase {
     }
 
     @MainActor
+    func testMissingClockReadingFailsSnapshotCapture() {
+        let (model, _) = makeFixture(status: .playing)
+        model.playbackSnapshotNowNanoseconds = { nil }
+
+        XCTAssertNil(model.captureHLSPlaybackSnapshot())
+    }
+
+    @MainActor
+    func testDefaultSnapshotClockUsesSharedContinuousEpoch() throws {
+        let (model, _) = makeFixture(status: .playing)
+        let snapshot = try XCTUnwrap(model.captureHLSPlaybackSnapshot())
+        let now = try XCTUnwrap(HLSPlaybackMonotonicClock.shared.nowNanoseconds())
+
+        XCTAssertGreaterThanOrEqual(now, snapshot.observedAtNanoseconds)
+    }
+
+    @MainActor
     private func makeFixture(
         status: AVPlayer.TimeControlStatus,
         hasItem: Bool = true,

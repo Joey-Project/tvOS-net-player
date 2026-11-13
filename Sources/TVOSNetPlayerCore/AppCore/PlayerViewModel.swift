@@ -255,7 +255,9 @@ public final class PlayerViewModel: ObservableObject {
     }
     var resumptionReadinessTimeout: Duration = .seconds(20)
     var resumptionSeekTimeout: Duration = .seconds(15)
-    var playbackSnapshotNowNanoseconds: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+    var playbackSnapshotNowNanoseconds: @Sendable () -> UInt64? = {
+        HLSPlaybackMonotonicClock.shared.nowNanoseconds()
+    }
 
     private struct PendingReplay {
         let player: AVPlayer
@@ -332,8 +334,8 @@ public final class PlayerViewModel: ObservableObject {
 
     /// Captures read-only native playback timing; it does not identify HLS renditions or authorize handover.
     public func captureHLSPlaybackSnapshot() -> HLSPlaybackSnapshot? {
-        let observedAtNanoseconds = playbackSnapshotNowNanoseconds()
-        guard let player, let controller = playbackController,
+        guard let observedAtNanoseconds = playbackSnapshotNowNanoseconds(),
+            let player, let controller = playbackController,
             let item = player.currentItem,
             controller.currentItem === item,
             controller.readinessStatus == .readyToPlay,
@@ -476,7 +478,8 @@ public final class PlayerViewModel: ObservableObject {
 
     /// Checks local playback ownership and freshness; this is neither a lease nor permission to switch.
     public func isCurrentHLSUpshiftAssessment(_ assessment: HLSOwnedUpshiftAssessment) -> Bool {
-        guard let owner = hlsUpshiftOwner, owner.id == assessment.ownerToken,
+        guard let nowNanoseconds = playbackSnapshotNowNanoseconds(),
+            let owner = hlsUpshiftOwner, owner.id == assessment.ownerToken,
             owner.snapshot == assessment.snapshot,
             isCurrentHLSUpshiftOwner(owner.id),
             let session = owner.context.hlsSession,
@@ -486,7 +489,7 @@ public final class PlayerViewModel: ObservableObject {
                 snapshot: assessment.snapshot,
                 rendition: assessment.rendition,
                 recommendation: assessment.recommendation,
-                nowNanoseconds: playbackSnapshotNowNanoseconds()
+                nowNanoseconds: nowNanoseconds
             )
         else { return false }
         return true

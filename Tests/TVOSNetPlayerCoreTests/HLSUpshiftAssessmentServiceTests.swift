@@ -15,6 +15,28 @@ final class HLSUpshiftAssessmentServiceTests: XCTestCase {
         XCTAssertEqual(calls, 0)
     }
 
+    func testMissingClockReadingFailsClosedWithoutCallingClient() async {
+        let client = ReadinessTestClient(readiness: makeReadiness(), behavior: .success)
+        let summary = CacheServerSummary(
+            id: "test-server",
+            name: "Test server",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.hlsPlaybackReadiness]
+        )
+        let service = HLSUpshiftAssessmentService(
+            client: client,
+            serverSummary: summary,
+            monotonicNowNanosecondsProvider: { nil }
+        )
+
+        let result = await service.assess(makeContext())
+
+        XCTAssertEqual(result.outcome, .hold(.clockAnomaly))
+        let calls = await client.callCount()
+        XCTAssertEqual(calls, 0)
+    }
+
     func testLegacyUnsupportedOperationMapsToSanitizedHold() async {
         let client = ReadinessTestClient(readiness: makeReadiness(), behavior: .unsupported)
         let service = makeService(client: client)

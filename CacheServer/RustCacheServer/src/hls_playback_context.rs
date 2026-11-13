@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use crate::suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock};
 use uuid::{Uuid, Variant, Version};
 
 const CONTEXT_VALIDITY: Duration = Duration::from_secs(5);
@@ -68,9 +69,17 @@ pub(crate) enum PlaybackContextStoreError {
     DeadlineOverflow,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct HlsPlaybackContextStore {
     contexts: Arc<Mutex<HashMap<String, PlaybackContext>>>,
+    clock: Arc<dyn SuspendClock>,
+    clock_state: Arc<Mutex<ClockState>>,
+}
+
+#[derive(Default)]
+struct ClockState {
+    last: Option<SuspendTimestamp>,
+    failed: bool,
 }
 
 #[derive(Clone)]
@@ -80,14 +89,24 @@ struct PlaybackContext {
     http_reader_id: String,
     challenge: String,
     next_sequence: u64,
-    challenge_deadline: Instant,
+    challenge_deadline: SuspendTimestamp,
     sample: Option<ExpiringSample>,
 }
 
 #[derive(Clone)]
 struct ExpiringSample {
     value: PlaybackTimingSample,
-    expires_at: Instant,
+    expires_at: SuspendTimestamp,
+}
+
+impl Default for HlsPlaybackContextStore {
+    fn default() -> Self {
+        Self {
+            contexts: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(SystemSuspendClock),
+            clock_state: Arc::new(Mutex::new(ClockState::default())),
+        }
+    }
 }
 
 impl HlsPlaybackContextStore {
@@ -105,7 +124,9 @@ impl HlsPlaybackContextStore {
         session_generation: u64,
         http_reader_id: String,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.open_with_clock(session_id, session_generation, http_reader_id, Instant::now)
+        self.open_with_clock(session_id, session_generation, http_reader_id, || {
+            self.clock.now()
+        })
     }
 
     #[cfg(test)]
@@ -113,9 +134,9 @@ impl HlsPlaybackContextStore {
         &self,
         session_id: String,
         session_generation: u64,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.open_with_clock(session_id, session_generation, String::new(), || now)
+        self.open_with_clock(session_id, session_generation, String::new(), || Some(now))
     }
 
     #[cfg(test)]
@@ -124,9 +145,9 @@ impl HlsPlaybackContextStore {
         session_id: String,
         session_generation: u64,
         http_reader_id: String,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.open_with_clock(session_id, session_generation, http_reader_id, || now)
+        self.open_with_clock(session_id, session_generation, http_reader_id, || Some(now))
     }
 
     fn open_with_clock(
@@ -134,7 +155,7 @@ impl HlsPlaybackContextStore {
         session_id: String,
         session_generation: u64,
         http_reader_id: String,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
         if !http_reader_id.is_empty() && !is_canonical_uuid_v4(&http_reader_id) {
             return Err(PlaybackContextStoreError::InvalidIdentifier);
@@ -146,10 +167,15 @@ impl HlsPlaybackContextStore {
             .contexts
             .lock()
             .expect("HLS playback context store lock poisoned");
-        let now = clock();
-        let deadline = now
-            .checked_add(CONTEXT_VALIDITY)
-            .ok_or(PlaybackContextStoreError::DeadlineOverflow)?;
+        let Some(now) = self.checked_now(clock) else {
+            contexts.clear();
+            return Err(PlaybackContextStoreError::DeadlineOverflow);
+        };
+        let Some(deadline) = now.checked_add(CONTEXT_VALIDITY) else {
+            self.fail_clock();
+            contexts.clear();
+            return Err(PlaybackContextStoreError::DeadlineOverflow);
+        };
         prune_expired(&mut contexts, now);
         if contexts.len() >= MAX_CONTEXTS
             || contexts
@@ -177,28 +203,31 @@ impl HlsPlaybackContextStore {
     }
 
     pub(crate) fn binding_for_update(&self, context_id: &str) -> Option<PlaybackContextBinding> {
-        self.binding_for_update_with_clock(context_id, Instant::now)
+        self.binding_for_update_with_clock(context_id, || self.clock.now())
     }
 
     #[cfg(test)]
     pub(crate) fn binding_for_update_at(
         &self,
         context_id: &str,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Option<PlaybackContextBinding> {
-        self.binding_for_update_with_clock(context_id, || now)
+        self.binding_for_update_with_clock(context_id, || Some(now))
     }
 
     fn binding_for_update_with_clock(
         &self,
         context_id: &str,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Option<PlaybackContextBinding> {
         let mut contexts = self
             .contexts
             .lock()
             .expect("HLS playback context store lock poisoned");
-        let now = clock();
+        let Some(now) = self.checked_now(clock) else {
+            contexts.clear();
+            return None;
+        };
         prune_expired(&mut contexts, now);
         contexts
             .get(context_id)
@@ -215,7 +244,7 @@ impl HlsPlaybackContextStore {
         sequence: u64,
         sample: PlaybackTimingSample,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.update_with_clock(context_id, challenge, sequence, sample, Instant::now)
+        self.update_with_clock(context_id, challenge, sequence, sample, || self.clock.now())
     }
 
     #[cfg(test)]
@@ -225,9 +254,9 @@ impl HlsPlaybackContextStore {
         challenge: &str,
         sequence: u64,
         sample: PlaybackTimingSample,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
-        self.update_with_clock(context_id, challenge, sequence, sample, || now)
+        self.update_with_clock(context_id, challenge, sequence, sample, || Some(now))
     }
 
     fn update_with_clock(
@@ -236,7 +265,7 @@ impl HlsPlaybackContextStore {
         challenge: &str,
         sequence: u64,
         sample: PlaybackTimingSample,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Result<PlaybackContextTicket, PlaybackContextStoreError> {
         if !is_uuid_syntax(context_id) || !is_uuid_syntax(challenge) {
             return Err(PlaybackContextStoreError::InvalidIdentifier);
@@ -251,10 +280,15 @@ impl HlsPlaybackContextStore {
             .contexts
             .lock()
             .expect("HLS playback context store lock poisoned");
-        let now = clock();
-        let next_deadline = now
-            .checked_add(CONTEXT_VALIDITY)
-            .ok_or(PlaybackContextStoreError::DeadlineOverflow)?;
+        let Some(now) = self.checked_now(clock) else {
+            contexts.clear();
+            return Err(PlaybackContextStoreError::DeadlineOverflow);
+        };
+        let Some(next_deadline) = now.checked_add(CONTEXT_VALIDITY) else {
+            self.fail_clock();
+            contexts.clear();
+            return Err(PlaybackContextStoreError::DeadlineOverflow);
+        };
         prune_expired(&mut contexts, now);
         let context = contexts
             .get(context_id)
@@ -313,46 +347,52 @@ impl HlsPlaybackContextStore {
     }
 
     pub(crate) fn sole_live_snapshot(&self) -> Option<PlaybackContextSnapshot> {
-        self.sole_live_snapshot_with_clock(Instant::now)
+        self.sole_live_snapshot_with_clock(|| self.clock.now())
     }
 
     pub(crate) fn sole_live_snapshot_for_reader(
         &self,
         http_reader_id: &str,
     ) -> Option<PlaybackContextSnapshot> {
-        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, Instant::now)
+        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, || self.clock.now())
     }
 
     #[cfg(test)]
-    pub(crate) fn sole_live_snapshot_at(&self, now: Instant) -> Option<PlaybackContextSnapshot> {
-        self.sole_live_snapshot_with_clock(|| now)
+    pub(crate) fn sole_live_snapshot_at(
+        &self,
+        now: SuspendTimestamp,
+    ) -> Option<PlaybackContextSnapshot> {
+        self.sole_live_snapshot_with_clock(|| Some(now))
     }
 
     #[cfg(test)]
     pub(crate) fn sole_live_snapshot_for_reader_at(
         &self,
         http_reader_id: &str,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Option<PlaybackContextSnapshot> {
-        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, || now)
+        self.sole_live_snapshot_for_reader_with_clock(http_reader_id, || Some(now))
     }
 
     fn sole_live_snapshot_with_clock(
         &self,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Option<PlaybackContextSnapshot> {
         let mut contexts = self
             .contexts
             .lock()
             .expect("HLS playback context store lock poisoned");
-        let now = clock();
+        let Some(now) = self.checked_now(clock) else {
+            contexts.clear();
+            return None;
+        };
         prune_expired(&mut contexts, now);
         if contexts.len() != 1 {
             return None;
         }
         let (context_id, context) = contexts.iter().next()?;
         let sample = context.sample.as_ref()?;
-        if sample.expires_at <= now {
+        if !is_deadline_live(sample.expires_at, now) {
             return None;
         }
         Some(PlaybackContextSnapshot {
@@ -366,7 +406,7 @@ impl HlsPlaybackContextStore {
     fn sole_live_snapshot_for_reader_with_clock(
         &self,
         http_reader_id: &str,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Option<PlaybackContextSnapshot> {
         if !is_canonical_uuid_v4(http_reader_id) {
             return None;
@@ -375,7 +415,10 @@ impl HlsPlaybackContextStore {
             .contexts
             .lock()
             .expect("HLS playback context store lock poisoned");
-        let now = clock();
+        let Some(now) = self.checked_now(clock) else {
+            contexts.clear();
+            return None;
+        };
         prune_expired(&mut contexts, now);
         let mut matching = contexts
             .iter()
@@ -385,7 +428,7 @@ impl HlsPlaybackContextStore {
             return None;
         }
         let sample = context.sample.as_ref()?;
-        if sample.expires_at <= now {
+        if !is_deadline_live(sample.expires_at, now) {
             return None;
         }
         Some(PlaybackContextSnapshot {
@@ -394,6 +437,36 @@ impl HlsPlaybackContextStore {
             session_generation: context.session_generation,
             sample: sample.value,
         })
+    }
+
+    fn checked_now(
+        &self,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
+    ) -> Option<SuspendTimestamp> {
+        let mut state = self
+            .clock_state
+            .lock()
+            .expect("HLS playback context clock lock poisoned");
+        if state.failed {
+            return None;
+        }
+        let Some(now) = clock() else {
+            state.failed = true;
+            return None;
+        };
+        if state.last.is_some_and(|last| now < last) {
+            state.failed = true;
+            return None;
+        }
+        state.last = Some(now);
+        Some(now)
+    }
+
+    fn fail_clock(&self) {
+        self.clock_state
+            .lock()
+            .expect("HLS playback context clock lock poisoned")
+            .failed = true;
     }
 }
 
@@ -440,13 +513,30 @@ fn unique_context_id(contexts: &HashMap<String, PlaybackContext>) -> String {
     }
 }
 
-fn prune_expired(contexts: &mut HashMap<String, PlaybackContext>, now: Instant) {
-    contexts.retain(|_, context| context.challenge_deadline > now);
+fn is_deadline_live(deadline: SuspendTimestamp, now: SuspendTimestamp) -> bool {
+    deadline
+        .checked_elapsed_since(now)
+        .is_some_and(|remaining| !remaining.is_zero())
+}
+
+fn prune_expired(contexts: &mut HashMap<String, PlaybackContext>, now: SuspendTimestamp) {
+    contexts.retain(|_, context| is_deadline_live(context.challenge_deadline, now));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suspend_clock::SuspendTimestamp;
+
+    fn timestamp(nanoseconds: u128) -> SuspendTimestamp {
+        SuspendTimestamp::from_nanos(nanoseconds)
+    }
+
+    fn after(timestamp: SuspendTimestamp, duration: Duration) -> SuspendTimestamp {
+        timestamp
+            .checked_add(duration)
+            .expect("test timestamp should not overflow")
+    }
 
     fn sample(playhead_seconds: f64) -> PlaybackTimingSample {
         PlaybackTimingSample {
@@ -459,7 +549,7 @@ mod tests {
     fn open(
         store: &HlsPlaybackContextStore,
         session_id: &str,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> PlaybackContextTicket {
         store
             .open_at(session_id.to_owned(), 1, now)
@@ -469,12 +559,12 @@ mod tests {
     #[test]
     fn tickets_rotate_and_sample_keeps_consumed_challenge_deadline() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(1_000_000_000);
         let first = open(&store, "session-a", now);
         assert_eq!(1, first.next_sequence);
         assert_eq!(5_000, first.validity_millis);
 
-        let accepted_at = now + Duration::from_millis(4_999);
+        let accepted_at = after(now, Duration::from_millis(4_999));
         let next = store
             .update_at(
                 &first.context_id,
@@ -494,24 +584,127 @@ mod tests {
         );
         assert!(
             store
-                .sole_live_snapshot_at(now + Duration::from_secs(5))
+                .sole_live_snapshot_at(after(now, Duration::from_secs(5)))
                 .is_none()
         );
         assert!(
             store
-                .binding_for_update_at(&next.context_id, now + Duration::from_secs(5))
+                .binding_for_update_at(&next.context_id, after(now, Duration::from_secs(5)))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn continuous_clock_advance_expires_sample_and_prunes_context() {
+        let store = HlsPlaybackContextStore::default();
+        let opened_at = timestamp(10_000_000_000);
+        let first = open(&store, "session-a", opened_at);
+        let sampled_at = after(opened_at, Duration::from_secs(1));
+        let next = store
+            .update_at(
+                &first.context_id,
+                &first.challenge,
+                first.next_sequence,
+                sample(4.0),
+                sampled_at,
+            )
+            .expect("live challenge should be consumed after the test clock advances");
+        assert!(
+            store
+                .sole_live_snapshot_at(after(opened_at, Duration::from_secs(4)))
+                .is_some()
+        );
+
+        let sleep_advanced_clock = after(opened_at, CONTEXT_VALIDITY);
+        assert!(store.sole_live_snapshot_at(sleep_advanced_clock).is_none());
+        assert!(
+            store
+                .binding_for_update_at(&next.context_id, sleep_advanced_clock)
+                .is_some()
+        );
+        assert_eq!(
+            Err(PlaybackContextStoreError::UnknownContext),
+            store.update_at(
+                &next.context_id,
+                &next.challenge,
+                next.next_sequence,
+                sample(5.0),
+                after(opened_at, Duration::from_secs(6)),
+            )
+        );
+        assert!(
+            store
+                .contexts
+                .lock()
+                .expect("store lock should be available")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unavailable_or_backwards_clock_withholds_and_retires_contexts() {
+        let store = HlsPlaybackContextStore::default();
+        let first = open(&store, "session-a", timestamp(20_000_000_000));
+        assert_eq!(
+            None,
+            store.binding_for_update_with_clock(&first.context_id, || None)
+        );
+        assert!(
+            store
+                .sole_live_snapshot_at(timestamp(20_000_000_001))
+                .is_none()
+        );
+        assert!(
+            store
+                .contexts
+                .lock()
+                .expect("store lock should be available")
+                .is_empty()
+        );
+
+        let store = HlsPlaybackContextStore::default();
+        let first = open(&store, "session-b", timestamp(30_000_000_000));
+        assert_eq!(
+            None,
+            store.binding_for_update_at(&first.context_id, timestamp(29_999_999_999))
+        );
+        assert_eq!(
+            Err(PlaybackContextStoreError::DeadlineOverflow),
+            store.open_at("session-c".to_owned(), 1, timestamp(30_000_000_001))
+        );
+    }
+
+    #[test]
+    fn context_deadline_overflow_is_rejected() {
+        let store = HlsPlaybackContextStore::default();
+        let existing = open(&store, "session-a", timestamp(0));
+        assert_eq!(
+            Err(PlaybackContextStoreError::DeadlineOverflow),
+            store.open_at("session-b".to_owned(), 1, timestamp(u128::MAX - 1))
+        );
+        assert!(
+            store
+                .contexts
+                .lock()
+                .expect("store lock should be available")
+                .is_empty()
+        );
+        assert!(
+            store
+                .binding_for_update_at(&existing.context_id, timestamp(u128::MAX))
+                .is_none()
         );
     }
 
     #[test]
     fn queued_update_reads_clock_after_lock_and_rejects_expired_challenge() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(2_000_000_000);
         let first = open(&store, "session-a", now);
-        let clock = Arc::new(Mutex::new(
-            now + CONTEXT_VALIDITY - Duration::from_millis(1),
-        ));
+        let clock = Arc::new(Mutex::new(after(
+            now,
+            CONTEXT_VALIDITY - Duration::from_millis(1),
+        )));
         let guard = store
             .contexts
             .lock()
@@ -534,9 +727,11 @@ mod tests {
                 sample(1.0),
                 move || {
                     assert!(clock_store.contexts.try_lock().is_err());
-                    *worker_clock
-                        .lock()
-                        .expect("test clock lock should be available")
+                    Some(
+                        *worker_clock
+                            .lock()
+                            .expect("test clock lock should be available"),
+                    )
                 },
             );
             result_sender
@@ -546,7 +741,7 @@ mod tests {
         started_receiver
             .recv()
             .expect("update worker should start before the clock advances");
-        *clock.lock().expect("test clock lock should be available") = now + CONTEXT_VALIDITY;
+        *clock.lock().expect("test clock lock should be available") = after(now, CONTEXT_VALIDITY);
         drop(guard);
 
         assert_eq!(
@@ -558,7 +753,7 @@ mod tests {
         worker.join().expect("update worker should finish");
         assert!(
             store
-                .binding_for_update_at(&first.context_id, now + CONTEXT_VALIDITY)
+                .binding_for_update_at(&first.context_id, after(now, CONTEXT_VALIDITY))
                 .is_none()
         );
     }
@@ -566,7 +761,7 @@ mod tests {
     #[test]
     fn replay_and_wrong_sequence_leave_current_challenge_and_sample_unchanged() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(3_000_000_000);
         let first = open(&store, "session-a", now);
         let second = store
             .update_at(
@@ -574,7 +769,7 @@ mod tests {
                 &first.challenge,
                 1,
                 sample(1.0),
-                now + Duration::from_secs(1),
+                after(now, Duration::from_secs(1)),
             )
             .expect("first sample should be accepted");
         let before = store
@@ -592,7 +787,7 @@ mod tests {
                 &first.challenge,
                 1,
                 sample(10.0),
-                now + Duration::from_secs(2),
+                after(now, Duration::from_secs(2)),
             )
         );
         assert_eq!(
@@ -602,7 +797,7 @@ mod tests {
                 &second.challenge,
                 9,
                 sample(10.0),
-                now + Duration::from_secs(2),
+                after(now, Duration::from_secs(2)),
             )
         );
         let after = store
@@ -624,7 +819,7 @@ mod tests {
     #[test]
     fn rejects_invalid_samples_and_uuid_fields() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(4_000_000_000);
         let first = open(&store, "session-a", now);
         for invalid in [
             PlaybackTimingSample {
@@ -659,7 +854,7 @@ mod tests {
                     &first.challenge,
                     1,
                     invalid,
-                    now + Duration::from_secs(1),
+                    after(now, Duration::from_secs(1)),
                 )
             );
         }
@@ -680,7 +875,7 @@ mod tests {
     #[test]
     fn enforces_global_and_per_session_caps_and_prunes_before_admission() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(5_000_000_000);
         for session_index in 0..(MAX_CONTEXTS / MAX_CONTEXTS_PER_SESSION) {
             for _ in 0..MAX_CONTEXTS_PER_SESSION {
                 store
@@ -696,7 +891,7 @@ mod tests {
             Err(PlaybackContextStoreError::AtCapacity),
             store.open_at("session-overflow".to_owned(), 1, now)
         );
-        let after_expiry = now + CONTEXT_VALIDITY;
+        let after_expiry = after(now, CONTEXT_VALIDITY);
         let ticket = store
             .open_at("session-after-expiry".to_owned(), 1, after_expiry)
             .expect("expired entries should be pruned before admission");
@@ -710,7 +905,7 @@ mod tests {
     #[test]
     fn sole_snapshot_requires_one_owner_and_a_fresh_sample() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(6_000_000_000);
         let first = open(&store, "session-a", now);
         assert!(store.sole_live_snapshot_at(now).is_none());
         store
@@ -727,7 +922,7 @@ mod tests {
         assert!(store.sole_live_snapshot_at(now).is_none());
         assert!(
             store
-                .sole_live_snapshot_at(now + CONTEXT_VALIDITY)
+                .sole_live_snapshot_at(after(now, CONTEXT_VALIDITY))
                 .is_none()
         );
         assert!(
@@ -740,7 +935,7 @@ mod tests {
     #[test]
     fn close_and_session_removal_only_remove_their_exact_contexts() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(7_000_000_000);
         let first = open(&store, "session-a", now);
         let second = open(&store, "session-b", now);
 
@@ -785,7 +980,7 @@ mod tests {
                 "session-a".to_owned(),
                 1,
                 "aaaaaaaa-aaaa-3aaa-8aaa-aaaaaaaaaaaa".to_owned(),
-                Instant::now(),
+                timestamp(1),
             )
         );
     }
@@ -793,7 +988,7 @@ mod tests {
     #[test]
     fn reader_snapshots_are_independent_and_duplicate_live_contexts_are_ambiguous() {
         let store = HlsPlaybackContextStore::default();
-        let now = Instant::now();
+        let now = timestamp(8_000_000_000);
         let reader_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let reader_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let first = store
@@ -851,7 +1046,7 @@ mod tests {
         );
         assert!(
             store
-                .sole_live_snapshot_for_reader_at(reader_b, now + CONTEXT_VALIDITY)
+                .sole_live_snapshot_for_reader_at(reader_b, after(now, CONTEXT_VALIDITY))
                 .is_none()
         );
     }

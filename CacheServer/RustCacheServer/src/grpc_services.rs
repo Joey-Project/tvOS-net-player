@@ -6324,6 +6324,8 @@ mod tests {
         time::Duration,
     };
 
+    use crate::suspend_clock::SuspendTimestamp;
+
     use crate::{
         bbdown_adapter::{
             BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
@@ -14685,7 +14687,7 @@ mod tests {
                 session.id.clone(),
                 first_generation,
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
-                StdInstant::now(),
+                SuspendTimestamp::from_nanos(1_000_000_000),
             )
             .expect("context for the first generation should open");
         let second_generation = state.register_hls_playback_session(session.clone());
@@ -14693,7 +14695,10 @@ mod tests {
         assert!(
             state
                 .hls_playback_contexts
-                .binding_for_update_at(&stale_context.context_id, StdInstant::now())
+                .binding_for_update_at(
+                    &stale_context.context_id,
+                    SuspendTimestamp::from_nanos(1_000_000_001),
+                )
                 .is_none()
         );
 
@@ -14703,14 +14708,17 @@ mod tests {
                 session.id.clone(),
                 second_generation,
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
-                StdInstant::now(),
+                SuspendTimestamp::from_nanos(2_000_000_000),
             )
             .expect("context for the second generation should open");
         state.remove_hls_playback_session(&session.id);
         assert!(
             state
                 .hls_playback_contexts
-                .binding_for_update_at(&removed_context.context_id, StdInstant::now())
+                .binding_for_update_at(
+                    &removed_context.context_id,
+                    SuspendTimestamp::from_nanos(2_000_000_001),
+                )
                 .is_none()
         );
         let generation = state.register_hls_playback_session(session.clone());

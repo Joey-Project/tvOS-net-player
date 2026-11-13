@@ -31,6 +31,7 @@ mod resolver_catalog;
 mod resolver_health;
 mod resolver_routing;
 mod resolver_settings;
+mod suspend_clock;
 mod task_output;
 pub mod task_registry;
 mod task_store;
