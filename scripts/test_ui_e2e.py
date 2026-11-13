@@ -105,12 +105,133 @@ class ProcessSupervisorTests(unittest.TestCase):
     def test_changed_group_identity_is_not_signalled(self) -> None:
         process = mock.Mock(pid=4245, returncode=None)
         with (
-            mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+            mock.patch.object(ui_e2e, "_child_has_exited", return_value=False) as child_has_exited,
             mock.patch.object(ui_e2e.os, "getpgid", return_value=9999),
             mock.patch.object(ui_e2e.os, "killpg") as killpg,
         ):
             with self.assertRaisesRegex(ui_e2e.UIE2EError, "original session/group leader"):
                 ui_e2e.stop_process_group(process)
+        self.assertEqual(
+            child_has_exited.call_args_list,
+            [mock.call(process), mock.call(process, require_fresh_waitid=True)],
+        )
+        killpg.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_exit_during_identity_check_keeps_unreaped_pid_anchor(self) -> None:
+        process = mock.Mock(pid=4246, returncode=None)
+        events: list[tuple[str, object]] = []
+        exit_status = mock.Mock(si_pid=process.pid)
+
+        def reap(*, timeout: float) -> int:
+            events.append(("wait", process.returncode))
+            process.returncode = 0
+            return 0
+
+        def signal_group(_pgid: int, signum: int) -> None:
+            events.append(("signal", (process.returncode, signum)))
+
+        expected_waitid = mock.call(
+            ui_e2e.os.P_PID,
+            process.pid,
+            ui_e2e.os.WEXITED | ui_e2e.os.WNOHANG | ui_e2e.os.WNOWAIT,
+        )
+        process.wait.side_effect = reap
+        with (
+            mock.patch.object(ui_e2e.os, "waitid", side_effect=[None, exit_status, exit_status]) as waitid,
+            mock.patch.object(ui_e2e.os, "getpgid", return_value=process.pid + 1),
+            mock.patch.object(ui_e2e.os, "killpg", side_effect=signal_group),
+            mock.patch.object(ui_e2e, "_group_has_live_members", return_value=False),
+        ):
+            ui_e2e.stop_process_group(process)
+
+        self.assertEqual(waitid.call_args_list, [expected_waitid] * 3)
+        self.assertEqual(
+            events,
+            [
+                ("signal", (None, ui_e2e.signal.SIGTERM)),
+                ("signal", (None, ui_e2e.signal.SIGKILL)),
+                ("wait", None),
+            ],
+        )
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_revalidation_failure_does_not_signal_or_reap(self) -> None:
+        for error, expected_error in (
+            (ChildProcessError("already reaped"), ui_e2e.UIE2EError),
+            (PermissionError("waitid denied"), PermissionError),
+        ):
+            with self.subTest(error=type(error).__name__):
+                process = mock.Mock(pid=4247, returncode=None)
+                with (
+                    mock.patch.object(ui_e2e.os, "waitid", side_effect=[None, error]),
+                    mock.patch.object(ui_e2e.os, "getpgid", return_value=9999),
+                    mock.patch.object(ui_e2e.os, "killpg") as killpg,
+                    self.assertRaises(expected_error) as caught,
+                ):
+                    ui_e2e.stop_process_group(process)
+                if isinstance(caught.exception, ui_e2e.UIE2EError):
+                    self.assertIn("reaped externally", str(caught.exception))
+                killpg.assert_not_called()
+                process.wait.assert_not_called()
+
+    def test_reaped_during_waitid_revalidation_is_not_exit_proof(self) -> None:
+        process = mock.Mock(pid=4248, returncode=None)
+        waitid_calls = 0
+
+        def waitid(*_args: object) -> object:
+            nonlocal waitid_calls
+            waitid_calls += 1
+            if waitid_calls == 1:
+                return None
+            process.returncode = 0
+            raise ChildProcessError("already reaped")
+
+        with (
+            mock.patch.object(ui_e2e.os, "waitid", side_effect=waitid),
+            mock.patch.object(ui_e2e.os, "getpgid", return_value=9999),
+            mock.patch.object(ui_e2e, "_group_has_live_members", return_value=True),
+            mock.patch.object(ui_e2e.os, "killpg") as killpg,
+            self.assertRaisesRegex(ui_e2e.UIE2EError, "reaped externally"),
+        ):
+            ui_e2e.stop_process_group(process)
+        killpg.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_reaped_during_identity_check_with_live_group_is_not_signalled(self) -> None:
+        process = mock.Mock(pid=4248, returncode=None)
+
+        def reap_before_identity(_pid: int) -> int:
+            process.returncode = 0
+            return process.pid + 1
+
+        with (
+            mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+            mock.patch.object(ui_e2e.os, "getpgid", side_effect=reap_before_identity),
+            mock.patch.object(ui_e2e, "_group_has_live_members", return_value=True) as has_live_members,
+            mock.patch.object(ui_e2e.os, "killpg") as killpg,
+            self.assertRaisesRegex(ui_e2e.UIE2EError, "leader already reaped"),
+        ):
+            ui_e2e.stop_process_group(process)
+        has_live_members.assert_called_once_with(process.pid)
+        killpg.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_reaped_during_identity_check_with_empty_group_returns_without_signalling(self) -> None:
+        process = mock.Mock(pid=4249, returncode=None)
+
+        def reap_before_identity(_pid: int) -> int:
+            process.returncode = 0
+            return process.pid + 1
+
+        with (
+            mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+            mock.patch.object(ui_e2e.os, "getpgid", side_effect=reap_before_identity),
+            mock.patch.object(ui_e2e, "_group_has_live_members", return_value=False) as has_live_members,
+            mock.patch.object(ui_e2e.os, "killpg") as killpg,
+        ):
+            ui_e2e.stop_process_group(process)
+        has_live_members.assert_called_once_with(process.pid)
         killpg.assert_not_called()
         process.wait.assert_not_called()
 
