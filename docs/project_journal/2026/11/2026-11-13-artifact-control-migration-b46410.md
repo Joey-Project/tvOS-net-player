@@ -5,7 +5,7 @@ status: active
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/artifact-control-migration
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/103
 supersedes: []
 superseded_by:
 ---
@@ -51,8 +51,8 @@ superseded_by:
   black-screen, authenticated live Bilibili or physical Apple TV acceptance.
 
 ## Next Steps
-- Complete and independently accept the tooling interface, then pin its merged
-  release identity and complete executable dependency manifest.
+- Pin the independently accepted tooling release identity and its complete
+  executable dependency manifest before using it for helper migration.
 - Deliver only the UI helper child-exit race fix and its tests in a new branch
   from updated master, using the released independent verifier.
 - After that helper is independently accepted and merged, pin the successor
@@ -64,6 +64,7 @@ superseded_by:
   result is established by this tooling work.
 
 ## Evidence
+- [Independent artifact control tooling PR #103](https://github.com/Joey-Project/tvOS-net-player/pull/103).
 - [Artifact verification boundaries](../../../architecture/artifact-verification.md).
 - [Prior independently accepted reader-binding PR #101](https://github.com/Joey-Project/tvOS-net-player/pull/101).
 - [Freshness and withdrawal PR #102](https://github.com/Joey-Project/tvOS-net-player/pull/102).
