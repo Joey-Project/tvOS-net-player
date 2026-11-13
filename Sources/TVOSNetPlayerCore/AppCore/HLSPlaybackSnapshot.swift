@@ -2,6 +2,54 @@ import AVFoundation
 import Foundation
 import TVOSNetPlayerCacheClient
 
+struct HLSPlaybackMonotonicClock: Sendable {
+    private let epoch: ContinuousClock.Instant
+    private let readInstant: @Sendable () -> ContinuousClock.Instant?
+
+    static let shared = HLSPlaybackMonotonicClock()
+
+    init(clock: ContinuousClock = ContinuousClock()) {
+        let epoch = clock.now
+        self.epoch = epoch
+        self.readInstant = { clock.now }
+    }
+
+    init(epoch: ContinuousClock.Instant, readInstant: @escaping @Sendable () -> ContinuousClock.Instant?) {
+        self.epoch = epoch
+        self.readInstant = readInstant
+    }
+
+    func nowNanoseconds() -> UInt64? {
+        guard let now = readInstant() else { return nil }
+        return Self.checkedNanoseconds(for: epoch.duration(to: now))
+    }
+
+    static func checkedNanoseconds(for duration: Duration) -> UInt64? {
+        let components = duration.components
+        guard components.seconds >= 0, components.attoseconds >= 0,
+            let seconds = UInt64(exactly: components.seconds),
+            let attoseconds = UInt64(exactly: components.attoseconds)
+        else {
+            return nil
+        }
+
+        let attosecondsPerNanosecond: UInt64 = 1_000_000_000
+        let subsecondNanoseconds = attoseconds / attosecondsPerNanosecond
+        let hasSubnanosecondRemainder = attoseconds % attosecondsPerNanosecond != 0
+        let (roundedSubsecondNanoseconds, roundingOverflow) = subsecondNanoseconds.addingReportingOverflow(
+            hasSubnanosecondRemainder ? 1 : 0
+        )
+        let (wholeSecondsNanoseconds, multiplicationOverflow) = seconds.multipliedReportingOverflow(
+            by: attosecondsPerNanosecond
+        )
+        let (nanoseconds, additionOverflow) = wholeSecondsNanoseconds.addingReportingOverflow(
+            roundedSubsecondNanoseconds
+        )
+        guard !roundingOverflow, !multiplicationOverflow, !additionOverflow else { return nil }
+        return nanoseconds
+    }
+}
+
 /// Immutable playback timing evidence captured at one point in time.
 public struct HLSPlaybackSnapshot: Equatable, Sendable {
     private struct BufferedInterval {

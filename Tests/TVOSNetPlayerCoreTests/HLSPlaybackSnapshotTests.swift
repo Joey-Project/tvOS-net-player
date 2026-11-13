@@ -1,9 +1,35 @@
 import AVFoundation
+import Foundation
 import XCTest
 import TVOSNetPlayerCacheClient
 @testable import TVOSNetPlayerCore
 
 final class HLSPlaybackSnapshotTests: XCTestCase {
+    func testContinuousClockConversionFailsClosedAndRoundsSubnanosecondsUp() {
+        let epoch = ContinuousClock().now
+        let missing = HLSPlaybackMonotonicClock(epoch: epoch, readInstant: { nil })
+        let backward = HLSPlaybackMonotonicClock(epoch: epoch, readInstant: { epoch.advanced(by: .seconds(-1)) })
+
+        XCTAssertNil(missing.nowNanoseconds())
+        XCTAssertNil(backward.nowNanoseconds())
+        XCTAssertEqual(
+            HLSPlaybackMonotonicClock.checkedNanoseconds(
+                for: Duration(secondsComponent: 0, attosecondsComponent: 1)
+            ),
+            1
+        )
+        XCTAssertNil(
+            HLSPlaybackMonotonicClock.checkedNanoseconds(
+                for: Duration(secondsComponent: -1, attosecondsComponent: 0)
+            )
+        )
+        XCTAssertNil(
+            HLSPlaybackMonotonicClock.checkedNanoseconds(
+                for: Duration(secondsComponent: Int64.max, attosecondsComponent: 0)
+            )
+        )
+    }
+
     func testCaptureSortsAndJoinsOverlappingAndTouchingRanges() throws {
         let snapshot = try XCTUnwrap(
             capture(
@@ -299,6 +325,24 @@ final class HLSPlaybackSnapshotTests: XCTestCase {
         let elapsedMillis = UInt64.max / 1_000_000 + (UInt64.max % 1_000_000 == 0 ? 0 : 1)
 
         XCTAssertEqual(context.contextAgeMillis, elapsedMillis)
+    }
+
+    func testSimulatedSleepGapMakesSnapshotStale() throws {
+        let snapshot = try XCTUnwrap(capture(playhead: 1, ranges: [range(0, 10)], observedAt: 100))
+        let context = try XCTUnwrap(
+            snapshot.context(
+                for: makeRequest(),
+                targetVideoBitrateBitsPerSecond: nil,
+                targetAudioBitrateBitsPerSecond: nil,
+                requiresAudio: false,
+                targetDecoderSupported: true,
+                expectedSessionGeneration: nil,
+                nowNanoseconds: 5_000_000_101
+            )
+        )
+
+        XCTAssertEqual(context.contextAgeMillis, 5_001)
+        XCTAssertEqual(HLSUpshiftPolicy.preflightHoldReason(for: context), .staleContext)
     }
 
     func testPolicyCompositionRequiresPlayingCoverageAndExplicitDecoderSupport() throws {

@@ -48,6 +48,7 @@ use crate::{
         MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, mp4_sidx_index, mp4_sidx_segment_ranges,
     },
     playback_policy::WeakNetworkPreference,
+    suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock},
 };
 
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
@@ -2045,6 +2046,8 @@ async fn send_hls_upstream_request(
     }
 
     let started_at = Instant::now();
+    let suspend_clock: Arc<dyn SuspendClock> = Arc::new(SystemSuspendClock);
+    let suspend_started_at = suspend_clock.now();
     let upstream = request.send().await?;
     let response_time = started_at.elapsed();
     let status =
@@ -2193,7 +2196,11 @@ async fn send_hls_upstream_request(
                     Arc::clone(&context.state.state.cdn_history),
                     context.resource.request.clone(),
                     observation_url,
-                    started_at,
+                    CdnBodyTiming {
+                        started_at,
+                        suspend_clock: Arc::clone(&suspend_clock),
+                        suspend_started_at,
+                    },
                     range_supported,
                     expected_body_bytes,
                     content_length_validated,
@@ -2303,11 +2310,19 @@ fn hls_policy_recording_stream(
     )
 }
 
+struct CdnBodyTiming {
+    started_at: Instant,
+    suspend_clock: Arc<dyn SuspendClock>,
+    suspend_started_at: Option<SuspendTimestamp>,
+}
+
 struct CdnBodyObservation {
     history: Arc<crate::cdn_history::CdnHistory>,
     request: crate::bbdown_adapter::BilibiliMediaRequest,
     url: Option<String>,
-    started_at: Instant,
+    timing: CdnBodyTiming,
+    suspend_first_byte_at: Option<SuspendTimestamp>,
+    suspend_first_byte_observed: bool,
     range_supported: Option<bool>,
     expected_body_bytes: Option<u64>,
     content_length_validated: bool,
@@ -2322,7 +2337,7 @@ impl CdnBodyObservation {
         history: Arc<crate::cdn_history::CdnHistory>,
         request: crate::bbdown_adapter::BilibiliMediaRequest,
         url: Option<String>,
-        started_at: Instant,
+        timing: CdnBodyTiming,
         range_supported: Option<bool>,
         expected_body_bytes: Option<u64>,
         content_length_validated: bool,
@@ -2331,7 +2346,9 @@ impl CdnBodyObservation {
             history,
             request,
             url,
-            started_at,
+            timing,
+            suspend_first_byte_at: None,
+            suspend_first_byte_observed: false,
             range_supported,
             expected_body_bytes,
             content_length_validated,
@@ -2346,17 +2363,22 @@ impl CdnBodyObservation {
         if chunk.is_empty() {
             return;
         }
+        if !self.suspend_first_byte_observed {
+            self.suspend_first_byte_observed = true;
+            self.suspend_first_byte_at = self.timing.suspend_clock.now();
+        }
         self.bytes = self
             .bytes
             .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         self.first_byte_latency
-            .get_or_insert_with(|| self.started_at.elapsed());
+            .get_or_insert_with(|| self.timing.started_at.elapsed());
     }
 
     fn finish(&mut self, outcome: CdnObservationOutcome) -> CdnObservationOutcome {
         if self.finished {
             return outcome;
         }
+        let suspend_completed_at = self.timing.suspend_clock.now();
         let outcome = if outcome == CdnObservationOutcome::Complete
             && self
                 .expected_body_bytes
@@ -2374,9 +2396,14 @@ impl CdnBodyObservation {
                 playback_observation(
                     outcome,
                     self.bytes,
-                    Some(self.started_at.elapsed()),
+                    Some(self.timing.started_at.elapsed()),
                     self.first_byte_latency,
                     self.range_supported,
+                )
+                .with_fresh_timing(
+                    self.timing.suspend_started_at,
+                    self.suspend_first_byte_at,
+                    suspend_completed_at,
                 ),
             );
         }
@@ -2390,13 +2417,14 @@ impl Drop for CdnBodyObservation {
         if self.finished || (self.bytes == 0 && !self.content_length_validated) {
             return;
         }
+        let suspend_completed_at = self.timing.suspend_clock.now();
         let (Some(runtime), Some(url)) = (self.runtime.take(), self.url.take()) else {
             return;
         };
         let history = Arc::clone(&self.history);
         let request = self.request.clone();
         let bytes = self.bytes;
-        let elapsed = self.started_at.elapsed();
+        let elapsed = self.timing.started_at.elapsed();
         let first_byte_latency = self.first_byte_latency;
         let range_supported = self.range_supported;
         let outcome = match self.expected_body_bytes {
@@ -2412,6 +2440,11 @@ impl Drop for CdnBodyObservation {
             Some(elapsed),
             first_byte_latency,
             range_supported,
+        )
+        .with_fresh_timing(
+            self.timing.suspend_started_at,
+            self.suspend_first_byte_at,
+            suspend_completed_at,
         );
         runtime.spawn_blocking(move || {
             record_cdn_observation(&history, &request, &url, observation);
@@ -2442,7 +2475,10 @@ fn playback_observation(
         elapsed,
         first_byte_latency,
         range_supported,
-        observed_at: std::time::Instant::now(),
+        fresh_elapsed: None,
+        fresh_first_byte_latency: None,
+        observed_at: SystemSuspendClock.now(),
+        fresh_timing_invalid: false,
     }
 }
 
@@ -2672,7 +2708,10 @@ async fn probe_hls_mp4_initialization_candidates(
                             elapsed: None,
                             first_byte_latency: None,
                             range_supported: Some(true),
-                            observed_at: std::time::Instant::now(),
+                            fresh_elapsed: None,
+                            fresh_first_byte_latency: None,
+                            observed_at: SystemSuspendClock.now(),
+                            fresh_timing_invalid: false,
                         },
                     );
                 }
@@ -3407,7 +3446,11 @@ async fn build_prewarmed_spliced_file_response(
                 Arc::clone(&context.state.state.cdn_history),
                 context.resource.request.clone(),
                 observation_candidate_url(&context.resource.request, &tail.final_url),
-                tail.started_at,
+                CdnBodyTiming {
+                    started_at: tail.started_at,
+                    suspend_clock: Arc::clone(&tail.suspend_clock),
+                    suspend_started_at: tail.suspend_started_at,
+                },
                 Some(true),
                 Some(tail.length),
                 tail.content_length_validated,
@@ -3448,6 +3491,8 @@ struct HlsUpstreamTailResponse {
     upstream: reqwest::Response,
     response_time: Duration,
     started_at: Instant,
+    suspend_clock: Arc<dyn SuspendClock>,
+    suspend_started_at: Option<SuspendTimestamp>,
     final_url: String,
     length: u64,
     content_length_validated: bool,
@@ -3471,6 +3516,8 @@ async fn open_hls_upstream_tail_response(
 
     for url in urls {
         let started_at = Instant::now();
+        let suspend_clock: Arc<dyn SuspendClock> = Arc::new(SystemSuspendClock);
+        let suspend_started_at = suspend_clock.now();
         let upstream =
             match hls_upstream_request_builder(context.state, context.resource, Method::GET, &url)
                 .header(RANGE.as_str(), tail_range.to_str().map_err(|_| ())?)
@@ -3574,6 +3621,8 @@ async fn open_hls_upstream_tail_response(
             upstream,
             response_time,
             started_at,
+            suspend_clock,
+            suspend_started_at,
             final_url,
             length: expected_range.length(),
             content_length_validated: declared_body_bytes
@@ -3648,7 +3697,14 @@ fn parse_range(header: Option<&HeaderValue>, size: u64) -> Result<Option<ByteRan
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, fs, path::PathBuf, sync::mpsc, thread};
+    use std::{
+        collections::VecDeque,
+        convert::Infallible,
+        fs,
+        path::PathBuf,
+        sync::{Mutex, mpsc},
+        thread,
+    };
 
     use super::*;
     use axum::{
@@ -3677,6 +3733,20 @@ mod tests {
         hls::{HlsMediaResource, HlsPlaybackSession, HlsVariant},
         task_output::TaskResourceRecord,
     };
+
+    struct ScriptedSuspendClock(Mutex<VecDeque<Option<SuspendTimestamp>>>);
+
+    impl ScriptedSuspendClock {
+        fn new(readings: impl IntoIterator<Item = Option<SuspendTimestamp>>) -> Self {
+            Self(Mutex::new(readings.into_iter().collect()))
+        }
+    }
+
+    impl SuspendClock for ScriptedSuspendClock {
+        fn now(&self) -> Option<SuspendTimestamp> {
+            self.0.lock().ok()?.pop_front().flatten()
+        }
+    }
 
     fn response_content_length(response: &Response<Body>) -> Option<u64> {
         response
@@ -3847,7 +3917,11 @@ mod tests {
             Arc::new(history.clone()),
             request.clone(),
             Some(request.url.clone()),
-            Instant::now(),
+            CdnBodyTiming {
+                started_at: Instant::now(),
+                suspend_clock: Arc::new(SystemSuspendClock),
+                suspend_started_at: None,
+            },
             None,
             Some(10),
             false,
@@ -3865,6 +3939,41 @@ mod tests {
             CdnHistory::default().rank_request(&unrelated),
             history.rank_request(&unrelated)
         );
+    }
+
+    #[test]
+    fn origin_supply_uses_suspend_inclusive_body_transfer_duration() {
+        let history = Arc::new(CdnHistory::default());
+        let request = media_request("https://cdn-a.example/video.m4s", Vec::new());
+        let started_at = SuspendTimestamp::from_nanos(0);
+        let completed_at = SuspendTimestamp::from_nanos(10_000_000_000);
+        let mut observation = CdnBodyObservation::new(
+            Arc::clone(&history),
+            request.clone(),
+            Some(request.url.clone()),
+            CdnBodyTiming {
+                started_at: Instant::now(),
+                suspend_clock: Arc::new(ScriptedSuspendClock::new([
+                    Some(SuspendTimestamp::from_nanos(1_000_000_000)),
+                    Some(completed_at),
+                ])),
+                suspend_started_at: Some(started_at),
+            },
+            Some(true),
+            Some(4),
+            true,
+        );
+        observation.observe_chunk(b"data");
+        assert_eq!(
+            observation.finish(CdnObservationOutcome::Complete),
+            CdnObservationOutcome::Complete
+        );
+
+        let supply = history
+            .recent_origin_supply_at(&request, completed_at)
+            .expect("sleep-inclusive transfer should produce fresh origin evidence");
+        assert_eq!(supply.throughput_bps, 3);
+        assert_eq!(supply.first_byte_latency, Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -3886,25 +3995,32 @@ mod tests {
 
         let history = Arc::new(CdnHistory::default());
         let request = media_request("https://cdn-a.example/video.m4s", Vec::new());
-        let drop_started_at;
-        let drop_finished_at;
+        let completed_at = SuspendTimestamp::from_nanos(20_000_000);
         {
             let _runtime_guard = runtime.enter();
             let mut observation = CdnBodyObservation::new(
                 Arc::clone(&history),
                 request.clone(),
                 Some(request.url.clone()),
-                Instant::now() - std::time::Duration::from_millis(10),
+                CdnBodyTiming {
+                    started_at: Instant::now() - std::time::Duration::from_millis(10),
+                    suspend_clock: Arc::new(ScriptedSuspendClock::new([
+                        Some(SuspendTimestamp::from_nanos(10_000_000)),
+                        Some(completed_at),
+                    ])),
+                    suspend_started_at: Some(SuspendTimestamp::from_nanos(0)),
+                },
                 Some(true),
                 Some(4),
                 true,
             );
             observation.observe_chunk(b"data");
-            drop_started_at = std::time::Instant::now();
             drop(observation);
-            drop_finished_at = std::time::Instant::now();
         }
-        assert_eq!(history.recent_origin_supply(&request), None);
+        assert_eq!(
+            history.fresh_origin_observed_at_for_test(&request, &request.url),
+            None
+        );
         release_tx
             .send(())
             .expect("blocking worker should be released");
@@ -3914,7 +4030,10 @@ mod tests {
                 .expect("blocking worker should finish within the bound")
                 .expect("blocking worker should not panic");
             timeout(std::time::Duration::from_secs(2), async {
-                while history.recent_origin_supply(&request).is_none() {
+                while history
+                    .fresh_origin_observed_at_for_test(&request, &request.url)
+                    .is_none()
+                {
                     tokio::task::yield_now().await;
                 }
             })
@@ -3925,8 +4044,7 @@ mod tests {
         let observed_at = history
             .fresh_origin_observed_at_for_test(&request, &request.url)
             .expect("complete body should produce a measured observation");
-        assert!(observed_at >= drop_started_at);
-        assert!(observed_at <= drop_finished_at);
+        assert_eq!(observed_at, completed_at);
     }
 
     #[tokio::test]

@@ -65,6 +65,23 @@ public enum HLSPlaybackContextReportingError: Error, Equatable, Sendable {
     case requestFailed
 }
 
+public enum HLSPlaybackContextWithdrawalFailure: Equatable, Sendable {
+    case openInFlightWithoutTicket
+    case openOutcomeUnknown
+    case invalidContextID
+    case closeRejected
+    case closeRequestFailed
+    case timedOut
+    case cancelled
+    case anotherContextRetiring
+}
+
+public enum HLSPlaybackContextWithdrawalOutcome: Equatable, Sendable {
+    case notRequired
+    case acknowledged
+    case unconfirmed(HLSPlaybackContextWithdrawalFailure)
+}
+
 /// Sends timing only when explicitly invoked; it does not poll or control playback.
 @MainActor
 public final class HLSPlaybackContextReportingService {
@@ -76,6 +93,43 @@ public final class HLSPlaybackContextReportingService {
         let ticketReceivedAtNanoseconds: UInt64
     }
 
+    private struct InFlightOpen {
+        let operation: UUID
+        let owner: HLSPlaybackContextOwner
+        var contextID: String?
+        var retirementID: UUID?
+    }
+
+    private struct InFlightUpdate {
+        let operation: UUID
+        let owner: HLSPlaybackContextOwner
+        let contextID: String
+        var retirementID: UUID?
+    }
+
+    private struct RetirementBarrier {
+        let id: UUID
+        let owner: HLSPlaybackContextOwner?
+        var contextID: String?
+        var pendingOpenOperation: UUID?
+        var unknownRemoteAuthority: Bool
+        var closeAttempted: Bool
+        var outcome: HLSPlaybackContextWithdrawalOutcome?
+    }
+
+    private struct CloseAttempt {
+        let id: UUID
+        var retirementID: UUID?
+        let contextID: String
+        let waiter: HLSPlaybackContextCloseWaiter
+        let task: Task<Void, Never>
+    }
+
+    private struct LegacyCloseReceipt {
+        let contextID: String
+        let outcome: HLSPlaybackContextWithdrawalOutcome
+    }
+
     private static let maximumSnapshotAgeNanoseconds: UInt64 = 5_000_000_000
     private static let closeWaitDuration: Duration = .seconds(1)
 
@@ -83,44 +137,112 @@ public final class HLSPlaybackContextReportingService {
     private let serverSummary: CacheServerSummary
     private let ownerProvider: @MainActor () -> HLSPlaybackContextOwner?
     private let snapshotProvider: @MainActor () -> HLSPlaybackSnapshot?
-    private let monotonicNowNanoseconds: @MainActor () -> UInt64
+    private let monotonicNowNanoseconds: @MainActor () -> UInt64?
 
     private var revision = UUID()
     private var operationID: UUID?
     private var activeContext: ActiveContext?
+    private var inFlightOpen: InFlightOpen?
+    private var inFlightUpdate: InFlightUpdate?
+    private var legacyInFlightOpen: InFlightOpen?
+    private var legacyInFlightUpdate: InFlightUpdate?
+    private var retirementBarrier: RetirementBarrier?
+    private var closeAttempt: CloseAttempt?
+    private var legacyCloseReceipt: LegacyCloseReceipt?
     private var lastMonotonicNowNanoseconds: UInt64?
-    private var closeAttemptID: UUID?
 
-    public init(
+    public convenience init(
+        client: any CacheControlClient,
+        serverSummary: CacheServerSummary,
+        ownerProvider: @escaping @MainActor () -> HLSPlaybackContextOwner?,
+        snapshotProvider: @escaping @MainActor () -> HLSPlaybackSnapshot?
+    ) {
+        self.init(
+            client: client,
+            serverSummary: serverSummary,
+            ownerProvider: ownerProvider,
+            snapshotProvider: snapshotProvider,
+            monotonicNowNanosecondsProvider: { HLSPlaybackMonotonicClock.shared.nowNanoseconds() }
+        )
+    }
+
+    public convenience init(
         client: any CacheControlClient,
         serverSummary: CacheServerSummary,
         ownerProvider: @escaping @MainActor () -> HLSPlaybackContextOwner?,
         snapshotProvider: @escaping @MainActor () -> HLSPlaybackSnapshot?,
-        monotonicNowNanoseconds: @escaping @MainActor () -> UInt64 = {
-            DispatchTime.now().uptimeNanoseconds
-        }
+        monotonicNowNanoseconds: @escaping @MainActor () -> UInt64
+    ) {
+        self.init(
+            client: client,
+            serverSummary: serverSummary,
+            ownerProvider: ownerProvider,
+            snapshotProvider: snapshotProvider,
+            monotonicNowNanosecondsProvider: { monotonicNowNanoseconds() }
+        )
+    }
+
+    init(
+        client: any CacheControlClient,
+        serverSummary: CacheServerSummary,
+        ownerProvider: @escaping @MainActor () -> HLSPlaybackContextOwner?,
+        snapshotProvider: @escaping @MainActor () -> HLSPlaybackSnapshot?,
+        monotonicNowNanosecondsProvider: @escaping @MainActor () -> UInt64?
     ) {
         self.client = client
         self.serverSummary = serverSummary
         self.ownerProvider = ownerProvider
         self.snapshotProvider = snapshotProvider
-        self.monotonicNowNanoseconds = monotonicNowNanoseconds
+        self.monotonicNowNanoseconds = monotonicNowNanosecondsProvider
     }
 
     /// Opens a context, captures timing only after the first ticket, then sends its first sample.
     public func start() async throws {
+        guard operationID == nil else {
+            throw HLSPlaybackContextReportingError.operationInProgress
+        }
+        if let retirementBarrier {
+            guard retirementBarrier.outcome == .acknowledged, closeAttempt == nil else {
+                throw HLSPlaybackContextReportingError.operationInProgress
+            }
+            self.retirementBarrier = nil
+        }
+
+        if inFlightOpen != nil || inFlightUpdate != nil {
+            guard legacyInFlightOpen == nil, legacyInFlightUpdate == nil else {
+                throw HLSPlaybackContextReportingError.operationInProgress
+            }
+            legacyInFlightOpen = inFlightOpen
+            legacyInFlightUpdate = inFlightUpdate
+            inFlightOpen = nil
+            inFlightUpdate = nil
+        } else if legacyInFlightOpen != nil || legacyInFlightUpdate != nil {
+            throw HLSPlaybackContextReportingError.operationInProgress
+        }
+
         let operation = UUID()
         revision = operation
         operationID = operation
-        let previousContext = activeContext
-        activeContext = nil
         defer {
             if operationID == operation {
                 operationID = nil
             }
+            if inFlightOpen?.operation == operation {
+                inFlightOpen = nil
+            }
+            if inFlightUpdate?.operation == operation {
+                inFlightUpdate = nil
+            }
+            if legacyInFlightOpen?.operation == operation {
+                legacyInFlightOpen = nil
+            }
+            if legacyInFlightUpdate?.operation == operation {
+                legacyInFlightUpdate = nil
+            }
         }
 
-        if let previousContext {
+        if let previousContext = activeContext {
+            activeContext = nil
             await closeBestEffort(previousContext.ticket.contextID)
         }
         try Task.checkCancellation()
@@ -143,11 +265,13 @@ public final class HLSPlaybackContextReportingService {
         try openRequest.validate()
         try requireCurrent(owner, revision: operation, operation: operation)
         let openRequestStarted = try checkedNow()
+        inFlightOpen = InFlightOpen(operation: operation, owner: owner, contextID: nil, retirementID: nil)
         var openedTicket: HLSPlaybackContextTicket?
 
         do {
             let ticket = try await client.openHLSPlaybackContext(openRequest)
             openedTicket = ticket
+            recordOpenedTicket(ticket, operation: operation)
             try Task.checkCancellation()
             let ticketReceivedAt = try checkedNow()
             try requireCurrent(owner, revision: operation, operation: operation)
@@ -176,6 +300,13 @@ public final class HLSPlaybackContextReportingService {
             try requireLive(ticket, requestStarted: openRequestStarted, now: updateRequestStarted)
             try requireFresh(snapshot, now: updateRequestStarted, notBefore: ticketReceivedAt)
 
+            inFlightOpen = nil
+            inFlightUpdate = InFlightUpdate(
+                operation: operation,
+                owner: owner,
+                contextID: ticket.contextID,
+                retirementID: retirementBarrier?.id
+            )
             let nextTicket = try await client.updateHLSPlaybackContext(updateRequest)
             try Task.checkCancellation()
             let afterUpdate = try checkedNow()
@@ -185,6 +316,7 @@ public final class HLSPlaybackContextReportingService {
             try nextTicket.validate(matching: updateRequest)
             try requireLive(nextTicket, requestStarted: updateRequestStarted, now: afterUpdate)
 
+            inFlightUpdate = nil
             activeContext = ActiveContext(
                 revision: operation,
                 owner: owner,
@@ -193,11 +325,55 @@ public final class HLSPlaybackContextReportingService {
                 ticketReceivedAtNanoseconds: afterUpdate
             )
         } catch {
-            if revision == operation {
-                activeContext = nil
-            }
             if let openedTicket {
-                await closeBestEffort(openedTicket.contextID)
+                let flightRetirementID = retirementID(for: operation)
+                clearInFlightOperation(operation)
+                if let flightRetirementID {
+                    if retirementBarrier?.id == flightRetirementID {
+                        _ = await resolveRetirement(flightRetirementID, allowExplicitRetry: false)
+                    }
+                } else if revision == operation, operationID == operation {
+                    activeContext = nil
+                    await closeBestEffort(openedTicket.contextID)
+                } else {
+                    await closeBestEffort(openedTicket.contextID)
+                }
+            } else if let opening = openOperation(operation) {
+                clearInFlightOperation(operation)
+                if let retirementID = opening.retirementID, retirementBarrier?.id == retirementID {
+                    updateRetirement(retirementID) {
+                        $0.pendingOpenOperation = nil
+                        $0.unknownRemoteAuthority = false
+                        $0.outcome = .unconfirmed(.openOutcomeUnknown)
+                    }
+                } else if revision == operation, operationID == operation {
+                    activeContext = nil
+                    let barrier = ensureRetirement(
+                        owner: opening.owner,
+                        contextID: nil,
+                        pendingOpenOperation: nil,
+                        unknownRemoteAuthority: true
+                    )
+                    updateRetirement(barrier.id) {
+                        $0.outcome = .unconfirmed(.openOutcomeUnknown)
+                    }
+                }
+            } else if let failedUpdate = updateOperation(operation) {
+                clearInFlightOperation(operation)
+                if let retirementID = failedUpdate.retirementID, retirementBarrier?.id == retirementID {
+                    _ = await resolveRetirement(retirementID, allowExplicitRetry: false)
+                } else if revision == operation, operationID == operation {
+                    activeContext = nil
+                    revision = UUID()
+                    let barrier = ensureRetirement(
+                        owner: failedUpdate.owner,
+                        contextID: failedUpdate.contextID,
+                        pendingOpenOperation: nil
+                    )
+                    _ = await resolveRetirement(barrier.id, allowExplicitRetry: false)
+                } else {
+                    await closeBestEffort(failedUpdate.contextID)
+                }
             }
             throw sanitized(error)
         }
@@ -206,6 +382,9 @@ public final class HLSPlaybackContextReportingService {
     /// Sends one fresh sample. Concurrent updates are rejected instead of overlapping sequences.
     public func update() async throws {
         guard operationID == nil else {
+            throw HLSPlaybackContextReportingError.operationInProgress
+        }
+        guard retirementBarrier == nil else {
             throw HLSPlaybackContextReportingError.operationInProgress
         }
         guard let context = activeContext else {
@@ -217,6 +396,12 @@ public final class HLSPlaybackContextReportingService {
         defer {
             if operationID == operation {
                 operationID = nil
+            }
+            if inFlightUpdate?.operation == operation {
+                inFlightUpdate = nil
+            }
+            if legacyInFlightUpdate?.operation == operation {
+                legacyInFlightUpdate = nil
             }
         }
 
@@ -260,6 +445,12 @@ public final class HLSPlaybackContextReportingService {
                 notBefore: context.ticketReceivedAtNanoseconds
             )
 
+            inFlightUpdate = InFlightUpdate(
+                operation: operation,
+                owner: context.owner,
+                contextID: context.ticket.contextID,
+                retirementID: nil
+            )
             let nextTicket = try await client.updateHLSPlaybackContext(request)
             try Task.checkCancellation()
             let afterUpdate = try checkedNow()
@@ -277,6 +468,7 @@ public final class HLSPlaybackContextReportingService {
             try nextTicket.validate(matching: request)
             try requireLive(nextTicket, requestStarted: requestStarted, now: afterUpdate)
 
+            inFlightUpdate = nil
             activeContext = ActiveContext(
                 revision: context.revision,
                 owner: context.owner,
@@ -285,26 +477,148 @@ public final class HLSPlaybackContextReportingService {
                 ticketReceivedAtNanoseconds: afterUpdate
             )
         } catch {
-            if revision == context.revision, operationID == operation,
-                activeContext?.ticket.contextID.utf8.elementsEqual(context.ticket.contextID.utf8) == true
-            {
+            let failedUpdate = updateOperation(operation)
+            let flightRetirementID = failedUpdate?.retirementID
+            let operationStillOwnsContext =
+                revision == context.revision && operationID == operation
+                && activeContext?.ticket.contextID.utf8.elementsEqual(context.ticket.contextID.utf8) == true
+            if operationStillOwnsContext {
                 activeContext = nil
                 revision = UUID()
             }
-            await closeBestEffort(context.ticket.contextID)
+            clearInFlightOperation(operation)
+            if let flightRetirementID {
+                if retirementBarrier?.id == flightRetirementID {
+                    _ = await resolveRetirement(flightRetirementID, allowExplicitRetry: false)
+                }
+            } else if operationStillOwnsContext {
+                await closeBestEffort(context.ticket.contextID)
+            } else {
+                await closeBestEffort(context.ticket.contextID)
+            }
             throw sanitized(error)
         }
     }
 
-    /// Withdraws local authority immediately and best-effort closes only the saved context ID.
+    /// Withdraws local authority immediately and makes in-flight results uncommittable.
     public func withdraw() async {
+        if let retirementBarrier {
+            _ = await resolveRetirement(retirementBarrier.id, allowExplicitRetry: false)
+            return
+        }
+
         let previousContext = activeContext
+        let opening = openOperation(operationID)
+        let updating = updateOperation(operationID)
         revision = UUID()
         operationID = nil
         activeContext = nil
+
         if let previousContext {
             await closeBestEffort(previousContext.ticket.contextID)
+        } else if let updating {
+            await closeBestEffort(updating.contextID)
+        } else if let opening, let contextID = opening.contextID {
+            await closeBestEffort(contextID)
+        } else if let closeAttempt {
+            await closeBestEffort(closeAttempt.contextID)
         }
+    }
+
+    /// Waits briefly for exact-ID server confirmation; a timeout or unknown ID is never an acknowledgment.
+    public func withdrawAndConfirmRemoteRemoval() async -> HLSPlaybackContextWithdrawalOutcome {
+        let previousContext = activeContext
+        let opening = inFlightOpen
+        let updating = inFlightUpdate
+        let hasLegacyOperation = legacyInFlightOpen != nil || legacyInFlightUpdate != nil
+        revision = UUID()
+        operationID = nil
+        activeContext = nil
+
+        if let retirementBarrier {
+            if let opening, opening.retirementID == nil {
+                inFlightOpen?.retirementID = retirementBarrier.id
+            }
+            if let updating, updating.retirementID == nil {
+                inFlightUpdate?.retirementID = retirementBarrier.id
+            }
+            return await resolveRetirement(retirementBarrier.id, allowExplicitRetry: true)
+        }
+
+        if hasLegacyOperation {
+            let barrier = ensureRetirement(
+                owner: nil,
+                contextID: nil,
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: true
+            )
+            updateRetirement(barrier.id) {
+                $0.outcome = .unconfirmed(.openOutcomeUnknown)
+            }
+            return .unconfirmed(.openOutcomeUnknown)
+        }
+
+        if let previousContext {
+            let barrier = ensureRetirement(
+                owner: previousContext.owner,
+                contextID: previousContext.ticket.contextID,
+                pendingOpenOperation: nil
+            )
+            if let updating {
+                inFlightUpdate?.retirementID = barrier.id
+            }
+            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+        }
+
+        if let updating {
+            let barrier = ensureRetirement(
+                owner: updating.owner,
+                contextID: updating.contextID,
+                pendingOpenOperation: nil
+            )
+            inFlightUpdate?.retirementID = barrier.id
+            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+        }
+
+        if let opening {
+            let barrier = ensureRetirement(
+                owner: opening.owner,
+                contextID: opening.contextID,
+                pendingOpenOperation: opening.contextID == nil ? opening.operation : nil
+            )
+            inFlightOpen?.retirementID = barrier.id
+            if opening.contextID == nil {
+                updateRetirement(barrier.id) {
+                    $0.outcome = .unconfirmed(.openInFlightWithoutTicket)
+                }
+                return .unconfirmed(.openInFlightWithoutTicket)
+            }
+            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+        }
+
+        if let closeAttempt {
+            let barrier = ensureRetirement(
+                owner: nil,
+                contextID: closeAttempt.contextID,
+                pendingOpenOperation: nil
+            )
+            self.closeAttempt?.retirementID = barrier.id
+            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+        }
+
+        if let legacyCloseReceipt {
+            if legacyCloseReceipt.outcome == .acknowledged {
+                return .acknowledged
+            }
+            let barrier = ensureRetirement(
+                owner: nil,
+                contextID: legacyCloseReceipt.contextID,
+                pendingOpenOperation: nil
+            )
+            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+        }
+
+        return .notRequired
     }
 
     private func captureFreshSample(
@@ -399,7 +713,9 @@ public final class HLSPlaybackContextReportingService {
     }
 
     private func checkedNow() throws -> UInt64 {
-        let now = monotonicNowNanoseconds()
+        guard let now = monotonicNowNanoseconds() else {
+            throw HLSPlaybackContextReportingError.clockAnomaly
+        }
         if let previous = lastMonotonicNowNanoseconds, now < previous {
             throw HLSPlaybackContextReportingError.clockAnomaly
         }
@@ -417,28 +733,308 @@ public final class HLSPlaybackContextReportingService {
         return owner.ownerToken.uuidString.lowercased()
     }
 
-    private func closeBestEffort(_ contextID: String) async {
-        let request = HLSPlaybackContextCloseRequest(contextID: contextID)
-        guard (try? request.validate()) != nil else { return }
-        guard closeAttemptID == nil else { return }
-
-        let attemptID = UUID()
-        closeAttemptID = attemptID
-        let completion = HLSPlaybackContextCloseWaiter()
-        let client = self.client
-
-        // Keep one detached cleanup per service; a non-cooperative client cannot fan out tasks.
-        Task.detached(priority: .utility) { [weak self] in
-            _ = try? await client.closeHLSPlaybackContext(request)
-            await self?.finishCloseAttempt(attemptID)
-            await completion.finish()
+    private func recordOpenedTicket(_ ticket: HLSPlaybackContextTicket, operation: UUID) {
+        if var opening = inFlightOpen, opening.operation == operation {
+            opening.contextID = ticket.contextID
+            inFlightOpen = opening
+        } else if var opening = legacyInFlightOpen, opening.operation == operation {
+            opening.contextID = ticket.contextID
+            legacyInFlightOpen = opening
         }
-        await completion.wait(for: Self.closeWaitDuration)
+        updateRetirement(forOpenOperation: operation) {
+            $0.contextID = ticket.contextID
+            $0.pendingOpenOperation = nil
+            $0.closeAttempted = false
+            $0.outcome = nil
+        }
     }
 
-    private func finishCloseAttempt(_ attemptID: UUID) {
-        guard closeAttemptID == attemptID else { return }
-        closeAttemptID = nil
+    private func ensureRetirement(
+        owner: HLSPlaybackContextOwner?,
+        contextID: String?,
+        pendingOpenOperation: UUID?,
+        unknownRemoteAuthority: Bool = false
+    ) -> RetirementBarrier {
+        if var existing = retirementBarrier {
+            if existing.contextID == nil, let contextID, existing.owner == owner {
+                existing.contextID = contextID
+                existing.pendingOpenOperation = nil
+                existing.closeAttempted = false
+                existing.outcome = nil
+            }
+            existing.unknownRemoteAuthority = existing.unknownRemoteAuthority || unknownRemoteAuthority
+            retirementBarrier = existing
+            return existing
+        }
+
+        let id = UUID()
+        let initialOutcome: HLSPlaybackContextWithdrawalOutcome?
+        if unknownRemoteAuthority {
+            initialOutcome = .unconfirmed(.openOutcomeUnknown)
+        } else if pendingOpenOperation != nil {
+            initialOutcome = .unconfirmed(.openInFlightWithoutTicket)
+        } else if contextID == nil {
+            initialOutcome = .unconfirmed(.openOutcomeUnknown)
+        } else {
+            initialOutcome = nil
+        }
+        let barrier = RetirementBarrier(
+            id: id,
+            owner: owner,
+            contextID: contextID,
+            pendingOpenOperation: pendingOpenOperation,
+            unknownRemoteAuthority: unknownRemoteAuthority,
+            closeAttempted: false,
+            outcome: initialOutcome
+        )
+        retirementBarrier = barrier
+        return barrier
+    }
+
+    private func updateRetirement(
+        _ id: UUID,
+        _ update: (inout RetirementBarrier) -> Void
+    ) {
+        guard var barrier = retirementBarrier, barrier.id == id else { return }
+        update(&barrier)
+        retirementBarrier = barrier
+    }
+
+    private func updateRetirement(
+        forOpenOperation operation: UUID,
+        _ update: (inout RetirementBarrier) -> Void
+    ) {
+        guard let barrier = retirementBarrier, barrier.pendingOpenOperation == operation else { return }
+        updateRetirement(barrier.id, update)
+    }
+
+    private func clearAcknowledgedRetirement(_ id: UUID) {
+        guard retirementBarrier?.id == id,
+            retirementBarrier?.outcome == .acknowledged,
+            closeAttempt == nil
+        else {
+            return
+        }
+        retirementBarrier = nil
+    }
+
+    private func resolveRetirement(
+        _ retirementID: UUID,
+        allowExplicitRetry: Bool
+    ) async -> HLSPlaybackContextWithdrawalOutcome {
+        guard var barrier = retirementBarrier, barrier.id == retirementID else {
+            return .unconfirmed(.anotherContextRetiring)
+        }
+        if Task.isCancelled {
+            return .unconfirmed(.cancelled)
+        }
+        if barrier.outcome == .acknowledged {
+            return .acknowledged
+        }
+        if barrier.unknownRemoteAuthority {
+            return .unconfirmed(.openOutcomeUnknown)
+        }
+        guard let contextID = barrier.contextID else {
+            return barrier.outcome ?? .unconfirmed(.openOutcomeUnknown)
+        }
+
+        if let closeAttempt {
+            guard closeAttempt.contextID.utf8.elementsEqual(contextID.utf8) else {
+                return .unconfirmed(.anotherContextRetiring)
+            }
+            if closeAttempt.retirementID == nil {
+                self.closeAttempt?.retirementID = retirementID
+            } else if closeAttempt.retirementID != retirementID {
+                return .unconfirmed(.anotherContextRetiring)
+            }
+            let result = await closeAttempt.waiter.wait(for: Self.closeWaitDuration)
+            return Task.isCancelled ? .unconfirmed(.cancelled) : result
+        }
+
+        if barrier.closeAttempted {
+            guard allowExplicitRetry else {
+                return barrier.outcome ?? .unconfirmed(.closeRequestFailed)
+            }
+            barrier.closeAttempted = false
+            barrier.outcome = nil
+        }
+
+        let request = HLSPlaybackContextCloseRequest(contextID: contextID)
+        guard (try? request.validate()) != nil else {
+            barrier.closeAttempted = true
+            let outcome: HLSPlaybackContextWithdrawalOutcome = .unconfirmed(.invalidContextID)
+            barrier.outcome = outcome
+            retirementBarrier = barrier
+            return outcome
+        }
+
+        barrier.closeAttempted = true
+        barrier.outcome = nil
+        retirementBarrier = barrier
+        let attemptID = UUID()
+        let waiter = HLSPlaybackContextCloseWaiter()
+        let client = self.client
+
+        let task = Task.detached(priority: .utility) { [weak self, waiter, client] in
+            let outcome: HLSPlaybackContextWithdrawalOutcome
+            do {
+                let response = try await client.closeHLSPlaybackContext(request)
+                outcome = response.closed ? .acknowledged : .unconfirmed(.closeRejected)
+            } catch {
+                outcome = .unconfirmed(.closeRequestFailed)
+            }
+            if let self {
+                await self.finishCloseAttempt(
+                    attemptID,
+                    contextID: contextID,
+                    outcome: outcome,
+                    waiter: waiter
+                )
+            } else {
+                await waiter.finish(outcome)
+            }
+        }
+        closeAttempt = CloseAttempt(
+            id: attemptID,
+            retirementID: retirementID,
+            contextID: contextID,
+            waiter: waiter,
+            task: task
+        )
+        let result = await waiter.wait(for: Self.closeWaitDuration)
+        return Task.isCancelled ? .unconfirmed(.cancelled) : result
+    }
+
+    private func finishCloseAttempt(
+        _ attemptID: UUID,
+        contextID: String,
+        outcome: HLSPlaybackContextWithdrawalOutcome,
+        waiter: HLSPlaybackContextCloseWaiter
+    ) async {
+        guard let attempt = closeAttempt, attempt.id == attemptID else {
+            await waiter.finish(outcome)
+            return
+        }
+        closeAttempt = nil
+        if let retirementID = attempt.retirementID,
+            var barrier = retirementBarrier,
+            barrier.id == retirementID,
+            barrier.contextID?.utf8.elementsEqual(contextID.utf8) == true
+        {
+            barrier.outcome = outcome
+            retirementBarrier = barrier
+        } else if attempt.retirementID == nil,
+            legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true
+        {
+            legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+        }
+        await waiter.finish(outcome)
+    }
+
+    private func closeBestEffort(_ contextID: String) async {
+        let request = HLSPlaybackContextCloseRequest(contextID: contextID)
+        guard (try? request.validate()) != nil else {
+            legacyCloseReceipt = LegacyCloseReceipt(
+                contextID: contextID,
+                outcome: .unconfirmed(.invalidContextID)
+            )
+            return
+        }
+        if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+            return
+        }
+        if let closeAttempt {
+            guard closeAttempt.contextID.utf8.elementsEqual(contextID.utf8) else {
+                legacyCloseReceipt = LegacyCloseReceipt(
+                    contextID: contextID,
+                    outcome: .unconfirmed(.anotherContextRetiring)
+                )
+                return
+            }
+            let outcome = await closeAttempt.waiter.wait(for: Self.closeWaitDuration)
+            if closeAttempt.retirementID == nil {
+                legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+            }
+            return
+        }
+
+        let attemptID = UUID()
+        let waiter = HLSPlaybackContextCloseWaiter()
+        let client = self.client
+        legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: .unconfirmed(.timedOut))
+        let task = Task.detached(priority: .utility) { [weak self, waiter, client] in
+            let outcome: HLSPlaybackContextWithdrawalOutcome
+            do {
+                let response = try await client.closeHLSPlaybackContext(request)
+                outcome = response.closed ? .acknowledged : .unconfirmed(.closeRejected)
+            } catch {
+                outcome = .unconfirmed(.closeRequestFailed)
+            }
+            if let self {
+                await self.finishCloseAttempt(
+                    attemptID,
+                    contextID: contextID,
+                    outcome: outcome,
+                    waiter: waiter
+                )
+            } else {
+                await waiter.finish(outcome)
+            }
+        }
+        closeAttempt = CloseAttempt(
+            id: attemptID,
+            retirementID: nil,
+            contextID: contextID,
+            waiter: waiter,
+            task: task
+        )
+        let outcome = await waiter.wait(for: Self.closeWaitDuration)
+        if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true,
+            closeAttempt?.retirementID == nil
+        {
+            legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+        }
+    }
+
+    private func openOperation(_ operation: UUID?) -> InFlightOpen? {
+        guard let operation else { return nil }
+        if let current = inFlightOpen, current.operation == operation {
+            return current
+        }
+        if let legacy = legacyInFlightOpen, legacy.operation == operation {
+            return legacy
+        }
+        return nil
+    }
+
+    private func updateOperation(_ operation: UUID?) -> InFlightUpdate? {
+        guard let operation else { return nil }
+        if let current = inFlightUpdate, current.operation == operation {
+            return current
+        }
+        if let legacy = legacyInFlightUpdate, legacy.operation == operation {
+            return legacy
+        }
+        return nil
+    }
+
+    private func retirementID(for operation: UUID) -> UUID? {
+        openOperation(operation)?.retirementID ?? updateOperation(operation)?.retirementID
+    }
+
+    private func clearInFlightOperation(_ operation: UUID) {
+        if inFlightOpen?.operation == operation {
+            inFlightOpen = nil
+        }
+        if inFlightUpdate?.operation == operation {
+            inFlightUpdate = nil
+        }
+        if legacyInFlightOpen?.operation == operation {
+            legacyInFlightOpen = nil
+        }
+        if legacyInFlightUpdate?.operation == operation {
+            legacyInFlightUpdate = nil
+        }
     }
 
     private func sanitized(_ error: any Error) -> any Error {
@@ -461,32 +1057,54 @@ public final class HLSPlaybackContextReportingService {
 }
 
 private actor HLSPlaybackContextCloseWaiter {
-    private var isFinished = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var deliveryOutcome: HLSPlaybackContextWithdrawalOutcome?
+    private var continuations: [UUID: CheckedContinuation<HLSPlaybackContextWithdrawalOutcome, Never>] = [:]
     private var timeoutTask: Task<Void, Never>?
 
-    func wait(for timeout: Duration) async {
-        await withCheckedContinuation { continuation in
-            guard !isFinished else {
-                continuation.resume()
-                return
+    func wait(for timeout: Duration) async -> HLSPlaybackContextWithdrawalOutcome {
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: .unconfirmed(.cancelled))
+                    return
+                }
+                if let deliveryOutcome {
+                    continuation.resume(returning: deliveryOutcome)
+                    return
+                }
+
+                continuations[waiterID] = continuation
+                if timeoutTask == nil {
+                    timeoutTask = Task.detached { [weak self] in
+                        do {
+                            try await Task.sleep(for: timeout)
+                        } catch {
+                            return
+                        }
+                        await self?.finish(.unconfirmed(.timedOut))
+                    }
+                }
             }
-            self.continuation = continuation
-            timeoutTask = Task.detached { [weak self] in
-                try? await Task.sleep(for: timeout)
-                guard let self else { return }
-                await self.finish()
-            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
         }
     }
 
-    func finish() {
-        guard !isFinished else { return }
-        isFinished = true
+    func finish(_ outcome: HLSPlaybackContextWithdrawalOutcome) {
+        guard deliveryOutcome == nil else { return }
+        deliveryOutcome = outcome
         timeoutTask?.cancel()
         timeoutTask = nil
-        let continuation = self.continuation
-        self.continuation = nil
-        continuation?.resume()
+        let pendingContinuations = Array(continuations.values)
+        self.continuations.removeAll()
+        for continuation in pendingContinuations {
+            continuation.resume(returning: outcome)
+        }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        guard let continuation = continuations.removeValue(forKey: waiterID) else { return }
+        continuation.resume(returning: .unconfirmed(.cancelled))
     }
 }

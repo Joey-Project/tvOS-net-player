@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::bbdown_adapter::{BilibiliMediaRequest, BilibiliMediaRequestKind};
+use crate::suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock};
 
 const VERSION: u8 = 1;
 const HOST_TTL_SECS: u64 = 24 * 60 * 60;
@@ -59,12 +60,16 @@ struct HistoryState {
     #[serde(skip)]
     fresh_origin_supply: BTreeMap<String, FreshOriginSupplyRecord>,
     #[serde(skip)]
-    fresh_origin_supply_eviction_floor: Option<Instant>,
+    fresh_origin_supply_eviction_floor: Option<SuspendTimestamp>,
+    #[serde(skip)]
+    fresh_origin_supply_last_check: Option<SuspendTimestamp>,
+    #[serde(skip)]
+    fresh_origin_supply_clock_failed: bool,
 }
 
 #[derive(Clone)]
 struct FreshOriginSupplyRecord {
-    observed_at: Instant,
+    observed_at: SuspendTimestamp,
     outcome: FreshOriginSupplyOutcome,
 }
 
@@ -152,7 +157,10 @@ pub(crate) struct CdnObservation {
     pub elapsed: Option<Duration>,
     pub first_byte_latency: Option<Duration>,
     pub range_supported: Option<bool>,
-    pub observed_at: Instant,
+    pub fresh_elapsed: Option<Duration>,
+    pub fresh_first_byte_latency: Option<Duration>,
+    pub observed_at: Option<SuspendTimestamp>,
+    pub fresh_timing_invalid: bool,
 }
 
 impl CdnObservation {
@@ -168,7 +176,10 @@ impl CdnObservation {
             elapsed: None,
             first_byte_latency: None,
             range_supported: None,
-            observed_at: Instant::now(),
+            fresh_elapsed: None,
+            fresh_first_byte_latency: None,
+            observed_at: SystemSuspendClock.now(),
+            fresh_timing_invalid: false,
         }
     }
 
@@ -186,7 +197,10 @@ impl CdnObservation {
             elapsed: Some(elapsed),
             first_byte_latency: Some(first_byte_latency),
             range_supported,
-            observed_at: Instant::now(),
+            fresh_elapsed: Some(elapsed),
+            fresh_first_byte_latency: Some(first_byte_latency),
+            observed_at: SystemSuspendClock.now(),
+            fresh_timing_invalid: false,
         }
     }
 
@@ -199,7 +213,10 @@ impl CdnObservation {
             elapsed: Some(elapsed),
             first_byte_latency: None,
             range_supported: None,
-            observed_at: Instant::now(),
+            fresh_elapsed: None,
+            fresh_first_byte_latency: None,
+            observed_at: SystemSuspendClock.now(),
+            fresh_timing_invalid: false,
         }
     }
 
@@ -214,6 +231,34 @@ impl CdnObservation {
     #[cfg(test)]
     pub(crate) fn failure(source: CdnObservationSource, outcome: CdnObservationOutcome) -> Self {
         Self::new(source, outcome, 0)
+    }
+
+    pub(crate) fn with_fresh_timing(
+        mut self,
+        started_at: Option<SuspendTimestamp>,
+        first_byte_at: Option<SuspendTimestamp>,
+        completed_at: Option<SuspendTimestamp>,
+    ) -> Self {
+        self.observed_at = completed_at;
+        self.fresh_elapsed = None;
+        self.fresh_first_byte_latency = None;
+        match started_at.zip(first_byte_at).zip(completed_at) {
+            Some(((started_at, first_byte_at), completed_at)) => {
+                match (
+                    completed_at.checked_elapsed_since(started_at),
+                    first_byte_at.checked_elapsed_since(started_at),
+                ) {
+                    (Some(elapsed), Some(first_byte_latency)) if first_byte_latency <= elapsed => {
+                        self.fresh_elapsed = Some(elapsed);
+                        self.fresh_first_byte_latency = Some(first_byte_latency);
+                    }
+                    _ => self.fresh_timing_invalid = true,
+                }
+            }
+            None if self.bytes > 0 => self.fresh_timing_invalid = true,
+            None => {}
+        }
+        self
     }
 }
 
@@ -300,7 +345,7 @@ impl CdnHistory {
         &self,
         request: &BilibiliMediaRequest,
     ) -> Option<RecentOriginSupply> {
-        self.recent_origin_supply_with_clock(request, Instant::now)
+        self.recent_origin_supply_with_clock(request, || SystemSuspendClock.now())
     }
 
     #[cfg(test)]
@@ -308,7 +353,7 @@ impl CdnHistory {
         &self,
         request: &BilibiliMediaRequest,
         url: &str,
-    ) -> Option<Instant> {
+    ) -> Option<SuspendTimestamp> {
         let digest = representation_digest(request)?;
         let origin = canonical_origin(url)?;
         self.lock_state()
@@ -318,22 +363,34 @@ impl CdnHistory {
     }
 
     #[cfg(test)]
-    fn recent_origin_supply_at(
+    pub(crate) fn recent_origin_supply_at(
         &self,
         request: &BilibiliMediaRequest,
-        now: Instant,
+        now: SuspendTimestamp,
     ) -> Option<RecentOriginSupply> {
-        self.recent_origin_supply_with_clock(request, || now)
+        self.recent_origin_supply_with_clock(request, || Some(now))
     }
 
     fn recent_origin_supply_with_clock(
         &self,
         request: &BilibiliMediaRequest,
-        clock: impl FnOnce() -> Instant,
+        clock: impl FnOnce() -> Option<SuspendTimestamp>,
     ) -> Option<RecentOriginSupply> {
         let digest = representation_digest(request)?;
-        let state = self.lock_state();
-        let now = clock();
+        let mut state = self.lock_state();
+        if state.fresh_origin_supply_clock_failed {
+            return None;
+        }
+        let now = clock()?;
+        if state
+            .fresh_origin_supply_last_check
+            .is_some_and(|last| now < last)
+        {
+            state.fresh_origin_supply_clock_failed = true;
+            state.fresh_origin_supply.clear();
+            return None;
+        }
+        state.fresh_origin_supply_last_check = Some(now);
         std::iter::once(&request.url)
             .chain(request.backup_urls.iter())
             .take(MAX_CANDIDATES)
@@ -349,7 +406,7 @@ impl CdnHistory {
                 else {
                     return None;
                 };
-                let age = now.checked_duration_since(record.observed_at)?;
+                let age = now.checked_elapsed_since(record.observed_at)?;
                 (age <= RECENT_ORIGIN_SUPPLY_MAX_AGE).then_some((
                     age,
                     *throughput_bps,
@@ -556,6 +613,10 @@ impl CdnHistory {
             return;
         };
         let mut state = self.lock_state();
+        if observation.observed_at.is_none() || observation.fresh_timing_invalid {
+            state.fresh_origin_supply_clock_failed = true;
+            state.fresh_origin_supply.clear();
+        }
         prune(&mut state, now);
         state.sequence = state.sequence.saturating_add(1);
         let sequence = state.sequence;
@@ -580,15 +641,15 @@ impl CdnHistory {
             let fresh_outcome = if invalidate_fresh {
                 Some(FreshOriginSupplyOutcome::Invalidated)
             } else if completed
-                && observation.source != CdnObservationSource::DownloadShard
-                && let Some(elapsed) = observation.elapsed
+                && observation.source == CdnObservationSource::Playback
+                && let Some(elapsed) = observation.fresh_elapsed
                 && !elapsed.is_zero()
                 && observation.bytes > 0
                 && observation
-                    .first_byte_latency
-                    .is_none_or(|latency| latency <= elapsed)
+                    .fresh_first_byte_latency
+                    .is_some_and(|latency| latency <= elapsed)
             {
-                let first_byte_latency = observation.first_byte_latency;
+                let first_byte_latency = observation.fresh_first_byte_latency;
                 let throughput_bps = (u128::from(observation.bytes) * 8 * 1_000_000_000
                     / elapsed.as_nanos())
                 .min(u128::from(u64::MAX)) as u64;
@@ -600,7 +661,12 @@ impl CdnHistory {
                 None
             };
             if let Some(fresh_outcome) = fresh_outcome {
-                record_fresh_origin_supply(&mut state, key, observation.observed_at, fresh_outcome);
+                if let Some(observed_at) = observation.observed_at {
+                    record_fresh_origin_supply(&mut state, key, observed_at, fresh_outcome);
+                } else if fresh_outcome.is_invalidation() {
+                    state.fresh_origin_supply_clock_failed = true;
+                    state.fresh_origin_supply.clear();
+                }
             }
         }
         if transport_failure || completed {
@@ -698,9 +764,12 @@ impl CdnHistory {
 fn record_fresh_origin_supply(
     state: &mut HistoryState,
     key: &str,
-    observed_at: Instant,
+    observed_at: SuspendTimestamp,
     outcome: FreshOriginSupplyOutcome,
 ) {
+    if state.fresh_origin_supply_clock_failed {
+        return;
+    }
     if let Some(previous) = state.fresh_origin_supply.get(key) {
         let newer = observed_at > previous.observed_at;
         let equal_time_failure_wins = observed_at == previous.observed_at
@@ -731,7 +800,7 @@ fn record_fresh_origin_supply(
 
 // Equal-time invalidations replace measured evidence; equal-time successes keep
 // the first decision. Evicted timestamps form a conservative floor for missing keys.
-fn make_fresh_origin_supply_room(state: &mut HistoryState, incoming_at: Instant) -> bool {
+fn make_fresh_origin_supply_room(state: &mut HistoryState, incoming_at: SuspendTimestamp) -> bool {
     let required_evictions = state
         .fresh_origin_supply
         .len()
@@ -1267,6 +1336,17 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suspend_clock::SuspendTimestamp;
+
+    fn timestamp(nanoseconds: u128) -> SuspendTimestamp {
+        SuspendTimestamp::from_nanos(nanoseconds)
+    }
+
+    fn after(timestamp: SuspendTimestamp, duration: Duration) -> SuspendTimestamp {
+        timestamp
+            .checked_add(duration)
+            .expect("test timestamp should not overflow")
+    }
 
     fn make_request(primary: &str, backups: &[&str]) -> BilibiliMediaRequest {
         BilibiliMediaRequest {
@@ -1636,7 +1716,10 @@ mod tests {
                 elapsed: Some(Duration::from_millis(10)),
                 first_byte_latency: Some(Duration::from_millis(1)),
                 range_supported: None,
-                observed_at: Instant::now(),
+                fresh_elapsed: None,
+                fresh_first_byte_latency: None,
+                observed_at: SystemSuspendClock.now(),
+                fresh_timing_invalid: false,
             },
         );
         let state = history.lock_state();
@@ -1653,6 +1736,7 @@ mod tests {
             probe(1_000_000, 100),
             100,
         );
+        assert_eq!(probe_history.recent_origin_supply(&probe_request), None);
         let state = probe_history.lock_state();
         let host = state.hosts.values().next().unwrap();
         assert!(host.throughput_bps.is_some());
@@ -1872,7 +1956,10 @@ mod tests {
             elapsed: Some(elapsed),
             first_byte_latency: ttfb,
             range_supported: Some(true),
-            observed_at: Instant::now(),
+            fresh_elapsed: Some(elapsed),
+            fresh_first_byte_latency: Some(ttfb.unwrap_or_default()),
+            observed_at: None,
+            fresh_timing_invalid: false,
         }
     }
 
@@ -1881,9 +1968,9 @@ mod tests {
         request: &BilibiliMediaRequest,
         url: &str,
         mut observation: CdnObservation,
-        measured_at: Instant,
+        measured_at: SuspendTimestamp,
     ) {
-        observation.observed_at = measured_at;
+        observation.observed_at = Some(measured_at);
         history.record_request_at(request, url, observation, 100);
     }
 
@@ -1891,7 +1978,7 @@ mod tests {
     fn recent_origin_supply_reports_goodput_and_expires_monotonically() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let measured_at = Instant::now();
+        let measured_at = timestamp(1_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -1905,7 +1992,7 @@ mod tests {
         );
 
         let sample = history
-            .recent_origin_supply_at(&request, measured_at + Duration::from_secs(3))
+            .recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(3)))
             .unwrap();
         assert_eq!(sample.age, Duration::from_secs(3));
         assert_eq!(sample.throughput_bps, 4_000_000);
@@ -1913,12 +2000,147 @@ mod tests {
         assert_eq!(
             history.recent_origin_supply_at(
                 &request,
-                measured_at + RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1)
+                after(
+                    measured_at,
+                    RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1),
+                )
             ),
             None
         );
         assert_eq!(
-            history.recent_origin_supply_at(&request, measured_at - Duration::from_nanos(1)),
+            history.recent_origin_supply_at(&request, timestamp(999_999_999)),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_supply_uses_continuous_transfer_elapsed_and_completion_time() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let started_at = timestamp(100_000_000_000);
+        let first_byte_at = after(started_at, Duration::from_millis(100));
+        let completed_at = after(started_at, Duration::from_secs(10));
+        let observation = CdnObservation::playback_complete(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Some(true),
+        )
+        .with_fresh_timing(Some(started_at), Some(first_byte_at), Some(completed_at));
+
+        history.record_request(&request, &request.url, observation);
+
+        let sample = history
+            .recent_origin_supply_at(&request, after(completed_at, Duration::from_secs(2)))
+            .expect("continuous transfer measurement should be available");
+        assert_eq!(sample.age, Duration::from_secs(2));
+        assert_eq!(sample.throughput_bps, 800);
+        assert_eq!(sample.first_byte_latency, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn missing_or_backwards_transfer_timestamps_do_not_create_fresh_supply() {
+        let request = make_request("https://a.example/video", &[]);
+
+        for (started_at, first_byte_at, completed_at) in [
+            (
+                Some(timestamp(20_000_000_000)),
+                None,
+                Some(timestamp(30_000_000_000)),
+            ),
+            (
+                Some(timestamp(20_000_000_000)),
+                Some(timestamp(19_000_000_000)),
+                Some(timestamp(30_000_000_000)),
+            ),
+            (
+                Some(timestamp(20_000_000_000)),
+                Some(timestamp(21_000_000_000)),
+                Some(timestamp(19_000_000_000)),
+            ),
+            (
+                Some(timestamp(0)),
+                Some(timestamp(1)),
+                Some(timestamp((u128::from(u64::MAX) + 1) * 1_000_000_000)),
+            ),
+        ] {
+            let history = CdnHistory::default();
+            let observation = CdnObservation::playback_complete(
+                100,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                Some(true),
+            )
+            .with_fresh_timing(started_at, first_byte_at, completed_at);
+            history.record_request(&request, &request.url, observation);
+            assert_eq!(
+                history.recent_origin_supply_at(
+                    &request,
+                    completed_at.unwrap_or_else(|| timestamp(1)),
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_transfer_clock_clears_existing_fresh_supply() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let valid_at = timestamp(20_000_000_000);
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(100, Duration::from_secs(1), None),
+            valid_at,
+        );
+        assert!(
+            history
+                .recent_origin_supply_at(&request, after(valid_at, Duration::from_secs(1)))
+                .is_some()
+        );
+
+        let unavailable = CdnObservation::playback_complete(
+            100,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Some(true),
+        )
+        .with_fresh_timing(
+            Some(timestamp(30_000_000_000)),
+            Some(timestamp(30_001_000_000)),
+            None,
+        );
+        history.record_request(&request, &request.url, unavailable);
+
+        assert!(history.lock_state().fresh_origin_supply_clock_failed);
+        assert_eq!(
+            history.recent_origin_supply_at(&request, timestamp(31_000_000_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn backwards_freshness_clock_permanently_withholds_supply() {
+        let history = CdnHistory::default();
+        let request = make_request("https://a.example/video", &[]);
+        let observed_at = timestamp(40_000_000_000);
+        record_measured_at(
+            &history,
+            &request,
+            &request.url,
+            measured_complete(100, Duration::from_secs(1), None),
+            observed_at,
+        );
+        assert!(
+            history
+                .recent_origin_supply_at(&request, after(observed_at, Duration::from_secs(1)))
+                .is_some()
+        );
+        assert_eq!(history.recent_origin_supply_at(&request, observed_at), None);
+        assert_eq!(
+            history.recent_origin_supply_at(&request, after(observed_at, Duration::from_secs(2))),
             None
         );
     }
@@ -1927,7 +2149,7 @@ mod tests {
     fn production_freshness_clock_is_evaluated_after_state_lock_acquisition() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let observed_at = Instant::now();
+        let observed_at = timestamp(2_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -1935,7 +2157,10 @@ mod tests {
             measured_complete(100, Duration::from_secs(1), None),
             observed_at,
         );
-        let decision_time = observed_at + RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1);
+        let decision_time = after(
+            observed_at,
+            RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1),
+        );
 
         assert_eq!(
             history.recent_origin_supply_with_clock(&request, || {
@@ -1943,7 +2168,7 @@ mod tests {
                     history.shared.state.try_lock(),
                     Err(std::sync::TryLockError::WouldBlock)
                 ));
-                decision_time
+                Some(decision_time)
             }),
             None
         );
@@ -1953,13 +2178,21 @@ mod tests {
     fn record_request_uses_the_captured_observation_time() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let observed_at = Instant::now() - RECENT_ORIGIN_SUPPLY_MAX_AGE - Duration::from_secs(1);
+        let observed_at = timestamp(1);
         let mut observation = measured_complete(1_000, Duration::from_secs(1), None);
-        observation.observed_at = observed_at;
+        observation.observed_at = Some(observed_at);
 
         history.record_request(&request, &request.url, observation);
 
-        assert_eq!(history.recent_origin_supply(&request), None);
+        assert_eq!(
+            history.recent_origin_supply_with_clock(&request, || {
+                Some(after(
+                    observed_at,
+                    RECENT_ORIGIN_SUPPLY_MAX_AGE + Duration::from_nanos(1),
+                ))
+            }),
+            None
+        );
         let key = representation_map_key(
             &representation_digest(&request).unwrap(),
             "https://a.example",
@@ -1974,7 +2207,7 @@ mod tests {
     fn delayed_success_cannot_cross_a_failure_tombstone_without_a_prior_sample() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let base = Instant::now();
+        let base = timestamp(3_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -1983,18 +2216,18 @@ mod tests {
                 CdnObservationSource::Playback,
                 CdnObservationOutcome::Timeout,
             ),
-            base + Duration::from_secs(2),
+            after(base, Duration::from_secs(2)),
         );
         record_measured_at(
             &history,
             &request,
             &request.url,
             measured_complete(10_000, Duration::from_secs(1), None),
-            base + Duration::from_secs(1),
+            after(base, Duration::from_secs(1)),
         );
 
         assert_eq!(
-            history.recent_origin_supply_at(&request, base + Duration::from_secs(2)),
+            history.recent_origin_supply_at(&request, after(base, Duration::from_secs(2))),
             None
         );
         let state = history.lock_state();
@@ -2003,7 +2236,7 @@ mod tests {
             "https://a.example",
         );
         let record = &state.fresh_origin_supply[&key];
-        assert_eq!(record.observed_at, base + Duration::from_secs(2));
+        assert_eq!(record.observed_at, after(base, Duration::from_secs(2)));
         assert!(record.outcome.is_invalidation());
     }
 
@@ -2011,8 +2244,8 @@ mod tests {
     fn delayed_failure_and_success_cannot_replace_a_newer_completion() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let base = Instant::now();
-        let completed_at = base + Duration::from_secs(3);
+        let base = timestamp(4_000_000_000);
+        let completed_at = after(base, Duration::from_secs(3));
         record_measured_at(
             &history,
             &request,
@@ -2028,14 +2261,14 @@ mod tests {
                 CdnObservationSource::Playback,
                 CdnObservationOutcome::ConnectionFailure,
             ),
-            base + Duration::from_secs(1),
+            after(base, Duration::from_secs(1)),
         );
         record_measured_at(
             &history,
             &request,
             &request.url,
             measured_complete(9_000, Duration::from_secs(1), None),
-            base + Duration::from_secs(2),
+            after(base, Duration::from_secs(2)),
         );
 
         let sample = history
@@ -2056,7 +2289,7 @@ mod tests {
     fn equal_time_failure_wins_and_equal_time_success_cannot_revive_supply() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let observed_at = Instant::now();
+        let observed_at = timestamp(5_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -2102,7 +2335,7 @@ mod tests {
         let request = make_request("https://a.example/video", &[]);
         let digest = representation_digest(&request).unwrap();
         history.record_at(&request.url, probe(1_000_000, 100), Some(&digest), 100);
-        let observed_at = Instant::now();
+        let observed_at = timestamp(6_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -2119,15 +2352,19 @@ mod tests {
                 CdnObservationSource::Playback,
                 CdnObservationOutcome::Timeout,
             ),
-            observed_at + Duration::from_secs(1),
+            after(observed_at, Duration::from_secs(1)),
         );
         history.lock_state().fresh_origin_supply_eviction_floor =
-            Some(observed_at + Duration::from_secs(1));
+            Some(after(observed_at, Duration::from_secs(1)));
         let serialized = serde_json::to_vec(&history.snapshot()).unwrap();
         let restored_state: HistoryState = serde_json::from_slice(&serialized).unwrap();
         assert!(restored_state.fresh_origin_supply.is_empty());
         assert_eq!(restored_state.fresh_origin_supply_eviction_floor, None);
-        assert!(history.recent_origin_supply(&request).is_some());
+        assert!(
+            history
+                .recent_origin_supply_at(&request, observed_at)
+                .is_some()
+        );
         history.flush().unwrap();
 
         let restored = CdnHistory::load(&path);
@@ -2144,7 +2381,7 @@ mod tests {
         let history = CdnHistory::default();
         let origin = "https://same.example/video";
         let request = make_request("https://primary.example/video", &[origin]);
-        let measured_at = Instant::now();
+        let measured_at = timestamp(7_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -2183,7 +2420,7 @@ mod tests {
     #[test]
     fn recent_origin_supply_bounds_raw_candidates_before_deduplication() {
         let history = CdnHistory::default();
-        let measured_at = Instant::now();
+        let measured_at = timestamp(8_000_000_000);
         let measured_url = "https://measured.example/video";
         let mut request = make_request("https://primary.example/video", &[]);
         request.backup_urls = vec![request.url.clone(); MAX_CANDIDATES - 1];
@@ -2209,7 +2446,7 @@ mod tests {
     fn unmeasured_success_does_not_refresh_and_failure_invalidation_is_sticky() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let measured_at = Instant::now();
+        let measured_at = timestamp(9_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -2219,16 +2456,17 @@ mod tests {
         );
         let mut no_elapsed = measured_complete(2_000, Duration::from_secs(1), None);
         no_elapsed.elapsed = None;
+        no_elapsed.fresh_elapsed = None;
         record_measured_at(
             &history,
             &request,
             &request.url,
             no_elapsed.clone(),
-            measured_at + Duration::from_secs(20),
+            after(measured_at, Duration::from_secs(20)),
         );
         assert_eq!(
             history
-                .recent_origin_supply_at(&request, measured_at + Duration::from_secs(29))
+                .recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(29)))
                 .unwrap()
                 .age,
             Duration::from_secs(29)
@@ -2242,17 +2480,17 @@ mod tests {
                 CdnObservationSource::Playback,
                 CdnObservationOutcome::Timeout,
             ),
-            measured_at + Duration::from_secs(30),
+            after(measured_at, Duration::from_secs(30)),
         );
         record_measured_at(
             &history,
             &request,
             &request.url,
             no_elapsed,
-            measured_at + Duration::from_secs(31),
+            after(measured_at, Duration::from_secs(31)),
         );
         assert_eq!(
-            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(31)),
+            history.recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(31))),
             None
         );
 
@@ -2265,11 +2503,11 @@ mod tests {
                 &request,
                 &request.url,
                 CdnObservation::new(CdnObservationSource::Playback, outcome, 100),
-                measured_at + Duration::from_secs(32),
+                after(measured_at, Duration::from_secs(32)),
             );
         }
         assert_eq!(
-            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(32)),
+            history.recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(32))),
             None
         );
     }
@@ -2285,7 +2523,7 @@ mod tests {
         ] {
             let history = CdnHistory::default();
             let request = make_request("https://a.example/video", &[]);
-            let measured_at = Instant::now();
+            let measured_at = timestamp(10_000_000_000);
             record_measured_at(
                 &history,
                 &request,
@@ -2298,17 +2536,18 @@ mod tests {
                 &request,
                 &request.url,
                 CdnObservation::failure(CdnObservationSource::Playback, outcome),
-                measured_at + Duration::from_secs(1),
+                after(measured_at, Duration::from_secs(1)),
             );
             assert_eq!(
-                history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(1)),
+                history
+                    .recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(1))),
                 None
             );
         }
 
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let measured_at = Instant::now();
+        let measured_at = timestamp(11_000_000_000);
         record_measured_at(
             &history,
             &request,
@@ -2323,10 +2562,10 @@ mod tests {
             &request,
             &request.url,
             range_unsupported,
-            measured_at + Duration::from_secs(1),
+            after(measured_at, Duration::from_secs(1)),
         );
         assert_eq!(
-            history.recent_origin_supply_at(&request, measured_at + Duration::from_secs(1)),
+            history.recent_origin_supply_at(&request, after(measured_at, Duration::from_secs(1))),
             None
         );
     }
@@ -2335,7 +2574,7 @@ mod tests {
     fn recent_origin_supply_validates_measurements_saturates_and_is_bounded() {
         let history = CdnHistory::default();
         let request = make_request("https://a.example/video", &[]);
-        let measured_at = Instant::now();
+        let measured_at = timestamp(12_000_000_000);
         for observation in [
             measured_complete(100, Duration::ZERO, None),
             measured_complete(0, Duration::from_secs(1), None),
@@ -2368,7 +2607,7 @@ mod tests {
                 &distinct,
                 &distinct.url,
                 measured_complete(1, Duration::from_secs(1), None),
-                measured_at + Duration::from_nanos(index as u64),
+                after(measured_at, Duration::from_nanos(index as u64)),
             );
         }
         assert_eq!(
@@ -2381,7 +2620,7 @@ mod tests {
     fn tombstones_count_toward_capacity_and_eviction_blocks_old_revival() {
         let history = CdnHistory::default();
         let target = make_request("https://a.example/video", &[]);
-        let base = Instant::now();
+        let base = timestamp(13_000_000_000);
         record_measured_at(
             &history,
             &target,
@@ -2405,7 +2644,7 @@ mod tests {
                 &request,
                 &request.url,
                 measured_complete(100, Duration::from_secs(1), None),
-                base + Duration::from_secs(index as u64 + 1),
+                after(base, Duration::from_secs(index as u64 + 1)),
             );
         }
         {
@@ -2428,7 +2667,10 @@ mod tests {
             &newest,
             &newest.url,
             measured_complete(100, Duration::from_secs(1), None),
-            base + Duration::from_secs(MAX_FRESH_ORIGIN_SUPPLY_ENTRIES as u64 + 1),
+            after(
+                base,
+                Duration::from_secs(MAX_FRESH_ORIGIN_SUPPLY_ENTRIES as u64 + 1),
+            ),
         );
         {
             let state = history.lock_state();
@@ -2445,7 +2687,7 @@ mod tests {
             &target,
             &target.url,
             measured_complete(10_000, Duration::from_secs(1), None),
-            base - Duration::from_nanos(1),
+            timestamp(12_999_999_999),
         );
         assert_eq!(history.recent_origin_supply_at(&target, base), None);
         assert!(
