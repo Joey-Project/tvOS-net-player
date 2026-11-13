@@ -1,11 +1,11 @@
 ---
 id: 20261113-b46409
 title: Sleep-Aware HLS Freshness and Withdrawal
-status: active
+status: completed
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/hls-freshness-barrier
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/102
 supersedes: []
 superseded_by:
 ---
@@ -58,7 +58,6 @@ superseded_by:
   Failed preparation is not a valid negative latency result.
 
 ## Next Steps
-- Implement the conservative freshness and explicit withdrawal contracts.
 - Consume validated indexes and reader ownership in a later scheduler slice:
   missing near-low/audio first; eligible high before far-low only with a safe
   continuous buffer and fresh adequate origin supply. Inadequate origin keeps
@@ -67,6 +66,7 @@ superseded_by:
   neither prerequisite foundation claims faster upshift.
 
 ## Evidence
+- [Sleep-aware freshness and withdrawal PR #102](https://github.com/Joey-Project/tvOS-net-player/pull/102).
 - [Stable reader binding PR #101](https://github.com/Joey-Project/tvOS-net-player/pull/101).
 - [Playback context PR #100](https://github.com/Joey-Project/tvOS-net-player/pull/100).
 - [Reader binding decisions](2026-11-12-hls-reader-binding-b46408.md).
