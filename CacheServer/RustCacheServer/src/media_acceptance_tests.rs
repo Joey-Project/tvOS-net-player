@@ -5,9 +5,10 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     pin::Pin,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -72,6 +73,10 @@ const TRANSCODE_CASE_FULL_NAME: &str = "media_acceptance_tests::native_transcode
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const MAX_PROBE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHILD_STDERR_BYTES: usize = 128 * 1024;
+const MAX_CHILD_DIAGNOSTIC_STDERR_BYTES: usize = 256;
+const CHILD_REAP_GRACE: Duration = Duration::from_secs(3);
+const CHILD_OUTPUT_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+const CHILD_OUTPUT_ABORT_JOIN_GRACE: Duration = Duration::from_millis(100);
 const MAX_FIXTURE_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_SOURCE_FIXTURE_BYTES: u64 = 60 * 1024 * 1024;
 const MAX_SINGLE_HIGH_FIXTURE_BYTES: u64 = 40 * 1024 * 1024;
@@ -466,16 +471,77 @@ struct FfprobeFormat {
 
 struct ProcessCapture {
     status_code: Option<i32>,
+    status_signal: Option<i32>,
     success: bool,
     stdout: Vec<u8>,
     stdout_truncated: bool,
     stderr_tail: Vec<u8>,
     stderr_truncated: bool,
+    context: ChildProcessContext,
+    elapsed: Duration,
+}
+
+struct ChildProcessContext {
+    phase: String,
+    executable: String,
+    deadline: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum ChildOwnership {
+    Owned,
+    Reaped,
+    IdentityUnverified,
+}
+
+struct OwnedChild {
+    child: Child,
+    ownership: ChildOwnership,
+}
+
+struct ProcessDiagnostic<'a> {
+    context: &'a ChildProcessContext,
+    elapsed: Duration,
+    process_identity_verified: bool,
+    child_cleanup_status: &'a str,
+    child_reaped: bool,
+    child_status: &'a str,
+    stderr_bytes: &'a [u8],
+    stderr_truncated: bool,
+    stdout_capture_status: &'a str,
+    stderr_capture_status: &'a str,
+}
+
+struct ChildTermination {
+    process_identity_verified: bool,
+    cleanup_status: &'static str,
+    kill_requested: bool,
+    kill_error_kind: Option<std::io::ErrorKind>,
+    post_failure_wait: Duration,
+    reaped_status: Option<ExitStatus>,
+    reap_error_kind: Option<std::io::ErrorKind>,
+    reap_attempted: bool,
+    reap_timed_out: bool,
+}
+
+enum ChildWaitOutcome {
+    Exited(ExitStatus),
+    TimedOut(ChildTermination),
+    Failed {
+        error_kind: std::io::ErrorKind,
+        termination: ChildTermination,
+    },
 }
 
 struct CapturedStream {
     bytes: Vec<u8>,
     truncated: bool,
+}
+
+struct CaptureTaskOutcome {
+    capture: Option<CapturedStream>,
+    status: &'static str,
+    error: Option<&'static str>,
 }
 
 struct OriginMedia {
@@ -851,6 +917,7 @@ async fn run_native_case(case: NativeCase) {
     let report_path = env::var_os("LAN_MEDIA_ACCEPTANCE_ARTIFACTS")
         .map(PathBuf::from)
         .map(|directory| directory.join(case.report_name()));
+    let case_started = Instant::now();
 
     let outcome = match report_path.as_ref() {
         Some(path) => {
@@ -858,9 +925,11 @@ async fn run_native_case(case: NativeCase) {
                 Ok(()) => match timeout(case.deadline(), run_case(case, Arc::clone(&report))).await
                 {
                     Ok(result) => result,
-                    Err(_) => {
-                        Err("native acceptance case exceeded its finite case deadline".to_owned())
-                    }
+                    Err(_) => Err(format!(
+                        "native acceptance case exceeded its finite case deadline; phase=case-deadline; elapsed_ms={}; deadline_ms={}; outer_abort_requested=true; inner_child_cleanup=unverified",
+                        case_started.elapsed().as_millis(),
+                        case.deadline().as_millis(),
+                    )),
                 },
                 Err(_) => Err("acceptance artifact directory could not be created".to_owned()),
             }
@@ -916,7 +985,8 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         fixture_duration,
         &report,
     )
-    .await?;
+    .await
+    .map_err(|error| format!("phase=fixture-preparation; {error}"))?;
     enforce_fixture_budget(case, &fixture)?;
 
     let origin_listener = bind_loopback_listener().await?;
@@ -1019,9 +1089,17 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
             false,
             MAX_FIXTURE_BYTES,
             Duration::from_secs(15),
+            "transcoded-output-container-ffprobe",
+        )
+        .await
+        .map_err(|error| format!("phase=transcoded-output-inspection; {error}"))?;
+        let probe_metadata = ffprobe_media(
+            &ffprobe,
+            &cached.path,
+            Duration::from_secs(15),
+            "transcoded-output-inspection-ffprobe",
         )
         .await?;
-        let probe_metadata = ffprobe_media(&ffprobe, &cached.path, Duration::from_secs(15)).await?;
         let output_streams = probe_metadata.streams;
         let video = output_streams
             .iter()
@@ -1147,6 +1225,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         .then(|| temporary_root.join("recovery-observation.trigger"));
     let minimum_steady_play_seconds =
         matches!(case, NativeCase::BufferedContinuity).then_some(MINIMUM_STEADY_PLAY_SECONDS);
+    let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
+    let probe_task_started = Instant::now();
+    let probe_executable = diagnostic_executable_basename(&probe_path);
     let mut probe = AbortTask(Some(tokio::spawn(run_native_probe(
         probe_path,
         master_url,
@@ -1175,17 +1256,25 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         .await;
         if let Err(error) = timeline {
             probe.abort();
-            return Err(error);
+            return Err(format!(
+                "{error}; phase=native-probe; executable={probe_executable}; elapsed_ms={}; deadline_ms={}; probe_task_abort_requested=true; inner_child_cleanup=unverified",
+                probe_task_started.elapsed().as_millis(),
+                probe_timeout.as_millis(),
+            ));
         }
     }
 
-    let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
+    let probe_started = Instant::now();
     let process = timeout(probe_timeout, probe.join()).await;
     let process = match process {
         Ok(result) => result?,
         Err(_) => {
             probe.abort();
-            return Err("native probe exceeded its declared deadline".to_owned());
+            return Err(format!(
+                "native probe exceeded its declared deadline; phase=native-probe; executable={probe_executable}; elapsed_ms={}; deadline_ms={}; outer_abort_requested=true; inner_child_cleanup=unverified",
+                probe_started.elapsed().as_millis(),
+                probe_timeout.as_millis(),
+            ));
         }
     };
     let probe_value = parse_probe_result(process?, &report)?;
@@ -1594,6 +1683,7 @@ async fn generate_and_inspect_fixture(
     command.current_dir(directory).args(arguments);
     let generated = run_process(
         command,
+        "fixture-generation",
         if case.uses_long_profile() {
             LONG_RECOVERY_FFMPEG_TIMEOUT
         } else {
@@ -1604,11 +1694,12 @@ async fn generate_and_inspect_fixture(
     .await?;
     if !generated.success {
         return Err(format!(
-            "FFmpeg fixture generation failed with exit code {}",
+            "FFmpeg fixture generation failed with exit code {}; {}",
             generated
                 .status_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            generated.diagnostics()
         ));
     }
 
@@ -1631,7 +1722,8 @@ async fn generate_and_inspect_fixture(
         high_limit,
         case.uses_long_profile(),
     )
-    .await?;
+    .await
+    .map_err(|error| format!("phase=fixture-inspection-high; {error}"))?;
     let low = if case.uses_progressive_abr() {
         Some(
             inspect_fixture(
@@ -1647,7 +1739,8 @@ async fn generate_and_inspect_fixture(
                 low_limit,
                 case.uses_long_profile(),
             )
-            .await?,
+            .await
+            .map_err(|error| format!("phase=fixture-inspection-low; {error}"))?,
         )
     } else {
         None
@@ -1665,7 +1758,8 @@ async fn generate_and_inspect_fixture(
         audio_limit,
         case.uses_long_profile(),
     )
-    .await?;
+    .await
+    .map_err(|error| format!("phase=fixture-inspection-audio; {error}"))?;
     if let Ok(mut data) = report.lock() {
         data.fixture_media.clear();
         data.fixture_media.push(high.record.clone());
@@ -1777,6 +1871,13 @@ async fn inspect_fixture(
     maximum_bytes: u64,
     long_profile: bool,
 ) -> Result<InspectedMedia, String> {
+    let representation = match expected.representation_code {
+        1 => "high",
+        2 => "low",
+        3 => "audio",
+        _ => "unknown",
+    };
+    let container_phase = format!("fixture-inspection-{representation}-container-ffprobe");
     let mut inspected = inspect_mp4(
         path,
         expected.representation_code,
@@ -1788,8 +1889,10 @@ async fn inspect_fixture(
         } else {
             Duration::from_secs(15)
         },
+        &container_phase,
     )
     .await?;
+    let metadata_phase = format!("fixture-inspection-{representation}-metadata-ffprobe");
     let metadata = ffprobe_media(
         ffprobe,
         path,
@@ -1798,6 +1901,7 @@ async fn inspect_fixture(
         } else {
             Duration::from_secs(15)
         },
+        &metadata_phase,
     )
     .await?;
     let duration = metadata
@@ -1867,6 +1971,7 @@ async fn inspect_mp4(
     require_global_sidx: bool,
     maximum_bytes: u64,
     ffprobe_timeout: Duration,
+    ffprobe_phase: &str,
 ) -> Result<InspectedMedia, String> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -1930,7 +2035,7 @@ async fn inspect_mp4(
     } else {
         None
     };
-    let parsed = ffprobe_media(ffprobe, path, ffprobe_timeout).await?;
+    let parsed = ffprobe_media(ffprobe, path, ffprobe_timeout, ffprobe_phase).await?;
     let video = parsed
         .streams
         .iter()
@@ -2067,6 +2172,7 @@ async fn ffprobe_media(
     ffprobe: &Path,
     path: &Path,
     timeout: Duration,
+    phase: &str,
 ) -> Result<FfprobeOutput, String> {
     let mut command = Command::new(ffprobe);
     command.args([
@@ -2078,12 +2184,19 @@ async fn ffprobe_media(
         "json",
     ]);
     command.arg(path);
-    let output = run_process(command, timeout, 32 * 1024).await?;
+    let output = run_process(command, phase, timeout, 32 * 1024).await?;
     if !output.success || output.stdout_truncated {
-        return Err("ffprobe metadata inspection failed or exceeded its 32 KiB bound".to_owned());
+        return Err(format!(
+            "ffprobe metadata inspection failed or exceeded its 32 KiB bound; {}",
+            output.diagnostics()
+        ));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|_| "ffprobe returned invalid bounded metadata JSON".to_owned())
+    serde_json::from_slice(&output.stdout).map_err(|_| {
+        format!(
+            "ffprobe returned invalid bounded metadata JSON; {}",
+            output.diagnostics()
+        )
+    })
 }
 
 fn video_codec_code(codec: &str) -> u8 {
@@ -2878,6 +2991,7 @@ async fn run_native_probe(
     }
     run_process(
         command,
+        "native-probe",
         Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
         MAX_PROBE_JSON_BYTES,
     )
@@ -2886,23 +3000,29 @@ async fn run_native_probe(
 
 fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
     if process.stdout_truncated || process.stdout.len() > MAX_PROBE_JSON_BYTES {
-        return Err("native probe JSON exceeded its 64 KiB bound".to_owned());
+        return Err(format!(
+            "native probe JSON exceeded its 64 KiB bound; {}",
+            process.diagnostics()
+        ));
     }
-    let mut value: Value = serde_json::from_slice(&process.stdout)
-        .map_err(|_| "native probe did not return bounded JSON".to_owned())?;
+    let mut value: Value = serde_json::from_slice(&process.stdout).map_err(|_| {
+        format!(
+            "native probe did not return bounded JSON; {}",
+            process.diagnostics()
+        )
+    })?;
     redact_probe_json(&mut value);
     if let Ok(mut data) = report.lock() {
         data.probe = Some(value.clone());
     }
     if !process.success {
         return Err(format!(
-            "native probe exited with status {}; bounded_stderr_bytes={}; stderr_truncated={}",
+            "native probe exited with status {}; {}",
             process
                 .status_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned()),
-            process.stderr_tail.len(),
-            process.stderr_truncated
+            process.diagnostics()
         ));
     }
     Ok(value)
@@ -3855,64 +3975,278 @@ fn resolve_playlist_resource(
 
 async fn run_process(
     mut command: Command,
+    phase: &str,
     deadline: Duration,
     max_stdout_bytes: usize,
 ) -> Result<ProcessCapture, String> {
+    let context = ChildProcessContext::new(&command, phase, deadline);
+    let started_at = Instant::now();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| "required local acceptance child process could not be started".to_owned())?;
-    capture_child(&mut child, deadline, max_stdout_bytes).await
+        // OwnedChild handles cancellation only while identity is verified; unconditional drop-kill
+        // could signal a PID after a wait error.
+        .kill_on_drop(false);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let diagnostic = ProcessDiagnostic {
+                context: &context,
+                elapsed: started_at.elapsed(),
+                process_identity_verified: false,
+                child_cleanup_status: "not_started",
+                child_reaped: false,
+                child_status: "unknown",
+                stderr_bytes: &[],
+                stderr_truncated: false,
+                stdout_capture_status: "not_started",
+                stderr_capture_status: "not_started",
+            };
+            let details = format_process_diagnostics(&diagnostic);
+            return Err(format!(
+                "required local acceptance child process could not be started; failure_kind=spawn_error; spawn_error_kind={:?}; {details}",
+                error.kind()
+            ));
+        }
+    };
+    let mut child = OwnedChild::new(child);
+    capture_child(&mut child, context, started_at, max_stdout_bytes).await
 }
 
 async fn capture_child(
-    child: &mut Child,
-    deadline: Duration,
+    child: &mut OwnedChild,
+    context: ChildProcessContext,
+    started_at: Instant,
     max_stdout_bytes: usize,
 ) -> Result<ProcessCapture, String> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "acceptance child stdout pipe was unavailable".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "acceptance child stderr pipe was unavailable".to_owned())?;
-    let stdout_task = tokio::spawn(capture_stream(stdout, max_stdout_bytes, false));
-    let stderr_task = tokio::spawn(capture_stream(stderr, MAX_CHILD_STDERR_BYTES, true));
-    let wait_result = timeout(deadline, child.wait()).await;
-    let timed_out = wait_result.is_err();
-    let status = match wait_result {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(_)) => None,
-        Err(_) => {
-            let _ = child.start_kill();
-            timeout(Duration::from_secs(3), child.wait())
-                .await
-                .ok()
-                .and_then(Result::ok)
+    let stdout = match child.child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let termination = terminate_and_reap(child).await;
+            let child_status = termination
+                .reaped_status
+                .as_ref()
+                .map(|status| child_status_label(status.code(), status.signal()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let diagnostic = ProcessDiagnostic {
+                context: &context,
+                elapsed: started_at.elapsed(),
+                process_identity_verified: termination.process_identity_verified,
+                child_cleanup_status: termination.cleanup_status,
+                child_reaped: termination.reaped_status.is_some(),
+                child_status: &child_status,
+                stderr_bytes: &[],
+                stderr_truncated: false,
+                stdout_capture_status: "not_started",
+                stderr_capture_status: "not_started",
+            };
+            return Err(format_child_wait_failure(
+                "acceptance child stdout pipe was unavailable",
+                "capture_setup",
+                None,
+                &termination,
+                &diagnostic,
+            ));
         }
     };
-    let stdout = finish_capture_task(stdout_task).await?;
-    let stderr = finish_capture_task(stderr_task).await?;
-    if timed_out {
-        return Err("acceptance child process exceeded its finite deadline".to_owned());
+    let stderr = match child.child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let termination = terminate_and_reap(child).await;
+            let child_status = termination
+                .reaped_status
+                .as_ref()
+                .map(|status| child_status_label(status.code(), status.signal()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let diagnostic = ProcessDiagnostic {
+                context: &context,
+                elapsed: started_at.elapsed(),
+                process_identity_verified: termination.process_identity_verified,
+                child_cleanup_status: termination.cleanup_status,
+                child_reaped: termination.reaped_status.is_some(),
+                child_status: &child_status,
+                stderr_bytes: &[],
+                stderr_truncated: false,
+                stdout_capture_status: "not_started",
+                stderr_capture_status: "not_started",
+            };
+            return Err(format_child_wait_failure(
+                "acceptance child stderr pipe was unavailable",
+                "capture_setup",
+                None,
+                &termination,
+                &diagnostic,
+            ));
+        }
+    };
+    let stdout_task = tokio::spawn(capture_stream(stdout, max_stdout_bytes, false));
+    let stderr_task = tokio::spawn(capture_stream(stderr, MAX_CHILD_STDERR_BYTES, true));
+    let wait_outcome = wait_for_child(child, context.deadline).await;
+    let stdout_capture = finish_capture_task(stdout_task).await;
+    let stderr_capture = finish_capture_task(stderr_task).await;
+    let elapsed = started_at.elapsed();
+    let stdout_status = stdout_capture.status;
+    let stderr_status = stderr_capture.status;
+    let stderr_bytes = stderr_capture
+        .capture
+        .as_ref()
+        .map(|capture| capture.bytes.as_slice())
+        .unwrap_or_default();
+    let stderr_truncated = stderr_capture
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.truncated);
+
+    match wait_outcome {
+        ChildWaitOutcome::Exited(status) => {
+            let child_status = child_status_label(status.code(), status.signal());
+            let details = format_process_diagnostics(&ProcessDiagnostic {
+                context: &context,
+                elapsed,
+                process_identity_verified: true,
+                child_cleanup_status: "reaped",
+                child_reaped: true,
+                child_status: &child_status,
+                stderr_bytes,
+                stderr_truncated,
+                stdout_capture_status: stdout_status,
+                stderr_capture_status: stderr_status,
+            });
+            if let Some(error) = stdout_capture.error.or(stderr_capture.error) {
+                return Err(format!("{error}; {details}"));
+            }
+            let stdout = stdout_capture
+                .capture
+                .ok_or_else(|| format!("acceptance child output reader task failed; {details}"))?;
+            let stderr = stderr_capture
+                .capture
+                .ok_or_else(|| format!("acceptance child output reader task failed; {details}"))?;
+            Ok(ProcessCapture {
+                status_code: status.code(),
+                status_signal: status.signal(),
+                success: status.success(),
+                stdout: stdout.bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_tail: stderr.bytes,
+                stderr_truncated: stderr.truncated,
+                context,
+                elapsed,
+            })
+        }
+        ChildWaitOutcome::TimedOut(termination) => {
+            let child_status = termination
+                .reaped_status
+                .as_ref()
+                .map(|status| child_status_label(status.code(), status.signal()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let diagnostic = ProcessDiagnostic {
+                context: &context,
+                elapsed,
+                process_identity_verified: termination.process_identity_verified,
+                child_cleanup_status: termination.cleanup_status,
+                child_reaped: termination.reaped_status.is_some(),
+                child_status: &child_status,
+                stderr_bytes,
+                stderr_truncated,
+                stdout_capture_status: stdout_status,
+                stderr_capture_status: stderr_status,
+            };
+            Err(format_child_wait_failure(
+                "acceptance child process exceeded its finite deadline",
+                "timeout",
+                None,
+                &termination,
+                &diagnostic,
+            ))
+        }
+        ChildWaitOutcome::Failed {
+            error_kind,
+            termination,
+        } => {
+            let child_status = termination
+                .reaped_status
+                .as_ref()
+                .map(|status| child_status_label(status.code(), status.signal()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let diagnostic = ProcessDiagnostic {
+                context: &context,
+                elapsed,
+                process_identity_verified: termination.process_identity_verified,
+                child_cleanup_status: termination.cleanup_status,
+                child_reaped: termination.reaped_status.is_some(),
+                child_status: &child_status,
+                stderr_bytes,
+                stderr_truncated,
+                stdout_capture_status: stdout_status,
+                stderr_capture_status: stderr_status,
+            };
+            Err(format_child_wait_failure(
+                "acceptance child process wait failed",
+                "wait_error",
+                Some(error_kind),
+                &termination,
+                &diagnostic,
+            ))
+        }
     }
-    if status.is_none() {
-        return Err("acceptance child process could not be reaped".to_owned());
+}
+
+async fn wait_for_child(child: &mut OwnedChild, deadline: Duration) -> ChildWaitOutcome {
+    match timeout(deadline, child.child.wait()).await {
+        Ok(wait_result) => {
+            child.ownership.observe_wait_result(&wait_result);
+            match wait_result {
+                Ok(status) => ChildWaitOutcome::Exited(status),
+                Err(error) => child_wait_error(error.kind()),
+            }
+        }
+        Err(_) => ChildWaitOutcome::TimedOut(terminate_and_reap(child).await),
     }
-    Ok(ProcessCapture {
-        status_code: status.as_ref().and_then(|status| status.code()),
-        success: status.as_ref().is_some_and(|status| status.success()),
-        stdout: stdout.bytes,
-        stdout_truncated: stdout.truncated,
-        stderr_tail: stderr.bytes,
-        stderr_truncated: stderr.truncated,
-    })
+}
+
+fn child_wait_error(error_kind: std::io::ErrorKind) -> ChildWaitOutcome {
+    ChildWaitOutcome::Failed {
+        error_kind,
+        termination: ChildTermination::unverified_after_wait_error(),
+    }
+}
+
+async fn terminate_and_reap(child: &mut OwnedChild) -> ChildTermination {
+    let kill_error_kind = child.child.start_kill().err().map(|error| error.kind());
+    let wait_started = Instant::now();
+    let (reaped_status, reap_error_kind, reap_timed_out) =
+        match timeout(CHILD_REAP_GRACE, child.child.wait()).await {
+            Ok(wait_result) => {
+                child.ownership.observe_wait_result(&wait_result);
+                match wait_result {
+                    Ok(status) => (Some(status), None, false),
+                    Err(error) => (None, Some(error.kind()), false),
+                }
+            }
+            Err(_) => (None, None, true),
+        };
+    let cleanup_status = if reaped_status.is_some() {
+        "reaped"
+    } else if reap_timed_out {
+        "reap_timed_out"
+    } else if reap_error_kind.is_some() {
+        "reap_error"
+    } else {
+        "unreaped_unknown"
+    };
+    ChildTermination {
+        process_identity_verified: child.ownership.process_identity_verified(),
+        cleanup_status,
+        kill_requested: true,
+        kill_error_kind,
+        post_failure_wait: wait_started.elapsed(),
+        reaped_status,
+        reap_error_kind,
+        reap_attempted: true,
+        reap_timed_out,
+    }
 }
 
 async fn capture_stream<R>(
@@ -3962,13 +4296,496 @@ where
 }
 
 async fn finish_capture_task(
-    task: JoinHandle<std::io::Result<CapturedStream>>,
-) -> Result<CapturedStream, String> {
-    timeout(Duration::from_secs(3), task)
-        .await
-        .map_err(|_| "acceptance child output reader exceeded its deadline".to_owned())?
-        .map_err(|_| "acceptance child output reader task failed".to_owned())?
-        .map_err(|_| "acceptance child output stream failed".to_owned())
+    mut task: JoinHandle<std::io::Result<CapturedStream>>,
+) -> CaptureTaskOutcome {
+    match timeout(CHILD_OUTPUT_DRAIN_DEADLINE, &mut task).await {
+        Ok(Ok(Ok(capture))) => CaptureTaskOutcome {
+            capture: Some(capture),
+            status: "drained",
+            error: None,
+        },
+        Ok(Ok(Err(_))) => CaptureTaskOutcome {
+            capture: None,
+            status: "stream_error",
+            error: Some("acceptance child output stream failed"),
+        },
+        Ok(Err(_)) => CaptureTaskOutcome {
+            capture: None,
+            status: "reader_task_failed",
+            error: Some("acceptance child output reader task failed"),
+        },
+        Err(_) => {
+            task.abort();
+            let abort_joined = timeout(CHILD_OUTPUT_ABORT_JOIN_GRACE, &mut task)
+                .await
+                .is_ok();
+            CaptureTaskOutcome {
+                capture: None,
+                status: if abort_joined {
+                    "drain_deadline_abort_joined"
+                } else {
+                    "drain_deadline_abort_pending"
+                },
+                error: Some("acceptance child output reader exceeded its deadline"),
+            }
+        }
+    }
+}
+
+impl ChildProcessContext {
+    fn new(command: &Command, phase: &str, deadline: Duration) -> Self {
+        let program = command.as_std().get_program();
+        let executable = diagnostic_executable_basename(Path::new(program));
+        Self {
+            phase: diagnostic_identifier(phase, 96),
+            executable,
+            deadline,
+        }
+    }
+}
+
+impl ChildTermination {
+    fn unverified_after_wait_error() -> Self {
+        Self {
+            process_identity_verified: false,
+            cleanup_status: "not_attempted_identity_unverified",
+            kill_requested: false,
+            kill_error_kind: None,
+            post_failure_wait: Duration::ZERO,
+            reaped_status: None,
+            reap_error_kind: None,
+            reap_attempted: false,
+            reap_timed_out: false,
+        }
+    }
+}
+
+impl ChildOwnership {
+    fn observe_wait_result(&mut self, result: &std::io::Result<ExitStatus>) {
+        *self = match result {
+            Ok(_) => Self::Reaped,
+            Err(_) => Self::IdentityUnverified,
+        };
+    }
+
+    fn should_start_kill_on_drop(self) -> bool {
+        matches!(self, Self::Owned)
+    }
+
+    fn process_identity_verified(self) -> bool {
+        !matches!(self, Self::IdentityUnverified)
+    }
+}
+
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            ownership: ChildOwnership::Owned,
+        }
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if self.ownership.should_start_kill_on_drop() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+impl ProcessCapture {
+    fn diagnostics(&self) -> String {
+        let child_status = child_status_label(self.status_code, self.status_signal);
+        format_process_diagnostics(&ProcessDiagnostic {
+            context: &self.context,
+            elapsed: self.elapsed,
+            process_identity_verified: true,
+            child_cleanup_status: "reaped",
+            child_reaped: true,
+            child_status: &child_status,
+            stderr_bytes: &self.stderr_tail,
+            stderr_truncated: self.stderr_truncated,
+            stdout_capture_status: "drained",
+            stderr_capture_status: "drained",
+        })
+    }
+}
+
+fn diagnostic_executable_basename(path: &Path) -> String {
+    let basename = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "unknown".into());
+    diagnostic_identifier(&basename, 64)
+}
+
+fn diagnostic_identifier(value: &str, maximum_chars: usize) -> String {
+    let identifier = value
+        .chars()
+        .take(maximum_chars)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if identifier.is_empty() {
+        "unknown".to_owned()
+    } else {
+        identifier
+    }
+}
+
+fn child_status_label(exit_code: Option<i32>, signal: Option<i32>) -> String {
+    match (exit_code, signal) {
+        (Some(code), _) => format!("exit:{code}"),
+        (None, Some(signal)) => format!("signal:{signal}"),
+        (None, None) => "unknown".to_owned(),
+    }
+}
+
+fn format_process_diagnostics(diagnostic: &ProcessDiagnostic<'_>) -> String {
+    let process = format_process_diagnostics_prefix(diagnostic);
+    let stderr = format_stderr_diagnostics(diagnostic.stderr_bytes, diagnostic.stderr_truncated);
+    format!("{process}; {stderr}")
+}
+
+fn format_process_diagnostics_prefix(diagnostic: &ProcessDiagnostic<'_>) -> String {
+    format!(
+        "phase={}; executable={}; elapsed_ms={}; deadline_ms={}; process_identity_verified={}; child_cleanup={}; child_reaped={}; child_status={}; stdout_capture={}; stderr_capture={}",
+        diagnostic.context.phase,
+        diagnostic.context.executable,
+        diagnostic.elapsed.as_millis(),
+        diagnostic.context.deadline.as_millis(),
+        diagnostic.process_identity_verified,
+        diagnostic.child_cleanup_status,
+        diagnostic.child_reaped,
+        diagnostic.child_status,
+        diagnostic.stdout_capture_status,
+        diagnostic.stderr_capture_status,
+    )
+}
+
+fn format_stderr_diagnostics(stderr_bytes: &[u8], stderr_truncated: bool) -> String {
+    let (stderr_tail, stderr_tail_truncated) = sanitize_stderr_tail(stderr_bytes);
+    format!(
+        "stderr_bytes={}; stderr_truncated={stderr_truncated}; stderr_tail_truncated={stderr_tail_truncated}; stderr_tail=\"{stderr_tail}\"",
+        stderr_bytes.len(),
+    )
+}
+
+fn format_child_wait_failure(
+    message: &str,
+    failure_kind: &str,
+    wait_error_kind: Option<std::io::ErrorKind>,
+    termination: &ChildTermination,
+    diagnostic: &ProcessDiagnostic<'_>,
+) -> String {
+    let process = format_process_diagnostics_prefix(diagnostic);
+    let stderr = format_stderr_diagnostics(diagnostic.stderr_bytes, diagnostic.stderr_truncated);
+    let wait_error = wait_error_kind
+        .map(|kind| format!("wait_error_kind={kind:?}; "))
+        .unwrap_or_default();
+    let wait_field = match failure_kind {
+        "timeout" => "post_timeout_wait_ms",
+        "wait_error" => "post_wait_ms",
+        _ => "post_failure_wait_ms",
+    };
+    format!(
+        "{message}; failure_kind={failure_kind}; {wait_error}{process}; kill_requested={}; kill_failed={}; kill_error_kind={:?}; {wait_field}={}; reap_attempted={}; reap_timed_out={}; reap_error_kind={:?}; {stderr}",
+        termination.kill_requested,
+        termination.kill_error_kind.is_some(),
+        termination.kill_error_kind,
+        termination.post_failure_wait.as_millis(),
+        termination.reap_attempted,
+        termination.reap_timed_out,
+        termination.reap_error_kind,
+    )
+}
+
+fn sanitize_stderr_tail(stderr_bytes: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(stderr_bytes);
+    let mut sanitized = String::new();
+    for line in text.lines() {
+        if !sanitized.is_empty() {
+            sanitized.push(' ');
+        }
+        let lowercase = line.to_ascii_lowercase();
+        let contains_sensitive_value = [
+            "http://",
+            "https://",
+            "ftp://",
+            "token=",
+            "access_token",
+            "refresh_token",
+            "password",
+            "authorization",
+            "cookie",
+            "credential",
+            "secret",
+            "api_key",
+            "api-key",
+            "path=",
+            "filename=",
+        ]
+        .iter()
+        .any(|marker| lowercase.contains(marker));
+        let contains_absolute_path = line.split_whitespace().any(|token| {
+            token
+                .trim_matches(|character: char| {
+                    matches!(character, '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';')
+                })
+                .starts_with('/')
+        });
+        if contains_sensitive_value || contains_absolute_path {
+            sanitized.push_str("[redacted]");
+        } else {
+            sanitized.extend(line.chars().map(|character| {
+                if character.is_ascii_graphic() && !matches!(character, '"' | '\\' | ';') {
+                    character
+                } else {
+                    ' '
+                }
+            }));
+        }
+    }
+    let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = sanitized.len() > MAX_CHILD_DIAGNOSTIC_STDERR_BYTES;
+    let start = sanitized
+        .len()
+        .saturating_sub(MAX_CHILD_DIAGNOSTIC_STDERR_BYTES);
+    (sanitized[start..].to_owned(), truncated)
+}
+
+#[cfg(test)]
+mod child_process_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn owned_child_stays_cancellable_until_successful_reap() {
+        let mut ownership = ChildOwnership::Owned;
+        assert!(ownership.should_start_kill_on_drop());
+
+        let successful_wait = Ok(ExitStatus::from_raw(0));
+        ownership.observe_wait_result(&successful_wait);
+
+        assert!(matches!(ownership, ChildOwnership::Reaped));
+        assert!(!ownership.should_start_kill_on_drop());
+        assert!(ownership.process_identity_verified());
+    }
+
+    #[test]
+    fn wait_error_revokes_child_drop_signaling_immediately() {
+        let mut ownership = ChildOwnership::Owned;
+        let wait_error = Err(std::io::Error::other("simulated wait error"));
+        ownership.observe_wait_result(&wait_error);
+
+        assert!(matches!(ownership, ChildOwnership::IdentityUnverified));
+        assert!(!ownership.should_start_kill_on_drop());
+        assert!(!ownership.process_identity_verified());
+    }
+
+    fn context() -> ChildProcessContext {
+        ChildProcessContext {
+            phase: "fixture-inspection-low-metadata-ffprobe".to_owned(),
+            executable: "ffprobe".to_owned(),
+            deadline: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn phase_identity_reports_only_the_executable_basename() {
+        let mut command = Command::new("/private/tmp/acceptance-tools/ffprobe");
+        command.arg("https://user:password@example.invalid/private?token=secret");
+        let context = ChildProcessContext::new(
+            &command,
+            "fixture-inspection-low-metadata-ffprobe",
+            Duration::from_secs(30),
+        );
+        let diagnostic = ProcessDiagnostic {
+            context: &context,
+            elapsed: Duration::from_millis(123),
+            process_identity_verified: false,
+            child_cleanup_status: "not_started",
+            child_reaped: false,
+            child_status: "unknown",
+            stderr_bytes: &[],
+            stderr_truncated: false,
+            stdout_capture_status: "not_started",
+            stderr_capture_status: "not_started",
+        };
+        let diagnostics = format_process_diagnostics(&diagnostic);
+
+        assert!(diagnostics.contains("phase=fixture-inspection-low-metadata-ffprobe"));
+        assert!(diagnostics.contains("executable=ffprobe"));
+        assert!(!diagnostics.contains("/private/tmp"));
+        assert!(!diagnostics.contains("example.invalid"));
+        assert!(!diagnostics.contains("secret"));
+    }
+
+    #[test]
+    fn timeout_reports_elapsed_deadline_kill_and_uncertain_reap() {
+        let termination = ChildTermination {
+            process_identity_verified: true,
+            cleanup_status: "reap_timed_out",
+            kill_requested: true,
+            kill_error_kind: None,
+            post_failure_wait: Duration::from_millis(37),
+            reaped_status: None,
+            reap_error_kind: None,
+            reap_attempted: true,
+            reap_timed_out: true,
+        };
+        let context = context();
+        let diagnostic = ProcessDiagnostic {
+            context: &context,
+            elapsed: Duration::from_millis(1_234),
+            process_identity_verified: termination.process_identity_verified,
+            child_cleanup_status: termination.cleanup_status,
+            child_reaped: false,
+            child_status: "unknown",
+            stderr_bytes: &[],
+            stderr_truncated: false,
+            stdout_capture_status: "drained",
+            stderr_capture_status: "drained",
+        };
+        let diagnostics = format_child_wait_failure(
+            "acceptance child process exceeded its finite deadline",
+            "timeout",
+            None,
+            &termination,
+            &diagnostic,
+        );
+
+        assert!(diagnostics.contains("failure_kind=timeout"));
+        assert!(diagnostics.contains("elapsed_ms=1234"));
+        assert!(diagnostics.contains("deadline_ms=30000"));
+        assert!(diagnostics.contains("kill_requested=true"));
+        assert!(diagnostics.contains("kill_failed=false"));
+        assert!(diagnostics.contains("post_timeout_wait_ms=37"));
+        assert!(diagnostics.contains("child_reaped=false"));
+        assert!(diagnostics.contains("reap_attempted=true"));
+        assert!(diagnostics.contains("reap_timed_out=true"));
+    }
+
+    #[test]
+    fn wait_error_marks_identity_unverified_without_kill_or_reap() {
+        let ChildWaitOutcome::Failed {
+            error_kind,
+            termination,
+        } = child_wait_error(std::io::ErrorKind::Other)
+        else {
+            panic!("wait error must remain a failure");
+        };
+        let context = context();
+        let diagnostic = ProcessDiagnostic {
+            context: &context,
+            elapsed: Duration::from_millis(45),
+            process_identity_verified: termination.process_identity_verified,
+            child_cleanup_status: termination.cleanup_status,
+            child_reaped: false,
+            child_status: "unknown",
+            stderr_bytes: &[],
+            stderr_truncated: false,
+            stdout_capture_status: "drained",
+            stderr_capture_status: "drained",
+        };
+        let diagnostics = format_child_wait_failure(
+            "acceptance child process wait failed",
+            "wait_error",
+            Some(std::io::ErrorKind::Other),
+            &termination,
+            &diagnostic,
+        );
+
+        assert!(diagnostics.contains("failure_kind=wait_error"));
+        assert_eq!(error_kind, std::io::ErrorKind::Other);
+        assert!(diagnostics.contains("wait_error_kind=Other"));
+        assert!(diagnostics.contains("post_wait_ms=0"));
+        assert!(!diagnostics.contains("post_timeout_wait_ms"));
+        assert!(diagnostics.contains("process_identity_verified=false"));
+        assert!(diagnostics.contains("child_cleanup=not_attempted_identity_unverified"));
+        assert!(diagnostics.contains("kill_requested=false"));
+        assert!(diagnostics.contains("kill_failed=false"));
+        assert!(diagnostics.contains("reap_attempted=false"));
+        assert!(diagnostics.contains("child_reaped=false"));
+    }
+
+    #[test]
+    fn timeout_reports_reaped_signal_status_and_failed_kill() {
+        let termination = ChildTermination {
+            process_identity_verified: true,
+            cleanup_status: "reaped",
+            kill_requested: true,
+            kill_error_kind: Some(std::io::ErrorKind::PermissionDenied),
+            post_failure_wait: Duration::from_millis(2),
+            reaped_status: Some(ExitStatus::from_raw(9)),
+            reap_error_kind: None,
+            reap_attempted: true,
+            reap_timed_out: false,
+        };
+        let context = context();
+        let diagnostic = ProcessDiagnostic {
+            context: &context,
+            elapsed: Duration::from_millis(30_100),
+            process_identity_verified: termination.process_identity_verified,
+            child_cleanup_status: termination.cleanup_status,
+            child_reaped: true,
+            child_status: "signal:9",
+            stderr_bytes: &[],
+            stderr_truncated: false,
+            stdout_capture_status: "drained",
+            stderr_capture_status: "drained",
+        };
+        let diagnostics = format_child_wait_failure(
+            "acceptance child process exceeded its finite deadline",
+            "timeout",
+            None,
+            &termination,
+            &diagnostic,
+        );
+
+        assert!(diagnostics.contains("kill_failed=true"));
+        assert!(diagnostics.contains("kill_error_kind=Some(PermissionDenied)"));
+        assert!(diagnostics.contains("child_reaped=true"));
+        assert!(diagnostics.contains("child_status=signal:9"));
+        assert!(diagnostics.contains("reap_timed_out=false"));
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_is_bounded_truncated_and_sanitized() {
+        let input = vec![b'x'; MAX_CHILD_DIAGNOSTIC_STDERR_BYTES * 2 + 64];
+        let captured = capture_stream(&input[..], 512, true).await.unwrap();
+        let context = context();
+        let diagnostic = ProcessDiagnostic {
+            context: &context,
+            elapsed: Duration::from_millis(10),
+            process_identity_verified: true,
+            child_cleanup_status: "reaped",
+            child_reaped: true,
+            child_status: "exit:1",
+            stderr_bytes: &captured.bytes,
+            stderr_truncated: captured.truncated,
+            stdout_capture_status: "drained",
+            stderr_capture_status: "drained",
+        };
+        let diagnostics = format_process_diagnostics(&diagnostic);
+        let (redacted, _) = sanitize_stderr_tail(
+            b"failed /private/tmp/fixture https://user:pass@example.invalid/?token=secret",
+        );
+
+        assert_eq!(captured.bytes.len(), 512);
+        assert!(captured.truncated);
+        assert!(diagnostics.contains("stderr_truncated=true"));
+        assert!(diagnostics.contains("stderr_tail_truncated=true"));
+        assert!(diagnostics.len() < 900);
+        assert!(!redacted.contains("private"));
+        assert!(!redacted.contains("example.invalid"));
+        assert!(!redacted.contains("secret"));
+    }
 }
 
 fn required_executable(name: &str) -> Result<PathBuf, String> {
