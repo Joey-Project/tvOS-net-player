@@ -105,6 +105,7 @@ public final class HLSPlaybackContextReportingService {
         let owner: HLSPlaybackContextOwner
         let contextID: String
         var retirementID: UUID?
+        var closeAcknowledged = false
     }
 
     private struct RetirementBarrier {
@@ -149,6 +150,8 @@ public final class HLSPlaybackContextReportingService {
     private var retirementBarrier: RetirementBarrier?
     private var closeAttempt: CloseAttempt?
     private var legacyCloseReceipt: LegacyCloseReceipt?
+    private var legacyCloseDebt: LegacyCloseReceipt?
+    private var legacyUnknownOpenOutcome = false
     private var lastMonotonicNowNanoseconds: UInt64?
 
     public convenience init(
@@ -201,8 +204,26 @@ public final class HLSPlaybackContextReportingService {
         guard operationID == nil else {
             throw HLSPlaybackContextReportingError.operationInProgress
         }
+        guard legacyCloseDebt == nil else {
+            throw HLSPlaybackContextReportingError.operationInProgress
+        }
+        if let legacyCloseReceipt, legacyCloseReceipt.outcome != .acknowledged {
+            guard let closeAttempt,
+                closeAttempt.contextID.utf8.elementsEqual(legacyCloseReceipt.contextID.utf8)
+            else {
+                throw HLSPlaybackContextReportingError.operationInProgress
+            }
+        }
+        if let activeContext, let closeAttempt,
+            !closeAttempt.contextID.utf8.elementsEqual(activeContext.ticket.contextID.utf8)
+        {
+            throw HLSPlaybackContextReportingError.operationInProgress
+        }
         if let retirementBarrier {
-            guard retirementBarrier.outcome == .acknowledged, closeAttempt == nil else {
+            guard retirementBarrier.outcome == .acknowledged,
+                !retirementBarrier.unknownRemoteAuthority,
+                closeAttempt == nil
+            else {
                 throw HLSPlaybackContextReportingError.operationInProgress
             }
             self.retirementBarrier = nil
@@ -326,16 +347,17 @@ public final class HLSPlaybackContextReportingService {
             )
         } catch {
             if let openedTicket {
+                let updateWasAlreadyClosed = updateOperation(operation)?.closeAcknowledged == true
                 let flightRetirementID = retirementID(for: operation)
                 clearInFlightOperation(operation)
                 if let flightRetirementID {
                     if retirementBarrier?.id == flightRetirementID {
                         _ = await resolveRetirement(flightRetirementID, allowExplicitRetry: false)
                     }
-                } else if revision == operation, operationID == operation {
-                    activeContext = nil
-                    await closeBestEffort(openedTicket.contextID)
-                } else {
+                } else if !updateWasAlreadyClosed {
+                    if revision == operation, operationID == operation {
+                        activeContext = nil
+                    }
                     await closeBestEffort(openedTicket.contextID)
                 }
             } else if let opening = openOperation(operation) {
@@ -343,7 +365,7 @@ public final class HLSPlaybackContextReportingService {
                 if let retirementID = opening.retirementID, retirementBarrier?.id == retirementID {
                     updateRetirement(retirementID) {
                         $0.pendingOpenOperation = nil
-                        $0.unknownRemoteAuthority = false
+                        $0.unknownRemoteAuthority = true
                         $0.outcome = .unconfirmed(.openOutcomeUnknown)
                     }
                 } else if revision == operation, operationID == operation {
@@ -357,8 +379,11 @@ public final class HLSPlaybackContextReportingService {
                     updateRetirement(barrier.id) {
                         $0.outcome = .unconfirmed(.openOutcomeUnknown)
                     }
+                } else {
+                    recordUnknownOpenOutcome()
                 }
             } else if let failedUpdate = updateOperation(operation) {
+                let updateWasAlreadyClosed = failedUpdate.closeAcknowledged
                 clearInFlightOperation(operation)
                 if let retirementID = failedUpdate.retirementID, retirementBarrier?.id == retirementID {
                     _ = await resolveRetirement(retirementID, allowExplicitRetry: false)
@@ -371,7 +396,7 @@ public final class HLSPlaybackContextReportingService {
                         pendingOpenOperation: nil
                     )
                     _ = await resolveRetirement(barrier.id, allowExplicitRetry: false)
-                } else {
+                } else if !updateWasAlreadyClosed {
                     await closeBestEffort(failedUpdate.contextID)
                 }
             }
@@ -479,6 +504,7 @@ public final class HLSPlaybackContextReportingService {
         } catch {
             let failedUpdate = updateOperation(operation)
             let flightRetirementID = failedUpdate?.retirementID
+            let updateWasAlreadyClosed = failedUpdate?.closeAcknowledged == true
             let operationStillOwnsContext =
                 revision == context.revision && operationID == operation
                 && activeContext?.ticket.contextID.utf8.elementsEqual(context.ticket.contextID.utf8) == true
@@ -491,9 +517,7 @@ public final class HLSPlaybackContextReportingService {
                 if retirementBarrier?.id == flightRetirementID {
                     _ = await resolveRetirement(flightRetirementID, allowExplicitRetry: false)
                 }
-            } else if operationStillOwnsContext {
-                await closeBestEffort(context.ticket.contextID)
-            } else {
+            } else if !updateWasAlreadyClosed {
                 await closeBestEffort(context.ticket.contextID)
             }
             throw sanitized(error)
@@ -528,93 +552,143 @@ public final class HLSPlaybackContextReportingService {
     /// Waits briefly for exact-ID server confirmation; a timeout or unknown ID is never an acknowledgment.
     public func withdrawAndConfirmRemoteRemoval() async -> HLSPlaybackContextWithdrawalOutcome {
         let previousContext = activeContext
-        let opening = inFlightOpen
-        let updating = inFlightUpdate
-        let hasLegacyOperation = legacyInFlightOpen != nil || legacyInFlightUpdate != nil
+        let currentOperation = operationID
+        let opening =
+            openOperation(currentOperation)
+            ?? (currentOperation == nil ? inFlightOpen ?? legacyInFlightOpen : nil)
+        let updating = updateOperation(currentOperation)
+        let targetOpenOperation =
+            retirementBarrier?.pendingOpenOperation
+            ?? (previousContext == nil ? opening?.operation : nil)
+        let hasOtherPendingOpen = [inFlightOpen, legacyInFlightOpen].contains { candidate in
+            guard let candidate, candidate.contextID == nil else { return false }
+            return candidate.operation != targetOpenOperation
+        }
+        let unknownOpenOutcome = legacyUnknownOpenOutcome || hasOtherPendingOpen
         revision = UUID()
         operationID = nil
         activeContext = nil
 
         if let retirementBarrier {
-            if let opening, opening.retirementID == nil {
-                inFlightOpen?.retirementID = retirementBarrier.id
+            if retirementBarrier.outcome == .acknowledged,
+                closeAttempt == nil,
+                let legacyCloseDebt
+            {
+                self.retirementBarrier = nil
+                let debtBarrier = ensureRetirement(
+                    owner: nil,
+                    contextID: legacyCloseDebt.contextID,
+                    pendingOpenOperation: nil,
+                    unknownRemoteAuthority: unknownOpenOutcome
+                )
+                let outcome = await resolveRetirement(debtBarrier.id, allowExplicitRetry: true)
+                return accountingForKnownCloseDebt(outcome)
             }
-            if let updating, updating.retirementID == nil {
-                inFlightUpdate?.retirementID = retirementBarrier.id
+            if unknownOpenOutcome {
+                updateRetirement(retirementBarrier.id) { $0.unknownRemoteAuthority = true }
             }
-            return await resolveRetirement(retirementBarrier.id, allowExplicitRetry: true)
-        }
-
-        if hasLegacyOperation {
-            let barrier = ensureRetirement(
-                owner: nil,
-                contextID: nil,
-                pendingOpenOperation: nil,
-                unknownRemoteAuthority: true
-            )
-            updateRetirement(barrier.id) {
-                $0.outcome = .unconfirmed(.openOutcomeUnknown)
-            }
-            return .unconfirmed(.openOutcomeUnknown)
+            if let opening { setRetirementID(retirementBarrier.id, forOpenOperation: opening.operation) }
+            if let updating { setRetirementID(retirementBarrier.id, forUpdateOperation: updating.operation) }
+            let outcome = await resolveRetirement(retirementBarrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
         }
 
         if let previousContext {
+            _ = preserveLegacyCloseReceipt(except: previousContext.ticket.contextID)
             let barrier = ensureRetirement(
                 owner: previousContext.owner,
                 contextID: previousContext.ticket.contextID,
-                pendingOpenOperation: nil
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
-            if let updating {
-                inFlightUpdate?.retirementID = barrier.id
+            if let updating,
+                updating.contextID.utf8.elementsEqual(previousContext.ticket.contextID.utf8)
+            {
+                setRetirementID(barrier.id, forUpdateOperation: updating.operation)
             }
-            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
         }
 
         if let updating {
+            _ = preserveLegacyCloseReceipt(except: updating.contextID)
             let barrier = ensureRetirement(
                 owner: updating.owner,
                 contextID: updating.contextID,
-                pendingOpenOperation: nil
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
-            inFlightUpdate?.retirementID = barrier.id
-            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            setRetirementID(barrier.id, forUpdateOperation: updating.operation)
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
         }
 
         if let opening {
+            if let contextID = opening.contextID {
+                _ = preserveLegacyCloseReceipt(except: contextID)
+            }
             let barrier = ensureRetirement(
                 owner: opening.owner,
                 contextID: opening.contextID,
-                pendingOpenOperation: opening.contextID == nil ? opening.operation : nil
+                pendingOpenOperation: opening.contextID == nil ? opening.operation : nil,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
-            inFlightOpen?.retirementID = barrier.id
+            setRetirementID(barrier.id, forOpenOperation: opening.operation)
             if opening.contextID == nil {
                 updateRetirement(barrier.id) {
                     $0.outcome = .unconfirmed(.openInFlightWithoutTicket)
                 }
                 return .unconfirmed(.openInFlightWithoutTicket)
             }
-            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
+        }
+
+        if let legacyCloseReceipt {
+            let barrier = ensureRetirement(
+                owner: nil,
+                contextID: legacyCloseReceipt.contextID,
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: unknownOpenOutcome
+            )
+            if legacyCloseReceipt.outcome == .acknowledged {
+                updateRetirement(barrier.id) { $0.outcome = .acknowledged }
+            }
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
         }
 
         if let closeAttempt {
             let barrier = ensureRetirement(
                 owner: nil,
                 contextID: closeAttempt.contextID,
-                pendingOpenOperation: nil
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
             self.closeAttempt?.retirementID = barrier.id
-            return await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
         }
 
-        if let legacyCloseReceipt {
-            if legacyCloseReceipt.outcome == .acknowledged {
-                return .acknowledged
-            }
+        if let legacyCloseDebt {
             let barrier = ensureRetirement(
                 owner: nil,
-                contextID: legacyCloseReceipt.contextID,
-                pendingOpenOperation: nil
+                contextID: legacyCloseDebt.contextID,
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
+            let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
+            return accountingForKnownCloseDebt(outcome)
+        }
+
+        if unknownOpenOutcome {
+            let barrier = ensureRetirement(
+                owner: nil,
+                contextID: nil,
+                pendingOpenOperation: nil,
+                unknownRemoteAuthority: true
+            )
+            updateRetirement(barrier.id) { $0.outcome = .unconfirmed(.openOutcomeUnknown) }
             return await resolveRetirement(barrier.id, allowExplicitRetry: true)
         }
 
@@ -808,9 +882,107 @@ public final class HLSPlaybackContextReportingService {
         updateRetirement(barrier.id, update)
     }
 
+    private func setRetirementID(_ retirementID: UUID, forOpenOperation operation: UUID) {
+        if inFlightOpen?.operation == operation {
+            inFlightOpen?.retirementID = retirementID
+        }
+        if legacyInFlightOpen?.operation == operation {
+            legacyInFlightOpen?.retirementID = retirementID
+        }
+    }
+
+    private func setRetirementID(_ retirementID: UUID, forUpdateOperation operation: UUID) {
+        if inFlightUpdate?.operation == operation {
+            inFlightUpdate?.retirementID = retirementID
+        }
+        if legacyInFlightUpdate?.operation == operation {
+            legacyInFlightUpdate?.retirementID = retirementID
+        }
+    }
+
+    private func recordUnknownOpenOutcome() {
+        if let barrier = retirementBarrier {
+            updateRetirement(barrier.id) {
+                $0.unknownRemoteAuthority = true
+                if $0.contextID == nil {
+                    $0.outcome = .unconfirmed(.openOutcomeUnknown)
+                }
+            }
+        } else {
+            legacyUnknownOpenOutcome = true
+        }
+    }
+
+    private func markUpdatesClosed(_ contextID: String) {
+        if var update = inFlightUpdate,
+            update.contextID.utf8.elementsEqual(contextID.utf8)
+        {
+            update.closeAcknowledged = true
+            inFlightUpdate = update
+        }
+        if var update = legacyInFlightUpdate,
+            update.contextID.utf8.elementsEqual(contextID.utf8)
+        {
+            update.closeAcknowledged = true
+            legacyInFlightUpdate = update
+        }
+    }
+
+    private func preserveLegacyCloseReceipt(except contextID: String) -> Bool {
+        guard let receipt = legacyCloseReceipt,
+            receipt.outcome != .acknowledged,
+            !receipt.contextID.utf8.elementsEqual(contextID.utf8)
+        else {
+            return true
+        }
+
+        if let legacyCloseDebt {
+            guard legacyCloseDebt.contextID.utf8.elementsEqual(receipt.contextID.utf8) else {
+                return false
+            }
+        } else {
+            legacyCloseDebt = receipt
+        }
+        legacyCloseReceipt = nil
+        return true
+    }
+
+    private func recordKnownCloseOutcome(
+        contextID: String,
+        outcome: HLSPlaybackContextWithdrawalOutcome
+    ) {
+        if outcome == .acknowledged {
+            if legacyCloseDebt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+                legacyCloseDebt = nil
+            }
+            if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+                legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+            }
+            return
+        }
+
+        if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+            legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+        } else if legacyCloseDebt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+            legacyCloseDebt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+        } else if legacyCloseDebt == nil {
+            legacyCloseDebt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
+        }
+    }
+
+    private func accountingForKnownCloseDebt(
+        _ outcome: HLSPlaybackContextWithdrawalOutcome
+    ) -> HLSPlaybackContextWithdrawalOutcome {
+        outcome == .acknowledged && legacyCloseDebt != nil
+            ? .unconfirmed(.anotherContextRetiring)
+            : outcome
+    }
+
     private func clearAcknowledgedRetirement(_ id: UUID) {
         guard retirementBarrier?.id == id,
             retirementBarrier?.outcome == .acknowledged,
+            retirementBarrier?.unknownRemoteAuthority == false,
+            legacyCloseDebt == nil,
             closeAttempt == nil
         else {
             return
@@ -829,9 +1001,9 @@ public final class HLSPlaybackContextReportingService {
             return .unconfirmed(.cancelled)
         }
         if barrier.outcome == .acknowledged {
-            return .acknowledged
+            return barrier.unknownRemoteAuthority ? .unconfirmed(.openOutcomeUnknown) : .acknowledged
         }
-        if barrier.unknownRemoteAuthority {
+        if barrier.unknownRemoteAuthority, barrier.contextID == nil {
             return .unconfirmed(.openOutcomeUnknown)
         }
         guard let contextID = barrier.contextID else {
@@ -848,7 +1020,8 @@ public final class HLSPlaybackContextReportingService {
                 return .unconfirmed(.anotherContextRetiring)
             }
             let result = await closeAttempt.waiter.wait(for: Self.closeWaitDuration)
-            return Task.isCancelled ? .unconfirmed(.cancelled) : result
+            guard !Task.isCancelled else { return .unconfirmed(.cancelled) }
+            return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
         }
 
         if barrier.closeAttempted {
@@ -902,7 +1075,21 @@ public final class HLSPlaybackContextReportingService {
             task: task
         )
         let result = await waiter.wait(for: Self.closeWaitDuration)
-        return Task.isCancelled ? .unconfirmed(.cancelled) : result
+        guard !Task.isCancelled else { return .unconfirmed(.cancelled) }
+        return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
+    }
+
+    private func applyingUnknownOpenOutcome(
+        to outcome: HLSPlaybackContextWithdrawalOutcome,
+        retirementID: UUID
+    ) -> HLSPlaybackContextWithdrawalOutcome {
+        guard outcome == .acknowledged,
+            retirementBarrier?.id == retirementID,
+            retirementBarrier?.unknownRemoteAuthority == true
+        else {
+            return outcome
+        }
+        return .unconfirmed(.openOutcomeUnknown)
     }
 
     private func finishCloseAttempt(
@@ -916,6 +1103,9 @@ public final class HLSPlaybackContextReportingService {
             return
         }
         closeAttempt = nil
+        if outcome == .acknowledged {
+            markUpdatesClosed(contextID)
+        }
         if let retirementID = attempt.retirementID,
             var barrier = retirementBarrier,
             barrier.id == retirementID,
@@ -923,17 +1113,18 @@ public final class HLSPlaybackContextReportingService {
         {
             barrier.outcome = outcome
             retirementBarrier = barrier
-        } else if attempt.retirementID == nil,
-            legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true
-        {
-            legacyCloseReceipt = LegacyCloseReceipt(contextID: contextID, outcome: outcome)
         }
+        recordKnownCloseOutcome(contextID: contextID, outcome: outcome)
         await waiter.finish(outcome)
     }
 
     private func closeBestEffort(_ contextID: String) async {
+        if legacyCloseDebt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
+            return
+        }
         let request = HLSPlaybackContextCloseRequest(contextID: contextID)
         guard (try? request.validate()) != nil else {
+            guard preserveLegacyCloseReceipt(except: contextID) else { return }
             legacyCloseReceipt = LegacyCloseReceipt(
                 contextID: contextID,
                 outcome: .unconfirmed(.invalidContextID)
@@ -943,6 +1134,7 @@ public final class HLSPlaybackContextReportingService {
         if legacyCloseReceipt?.contextID.utf8.elementsEqual(contextID.utf8) == true {
             return
         }
+        guard preserveLegacyCloseReceipt(except: contextID) else { return }
         if let closeAttempt {
             guard closeAttempt.contextID.utf8.elementsEqual(contextID.utf8) else {
                 legacyCloseReceipt = LegacyCloseReceipt(

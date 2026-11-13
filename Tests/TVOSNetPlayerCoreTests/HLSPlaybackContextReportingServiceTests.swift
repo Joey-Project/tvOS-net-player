@@ -160,6 +160,76 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         XCTAssertEqual(counts.closeCount, 0)
     }
 
+    func testLostOpenAfterLegacyWithdrawalStaysUnknownWithoutBlockingUntilConfirmation() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        await client.holdOpen(for: ownerA.sessionID)
+
+        let startA = Task { @MainActor in try await service.start() }
+        await client.waitForOpenCount(1)
+        await service.withdraw()
+        await client.failHeldOpen(for: ownerA.sessionID)
+        await client.releaseOpen(for: ownerA.sessionID)
+
+        do {
+            try await startA.value
+            XCTFail("Expected the withdrawn Open to lose its response.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .requestFailed)
+        }
+
+        currentOwner = ownerB
+        try await service.start()
+        let outcome = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(outcome, .unconfirmed(.openOutcomeUnknown))
+        do {
+            try await service.start()
+            XCTFail("Explicit confirmation must retain the unresolved Open evidence.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .operationInProgress)
+        }
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextB])
+    }
+
+    func testStrictWithdrawalKeepsLostOpenUnknownAfterLateFailure() async throws {
+        let client = PlaybackContextClientProbe()
+        let owner = try makeOwner(sessionID: "session-A", generation: 8)
+        let service = makeService(
+            client: client,
+            ownerProvider: { owner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        await client.holdOpen(for: owner.sessionID)
+
+        let start = Task { @MainActor in try await service.start() }
+        await client.waitForOpenCount(1)
+        let firstOutcome = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(firstOutcome, .unconfirmed(.openInFlightWithoutTicket))
+        await client.failHeldOpen(for: owner.sessionID)
+        await client.releaseOpen(for: owner.sessionID)
+
+        do {
+            try await start.value
+            XCTFail("Expected the retired Open to lose its response.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .requestFailed)
+        }
+        let lateOutcome = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(lateOutcome, .unconfirmed(.openOutcomeUnknown))
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeCount, 0)
+    }
+
     func testWithdrawalTracksInitialUpdateBeforeAwaitWhileNoContextIsActive() async throws {
         let client = PlaybackContextClientProbe()
         let owner = try makeOwner(sessionID: "session-A", generation: 8)
@@ -220,6 +290,57 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         }
         let counts = await client.counts()
         XCTAssertEqual(counts.closeContextIDs, [contextA])
+    }
+
+    func testAcknowledgedLegacyUpdateDoesNotPoisonBRegardlessOfCompletionOrder() async throws {
+        for completeUpdateBeforeBWithdrawal in [true, false] {
+            let client = PlaybackContextClientProbe()
+            let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+            let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+            var currentOwner: HLSPlaybackContextOwner? = ownerA
+            let service = makeService(
+                client: client,
+                ownerProvider: { currentOwner },
+                snapshotProvider: { self.snapshot(observedAt: 100) },
+                now: { 100 }
+            )
+            try await service.start()
+            await client.holdNextUpdate()
+
+            let updateA = Task { @MainActor in try await service.update() }
+            await client.waitForUpdateCount(2)
+            let closeA = await service.withdrawAndConfirmRemoteRemoval()
+            XCTAssertEqual(closeA, .acknowledged)
+
+            currentOwner = ownerB
+            try await service.start()
+            if completeUpdateBeforeBWithdrawal {
+                await client.releaseHeldUpdate()
+                do {
+                    try await updateA.value
+                    XCTFail("The retired Update cannot commit after its Close acknowledgment.")
+                } catch let error as HLSPlaybackContextReportingError {
+                    XCTAssertEqual(error, .ownerChanged)
+                }
+            }
+
+            let closeB = await service.withdrawAndConfirmRemoteRemoval()
+            XCTAssertEqual(closeB, .acknowledged)
+            if !completeUpdateBeforeBWithdrawal {
+                await client.releaseHeldUpdate()
+                do {
+                    try await updateA.value
+                    XCTFail("The retired Update cannot commit after B is closed.")
+                } catch let error as HLSPlaybackContextReportingError {
+                    XCTAssertEqual(error, .ownerChanged)
+                }
+            }
+
+            try await service.start()
+            let counts = await client.counts()
+            XCTAssertEqual(counts.closeContextIDs, [contextA, contextB])
+            XCTAssertEqual(counts.openSessionIDs, [ownerA.sessionID, ownerB.sessionID, ownerB.sessionID])
+        }
     }
 
     func testRepeatedWithdrawalsCoalesceOneCloseRPC() async throws {
@@ -644,6 +765,90 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         await client.waitForCompletedCloseCount(1)
     }
 
+    func testOlderCloseCannotAcknowledgeBWhileItsReceiptIsUnresolved() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        try await service.start()
+        await client.holdClose(for: contextA)
+
+        let withdrawA = Task { @MainActor in await service.withdraw() }
+        await client.waitForCloseCount(1)
+        currentOwner = ownerB
+        try await service.start()
+        await service.withdraw()
+
+        let unresolvedB = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(unresolvedB, .unconfirmed(.anotherContextRetiring))
+        await client.releaseClose(for: contextA)
+        await withdrawA.value
+
+        let confirmedB = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(confirmedB, .acknowledged)
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextA, contextB])
+    }
+
+    func testFailedLegacyUpdateCloseDebtSurvivesBAndLateUpdateCompletion() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        try await service.start()
+        await client.holdNextUpdate()
+        let updateA = Task { @MainActor in try await service.update() }
+        await client.waitForUpdateCount(2)
+        await client.holdClose(for: contextA)
+
+        let withdrawA = Task { @MainActor in await service.withdraw() }
+        await client.waitForCloseCount(1)
+        currentOwner = ownerB
+        try await service.start()
+        await service.withdraw()
+
+        let unresolvedB = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(unresolvedB, .unconfirmed(.anotherContextRetiring))
+        await client.releaseClose(for: contextA, closed: false)
+        await withdrawA.value
+
+        let bCloseWithAStillOwed = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(bCloseWithAStillOwed, .unconfirmed(.anotherContextRetiring))
+        do {
+            try await service.start()
+            XCTFail("B's acknowledgment cannot discard A's failed known close debt.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .operationInProgress)
+        }
+
+        let retryA = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(retryA, .acknowledged)
+        await client.releaseHeldUpdate()
+        do {
+            try await updateA.value
+            XCTFail("The late Update cannot restore the closed A context.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .ownerChanged)
+        }
+        try await service.start()
+
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextA, contextB, contextA])
+        XCTAssertEqual(counts.openSessionIDs, [ownerA.sessionID, ownerB.sessionID, ownerB.sessionID])
+    }
+
     func testBoundedCloseTimeoutKeepsNewOwnerBlockedUntilLateAck() async throws {
         let client = PlaybackContextClientProbe()
         let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
@@ -864,6 +1069,7 @@ private actor PlaybackContextClientProbe: CacheControlClient {
     private var closeRequests: [HLSPlaybackContextCloseRequest] = []
     private var contexts: [String: ContextRecord] = [:]
     private var heldOpenSessions: Set<String> = []
+    private var heldOpenFailureSessions: Set<String> = []
     private var heldOpenRequests: [String: HLSPlaybackContextOpenRequest] = [:]
     private var heldOpenContinuations: [String: CheckedContinuation<HLSPlaybackContextTicket, Error>] = [:]
     private var openCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -971,6 +1177,10 @@ private actor PlaybackContextClientProbe: CacheControlClient {
         failNextOpenResponse = true
     }
 
+    func failHeldOpen(for sessionID: String) {
+        heldOpenFailureSessions.insert(sessionID)
+    }
+
     func waitForOpenCount(_ count: Int) async {
         guard openRequests.count < count else { return }
         await withCheckedContinuation { openCountWaiters.append((count, $0)) }
@@ -983,7 +1193,11 @@ private actor PlaybackContextClientProbe: CacheControlClient {
         else {
             return
         }
-        continuation.resume(returning: makeOpenTicket(request))
+        if heldOpenFailureSessions.remove(sessionID) != nil {
+            continuation.resume(throwing: PlaybackContextClientError.openFailed)
+        } else {
+            continuation.resume(returning: makeOpenTicket(request))
+        }
     }
 
     func holdNextUpdate() {
@@ -1046,10 +1260,10 @@ private actor PlaybackContextClientProbe: CacheControlClient {
         return closeRequests.count >= count
     }
 
-    func releaseClose(for contextID: String) {
+    func releaseClose(for contextID: String, closed: Bool = true) {
         heldCloseIDs.remove(contextID)
         guard let continuation = heldCloseContinuations.removeValue(forKey: contextID) else { return }
-        continuation.resume(returning: HLSPlaybackContextCloseResponse(closed: true))
+        continuation.resume(returning: HLSPlaybackContextCloseResponse(closed: closed))
     }
 
     func counts() -> Counts {

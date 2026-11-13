@@ -50,6 +50,9 @@ superseded_by:
 ## Validation
 - Cover sleep-spanning/expired/backward readings, stale evidence, independent
   readers/generations, cancellation and in-flight retirement races.
+- Retain lost-Open uncertainty after legacy withdrawal. A known retired Update
+  must not discard a newer context's cleanup identity; an older Close must not
+  acknowledge a newer unresolved context. Cover both completion orderings.
 - Require complete format/lint/local CI, fixed-signed native3 with verified
   system mute, current-head GitHub CI/UI and GitHub Codex review, plus every
   conversation resolved before normal SHA-bound protected squash merge.
