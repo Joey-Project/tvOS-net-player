@@ -59,6 +59,10 @@ superseded_by:
 - Preserve the bounded legacy cleanup wait under caller cancellation while
   explicit confirmation remains cancellable and never treats cancellation as
   a server acknowledgment. Exercise the actual generated gRPC close route.
+- Cover an owned child exiting between UI helper liveness and identity reads.
+  Only fresh unreaped-child exit proof preserves the original PID reservation;
+  live identity changes, external reaping and failed revalidation still refuse
+  signals and cannot establish successful cleanup.
 - Require complete format/lint/local CI, fixed-signed native3 with verified
   system mute, current-head GitHub CI/UI and GitHub Codex review, plus every
   conversation resolved before normal SHA-bound protected squash merge.

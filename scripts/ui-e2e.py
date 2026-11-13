@@ -205,15 +205,19 @@ def _signal_process_group(process: subprocess.Popen[bytes], signum: int) -> None
             raise
 
 
-def _child_has_exited(process: subprocess.Popen[bytes]) -> bool:
+def _child_has_exited(
+    process: subprocess.Popen[bytes], *, require_fresh_waitid: bool = False
+) -> bool:
     if process.returncode is not None:
+        if require_fresh_waitid:
+            raise UIE2EError("Owned child was reaped externally; process-group identity is unverified.")
         return True
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         raise UIE2EError("Cannot reserve the owned process-group ID without waitid(WNOWAIT).")
     try:
         status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError as error:
-        if process.returncode is not None:
+        if process.returncode is not None and not require_fresh_waitid:
             return True
         raise UIE2EError("Owned child was reaped externally; process-group identity is unverified.") from error
     return status is not None and status.si_pid == process.pid
@@ -235,10 +239,21 @@ def stop_process_group(
             matches = os.getpgid(process.pid) == process.pid and os.getsid(process.pid) == process.pid
         except ProcessLookupError:
             # Darwin does not expose group/session metadata for a zombie. A
-            # WNOWAIT observation still proves our unreaped child reserves PID.
-            matches = _child_has_exited(process)
+            # fresh WNOWAIT observation still proves our child reserves PID.
+            matches = _child_has_exited(process, require_fresh_waitid=True)
         if not matches:
-            raise UIE2EError("Cleanup unverified: owned child is not its original session/group leader.")
+            if process.returncode is not None:
+                if not _group_has_live_members(process.pid):
+                    return
+                raise UIE2EError(
+                    "Cleanup unverified: leader already reaped; refusing to signal an unreserved PGID."
+                )
+            # Only a fresh WNOWAIT result for this PID can keep its original
+            # process-group reservation valid after metadata disagrees.
+            if not _child_has_exited(process, require_fresh_waitid=True):
+                raise UIE2EError(
+                    "Cleanup unverified: owned child is not its original session/group leader."
+                )
     _signal_process_group(process, signal.SIGTERM)
     deadline = time.monotonic() + grace_seconds
     while not _child_has_exited(process) and time.monotonic() < deadline:
