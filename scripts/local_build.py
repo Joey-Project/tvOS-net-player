@@ -34,6 +34,17 @@ PRODUCTS = {
     "probe": Path("bin/probe-lan-playback"),
     "media-tests": Path("bin/media-acceptance-tests"),
 }
+NATIVE_NAVIGATION_TARGET = "native-navigation-probe"
+NATIVE_NAVIGATION_EXECUTABLE = "native-navigation-probe"
+DIAGNOSTIC_IDENTIFIERS = {
+    NATIVE_NAVIGATION_TARGET: "dev.joey.tvos-net-player.native-navigation-probe",
+}
+DIAGNOSTIC_PRODUCTS = {
+    NATIVE_NAVIGATION_TARGET: Path("NativeNavigationProbe.app"),
+}
+LEGACY_NATIVE_NAVIGATION_PRODUCT = Path("bin/native-navigation-probe")
+DIAGNOSTIC_ROOT = Path("Diagnostics/NativeNavigation")
+CLI_TARGETS = tuple(sorted((*PRODUCTS, *DIAGNOSTIC_PRODUCTS)))
 RUN: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
 
 
@@ -120,7 +131,10 @@ def _receipt_path(root: Path) -> Path:
     return root / "receipt.json"
 
 
-def _read_receipt(root: Path, *, allow_missing: bool = False) -> dict:
+def _read_receipt(
+    root: Path, *, allow_missing: bool = False, products: dict[str, Path] | None = None,
+) -> dict:
+    allowed_products = PRODUCTS if products is None else products
     path = _receipt_path(root)
     try:
         receipt = json.loads(path.read_text())
@@ -137,7 +151,7 @@ def _read_receipt(root: Path, *, allow_missing: bool = False) -> dict:
             or not isinstance(receipt.get("products"), dict) or not receipt["products"]):
         raise BuildError(f"local build receipt has an invalid or empty schema: {path}")
     for target, item in receipt["products"].items():
-        if (target not in PRODUCTS or not isinstance(item, dict)
+        if (target not in allowed_products or not isinstance(item, dict)
                 or not isinstance(item.get("path"), str)
                 or not isinstance(item.get("source"), dict)
                 or not isinstance(item.get("cdhash"), str) or not item["cdhash"]):
@@ -198,12 +212,40 @@ def _codesign_details(path: Path) -> tuple[str, str, str, str, str]:
     )
 
 
+def _native_navigation_executable(path: Path) -> Path:
+    if path.is_symlink() or not path.is_dir():
+        raise BuildError(f"native-navigation product is not an app bundle: {path}")
+    info_path = path / "Contents/Info.plist"
+    try:
+        with info_path.open("rb") as stream:
+            info = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise BuildError(f"could not read native-navigation app metadata at {info_path}: {error}") from error
+    expected = {
+        "CFBundleIdentifier": DIAGNOSTIC_IDENTIFIERS[NATIVE_NAVIGATION_TARGET],
+        "CFBundleExecutable": NATIVE_NAVIGATION_EXECUTABLE,
+        "CFBundlePackageType": "APPL",
+        "CFBundleName": "Native Navigation Probe",
+        "CFBundleDisplayName": "Native Navigation Probe",
+    }
+    for key, value in expected.items():
+        if info.get(key) != value:
+            raise BuildError(f"native-navigation app metadata mismatch for {key} in {info_path}")
+    executable = path / "Contents/MacOS" / NATIVE_NAVIGATION_EXECUTABLE
+    if executable.is_symlink() or not executable.is_file():
+        raise BuildError(f"native-navigation app executable is missing or invalid: {executable}")
+    return executable
+
+
 def _expected_identifier(target: str, path: Path) -> str:
     if target == "app":
         with (path / "Contents/Info.plist").open("rb") as stream:
             actual = plistlib.load(stream).get("CFBundleIdentifier")
         if actual != IDENTIFIERS[target]:
             raise BuildError(f"app bundle identifier mismatch: expected {IDENTIFIERS[target]}, got {actual}")
+    if target in DIAGNOSTIC_IDENTIFIERS:
+        _native_navigation_executable(path)
+        return DIAGNOSTIC_IDENTIFIERS[target]
     return IDENTIFIERS[target]
 
 
@@ -216,11 +258,33 @@ def verify_product(target: str, path: Path, config: dict, previous: dict | None 
         raise BuildError(f"leaf certificate fingerprint mismatch for {path}")
     if previous and previous.get("designated_requirement") != requirement:
         raise BuildError(f"designated requirement changed unexpectedly for {target}")
-    return {
+    details = {
         "path": str(path), "identifier": identifier, "team_id": team,
         "certificate_sha1": cert_sha1, "designated_requirement": requirement,
         "cdhash": cdhash,
     }
+    if target == NATIVE_NAVIGATION_TARGET:
+        executable = _native_navigation_executable(path)
+        executable_metadata = _codesign_details(executable)
+        if executable_metadata != (identifier, team, cert_sha1, requirement, cdhash):
+            raise BuildError(f"native-navigation app and executable signatures do not match for {path}")
+        details["executable_cdhash"] = executable_metadata[4]
+    return details
+
+
+def _verify_legacy_native_navigation_product(path: Path, config: dict, previous: dict) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise BuildError(f"known legacy native-navigation product is missing or invalid: {path}")
+    identifier, team, cert_sha1, requirement, cdhash = _codesign_details(path)
+    if (identifier != DIAGNOSTIC_IDENTIFIERS[NATIVE_NAVIGATION_TARGET]
+            or team != config["team_id"]
+            or cert_sha1 != config["certificate_sha1"]
+            or previous.get("identifier") != identifier
+            or previous.get("team_id") != team
+            or previous.get("certificate_sha1") != cert_sha1
+            or previous.get("designated_requirement") != requirement
+            or previous.get("cdhash") != cdhash):
+        raise BuildError(f"known legacy native-navigation product does not match its diagnostic receipt: {path}")
 
 
 def _source_binding() -> dict:
@@ -233,8 +297,19 @@ def _source_binding() -> dict:
     return {"repository": str(ROOT), "head": head, "dirty": dirty}
 
 
-def _build(target: str, config: dict, root: Path, old_receipt: dict) -> dict:
-    destination = root / PRODUCTS[target]
+def _build(
+    target: str, config: dict, root: Path, old_receipt: dict, *, product_path: Path | None = None,
+) -> dict:
+    if target in PRODUCTS:
+        if product_path is not None:
+            raise BuildError(f"unexpected isolated product path for {target}")
+        relative_product_path = PRODUCTS[target]
+    elif target in DIAGNOSTIC_PRODUCTS and product_path == DIAGNOSTIC_PRODUCTS[target]:
+        relative_product_path = product_path
+    else:
+        raise BuildError(f"unsupported target or product path: {target}")
+
+    destination = root / relative_product_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     previous = old_receipt.get("products", {}).get(target)
     if destination.exists() and not previous:
@@ -245,6 +320,18 @@ def _build(target: str, config: dict, root: Path, old_receipt: dict) -> dict:
         prior = verify_product(target, destination, config, previous)
         if prior["cdhash"] != previous.get("cdhash"):
             raise BuildError(f"refusing to overwrite a product whose CDHash differs from its receipt: {destination}")
+        if (target == NATIVE_NAVIGATION_TARGET
+                and prior.get("executable_cdhash") != previous.get("executable_cdhash")):
+            raise BuildError(f"refusing to overwrite a product whose executable CDHash differs from its receipt: {destination}")
+    elif target == NATIVE_NAVIGATION_TARGET and previous:
+        legacy_path = root / LEGACY_NATIVE_NAVIGATION_PRODUCT
+        previous_path = Path(previous.get("path", ""))
+        if previous_path == legacy_path:
+            _verify_legacy_native_navigation_product(legacy_path, config, previous)
+        elif previous_path != destination:
+            raise BuildError(f"refusing to migrate a diagnostic receipt from an unknown product path: {previous.get('path')}")
+    elif target == NATIVE_NAVIGATION_TARGET and (root / LEGACY_NATIVE_NAVIGATION_PRODUCT).exists():
+        raise BuildError(f"refusing to migrate an unreceipted legacy native-navigation product: {root / LEGACY_NATIVE_NAVIGATION_PRODUCT}")
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent)) / destination.name
     try:
         if target == "app":
@@ -271,6 +358,28 @@ def _build(target: str, config: dict, root: Path, old_receipt: dict) -> dict:
                 "-warnings-as-errors", "-parse-as-library", str(ROOT / "scripts/probe-lan-playback.swift"),
                 "-o", str(staging),
             ], capture=False)
+        elif target == NATIVE_NAVIGATION_TARGET:
+            staging.mkdir()
+            executable = staging / "Contents/MacOS" / NATIVE_NAVIGATION_EXECUTABLE
+            executable.parent.mkdir(parents=True)
+            with (staging / "Contents/Info.plist").open("wb") as stream:
+                plistlib.dump({
+                    "CFBundleDevelopmentRegion": "en",
+                    "CFBundleDisplayName": "Native Navigation Probe",
+                    "CFBundleExecutable": NATIVE_NAVIGATION_EXECUTABLE,
+                    "CFBundleIdentifier": DIAGNOSTIC_IDENTIFIERS[target],
+                    "CFBundleInfoDictionaryVersion": "6.0",
+                    "CFBundleName": "Native Navigation Probe",
+                    "CFBundlePackageType": "APPL",
+                    "CFBundleShortVersionString": "1.0",
+                    "CFBundleVersion": "1",
+                    "NSPrincipalClass": "NSApplication",
+                }, stream, sort_keys=True)
+            _run([
+                "xcrun", "swiftc", "-swift-version", "6", "-strict-concurrency=complete",
+                "-warnings-as-errors", "-parse-as-library", str(ROOT / "scripts/native-navigation-probe.swift"),
+                "-o", str(executable),
+            ], capture=False)
         elif target == "media-tests":
             cargo_target = root / "CargoTarget" / hashlib.sha256(str(ROOT).encode()).hexdigest()[:16]
             output = _run([
@@ -289,8 +398,19 @@ def _build(target: str, config: dict, root: Path, old_receipt: dict) -> dict:
         else:
             raise BuildError(f"unsupported target {target}")
 
-        if target != "app":
-            _run(["codesign", "--force", "--sign", config["identity_sha1"], "--identifier", IDENTIFIERS[target], str(staging)])
+        if target == NATIVE_NAVIGATION_TARGET:
+            executable = _native_navigation_executable(staging)
+            identifier = DIAGNOSTIC_IDENTIFIERS[target]
+            for signed_path in (executable, staging):
+                _run([
+                    "codesign", "--force", "--sign", config["identity_sha1"],
+                    "--identifier", identifier, str(signed_path),
+                ])
+        elif target != "app":
+            _run([
+                "codesign", "--force", "--sign", config["identity_sha1"],
+                "--identifier", _expected_identifier(target, staging), str(staging),
+            ])
         details = verify_product(target, staging, config, previous)
         details["path"] = str(destination)
         details["source"] = _source_binding()
@@ -356,6 +476,53 @@ def prepare_targets(targets: set[str], *, config_file: Path | None = None) -> di
         return receipt
 
 
+@contextlib.contextmanager
+def prepared_diagnostic_targets(targets: set[str], *, config_file: Path | None = None):
+    if targets != {NATIVE_NAVIGATION_TARGET}:
+        raise BuildError("native-navigation-probe must be prepared alone in its diagnostic namespace")
+    config = load_config(config_file)
+    root: Path = config["durable_root"] / DIAGNOSTIC_ROOT
+    verify_identity(config)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = _locked(root)
+    try:
+        receipt_path = _receipt_path(root)
+        if receipt_path.exists():
+            receipt = _read_receipt(root, products=DIAGNOSTIC_PRODUCTS)
+        else:
+            orphaned = [str(root / product) for product in DIAGNOSTIC_PRODUCTS.values() if (root / product).exists()]
+            if orphaned:
+                raise BuildError(f"diagnostic receipt is missing for existing stable product: {', '.join(orphaned)}")
+            receipt = _read_receipt(root, allow_missing=True, products=DIAGNOSTIC_PRODUCTS)
+        products = dict(receipt.get("products", {}))
+        for target in sorted(targets):
+            products[target] = _build(
+                target, config, root, receipt, product_path=DIAGNOSTIC_PRODUCTS[target],
+            )
+            receipt = {
+                "schema_version": 1, "source": _source_binding(), "team_id": config["team_id"],
+                "identity_sha1": config["identity_sha1"], "certificate_sha1": config["certificate_sha1"],
+                "products": products, "receipt_path": str(_receipt_path(root)),
+            }
+            _write_receipt(root, receipt)
+        yield receipt
+    finally:
+        lock.rmdir()
+
+
+def prepare_diagnostic_targets(targets: set[str], *, config_file: Path | None = None) -> dict:
+    with prepared_diagnostic_targets(targets, config_file=config_file) as receipt:
+        return receipt
+
+
+def _prepare_selection(targets: set[str], *, config_file: Path | None = None) -> dict:
+    if NATIVE_NAVIGATION_TARGET in targets:
+        if targets != {NATIVE_NAVIGATION_TARGET}:
+            raise BuildError("native-navigation-probe must be built separately from legacy products")
+        return prepare_diagnostic_targets(targets, config_file=config_file)
+    return prepare_targets(targets, config_file=config_file)
+
+
 def status() -> dict:
     config = load_config()
     verify_identity(config)
@@ -384,6 +551,34 @@ def status() -> dict:
         lock.rmdir()
 
 
+def native_navigation_status() -> dict:
+    config = load_config()
+    verify_identity(config)
+    root: Path = config["durable_root"] / DIAGNOSTIC_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    lock = _locked(root)
+    try:
+        receipt = _read_receipt(root, products=DIAGNOSTIC_PRODUCTS)
+        source = _source_binding()
+        for target, product in DIAGNOSTIC_PRODUCTS.items():
+            if (root / product).exists() and target not in receipt["products"]:
+                raise BuildError(f"diagnostic stable product has no receipt entry for {target}: {root / product}")
+        for target, item in receipt.get("products", {}).items():
+            path = Path(item["path"])
+            if target not in DIAGNOSTIC_PRODUCTS or path != root / DIAGNOSTIC_PRODUCTS[target]:
+                raise BuildError(f"diagnostic receipt contains an unexpected product path: {path}")
+            if item.get("source") != source:
+                raise BuildError(f"diagnostic receipt source state does not match the current checkout for {target}")
+            actual = verify_product(target, path, config, item)
+            if actual["cdhash"] != item.get("cdhash"):
+                raise BuildError(f"diagnostic product CDHash differs from its receipt for {target}")
+            if actual.get("executable_cdhash") != item.get("executable_cdhash"):
+                raise BuildError(f"diagnostic executable CDHash differs from its receipt for {target}")
+        return receipt
+    finally:
+        lock.rmdir()
+
+
 def isolated() -> bool:
     return os.environ.get("LOCAL_BUILD_MODE", "").lower() == "isolated" or os.environ.get("CI", "").lower() == "true"
 
@@ -392,24 +587,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("native-navigation-status")
     build = sub.add_parser("build")
-    build.add_argument("targets", nargs="+", choices=sorted(PRODUCTS))
+    build.add_argument("targets", nargs="+", choices=CLI_TARGETS)
     prepare = sub.add_parser("prepare")
-    prepare.add_argument("targets", nargs="+", choices=sorted(PRODUCTS))
+    prepare.add_argument("targets", nargs="+", choices=CLI_TARGETS)
     prepare.add_argument("--json", action="store_true")
-    prepare.add_argument("--print-path", choices=sorted(PRODUCTS))
+    prepare.add_argument(
+        "--print-path", choices=CLI_TARGETS,
+        help="print the product path; native-navigation-probe prints its .app bundle path",
+    )
     run = sub.add_parser("run")
-    run.add_argument("target", choices=("probe", "media-tests"))
+    run.add_argument("target", choices=("probe", "media-tests", NATIVE_NAVIGATION_TARGET))
     run.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
             arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-            with prepared_targets({args.target}) as receipt:
+            context = (
+                prepared_diagnostic_targets({args.target})
+                if args.target == NATIVE_NAVIGATION_TARGET
+                else prepared_targets({args.target})
+            )
+            with context as receipt:
                 executable = receipt["products"][args.target]["path"]
+                if args.target == NATIVE_NAVIGATION_TARGET:
+                    executable = str(_native_navigation_executable(Path(executable)))
                 return subprocess.run([executable, *arguments], check=False).returncode
-        result = status() if args.command == "status" else prepare_targets(set(args.targets))
+        if args.command == "status":
+            result = status()
+        elif args.command == "native-navigation-status":
+            result = native_navigation_status()
+        else:
+            result = _prepare_selection(set(args.targets))
         if args.command == "prepare" and args.print_path:
+            if args.print_path not in args.targets:
+                raise BuildError("--print-path must name one of the selected targets")
             print(result["products"][args.print_path]["path"])
             return 0
         print(json.dumps(result, indent=2, sort_keys=True))

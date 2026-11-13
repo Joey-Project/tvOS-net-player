@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+
+SCRIPT = Path(__file__).with_name("native-navigation-fixture.py")
+SPEC = importlib.util.spec_from_file_location("native_navigation_fixture", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+fixture = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(fixture)
+
+
+class FixtureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.media = self.root / "media"
+        self.media.mkdir()
+        (self.media / "master.m3u8").write_text(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n"
+            "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\nsegment0000.m4s\n#EXT-X-ENDLIST\n",
+            encoding="ascii",
+        )
+        (self.media / "init.mp4").write_bytes(b"init-data")
+        (self.media / "segment0000.m4s").write_bytes(bytes(range(64)))
+        self.stop_event = threading.Event()
+        self.events_path = self.root / "events.jsonl"
+        self.log = fixture.EventLog(self.events_path, "unit-run", self.stop_event)
+        self.limiter = fixture.TransferLimiter(1024, None)
+        self.state = fixture.FixtureState(self.media, self.log, self.stop_event, self.limiter)
+
+    def start_server(self, *, max_bytes: int = 1024):
+        limiter = fixture.TransferLimiter(max_bytes, None)
+        self.state = fixture.FixtureState(self.media, self.log, self.stop_event, limiter)
+        server = fixture.FixtureServer(("127.0.0.1", 0), fixture.FixtureHandler)
+        server.fixture_state = self.state
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def events(self) -> list[dict[str, object]]:
+        lines = self.events_path.read_text(encoding="ascii").splitlines()
+        return [json.loads(line) for line in lines]
+
+    def test_raw_clock_fails_closed_when_darwin_clock_is_unavailable(self) -> None:
+        with mock.patch.object(fixture.time, "CLOCK_MONOTONIC_RAW", None, create=True):
+            with self.assertRaisesRegex(fixture.FixtureError, "CLOCK_MONOTONIC_RAW"):
+                fixture.raw_clock_ns()
+
+    def test_raw_clock_uses_only_explicit_clock_id(self) -> None:
+        with mock.patch.object(fixture.time, "CLOCK_MONOTONIC_RAW", 987, create=True):
+            with mock.patch.object(fixture.time, "clock_gettime_ns", return_value=123456) as clock:
+                self.assertEqual(fixture.raw_clock_ns(), 123456)
+        clock.assert_called_once_with(987)
+
+    def test_raw_clock_rejects_nonpositive_or_noninteger_values(self) -> None:
+        for value in (0, -1, True, 1.5, "123"):
+            with self.subTest(value=value):
+                with mock.patch.object(fixture.time, "CLOCK_MONOTONIC_RAW", 987, create=True):
+                    with mock.patch.object(fixture.time, "clock_gettime_ns", return_value=value):
+                        with self.assertRaisesRegex(fixture.FixtureError, "invalid nanosecond"):
+                            fixture.raw_clock_ns()
+
+    def test_run_rejects_non_darwin_before_creating_output(self) -> None:
+        output = self.root / "output"
+        with mock.patch.object(fixture.sys, "platform", "linux"):
+            with mock.patch.object(fixture, "raw_clock_ns") as clock:
+                result = fixture.run(["--output-root", str(output), "--run-id", "unit"])
+        self.assertEqual(result, 1)
+        self.assertFalse(output.exists())
+        clock.assert_not_called()
+
+    def test_run_rejects_invalid_clock_before_creating_output(self) -> None:
+        output = self.root / "output"
+        with mock.patch.object(fixture.sys, "platform", "darwin"):
+            with mock.patch.object(fixture, "raw_clock_ns", side_effect=fixture.FixtureError("invalid clock")):
+                result = fixture.run(["--output-root", str(output), "--run-id", "unit"])
+        self.assertEqual(result, 1)
+        self.assertFalse(output.exists())
+
+    def test_run_reports_cleanup_success_and_failure_truthfully(self) -> None:
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                output = self.root / f"output-{cleanup_fails}"
+                output.mkdir()
+                owned_temp = tempfile.TemporaryDirectory(prefix="test-media-")
+                real_cleanup = owned_temp.cleanup
+                media_directory = Path(owned_temp.name)
+                cleanup_calls: list[None] = []
+
+                def cleanup() -> None:
+                    cleanup_calls.append(None)
+                    self.assertFalse((output / "unit" / "report.json").exists())
+                    if cleanup_fails:
+                        raise OSError("synthetic cleanup failure")
+                    real_cleanup()
+
+                owned_temp.cleanup = cleanup  # type: ignore[method-assign]
+
+                def fail_generation(*_args, **_kwargs):
+                    raise fixture.FixtureError("synthetic generation failure")
+
+                with mock.patch.object(fixture.sys, "platform", "darwin"):
+                    with mock.patch.object(fixture, "raw_clock_ns", return_value=1):
+                        with mock.patch.object(fixture.tempfile, "TemporaryDirectory", return_value=owned_temp):
+                            with mock.patch.object(fixture, "generate_media", side_effect=fail_generation):
+                                result = fixture.run(["--output-root", str(output), "--run-id", "unit"])
+
+                try:
+                    report = json.loads((output / "unit" / "report.json").read_text(encoding="ascii"))
+                    self.assertEqual(result, 1)
+                    self.assertEqual(cleanup_calls, [None])
+                    self.assertEqual(report["media_cleaned"], not cleanup_fails)
+                    self.assertIn("synthetic generation failure", report["error"])
+                    self.assertEqual("synthetic cleanup failure" in report["error"], cleanup_fails)
+                    self.assertEqual(report["shutdown_reason"], "media_cleanup_failure" if cleanup_fails else "requested")
+                    if not cleanup_fails:
+                        self.assertFalse(media_directory.exists())
+                finally:
+                    real_cleanup()
+
+    def test_range_parser_accepts_single_byte_ranges(self) -> None:
+        self.assertIsNone(fixture.parse_byte_range(None, 64))
+        self.assertEqual(fixture.parse_byte_range("bytes=4-9", 64), (4, 9))
+        self.assertEqual(fixture.parse_byte_range("bytes=60-", 64), (60, 63))
+        self.assertEqual(fixture.parse_byte_range("bytes=-8", 64), (56, 63))
+        self.assertEqual(fixture.parse_byte_range("bytes=-100", 64), (0, 63))
+
+    def test_range_parser_rejects_multiple_or_unsatisfiable_ranges(self) -> None:
+        for value in ("bytes=1-2,4-5", "bytes=-0", "bytes=64-", "bytes=10-2", "items=1-2"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                fixture.parse_byte_range(value, 64)
+
+    def test_event_log_enforces_event_and_byte_budgets(self) -> None:
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=5):
+            with mock.patch.object(fixture, "MAX_EVENTS", 1):
+                self.log.emit("request_start", fixture_basename="segment0000.m4s", range="none", segment_index=0)
+                with self.assertRaisesRegex(fixture.FixtureError, "event log budget"):
+                    self.log.emit("request_finish", fixture_basename="segment0000.m4s", range="none", segment_index=0)
+        self.assertTrue(self.stop_event.is_set())
+        self.assertEqual(self.log.event_count, 1)
+        self.assertEqual(self.log.failure_reason, "fixture event log budget exceeded")
+        row = self.events()[0]
+        self.assertEqual(row["clock_ns"], 5)
+        self.assertEqual(row["clock_domain"], fixture.CLOCK_DOMAIN)
+        self.assertEqual(row["schema_version"], 1)
+
+    def test_event_log_byte_cap_does_not_write_over_budget(self) -> None:
+        path = self.root / "tiny.jsonl"
+        stop_event = threading.Event()
+        log = fixture.EventLog(path, "unit-run", stop_event)
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=5):
+            with mock.patch.object(fixture, "MAX_FIXTURE_LOG_BYTES", 8):
+                with self.assertRaisesRegex(fixture.FixtureError, "event log budget"):
+                    log.emit("request_start", fixture_basename="segment0000.m4s", range="none", segment_index=0)
+        self.assertEqual(path.stat().st_size, 0)
+        self.assertTrue(stop_event.is_set())
+
+    def test_media_allowlist_rejects_external_and_traversal_paths(self) -> None:
+        for value in ("/../secret", "/%2e%2e/secret", "http://example.test/a", "/segment9999.m4s", "/master.m3u8?url=x"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.state.media_path(value))
+        self.assertEqual(self.state.media_path("/segment0000.m4s")[1:], ("segment0000.m4s", 0))
+
+    def test_http_get_head_single_range_and_416(self) -> None:
+        base = self.start_server()
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=77):
+            with urllib.request.urlopen(base + "/segment0000.m4s", timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "video/iso.segment")
+                self.assertEqual(response.read(), bytes(range(64)))
+            request = urllib.request.Request(base + "/segment0000.m4s", method="HEAD")
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Content-Length"], "64")
+            request = urllib.request.Request(base + "/segment0000.m4s", headers={"Range": "bytes=3-7"})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers["Content-Range"], "bytes 3-7/64")
+                self.assertEqual(response.read(), bytes(range(3, 8)))
+            request = urllib.request.Request(base + "/segment0000.m4s", headers={"Range": "bytes=64-"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=2)
+            self.assertEqual(caught.exception.code, 416)
+            self.assertEqual(caught.exception.headers["Content-Range"], "bytes */64")
+            caught.exception.close()
+        finishes = [event for event in self.events() if event["kind"] == "request_finish"]
+        self.assertEqual([event["status"] for event in finishes], [200, 200, 206])
+        starts = [event for event in self.events() if event["kind"] == "request_start"]
+        self.assertTrue(all(event["observation"] == "fixture_received" for event in starts))
+        self.assertTrue(all(event["observation"] == "fixture_response_finished" for event in finishes))
+        self.assertTrue(all("bytes_written" in event and "bytes_sent" not in event for event in finishes))
+        self.assertTrue(all(event["clock_ns"] == 77 for event in self.events()))
+
+    def test_transfer_limit_rejects_prefetch_after_byte_budget(self) -> None:
+        base = self.start_server(max_bytes=16)
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=88):
+            request = urllib.request.Request(base + "/segment0000.m4s", headers={"Range": "bytes=0-15"})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(len(response.read()), 16)
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(base + "/segment0000.m4s", timeout=2)
+            self.assertEqual(caught.exception.code, 429)
+            caught.exception.close()
+
+    def test_barrier_acknowledges_matching_id_after_simulated_delay(self) -> None:
+        base = self.start_server()
+        payload = json.dumps({"request_id": "jump-1", "delay_ms": 30}).encode("ascii")
+        request = urllib.request.Request(
+            base + "/barrier", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        began = time.monotonic()
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=99):
+            with urllib.request.urlopen(request, timeout=2) as response:
+                ack = json.loads(response.read())
+        self.assertGreaterEqual(time.monotonic() - began, 0.02)
+        self.assertEqual(ack, {"request_id": "jump-1", "outcome": "acknowledged"})
+        self.assertEqual([event["kind"] for event in self.events()], ["barrier_requested", "barrier_acknowledged"])
+
+    def test_barrier_rejects_invalid_payload(self) -> None:
+        base = self.start_server()
+        payload = json.dumps({"request_id": "bad", "delay_ms": 2001}).encode("ascii")
+        request = urllib.request.Request(base + "/barrier", data=payload, method="POST")
+        with mock.patch.object(fixture, "raw_clock_ns", return_value=101):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+        self.assertEqual(self.log.event_count, 0)
+
+    def test_cli_defaults_keep_far_seek_media_bounded(self) -> None:
+        options = fixture._parse_args(["--output-root", str(self.root), "--run-id", "unit"])
+        self.assertEqual(options.port, 0)
+        self.assertEqual(options.max_media_bytes, 8 * 1024 * 1024)
+        self.assertEqual(options.max_media_bytes_per_second, 16 * 1024)
+        self.assertLess(options.max_media_bytes_per_second * 8, 300_000)
+        self.assertLess(options.max_media_bytes, 600 * 300_000 // 8)
+
+    def test_generation_stops_when_media_growth_exceeds_cap(self) -> None:
+        output = self.root / "output"
+        output.mkdir()
+
+        class FinishedProducer:
+            pid = 321
+            stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def produce(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"x" * 9)
+            return FinishedProducer()
+
+        with mock.patch.object(fixture.shutil, "which", side_effect=["ffmpeg", "ffprobe"]):
+            with mock.patch.object(fixture.subprocess, "Popen", side_effect=produce):
+                with mock.patch.object(fixture, "MAX_MEDIA_BYTES", 8):
+                    with self.assertRaisesRegex(fixture.FixtureError, "generation exceeded"):
+                        fixture.generate_media(self.media, output, started=time.monotonic())
+
+if __name__ == "__main__":
+    unittest.main()
