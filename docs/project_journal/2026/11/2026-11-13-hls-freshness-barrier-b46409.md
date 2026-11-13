@@ -53,6 +53,9 @@ superseded_by:
 - Retain lost-Open uncertainty after legacy withdrawal. A known retired Update
   must not discard a newer context's cleanup identity; an older Close must not
   acknowledge a newer unresolved context. Cover both completion orderings.
+- Keep a pending Open distinct from a genuinely lost outcome: its eventual
+  valid ticket and acknowledged exact-ID removal can discharge that pending
+  operation, but cannot clear unrelated unresolved or unknown authority.
 - Require complete format/lint/local CI, fixed-signed native3 with verified
   system mute, current-head GitHub CI/UI and GitHub Codex review, plus every
   conversation resolved before normal SHA-bound protected squash merge.

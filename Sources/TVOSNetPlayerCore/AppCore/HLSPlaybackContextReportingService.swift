@@ -113,6 +113,8 @@ public final class HLSPlaybackContextReportingService {
         let owner: HLSPlaybackContextOwner?
         var contextID: String?
         var pendingOpenOperation: UUID?
+        var pendingOtherOpenOperations: Set<UUID>
+        var pendingOtherOpenCloseContextIDs: [UUID: String]
         var unknownRemoteAuthority: Bool
         var closeAttempted: Bool
         var outcome: HLSPlaybackContextWithdrawalOutcome?
@@ -221,7 +223,7 @@ public final class HLSPlaybackContextReportingService {
         }
         if let retirementBarrier {
             guard retirementBarrier.outcome == .acknowledged,
-                !retirementBarrier.unknownRemoteAuthority,
+                !hasUnresolvedOpenAuthority(retirementBarrier),
                 closeAttempt == nil
             else {
                 throw HLSPlaybackContextReportingError.operationInProgress
@@ -364,7 +366,11 @@ public final class HLSPlaybackContextReportingService {
                 clearInFlightOperation(operation)
                 if let retirementID = opening.retirementID, retirementBarrier?.id == retirementID {
                     updateRetirement(retirementID) {
-                        $0.pendingOpenOperation = nil
+                        if $0.pendingOpenOperation == operation {
+                            $0.pendingOpenOperation = nil
+                        }
+                        $0.pendingOtherOpenOperations.remove(operation)
+                        $0.pendingOtherOpenCloseContextIDs.removeValue(forKey: operation)
                         $0.unknownRemoteAuthority = true
                         $0.outcome = .unconfirmed(.openOutcomeUnknown)
                     }
@@ -380,7 +386,7 @@ public final class HLSPlaybackContextReportingService {
                         $0.outcome = .unconfirmed(.openOutcomeUnknown)
                     }
                 } else {
-                    recordUnknownOpenOutcome()
+                    recordUnknownOpenOutcome(operation: operation)
                 }
             } else if let failedUpdate = updateOperation(operation) {
                 let updateWasAlreadyClosed = failedUpdate.closeAcknowledged
@@ -560,11 +566,17 @@ public final class HLSPlaybackContextReportingService {
         let targetOpenOperation =
             retirementBarrier?.pendingOpenOperation
             ?? (previousContext == nil ? opening?.operation : nil)
-        let hasOtherPendingOpen = [inFlightOpen, legacyInFlightOpen].contains { candidate in
-            guard let candidate, candidate.contextID == nil else { return false }
-            return candidate.operation != targetOpenOperation
-        }
-        let unknownOpenOutcome = legacyUnknownOpenOutcome || hasOtherPendingOpen
+        let otherPendingOpenOperations = Set(
+            [inFlightOpen, legacyInFlightOpen].compactMap { candidate -> UUID? in
+                guard let candidate, candidate.contextID == nil,
+                    candidate.operation != targetOpenOperation
+                else {
+                    return nil
+                }
+                return candidate.operation
+            }
+        )
+        let unknownOpenOutcome = legacyUnknownOpenOutcome
         revision = UUID()
         operationID = nil
         activeContext = nil
@@ -574,18 +586,29 @@ public final class HLSPlaybackContextReportingService {
                 closeAttempt == nil,
                 let legacyCloseDebt
             {
+                let acknowledgedBarrier = retirementBarrier
                 self.retirementBarrier = nil
                 let debtBarrier = ensureRetirement(
                     owner: nil,
                     contextID: legacyCloseDebt.contextID,
                     pendingOpenOperation: nil,
+                    pendingOtherOpenOperations: acknowledgedBarrier.pendingOtherOpenOperations
+                        .union(otherPendingOpenOperations),
+                    pendingOtherOpenCloseContextIDs: acknowledgedBarrier
+                        .pendingOtherOpenCloseContextIDs,
                     unknownRemoteAuthority: unknownOpenOutcome
+                        || acknowledgedBarrier.unknownRemoteAuthority
                 )
                 let outcome = await resolveRetirement(debtBarrier.id, allowExplicitRetry: true)
                 return accountingForKnownCloseDebt(outcome)
             }
             if unknownOpenOutcome {
                 updateRetirement(retirementBarrier.id) { $0.unknownRemoteAuthority = true }
+            }
+            if !otherPendingOpenOperations.isEmpty {
+                updateRetirement(retirementBarrier.id) {
+                    $0.pendingOtherOpenOperations.formUnion(otherPendingOpenOperations)
+                }
             }
             if let opening { setRetirementID(retirementBarrier.id, forOpenOperation: opening.operation) }
             if let updating { setRetirementID(retirementBarrier.id, forUpdateOperation: updating.operation) }
@@ -599,6 +622,7 @@ public final class HLSPlaybackContextReportingService {
                 owner: previousContext.owner,
                 contextID: previousContext.ticket.contextID,
                 pendingOpenOperation: nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             if let updating,
@@ -616,6 +640,7 @@ public final class HLSPlaybackContextReportingService {
                 owner: updating.owner,
                 contextID: updating.contextID,
                 pendingOpenOperation: nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             setRetirementID(barrier.id, forUpdateOperation: updating.operation)
@@ -631,6 +656,7 @@ public final class HLSPlaybackContextReportingService {
                 owner: opening.owner,
                 contextID: opening.contextID,
                 pendingOpenOperation: opening.contextID == nil ? opening.operation : nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             setRetirementID(barrier.id, forOpenOperation: opening.operation)
@@ -649,6 +675,7 @@ public final class HLSPlaybackContextReportingService {
                 owner: nil,
                 contextID: legacyCloseReceipt.contextID,
                 pendingOpenOperation: nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             if legacyCloseReceipt.outcome == .acknowledged {
@@ -663,6 +690,7 @@ public final class HLSPlaybackContextReportingService {
                 owner: nil,
                 contextID: closeAttempt.contextID,
                 pendingOpenOperation: nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             self.closeAttempt?.retirementID = barrier.id
@@ -675,18 +703,20 @@ public final class HLSPlaybackContextReportingService {
                 owner: nil,
                 contextID: legacyCloseDebt.contextID,
                 pendingOpenOperation: nil,
+                pendingOtherOpenOperations: otherPendingOpenOperations,
                 unknownRemoteAuthority: unknownOpenOutcome
             )
             let outcome = await resolveRetirement(barrier.id, allowExplicitRetry: true)
             return accountingForKnownCloseDebt(outcome)
         }
 
-        if unknownOpenOutcome {
+        if unknownOpenOutcome || !otherPendingOpenOperations.isEmpty {
             let barrier = ensureRetirement(
                 owner: nil,
                 contextID: nil,
                 pendingOpenOperation: nil,
-                unknownRemoteAuthority: true
+                pendingOtherOpenOperations: otherPendingOpenOperations,
+                unknownRemoteAuthority: unknownOpenOutcome
             )
             updateRetirement(barrier.id) { $0.outcome = .unconfirmed(.openOutcomeUnknown) }
             return await resolveRetirement(barrier.id, allowExplicitRetry: true)
@@ -816,10 +846,14 @@ public final class HLSPlaybackContextReportingService {
             legacyInFlightOpen = opening
         }
         updateRetirement(forOpenOperation: operation) {
-            $0.contextID = ticket.contextID
-            $0.pendingOpenOperation = nil
-            $0.closeAttempted = false
-            $0.outcome = nil
+            if $0.pendingOpenOperation == operation {
+                $0.contextID = ticket.contextID
+                $0.pendingOpenOperation = nil
+                $0.closeAttempted = false
+                $0.outcome = nil
+            } else if $0.pendingOtherOpenOperations.remove(operation) != nil {
+                $0.pendingOtherOpenCloseContextIDs[operation] = ticket.contextID
+            }
         }
     }
 
@@ -827,6 +861,8 @@ public final class HLSPlaybackContextReportingService {
         owner: HLSPlaybackContextOwner?,
         contextID: String?,
         pendingOpenOperation: UUID?,
+        pendingOtherOpenOperations: Set<UUID> = [],
+        pendingOtherOpenCloseContextIDs: [UUID: String] = [:],
         unknownRemoteAuthority: Bool = false
     ) -> RetirementBarrier {
         if var existing = retirementBarrier {
@@ -836,6 +872,14 @@ public final class HLSPlaybackContextReportingService {
                 existing.closeAttempted = false
                 existing.outcome = nil
             }
+            let primaryOpenOperation = existing.pendingOpenOperation
+            existing.pendingOtherOpenOperations.formUnion(
+                pendingOtherOpenOperations.filter { $0 != primaryOpenOperation }
+            )
+            existing.pendingOtherOpenCloseContextIDs.merge(
+                pendingOtherOpenCloseContextIDs,
+                uniquingKeysWith: { current, _ in current }
+            )
             existing.unknownRemoteAuthority = existing.unknownRemoteAuthority || unknownRemoteAuthority
             retirementBarrier = existing
             return existing
@@ -857,6 +901,8 @@ public final class HLSPlaybackContextReportingService {
             owner: owner,
             contextID: contextID,
             pendingOpenOperation: pendingOpenOperation,
+            pendingOtherOpenOperations: pendingOtherOpenOperations,
+            pendingOtherOpenCloseContextIDs: pendingOtherOpenCloseContextIDs,
             unknownRemoteAuthority: unknownRemoteAuthority,
             closeAttempted: false,
             outcome: initialOutcome
@@ -878,7 +924,12 @@ public final class HLSPlaybackContextReportingService {
         forOpenOperation operation: UUID,
         _ update: (inout RetirementBarrier) -> Void
     ) {
-        guard let barrier = retirementBarrier, barrier.pendingOpenOperation == operation else { return }
+        guard let barrier = retirementBarrier,
+            barrier.pendingOpenOperation == operation
+                || barrier.pendingOtherOpenOperations.contains(operation)
+        else {
+            return
+        }
         updateRetirement(barrier.id, update)
     }
 
@@ -900,9 +951,14 @@ public final class HLSPlaybackContextReportingService {
         }
     }
 
-    private func recordUnknownOpenOutcome() {
+    private func recordUnknownOpenOutcome(operation: UUID) {
         if let barrier = retirementBarrier {
             updateRetirement(barrier.id) {
+                if $0.pendingOpenOperation == operation {
+                    $0.pendingOpenOperation = nil
+                }
+                $0.pendingOtherOpenOperations.remove(operation)
+                $0.pendingOtherOpenCloseContextIDs.removeValue(forKey: operation)
                 $0.unknownRemoteAuthority = true
                 if $0.contextID == nil {
                     $0.outcome = .unconfirmed(.openOutcomeUnknown)
@@ -911,6 +967,21 @@ public final class HLSPlaybackContextReportingService {
         } else {
             legacyUnknownOpenOutcome = true
         }
+    }
+
+    private func hasUnresolvedOpenAuthority(_ barrier: RetirementBarrier) -> Bool {
+        barrier.unknownRemoteAuthority
+            || barrier.pendingOpenOperation != nil
+            || !barrier.pendingOtherOpenOperations.isEmpty
+            || !barrier.pendingOtherOpenCloseContextIDs.isEmpty
+    }
+
+    private func clearAcknowledgedOtherOpenClosures(_ contextID: String) {
+        guard var barrier = retirementBarrier else { return }
+        barrier.pendingOtherOpenCloseContextIDs = barrier.pendingOtherOpenCloseContextIDs.filter {
+            !$0.value.utf8.elementsEqual(contextID.utf8)
+        }
+        retirementBarrier = barrier
     }
 
     private func markUpdatesClosed(_ contextID: String) {
@@ -979,9 +1050,10 @@ public final class HLSPlaybackContextReportingService {
     }
 
     private func clearAcknowledgedRetirement(_ id: UUID) {
-        guard retirementBarrier?.id == id,
-            retirementBarrier?.outcome == .acknowledged,
-            retirementBarrier?.unknownRemoteAuthority == false,
+        guard let barrier = retirementBarrier,
+            barrier.id == id,
+            barrier.outcome == .acknowledged,
+            !hasUnresolvedOpenAuthority(barrier),
             legacyCloseDebt == nil,
             closeAttempt == nil
         else {
@@ -1001,12 +1073,42 @@ public final class HLSPlaybackContextReportingService {
             return .unconfirmed(.cancelled)
         }
         if barrier.outcome == .acknowledged {
-            return barrier.unknownRemoteAuthority ? .unconfirmed(.openOutcomeUnknown) : .acknowledged
+            if !hasUnresolvedOpenAuthority(barrier) {
+                return .acknowledged
+            }
+            if allowExplicitRetry,
+                let (operation, contextID) = barrier.pendingOtherOpenCloseContextIDs.first
+            {
+                return await resolvePendingOtherOpenClose(
+                    retirementID,
+                    operation: operation,
+                    contextID: contextID
+                )
+            }
+            return .unconfirmed(.openOutcomeUnknown)
         }
         if barrier.unknownRemoteAuthority, barrier.contextID == nil {
+            if allowExplicitRetry,
+                let (operation, contextID) = barrier.pendingOtherOpenCloseContextIDs.first
+            {
+                return await resolvePendingOtherOpenClose(
+                    retirementID,
+                    operation: operation,
+                    contextID: contextID
+                )
+            }
             return .unconfirmed(.openOutcomeUnknown)
         }
         guard let contextID = barrier.contextID else {
+            if allowExplicitRetry,
+                let (operation, contextID) = barrier.pendingOtherOpenCloseContextIDs.first
+            {
+                return await resolvePendingOtherOpenClose(
+                    retirementID,
+                    operation: operation,
+                    contextID: contextID
+                )
+            }
             return barrier.outcome ?? .unconfirmed(.openOutcomeUnknown)
         }
 
@@ -1044,6 +1146,49 @@ public final class HLSPlaybackContextReportingService {
         barrier.closeAttempted = true
         barrier.outcome = nil
         retirementBarrier = barrier
+        let result = await beginCloseAttempt(contextID: contextID, retirementID: retirementID)
+        return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
+    }
+
+    private func resolvePendingOtherOpenClose(
+        _ retirementID: UUID,
+        operation: UUID,
+        contextID: String
+    ) async -> HLSPlaybackContextWithdrawalOutcome {
+        guard let barrier = retirementBarrier, barrier.id == retirementID,
+            barrier.pendingOtherOpenCloseContextIDs[operation]?.utf8.elementsEqual(contextID.utf8)
+                == true
+        else {
+            return .unconfirmed(.anotherContextRetiring)
+        }
+        if Task.isCancelled {
+            return .unconfirmed(.cancelled)
+        }
+        if let closeAttempt {
+            guard closeAttempt.contextID.utf8.elementsEqual(contextID.utf8) else {
+                return .unconfirmed(.anotherContextRetiring)
+            }
+            if closeAttempt.retirementID == nil {
+                self.closeAttempt?.retirementID = retirementID
+            } else if closeAttempt.retirementID != retirementID {
+                return .unconfirmed(.anotherContextRetiring)
+            }
+            let result = await closeAttempt.waiter.wait(for: Self.closeWaitDuration)
+            guard !Task.isCancelled else { return .unconfirmed(.cancelled) }
+            return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
+        }
+        let result = await beginCloseAttempt(contextID: contextID, retirementID: nil)
+        return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
+    }
+
+    private func beginCloseAttempt(
+        contextID: String,
+        retirementID: UUID?
+    ) async -> HLSPlaybackContextWithdrawalOutcome {
+        let request = HLSPlaybackContextCloseRequest(contextID: contextID)
+        guard (try? request.validate()) != nil else {
+            return .unconfirmed(.invalidContextID)
+        }
         let attemptID = UUID()
         let waiter = HLSPlaybackContextCloseWaiter()
         let client = self.client
@@ -1076,7 +1221,7 @@ public final class HLSPlaybackContextReportingService {
         )
         let result = await waiter.wait(for: Self.closeWaitDuration)
         guard !Task.isCancelled else { return .unconfirmed(.cancelled) }
-        return applyingUnknownOpenOutcome(to: result, retirementID: retirementID)
+        return result
     }
 
     private func applyingUnknownOpenOutcome(
@@ -1085,7 +1230,8 @@ public final class HLSPlaybackContextReportingService {
     ) -> HLSPlaybackContextWithdrawalOutcome {
         guard outcome == .acknowledged,
             retirementBarrier?.id == retirementID,
-            retirementBarrier?.unknownRemoteAuthority == true
+            let retirementBarrier,
+            hasUnresolvedOpenAuthority(retirementBarrier)
         else {
             return outcome
         }
@@ -1105,6 +1251,7 @@ public final class HLSPlaybackContextReportingService {
         closeAttempt = nil
         if outcome == .acknowledged {
             markUpdatesClosed(contextID)
+            clearAcknowledgedOtherOpenClosures(contextID)
         }
         if let retirementID = attempt.retirementID,
             var barrier = retirementBarrier,
@@ -1112,6 +1259,17 @@ public final class HLSPlaybackContextReportingService {
             barrier.contextID?.utf8.elementsEqual(contextID.utf8) == true
         {
             barrier.outcome = outcome
+            retirementBarrier = barrier
+        }
+        if outcome == .acknowledged,
+            var barrier = retirementBarrier,
+            barrier.contextID == nil,
+            barrier.pendingOpenOperation == nil,
+            barrier.pendingOtherOpenOperations.isEmpty,
+            barrier.pendingOtherOpenCloseContextIDs.isEmpty,
+            !barrier.unknownRemoteAuthority
+        {
+            barrier.outcome = .acknowledged
             retirementBarrier = barrier
         }
         recordKnownCloseOutcome(contextID: contextID, outcome: outcome)

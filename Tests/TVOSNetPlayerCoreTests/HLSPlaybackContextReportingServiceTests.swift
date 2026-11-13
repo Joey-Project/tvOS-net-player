@@ -200,6 +200,163 @@ final class HLSPlaybackContextReportingServiceTests: XCTestCase {
         XCTAssertEqual(counts.closeContextIDs, [contextB])
     }
 
+    func testLateLegacyOpenCloseAcknowledgmentRecoversInEitherCloseOrder() async throws {
+        for closeBFirst in [true, false] {
+            let client = PlaybackContextClientProbe()
+            let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+            let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+            var currentOwner: HLSPlaybackContextOwner? = ownerA
+            let service = makeService(
+                client: client,
+                ownerProvider: { currentOwner },
+                snapshotProvider: { self.snapshot(observedAt: 100) },
+                now: { 100 }
+            )
+            await client.holdOpen(for: ownerA.sessionID)
+
+            let startA = Task { @MainActor in try await service.start() }
+            await client.waitForOpenCount(1)
+            await service.withdraw()
+            currentOwner = ownerB
+            try await service.start()
+
+            if closeBFirst {
+                let closeB = await service.withdrawAndConfirmRemoteRemoval()
+                XCTAssertEqual(closeB, .unconfirmed(.openOutcomeUnknown))
+                await client.releaseOpen(for: ownerA.sessionID)
+                do {
+                    try await startA.value
+                    XCTFail("The withdrawn A Open cannot restore local authority.")
+                } catch let error as HLSPlaybackContextReportingError {
+                    XCTAssertEqual(error, .ownerChanged)
+                }
+            } else {
+                await client.releaseOpen(for: ownerA.sessionID)
+                do {
+                    try await startA.value
+                    XCTFail("The withdrawn A Open cannot restore local authority.")
+                } catch let error as HLSPlaybackContextReportingError {
+                    XCTAssertEqual(error, .ownerChanged)
+                }
+                let closeB = await service.withdrawAndConfirmRemoteRemoval()
+                XCTAssertEqual(closeB, .acknowledged)
+            }
+
+            let countsBeforeRecovery = await client.counts()
+            XCTAssertEqual(
+                countsBeforeRecovery.closeContextIDs,
+                closeBFirst ? [contextB, contextA] : [contextA, contextB]
+            )
+            if closeBFirst {
+                let recovered = await service.withdrawAndConfirmRemoteRemoval()
+                XCTAssertEqual(recovered, .acknowledged)
+            }
+
+            currentOwner = ownerA
+            try await service.start()
+            let counts = await client.counts()
+            XCTAssertEqual(counts.openSessionIDs, [ownerA.sessionID, ownerB.sessionID, ownerA.sessionID])
+        }
+    }
+
+    func testLateOpenCloseAcknowledgmentDoesNotClearAnotherLostOpen() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        await client.holdOpen(for: ownerA.sessionID)
+        await client.holdOpen(for: ownerB.sessionID)
+
+        let startA = Task { @MainActor in try await service.start() }
+        await client.waitForOpenCount(1)
+        await service.withdraw()
+        currentOwner = ownerB
+        let startB = Task { @MainActor in try await service.start() }
+        await client.waitForOpenCount(2)
+
+        let firstOutcome = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(firstOutcome, .unconfirmed(.openInFlightWithoutTicket))
+        await client.failHeldOpen(for: ownerB.sessionID)
+        await client.releaseOpen(for: ownerB.sessionID)
+        do {
+            try await startB.value
+            XCTFail("B's lost Open response must remain unknown.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .requestFailed)
+        }
+
+        await client.releaseOpen(for: ownerA.sessionID)
+        do {
+            try await startA.value
+            XCTFail("The withdrawn A Open cannot restore local authority.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .ownerChanged)
+        }
+
+        let outcome = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(outcome, .unconfirmed(.openOutcomeUnknown))
+        do {
+            try await service.start()
+            XCTFail("A's acknowledged close cannot resolve B's lost Open.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .operationInProgress)
+        }
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextA])
+    }
+
+    func testLateOpenCloseAcknowledgmentDoesNotClearBKnownCloseDebtInABAOrder() async throws {
+        let client = PlaybackContextClientProbe()
+        let ownerA = try makeOwner(sessionID: "session-A", generation: 8)
+        let ownerB = try makeOwner(sessionID: "session-B", generation: 11)
+        var currentOwner: HLSPlaybackContextOwner? = ownerA
+        let service = makeService(
+            client: client,
+            ownerProvider: { currentOwner },
+            snapshotProvider: { self.snapshot(observedAt: 100) },
+            now: { 100 }
+        )
+        await client.holdOpen(for: ownerA.sessionID)
+
+        let startA = Task { @MainActor in try await service.start() }
+        await client.waitForOpenCount(1)
+        await service.withdraw()
+        currentOwner = ownerB
+        try await service.start()
+        await client.setNextCloseResponse(false)
+
+        let failedCloseB = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(failedCloseB, .unconfirmed(.closeRejected))
+        await client.releaseOpen(for: ownerA.sessionID)
+        do {
+            try await startA.value
+            XCTFail("The withdrawn A Open cannot restore local authority.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .ownerChanged)
+        }
+
+        currentOwner = ownerA
+        do {
+            try await service.start()
+            XCTFail("A's acknowledged close cannot discard B's known close debt.")
+        } catch let error as HLSPlaybackContextReportingError {
+            XCTAssertEqual(error, .operationInProgress)
+        }
+        let retriedCloseB = await service.withdrawAndConfirmRemoteRemoval()
+        XCTAssertEqual(retriedCloseB, .acknowledged)
+        try await service.start()
+
+        let counts = await client.counts()
+        XCTAssertEqual(counts.closeContextIDs, [contextB, contextA, contextB])
+        XCTAssertEqual(counts.openSessionIDs, [ownerA.sessionID, ownerB.sessionID, ownerA.sessionID])
+    }
+
     func testStrictWithdrawalKeepsLostOpenUnknownAfterLateFailure() async throws {
         let client = PlaybackContextClientProbe()
         let owner = try makeOwner(sessionID: "session-A", generation: 8)
