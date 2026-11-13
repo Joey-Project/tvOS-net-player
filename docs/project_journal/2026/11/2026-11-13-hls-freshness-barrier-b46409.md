@@ -13,10 +13,13 @@ superseded_by:
 # Sleep-Aware HLS Freshness and Withdrawal
 
 ## Decision
-- Continue from stable reader binding PR #101 on updated master. Before a
-  scheduler consumes timing, make context, snapshot and recent-origin evidence
-  age conservatively across system sleep. Origin transfer measurements that
-  span sleep must not become optimistic new bandwidth evidence after wake.
+- Start from accepted master/base `1f6465c95570cff3c652401ad13f77e7ed9b4f65`,
+  which independently includes PR #105 native diagnostics and PR #104 UI helper
+  migration. PR #104 child-exit coverage is a prerequisite baseline, not part of
+  PR #102's net scope. Before a scheduler consumes timing, make context, snapshot
+  and recent-origin evidence age conservatively across system sleep. Origin
+  transfer measurements that span sleep must not become optimistic new
+  bandwidth evidence after wake.
 - Keep the same clock domain for snapshot capture and AppCore freshness checks.
   Missing, backward, unavailable or otherwise invalid readings cannot authorize
   speculative priority changes.
@@ -59,10 +62,11 @@ superseded_by:
 - Preserve the bounded legacy cleanup wait under caller cancellation while
   explicit confirmation remains cancellable and never treats cancellation as
   a server acknowledgment. Exercise the actual generated gRPC close route.
-- Cover an owned child exiting between UI helper liveness and identity reads.
-  Only fresh unreaped-child exit proof preserves the original PID reservation;
-  live identity changes, external reaping and failed revalidation still refuse
-  signals and cannot establish successful cleanup.
+- The accepted PR #104 prerequisite covers an owned child exiting between UI
+  helper liveness and identity reads. Only fresh unreaped-child exit proof
+  preserves the original PID reservation; live identity changes, external
+  reaping and failed revalidation still refuse signals and cannot establish
+  successful cleanup. This helper coverage is not part of PR #102's net scope.
 - Require complete format/lint/local CI, fixed-signed native3 with verified
   system mute, current-head GitHub CI/UI and GitHub Codex review, plus every
   conversation resolved before normal SHA-bound protected squash merge.
