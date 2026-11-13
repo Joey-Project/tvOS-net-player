@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/ui-child-exit-migration
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/104
 supersedes: []
 superseded_by:
 ---
