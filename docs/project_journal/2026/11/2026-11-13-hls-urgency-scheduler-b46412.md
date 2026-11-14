@@ -187,6 +187,11 @@ superseded_by:
   challenge-followed timing sample for every update. This does not establish
   external gRPC transport, the complete AppCore reporter loop, GUI interaction,
   audible audio, or the absence of visible black frames.
+- Reader-bound playlist preflight preserves the legacy canonical validation.
+  It separately checks every selected playlist URI and range against that
+  canonical content, allowing only the exact expected reader association.
+  Validation-only normalization never rewrites the served or player URL;
+  missing, duplicated, mismatched or unrelated query fields remain failures.
 - Eligibility requires a completed recovery-phase preparation, matching
   reader/context/session generation and target window, actual missing-to-readable
   cache transitions, completed source-range overlap and known player-request

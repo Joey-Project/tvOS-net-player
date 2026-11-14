@@ -1659,6 +1659,310 @@ async fn run_native_high_preparation_probe(
     .await
 }
 
+async fn validate_reader_bound_master_playlist(
+    client: &reqwest::Client,
+    bound_master_url: &str,
+    reader_id: &str,
+    case: NativeCase,
+    expected: PlaylistExpectations,
+    long_profile: bool,
+) -> Result<HlsPlaylistPreflight, String> {
+    ensure_loopback_url(bound_master_url)?;
+    let bound_master_url = url::Url::parse(bound_master_url)
+        .map_err(|_| "reader-bound HLS master URL was invalid".to_owned())?;
+    let mut master_query = bound_master_url.query_pairs();
+    if !master_query
+        .next()
+        .is_some_and(|(name, value)| name == "playback_reader" && value == reader_id)
+        || master_query.next().is_some()
+    {
+        return Err("reader-bound HLS master query did not identify exactly one reader".to_owned());
+    }
+    let mut canonical_master_url = bound_master_url.clone();
+    canonical_master_url.set_query(None);
+    let expected_video_fragments = expected.video_fragments;
+    let expected_audio_fragments = expected.audio_fragments;
+
+    let preflight = validate_master_playlist(
+        client,
+        canonical_master_url.as_str(),
+        case,
+        expected,
+        long_profile,
+    )
+    .await?;
+    let maximum_bytes = playlist_response_limit(long_profile);
+    let canonical_master = fetch_playlist(client, &canonical_master_url, maximum_bytes).await?;
+    let bound_master = fetch_playlist(client, &bound_master_url, maximum_bytes).await?;
+    compare_reader_bound_playlist(
+        &canonical_master_url,
+        &bound_master_url,
+        &canonical_master,
+        &bound_master,
+        reader_id,
+        false,
+    )?;
+
+    let canonical_selected = selected_high_playlist_uris(&canonical_master)?;
+    let bound_selected = selected_high_playlist_uris(&bound_master)?;
+    let canonical_video_url =
+        resolve_same_origin_playlist(&canonical_master_url, &canonical_selected.video_uri)?;
+    let bound_video_url =
+        resolve_same_origin_playlist(&bound_master_url, &bound_selected.video_uri)?;
+    compare_bound_and_canonical_media(
+        client,
+        &canonical_video_url,
+        &bound_video_url,
+        reader_id,
+        expected_video_fragments,
+        maximum_bytes,
+    )
+    .await?;
+
+    match (canonical_selected.audio_uri, bound_selected.audio_uri) {
+        (Some(canonical_uri), Some(bound_uri)) => {
+            let canonical_url =
+                resolve_same_origin_playlist(&canonical_master_url, &canonical_uri)?;
+            let bound_url = resolve_same_origin_playlist(&bound_master_url, &bound_uri)?;
+            compare_bound_and_canonical_media(
+                client,
+                &canonical_url,
+                &bound_url,
+                reader_id,
+                expected_audio_fragments,
+                maximum_bytes,
+            )
+            .await?;
+        }
+        (None, None) => {}
+        _ => return Err("reader-bound master changed its selected audio playlist".to_owned()),
+    }
+    Ok(preflight)
+}
+
+async fn compare_bound_and_canonical_media(
+    client: &reqwest::Client,
+    canonical_url: &url::Url,
+    bound_url: &url::Url,
+    reader_id: &str,
+    expected_fragments: u64,
+    maximum_bytes: usize,
+) -> Result<(), String> {
+    let canonical_body = fetch_playlist(client, canonical_url, maximum_bytes).await?;
+    let bound_body = fetch_playlist(client, bound_url, maximum_bytes).await?;
+    validate_media_playlist_body(canonical_url, &canonical_body, expected_fragments)?;
+    compare_reader_bound_playlist(
+        canonical_url,
+        bound_url,
+        &canonical_body,
+        &bound_body,
+        reader_id,
+        true,
+    )
+}
+
+fn compare_reader_bound_playlist(
+    canonical_url: &url::Url,
+    bound_url: &url::Url,
+    canonical_body: &str,
+    bound_body: &str,
+    reader_id: &str,
+    media_playlist: bool,
+) -> Result<(), String> {
+    let canonical_lines = canonical_body.lines().map(str::trim).collect::<Vec<_>>();
+    let bound_lines = bound_body.lines().map(str::trim).collect::<Vec<_>>();
+    if canonical_lines.len() != bound_lines.len() {
+        return Err("reader-bound HLS playlist changed its line structure".to_owned());
+    }
+    let mut index = 0;
+    while index < canonical_lines.len() {
+        let canonical_line = canonical_lines[index];
+        let bound_line = bound_lines[index];
+        if media_playlist && canonical_line.starts_with("#EXTINF:") {
+            if canonical_line != bound_line
+                || bound_lines.get(index + 1) != canonical_lines.get(index + 1)
+            {
+                return Err("reader-bound HLS segment duration or range changed".to_owned());
+            }
+            let range = canonical_lines
+                .get(index + 1)
+                .and_then(|line| line.strip_prefix("#EXT-X-BYTERANGE:"))
+                .and_then(parse_hls_byte_range)
+                .ok_or_else(|| "canonical HLS segment range was invalid".to_owned())?;
+            let canonical_uri = canonical_lines
+                .get(index + 2)
+                .ok_or_else(|| "canonical HLS segment URI was missing".to_owned())?;
+            let bound_uri = bound_lines
+                .get(index + 2)
+                .ok_or_else(|| "reader-bound HLS segment URI was missing".to_owned())?;
+            compare_bound_reference(
+                canonical_url,
+                bound_url,
+                canonical_uri,
+                bound_uri,
+                reader_id,
+                Some(range),
+            )?;
+            index += 3;
+            continue;
+        }
+        if canonical_line.starts_with('#') {
+            if let (Some((canonical_tag, canonical_attrs)), Some((bound_tag, bound_attrs))) = (
+                hls_uri_attributes(canonical_line),
+                hls_uri_attributes(bound_line),
+            ) {
+                if canonical_tag != bound_tag {
+                    return Err("reader-bound HLS URI tag changed".to_owned());
+                }
+                let mut canonical_other = canonical_attrs.clone();
+                let mut bound_other = bound_attrs.clone();
+                let canonical_uri = canonical_other.remove("URI");
+                let bound_uri = bound_other.remove("URI");
+                if canonical_other != bound_other {
+                    return Err("reader-bound HLS URI attributes changed".to_owned());
+                }
+                match (canonical_uri, bound_uri) {
+                    (Some(canonical_uri), Some(bound_uri)) => compare_bound_reference(
+                        canonical_url,
+                        bound_url,
+                        &canonical_uri,
+                        &bound_uri,
+                        reader_id,
+                        None,
+                    )?,
+                    (None, None) => {}
+                    _ => {
+                        return Err(
+                            "reader-bound HLS URI attribute was added or removed".to_owned()
+                        );
+                    }
+                }
+            } else if canonical_line != bound_line {
+                return Err("reader-bound HLS playlist metadata changed".to_owned());
+            }
+        } else if !canonical_line.is_empty() {
+            compare_bound_reference(
+                canonical_url,
+                bound_url,
+                canonical_line,
+                bound_line,
+                reader_id,
+                None,
+            )?;
+        } else if canonical_line != bound_line {
+            return Err("reader-bound HLS playlist structure changed".to_owned());
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn hls_uri_attributes(line: &str) -> Option<(&str, HashMap<String, String>)> {
+    let (tag, value) = line.strip_prefix('#')?.split_once(':')?;
+    let attributes = parse_hls_attributes(value)?;
+    attributes.contains_key("URI").then_some((tag, attributes))
+}
+
+fn compare_bound_reference(
+    canonical_base: &url::Url,
+    bound_base: &url::Url,
+    canonical_uri: &str,
+    bound_uri: &str,
+    reader_id: &str,
+    expected_range: Option<(u64, u64)>,
+) -> Result<(), String> {
+    let canonical = canonical_base
+        .join(canonical_uri)
+        .map_err(|_| "canonical HLS URI could not be resolved".to_owned())?;
+    let bound = bound_base
+        .join(bound_uri)
+        .map_err(|_| "reader-bound HLS URI could not be resolved".to_owned())?;
+    if canonical.origin() != canonical_base.origin()
+        || canonical.username() != ""
+        || canonical.password().is_some()
+        || canonical.fragment().is_some()
+        || !canonical.path().starts_with('/')
+    {
+        return Err("canonical HLS URI was not same-origin".to_owned());
+    }
+    let normalized = validate_and_remove_reader(&bound, bound_base, reader_id, expected_range)?;
+    let mut canonical_normalized = canonical.clone();
+    validate_optional_segment_query(&mut canonical_normalized, expected_range)?;
+    if normalized != canonical_normalized {
+        return Err("reader-bound HLS URI did not match canonical content".to_owned());
+    }
+    ensure_loopback_url(bound.as_str())
+}
+
+fn validate_and_remove_reader(
+    bound: &url::Url,
+    base: &url::Url,
+    reader_id: &str,
+    expected_range: Option<(u64, u64)>,
+) -> Result<url::Url, String> {
+    if bound.origin() != base.origin()
+        || bound.username() != ""
+        || bound.password().is_some()
+        || bound.fragment().is_some()
+        || !bound.path().starts_with('/')
+    {
+        return Err("reader-bound HLS URI was not same-origin".to_owned());
+    }
+    let mut saw_reader = false;
+    let mut normalized = bound.clone();
+    for (name, value) in bound.query_pairs() {
+        match name.as_ref() {
+            "playback_reader" if !saw_reader && value == reader_id => saw_reader = true,
+            "segment" => {}
+            _ => return Err("reader-bound HLS URI had an unknown or duplicate query".to_owned()),
+        }
+    }
+    if !saw_reader {
+        return Err("reader-bound HLS URI omitted its reader".to_owned());
+    }
+    let mut pairs = bound
+        .query_pairs()
+        .filter(|(name, _)| name != "playback_reader");
+    let remaining = pairs
+        .next()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()));
+    if pairs.next().is_some() {
+        return Err("reader-bound HLS URI had multiple non-reader queries".to_owned());
+    }
+    normalized.set_query(None);
+    if let Some((name, value)) = remaining {
+        if name != "segment"
+            || expected_range
+                .map(|(offset, length)| format!("{offset}-{length}") != value)
+                .unwrap_or(true)
+        {
+            return Err("reader-bound HLS segment query did not match its byte range".to_owned());
+        }
+        normalized.query_pairs_mut().append_pair(&name, &value);
+    }
+    Ok(normalized)
+}
+
+fn validate_optional_segment_query(
+    canonical: &mut url::Url,
+    expected_range: Option<(u64, u64)>,
+) -> Result<(), String> {
+    let mut pairs = canonical.query_pairs();
+    let first = pairs.next();
+    if pairs.next().is_some() {
+        return Err("canonical HLS URI had multiple queries".to_owned());
+    }
+    match first {
+        None => {}
+        Some((name, value))
+            if name == "segment"
+                && expected_range
+                    .is_some_and(|(offset, length)| value == format!("{offset}-{length}")) => {}
+        _ => return Err("canonical HLS segment query did not match its byte range".to_owned()),
+    }
+    Ok(())
+}
+
 async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
     if std::env::var("LAN_MEDIA_HIGH_PREPARATION_SYSTEM_MUTED").as_deref() != Ok("verified") {
         return Err("system audio mute was not verified before native playback".to_owned());
@@ -1787,9 +2091,10 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
     let master_url = format!("{master_url}?playback_reader={reader_id}");
     ensure_loopback_url(&master_url)?;
     let client = local_only_http_client()?;
-    let playlist_preflight = validate_master_playlist(
+    let playlist_preflight = validate_reader_bound_master_playlist(
         &client,
         &master_url,
+        &reader_id,
         NativeCase::ProgressiveAbr,
         PlaylistExpectations {
             video_fragments: fixture.high_video.record.fragment_count,
@@ -2015,6 +2320,35 @@ fn write_arm_report(path: &Path, report: &ArmReport) -> Result<(), String> {
 mod pure_helper_tests {
     use super::*;
 
+    const TEST_READER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn canonical_media_playlist() -> &'static str {
+        concat!(
+            "#EXTM3U\n",
+            "#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"100@0\"\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@100\nvideo.m4s?segment=100-200\n",
+            "#EXTINF:2.000,\n#EXT-X-BYTERANGE:200@300\nvideo.m4s?segment=300-200\n",
+            "#EXT-X-ENDLIST\n",
+        )
+    }
+
+    fn bound_media_playlist() -> String {
+        canonical_media_playlist()
+            .replace(
+                "URI=\"video.m4s\"",
+                &format!("URI=\"video.m4s?playback_reader={TEST_READER}\""),
+            )
+            .replace(
+                "video.m4s?segment=100-200",
+                &format!("video.m4s?segment=100-200&playback_reader={TEST_READER}"),
+            )
+            .replace(
+                "video.m4s?segment=300-200",
+                &format!("video.m4s?segment=300-200&playback_reader={TEST_READER}"),
+            )
+    }
+
     #[test]
     fn lower_bound_counts_only_known_missing_to_readable_ranges() {
         assert_eq!(
@@ -2032,6 +2366,124 @@ mod pure_helper_tests {
         assert_eq!(
             readable_transition_lower_bound(ReadState::Missing, ReadState::Unknown),
             0
+        );
+    }
+
+    #[test]
+    fn reader_bound_playlists_match_canonical_content_and_preserve_ranges() {
+        let canonical_url = url::Url::parse("http://127.0.0.1/hls/session/video.m3u8").unwrap();
+        let bound_url = url::Url::parse(&format!(
+            "http://127.0.0.1/hls/session/video.m3u8?playback_reader={TEST_READER}"
+        ))
+        .unwrap();
+        let bound = bound_media_playlist();
+
+        let legacy_error = validate_media_playlist_body(&bound_url, &bound, 2).unwrap_err();
+        assert_eq!(
+            legacy_error,
+            "selected production media playlist omitted a valid initialization map"
+        );
+        validate_media_playlist_body(&canonical_url, canonical_media_playlist(), 2).unwrap();
+        compare_reader_bound_playlist(
+            &canonical_url,
+            &bound_url,
+            canonical_media_playlist(),
+            &bound,
+            TEST_READER,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reader_bound_playlist_rejects_invalid_binding_and_reference_changes() {
+        let canonical_url = url::Url::parse("http://127.0.0.1/hls/session/video.m3u8").unwrap();
+        let bound_url = url::Url::parse(&format!(
+            "http://127.0.0.1/hls/session/video.m3u8?playback_reader={TEST_READER}"
+        ))
+        .unwrap();
+        let bound = bound_media_playlist();
+        let rejects = |candidate: &str| {
+            compare_reader_bound_playlist(
+                &canonical_url,
+                &bound_url,
+                canonical_media_playlist(),
+                candidate,
+                TEST_READER,
+                true,
+            )
+            .is_err()
+        };
+
+        assert!(rejects(
+            &bound.replace(&format!("?playback_reader={TEST_READER}",), "",)
+        ));
+        assert!(rejects(
+            &bound.replace(TEST_READER, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",)
+        ));
+        assert!(rejects(&bound.replace(
+            &format!("playback_reader={TEST_READER}"),
+            &format!("playback_reader={TEST_READER}&playback_reader={TEST_READER}"),
+        )));
+        assert!(rejects(&bound.replace(
+            &format!("playback_reader={TEST_READER}"),
+            &format!("playback_reader={TEST_READER}&extra=1"),
+        )));
+        assert!(rejects(
+            &bound.replace("segment=100-200", "segment=100-199")
+        ));
+        assert!(rejects(
+            &bound.replace("BYTERANGE=\"100@0\"", "BYTERANGE=\"101@0\"")
+        ));
+        assert!(rejects(&bound.replace(
+            &format!("video.m4s?playback_reader={TEST_READER}"),
+            &format!("http://example.test/video.m4s?playback_reader={TEST_READER}"),
+        )));
+        assert!(rejects(&bound.replace(
+            &format!("video.m4s?playback_reader={TEST_READER}"),
+            &format!("video.m4s?playback_reader={TEST_READER}#fragment"),
+        )));
+        assert!(rejects(&bound.replace(
+            &format!("video.m4s?playback_reader={TEST_READER}"),
+            &format!("http://user@127.0.0.1/video.m4s?playback_reader={TEST_READER}"),
+        )));
+    }
+
+    #[test]
+    fn reader_bound_master_requires_exact_uri_equivalence() {
+        let canonical_url = url::Url::parse("http://127.0.0.1/hls/session/master.m3u8").unwrap();
+        let bound_url = url::Url::parse(&format!(
+            "http://127.0.0.1/hls/session/master.m3u8?playback_reader={TEST_READER}"
+        ))
+        .unwrap();
+        let canonical = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio.m3u8\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=200000,AUDIO=\"audio\"\n",
+            "video.m3u8\n",
+        );
+        let bound = format!(
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio.m3u8?playback_reader={TEST_READER}\"\n#EXT-X-STREAM-INF:BANDWIDTH=200000,AUDIO=\"audio\"\nvideo.m3u8?playback_reader={TEST_READER}\n"
+        );
+        compare_reader_bound_playlist(
+            &canonical_url,
+            &bound_url,
+            canonical,
+            &bound,
+            TEST_READER,
+            false,
+        )
+        .unwrap();
+        assert!(
+            compare_reader_bound_playlist(
+                &canonical_url,
+                &bound_url,
+                canonical,
+                &bound.replace("video.m3u8?playback_reader", "other.m3u8?playback_reader"),
+                TEST_READER,
+                false,
+            )
+            .is_err()
         );
     }
 
