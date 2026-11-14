@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import sys
 import tempfile
 import threading
 import time
@@ -55,7 +56,7 @@ class FixtureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.media = self.root / "media"
         self.media.mkdir()
         (self.media / "master.m3u8").write_text(
@@ -386,10 +387,21 @@ class FixtureTests(unittest.TestCase):
                     return original_walk_bytes(root)
 
                 ready = threading.Event()
-                ready_lines: list[str] = []
+                ready_payloads: list[dict[str, object]] = []
+                ready_path = output / "drain" / "ready.json"
 
-                def capture_print(*args, **_kwargs) -> None:
-                    ready_lines.append(" ".join(str(arg) for arg in args))
+                def capture_print(*args, **kwargs) -> None:
+                    if kwargs.get("file", sys.stdout) is not sys.stdout:
+                        return
+                    try:
+                        payload = json.loads(" ".join(str(arg) for arg in args))
+                    except (json.JSONDecodeError, TypeError):
+                        return
+                    if not isinstance(payload, dict) or payload.get("ready") != str(ready_path):
+                        return
+                    if not isinstance(payload.get("url"), str):
+                        return
+                    ready_payloads.append(payload)
                     ready.set()
 
                 run_thread = threading.Thread(
@@ -397,6 +409,8 @@ class FixtureTests(unittest.TestCase):
                         fixture.run(["--output-root", str(output), "--run-id", "drain"])
                     )
                 )
+                request_thread: threading.Thread | None = None
+                request_result: list[bytes] = []
                 with mock.patch.object(fixture.sys, "platform", "darwin"), \
                     mock.patch.object(fixture, "raw_clock_ns", return_value=123), \
                     mock.patch.object(fixture, "generate_media", side_effect=generate), \
@@ -406,29 +420,34 @@ class FixtureTests(unittest.TestCase):
                     mock.patch.object(fixture.EventLog, "emit", delayed_finish), \
                     mock.patch("builtins.print", side_effect=capture_print):
                     run_thread.start()
-                    self.assertTrue(ready.wait(2))
-                    ready_value = json.loads(ready_lines[0])
-                    request_result: list[bytes] = []
-                    request_thread = threading.Thread(
-                        target=lambda: request_result.append(
-                            urllib.request.urlopen(
+                    try:
+                        self.assertTrue(ready.wait(2))
+                        ready_value = ready_payloads[0]
+
+                        def request_segment() -> None:
+                            with urllib.request.urlopen(
                                 ready_value["url"].removesuffix("master.m3u8") + "segment0000.m4s",
                                 timeout=2,
-                            ).read()
-                        )
-                    )
-                    request_thread.start()
-                    self.assertTrue(finish_entered.wait(2))
-                    if trigger_exception:
-                        fail_loop.set()
-                    else:
-                        servers[0].fixture_state.stop_event.set()
-                    self.assertTrue(shutdown_entered.wait(2))
-                    release_finish.set()
-                    request_thread.join(2)
-                    run_thread.join(2)
+                            ) as response:
+                                request_result.append(response.read())
 
-                self.assertFalse(request_thread.is_alive())
+                        request_thread = threading.Thread(target=request_segment)
+                        request_thread.start()
+                        self.assertTrue(finish_entered.wait(2))
+                        if trigger_exception:
+                            fail_loop.set()
+                        else:
+                            servers[0].fixture_state.stop_event.set()
+                        self.assertTrue(shutdown_entered.wait(2))
+                    finally:
+                        release_finish.set()
+                        if servers:
+                            servers[0].fixture_state.stop_event.set()
+                        if request_thread is not None:
+                            request_thread.join(2)
+                        run_thread.join(2)
+
+                self.assertFalse(request_thread is not None and request_thread.is_alive())
                 self.assertFalse(run_thread.is_alive())
                 self.assertEqual(request_result, [b"segment"])
                 self.assertEqual(run_results, [1 if expected_failure or trigger_exception else 0])
