@@ -206,6 +206,13 @@ public final class PlayerViewModel: ObservableObject {
     private var playbackProgressContext: PlayerPlaybackProgressContext?
     private var hlsUpshiftOwner: HLSUpshiftOwner?
     private var hlsUpshiftTask: Task<HLSOwnedUpshiftAssessment?, Never>?
+    private var hlsPlaybackReaderOwner: HLSPlaybackReaderOwner?
+    private var hlsPlaybackContextOwner: HLSPlaybackContextOwner?
+    private var hlsPlaybackContextAuthority: HLSPlaybackContextAuthority?
+    private var hlsPlaybackContextService: HLSPlaybackContextReportingService?
+    private var hlsPlaybackContextTask: Task<Void, Never>?
+    private var hlsPlaybackContextWithdrawalTask: Task<Void, Never>?
+    private var hlsPlaybackContextEpoch = UUID()
     private var playbackController: (any PlayerPlaybackControlling)?
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
@@ -271,6 +278,44 @@ public final class PlayerViewModel: ObservableObject {
         let sessionID: String
         let snapshot: HLSPlaybackSnapshot
         let service: HLSUpshiftPreparationService
+    }
+
+    @MainActor
+    private final class HLSPlaybackReaderOwner {
+        let token: UUID
+        weak var player: AVPlayer?
+        weak var controller: (any PlayerPlaybackControlling)?
+        weak var item: AVPlayerItem?
+        let context: PlayerPlaybackProgressContext
+        let session: PlayerHLSPlaybackSessionContext
+        let serverSummary: CacheServerSummary
+        let reportingEnabled: Bool
+
+        init(
+            token: UUID,
+            player: AVPlayer,
+            controller: any PlayerPlaybackControlling,
+            item: AVPlayerItem,
+            context: PlayerPlaybackProgressContext,
+            session: PlayerHLSPlaybackSessionContext,
+            serverSummary: CacheServerSummary,
+            reportingEnabled: Bool
+        ) {
+            self.token = token
+            self.player = player
+            self.controller = controller
+            self.item = item
+            self.context = context
+            self.session = session
+            self.serverSummary = serverSummary
+            self.reportingEnabled = reportingEnabled
+        }
+    }
+
+    private struct HLSPlaybackContextAuthority {
+        let epoch: UUID
+        let owner: HLSPlaybackContextOwner
+        let reader: HLSPlaybackReaderOwner
     }
 
     @MainActor
@@ -576,6 +621,12 @@ public final class PlayerViewModel: ObservableObject {
 
     deinit {
         playbackProgressReportTask?.cancel()
+        hlsPlaybackContextTask?.cancel()
+        if hlsPlaybackContextWithdrawalTask == nil, let service = hlsPlaybackContextService {
+            Task { @MainActor in
+                _ = await service.withdrawAndConfirmRemoteRemoval()
+            }
+        }
     }
 
     public func load() {
@@ -704,18 +755,61 @@ public final class PlayerViewModel: ObservableObject {
         resumptionOperation: PlaybackResumptionOperation? = nil
     ) {
         invalidateHLSUpshiftAssessment()
+        invalidateHLSPlaybackContext()
         let queuedStoppedReport =
             suppressCurrentPosition
             ? false : queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
 
-        let (nextPlayer, nextController) = playbackControllerFactory(url)
+        let sourceProgressContext = progressContext?.withPlaybackURI(url.absoluteString)
+        let readerToken = UUID()
+        let readerSession = sourceProgressContext?.hlsSession
+        let readerSummary = readerSession?.serverSummary
+        var playerURL = url
+        var contextReportingEnabled = false
+        if let readerSession, let readerSummary,
+            readerSummary.id.utf8.elementsEqual(readerSession.serverID.utf8),
+            readerSummary.supportsHLSPlaybackContext,
+            readerSummary.supportsHLSRenditionCatalog
+        {
+            if readerSummary.supportsHLSPlaybackReaderBinding {
+                if let boundURL = HLSPlaybackReaderURLBinding.applying(
+                    to: url,
+                    server: readerSummary,
+                    expectedServerID: readerSession.serverID,
+                    sessionID: readerSession.sessionID,
+                    readerID: readerToken
+                ) {
+                    playerURL = boundURL
+                    contextReportingEnabled = true
+                }
+            } else {
+                contextReportingEnabled = true
+            }
+        }
+
+        let (nextPlayer, nextController) = playbackControllerFactory(playerURL)
         nextPlayer.defaultRate = playbackSpeed.rate
         player = nextPlayer
         playbackController = nextController
         loadedURL = url
-        playbackProgressContext = progressContext?.withPlaybackURI(url.absoluteString)
+        playbackProgressContext = sourceProgressContext
+        hlsPlaybackReaderOwner = nil
+        if let sourceProgressContext, let readerSession, let readerSummary, let item = nextPlayer.currentItem,
+            nextController.currentItem === item, contextReportingEnabled
+        {
+            hlsPlaybackReaderOwner = HLSPlaybackReaderOwner(
+                token: readerToken,
+                player: nextPlayer,
+                controller: nextController,
+                item: item,
+                context: sourceProgressContext,
+                session: readerSession,
+                serverSummary: readerSummary,
+                reportingEnabled: true
+            )
+        }
         playbackProgressReportingMessage = nil
         validationMessage = nil
         resumePositionUnrestoredItem = nil
@@ -778,6 +872,7 @@ public final class PlayerViewModel: ObservableObject {
         observePlaybackEnd(for: nextPlayer.currentItem)
         observePlaybackResume(for: nextPlayer)
         observePlaybackTimeJumps(for: nextPlayer.currentItem)
+        handleHLSPlaybackContextStateChange(using: nextController)
     }
 
     public func skipBackward() {
@@ -937,6 +1032,7 @@ public final class PlayerViewModel: ObservableObject {
         let target =
             durationSeconds.map { targetSeconds >= $0 } == true
             ? duration : CMTime(seconds: targetSeconds, preferredTimescale: 600)
+        invalidateHLSPlaybackContext()
         recordInitializedManualResumptionTakeover(using: controller)
         if Self.isAtPlaybackEnd(currentTime: target, duration: duration),
             let player, let item = controller.currentItem, player.currentItem === item
@@ -965,6 +1061,7 @@ public final class PlayerViewModel: ObservableObject {
             }
         } else {
             controller.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+            handleHLSPlaybackContextStateChange(using: controller)
             initializeManualPlaybackTransport(using: controller)
             queuePlaybackProgressReport(
                 positionSeconds: target.seconds, durationSeconds: durationSeconds, intent: .seek)
@@ -1462,6 +1559,8 @@ public final class PlayerViewModel: ObservableObject {
 
     private func stopPlaybackProgressReporting() {
         pendingReplay = nil
+        invalidateHLSPlaybackContext()
+        hlsPlaybackReaderOwner = nil
         stopPlaybackProgressHeartbeat()
         playbackEndObservationID = UUID()
         playbackEndObserver?.cancel()
@@ -1477,6 +1576,187 @@ public final class PlayerViewModel: ObservableObject {
     private func stopPlaybackProgressHeartbeat() {
         playbackProgressReportTask?.cancel()
         playbackProgressReportTask = nil
+    }
+
+    private func handleHLSPlaybackContextStateChange(using controller: (any PlayerPlaybackControlling)?) {
+        guard let reader = hlsPlaybackReaderOwner else { return }
+        guard isHLSPlaybackContextReaderCurrent(reader),
+            let readerController = reader.controller,
+            let controller,
+            readerController === controller,
+            controller.timeControlStatus == .playing,
+            controller.readinessStatus == .readyToPlay,
+            captureHLSPlaybackSnapshot() != nil
+        else {
+            invalidateHLSPlaybackContext()
+            return
+        }
+
+        if hlsPlaybackContextWithdrawalTask != nil { return }
+        if let authority = hlsPlaybackContextAuthority,
+            isCurrentHLSPlaybackContextAuthority(authority)
+        {
+            return
+        }
+        if hlsPlaybackContextService != nil {
+            invalidateHLSPlaybackContext()
+            return
+        }
+        guard hlsPlaybackContextTask == nil else { return }
+
+        let epoch = UUID()
+        hlsPlaybackContextEpoch = epoch
+        let client = cacheClientFactory(reader.context.endpoint)
+        hlsPlaybackContextTask = Task { @MainActor [weak self] in
+            defer {
+                if self?.hlsPlaybackContextEpoch == epoch {
+                    self?.hlsPlaybackContextTask = nil
+                }
+            }
+
+            while !Task.isCancelled {
+                guard self?.isCurrentHLSPlaybackContextReader(reader, epoch: epoch) == true else { return }
+                do {
+                    let request = try HLSRenditionCatalogRequest(sessionID: reader.session.sessionID)
+                    let catalog = try await client.getHLSRenditionCatalog(request)
+                    guard !Task.isCancelled,
+                        self?.isCurrentHLSPlaybackContextReader(reader, epoch: epoch) == true,
+                        catalog.sessionID.utf8.elementsEqual(reader.session.sessionID.utf8),
+                        let owner = HLSPlaybackContextOwner(
+                            ownerToken: reader.token,
+                            serverID: reader.session.serverID,
+                            sessionID: reader.session.sessionID,
+                            sessionGeneration: catalog.sessionGeneration
+                        )
+                    else {
+                        return
+                    }
+
+                    let authority = HLSPlaybackContextAuthority(epoch: epoch, owner: owner, reader: reader)
+                    let service = HLSPlaybackContextReportingService(
+                        client: client,
+                        serverSummary: reader.serverSummary,
+                        ownerProvider: { [weak self] in
+                            guard let self, self.isCurrentHLSPlaybackContextAuthority(authority) else { return nil }
+                            return authority.owner
+                        },
+                        snapshotProvider: { [weak self] in
+                            guard let self, self.isCurrentHLSPlaybackContextAuthority(authority) else { return nil }
+                            return self.captureHLSPlaybackSnapshot()
+                        },
+                        monotonicNowNanosecondsProvider: { [weak self] in
+                            self?.playbackSnapshotNowNanoseconds()
+                        }
+                    )
+                    self?.hlsPlaybackContextOwner = owner
+                    self?.hlsPlaybackContextAuthority = authority
+                    self?.hlsPlaybackContextService = service
+                    try await service.start()
+                    guard !Task.isCancelled else { return }
+                    guard self?.isCurrentHLSPlaybackContextAuthority(authority) == true else {
+                        self?.invalidateHLSPlaybackContext()
+                        return
+                    }
+
+                    while !Task.isCancelled {
+                        try await Task.sleep(for: .seconds(1))
+                        guard !Task.isCancelled,
+                            self?.isCurrentHLSPlaybackContextAuthority(authority) == true
+                        else {
+                            return
+                        }
+                        try await service.update()
+                    }
+                    return
+                } catch {
+                    guard !Task.isCancelled,
+                        self?.isCurrentHLSPlaybackContextReader(reader, epoch: epoch) == true
+                    else {
+                        return
+                    }
+                    if self?.hlsPlaybackContextService != nil {
+                        self?.invalidateHLSPlaybackContext()
+                        return
+                    }
+                    self?.hlsPlaybackContextTask = nil
+                    do {
+                        try await Task.sleep(for: .seconds(1))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled,
+                        self?.isCurrentHLSPlaybackContextReader(reader, epoch: epoch) == true
+                    else {
+                        return
+                    }
+                    self?.handleHLSPlaybackContextStateChange(using: reader.controller)
+                    return
+                }
+            }
+        }
+    }
+
+    private func isHLSPlaybackContextReaderCurrent(_ reader: HLSPlaybackReaderOwner) -> Bool {
+        guard let readerPlayer = reader.player,
+            let readerController = reader.controller,
+            let readerItem = reader.item
+        else {
+            return false
+        }
+        return hlsPlaybackReaderOwner?.token == reader.token
+            && player === readerPlayer
+            && playbackController === readerController
+            && readerPlayer.currentItem === readerItem
+            && readerController.currentItem === readerItem
+            && playbackProgressContext == reader.context
+    }
+
+    private func isCurrentHLSPlaybackContextReader(_ reader: HLSPlaybackReaderOwner, epoch: UUID) -> Bool {
+        hlsPlaybackContextEpoch == epoch
+            && isHLSPlaybackContextReaderCurrent(reader)
+            && reader.reportingEnabled
+            && reader.controller?.timeControlStatus == .playing
+            && reader.controller?.readinessStatus == .readyToPlay
+            && captureHLSPlaybackSnapshot() != nil
+    }
+
+    private func isCurrentHLSPlaybackContextAuthority(_ authority: HLSPlaybackContextAuthority) -> Bool {
+        hlsPlaybackContextAuthority?.epoch == authority.epoch
+            && hlsPlaybackContextOwner == authority.owner
+            && isCurrentHLSPlaybackContextReader(authority.reader, epoch: authority.epoch)
+    }
+
+    private func invalidateHLSPlaybackContext() {
+        hlsPlaybackContextEpoch = UUID()
+        hlsPlaybackContextTask?.cancel()
+        hlsPlaybackContextTask = nil
+        hlsPlaybackContextOwner = nil
+        hlsPlaybackContextAuthority = nil
+        guard let service = hlsPlaybackContextService,
+            hlsPlaybackContextWithdrawalTask == nil
+        else {
+            return
+        }
+
+        hlsPlaybackContextWithdrawalTask = Task { @MainActor [weak self] in
+            let outcome = await service.withdrawAndConfirmRemoteRemoval()
+            guard let self, self.hlsPlaybackContextService === service else { return }
+            guard outcome == .acknowledged || outcome == .notRequired else {
+                self.hlsPlaybackContextWithdrawalTask = nil
+                return
+            }
+            self.hlsPlaybackContextService = nil
+            self.hlsPlaybackContextOwner = nil
+            self.hlsPlaybackContextAuthority = nil
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                self.hlsPlaybackContextWithdrawalTask = nil
+                return
+            }
+            self.hlsPlaybackContextWithdrawalTask = nil
+            self.handleHLSPlaybackContextStateChange(using: self.playbackController)
+        }
     }
 
     private func observePlaybackEnd(for item: AVPlayerItem?) {
@@ -1509,7 +1789,7 @@ public final class PlayerViewModel: ObservableObject {
         guard let item = player.currentItem else { return }
         playbackResumeObserver = player.publisher(for: \.timeControlStatus)
             .sink { [weak self, weak player, weak item] status in
-                guard status == .playing || status == .paused else {
+                guard status == .playing || status == .paused || status == .waitingToPlayAtSpecifiedRate else {
                     return
                 }
 
@@ -1519,13 +1799,24 @@ public final class PlayerViewModel: ObservableObject {
                     else {
                         return
                     }
-                    if status == .playing {
-                        self.handlePlaybackResume(using: player)
-                    } else {
-                        self.handlePlaybackPause(using: player)
-                    }
+                    self.handlePlaybackTimeControlStatusChange(using: self.playbackController)
                 }
             }
+    }
+
+    func handlePlaybackTimeControlStatusChange(using controller: (any PlayerPlaybackControlling)?) {
+        guard let controller else { return }
+        handleHLSPlaybackContextStateChange(using: controller)
+        switch controller.timeControlStatus {
+        case .playing:
+            handlePlaybackResume(using: controller)
+        case .paused:
+            handlePlaybackPause(using: controller)
+        case .waitingToPlayAtSpecifiedRate:
+            break
+        @unknown default:
+            invalidateHLSPlaybackContext()
+        }
     }
 
     func handlePlaybackResume(using controller: (any PlayerPlaybackControlling)?) {
@@ -1534,6 +1825,7 @@ public final class PlayerViewModel: ObservableObject {
         else {
             return
         }
+        handleHLSPlaybackContextStateChange(using: controller)
 
         if resumePositionUnrestoredItem === item {
             markManualInteraction(preservingResumptionResult: true)
@@ -1558,6 +1850,7 @@ public final class PlayerViewModel: ObservableObject {
         else {
             return
         }
+        invalidateHLSPlaybackContext()
 
         let position = controller.currentTime().seconds
         guard position.isFinite, position >= 0 else { return }
@@ -1582,6 +1875,8 @@ public final class PlayerViewModel: ObservableObject {
                 Task { @MainActor [weak self, weak item] in
                     guard let self, let item, self.player?.currentItem === item else { return }
                     self.invalidateHLSUpshiftAssessment()
+                    self.invalidateHLSPlaybackContext()
+                    self.handleHLSPlaybackContextStateChange(using: self.playbackController)
                     self.handlePlaybackTimeJump(using: self.player)
                 }
             }
@@ -1632,6 +1927,7 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
         invalidateHLSUpshiftAssessment()
+        invalidateHLSPlaybackContext()
         let queuedStoppedReport: Bool
         if let terminalTime {
             queuePlaybackProgressReport(

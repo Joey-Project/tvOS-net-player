@@ -1455,6 +1455,7 @@ final class PlayerViewModelTests: XCTestCase {
     func testNativePauseIgnoresStaleControllerEvenWhenItemMatches() async throws {
         let identity = makePlaybackIdentity()
         let (model, controller, store, client) = try makeResumableFixture(identity: identity)
+        await model.flushPlaybackProgressReports()
         store.updatePlayback(
             identity: identity,
             positionSeconds: 42,
@@ -3120,6 +3121,482 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeTimeJumpsRotateReportingContextWithoutReplacingPlaybackItem() async throws {
+        let client = FakePlaybackProgressClient()
+        let notificationCenter = NotificationCenter()
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        model.playbackNotificationCenter = notificationCenter
+        model.playbackSnapshotNowNanoseconds = { 10_000_000_000 }
+
+        let sourceURL = try XCTUnwrap(URL(string: "https://cache.local/hls/session-1/master.m3u8?token=original"))
+        model.streamURLText = sourceURL.absoluteString
+        let summary = CacheServerSummary(
+            id: "server",
+            name: "Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [
+                CacheServerCapability.hlsPlaybackContext,
+                CacheServerCapability.hlsPlaybackReaderBinding,
+                CacheServerCapability.hlsRenditionCatalog,
+            ]
+        )
+        let session = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(
+                serverID: "server",
+                sessionID: "session-1",
+                serverSummary: summary
+            )
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: session
+        )
+        let captures = PlaybackFactoryCapture()
+        model.playbackControllerFactory = { url in
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            captures.urls.append(url)
+            captures.players.append(player)
+            captures.controllers.append(controller)
+            return (player, controller)
+        }
+
+        XCTAssertTrue(model.loadTransient(streamURLText: sourceURL.absoluteString, progressContext: context))
+        let player = try XCTUnwrap(model.player)
+        let item = try XCTUnwrap(player.currentItem)
+        let controller = try XCTUnwrap(captures.controllers.first)
+        controller.loadedMediaTimeRangesOverride = [
+            CMTimeRange(start: .zero, duration: CMTime(seconds: 30, preferredTimescale: 600))
+        ]
+        controller.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 1, updates: 1)
+
+        let initialCounts = await client.hlsRequestCounts()
+        let initialOpenRequests = await client.hlsOpenRequestsSnapshot()
+        let initialOpenedContextIDs = await client.hlsOpenedContextIDsSnapshot()
+        let initialOpen = try XCTUnwrap(initialOpenRequests.first)
+        let initialContextID = try XCTUnwrap(initialOpenedContextIDs.first)
+        let boundURL = try XCTUnwrap(captures.urls.first)
+        let boundReaderID = URLComponents(url: boundURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "playback_reader" })?.value
+        XCTAssertEqual(boundReaderID, initialOpen.httpReaderID)
+        XCTAssertEqual(initialOpen.expectedSessionGeneration, 7)
+        XCTAssertEqual(model.loadedURL, sourceURL)
+        XCTAssertEqual(model.streamURLText, sourceURL.absoluteString)
+
+        for _ in 0..<3 {
+            notificationCenter.post(name: .AVPlayerItemTimeJumped, object: item)
+        }
+        await Self.waitForHLSActivity(client: client, opens: 2, closes: 1, updates: 2)
+
+        let rotatedCounts = await client.hlsRequestCounts()
+        let opens = await client.hlsOpenRequestsSnapshot()
+        let closes = await client.hlsCloseRequestsSnapshot()
+        XCTAssertEqual(rotatedCounts.open, 2)
+        XCTAssertEqual(closes.first?.contextID, initialContextID)
+        XCTAssertEqual(opens.last?.httpReaderID, boundReaderID)
+        XCTAssertTrue(model.player === player)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(captures.urls.first, boundURL)
+        XCTAssertEqual(model.loadedURL, sourceURL)
+
+        model.checkpointPlayback()
+        await model.flushPlaybackProgressReports()
+        let progressReports = await client.reportsSnapshot()
+        XCTAssertEqual(progressReports.last?.playbackURI, sourceURL.absoluteString)
+        XCTAssertEqual(initialCounts.catalog, 1)
+    }
+
+    @MainActor
+    func testPauseBufferingEndAndUnsupportedServerWithdrawOrFallBack() async throws {
+        let client = FakePlaybackProgressClient()
+        let notificationCenter = NotificationCenter()
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        model.playbackNotificationCenter = notificationCenter
+        model.playbackSnapshotNowNanoseconds = { 10_000_000_000 }
+        let sourceURL = try XCTUnwrap(URL(string: "https://cache.local/hls/session-2/master.m3u8"))
+        let summary = CacheServerSummary(
+            id: "server",
+            name: "Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [
+                CacheServerCapability.hlsPlaybackContext,
+                CacheServerCapability.hlsPlaybackReaderBinding,
+                CacheServerCapability.hlsRenditionCatalog,
+            ]
+        )
+        let session = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(serverID: "server", sessionID: "session-2", serverSummary: summary)
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: session
+        )
+        let captures = PlaybackFactoryCapture()
+        model.playbackControllerFactory = { url in
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            captures.urls.append(url)
+            captures.players.append(player)
+            captures.controllers.append(controller)
+            return (player, controller)
+        }
+
+        XCTAssertTrue(model.loadTransient(streamURLText: sourceURL.absoluteString, progressContext: context))
+        let item = try XCTUnwrap(model.player?.currentItem)
+        let controller = try XCTUnwrap(captures.controllers.first)
+        controller.loadedMediaTimeRangesOverride = [
+            CMTimeRange(start: .zero, duration: CMTime(seconds: 30, preferredTimescale: 600))
+        ]
+        controller.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 1, updates: 1)
+
+        controller.timeControlStatus = .waitingToPlayAtSpecifiedRate
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 1, closes: 1)
+
+        controller.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 2, updates: 2)
+
+        controller.timeControlStatus = .paused
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 2, closes: 2)
+
+        controller.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 3, updates: 3)
+        notificationCenter.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        await Self.waitForHLSActivity(client: client, opens: 3, closes: 3)
+
+        let unsupportedClient = FakePlaybackProgressClient()
+        let unsupportedModel = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in unsupportedClient }
+        )
+        unsupportedModel.playbackSnapshotNowNanoseconds = { 10_000_000_000 }
+        let unsupportedSummary = CacheServerSummary(
+            id: "server",
+            name: "Old Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: []
+        )
+        let unsupportedSession = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(
+                serverID: "server",
+                sessionID: "session-2",
+                serverSummary: unsupportedSummary
+            )
+        )
+        let unsupportedContext = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: unsupportedSession
+        )
+        let unsupportedCaptures = PlaybackFactoryCapture()
+        unsupportedModel.playbackControllerFactory = { url in
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            unsupportedCaptures.urls.append(url)
+            unsupportedCaptures.players.append(player)
+            unsupportedCaptures.controllers.append(controller)
+            return (player, controller)
+        }
+        XCTAssertTrue(
+            unsupportedModel.loadTransient(
+                streamURLText: sourceURL.absoluteString,
+                progressContext: unsupportedContext
+            )
+        )
+        let unsupportedController = try XCTUnwrap(unsupportedCaptures.controllers.first)
+        unsupportedController.timeControlStatus = .playing
+        unsupportedModel.handlePlaybackTimeControlStatusChange(using: unsupportedController)
+        try await Task.sleep(for: .milliseconds(50))
+        let unsupportedCounts = await unsupportedClient.hlsRequestCounts()
+        XCTAssertEqual(unsupportedCaptures.urls.first, sourceURL)
+        XCTAssertEqual(unsupportedCounts.catalog, 0)
+        XCTAssertEqual(unsupportedCounts.open, 0)
+    }
+
+    @MainActor
+    func testContextWithoutRenditionCatalogKeepsOriginalPlaybackWithoutReportingRetries() async throws {
+        let client = FakePlaybackProgressClient()
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let sourceURL = try XCTUnwrap(
+            URL(string: "https://cache.local/hls/session-context-only/master.m3u8?token=original")
+        )
+        model.streamURLText = sourceURL.absoluteString
+        let summary = CacheServerSummary(
+            id: "server",
+            name: "Context-Only Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.hlsPlaybackContext, CacheServerCapability.hlsPlaybackReaderBinding]
+        )
+        let session = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(
+                serverID: "server",
+                sessionID: "session-context-only",
+                serverSummary: summary
+            )
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: session
+        )
+        let captures = PlaybackFactoryCapture()
+        model.playbackControllerFactory = { url in
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            captures.urls.append(url)
+            captures.players.append(player)
+            captures.controllers.append(controller)
+            return (player, controller)
+        }
+
+        XCTAssertTrue(model.loadTransient(streamURLText: sourceURL.absoluteString, progressContext: context))
+        let player = try XCTUnwrap(model.player)
+        let item = try XCTUnwrap(player.currentItem)
+        let controller = try XCTUnwrap(captures.controllers.first)
+        XCTAssertTrue(controller.currentItem === item)
+        controller.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+
+        try await Task.sleep(for: .milliseconds(1_100))
+
+        let counts = await client.hlsRequestCounts()
+        XCTAssertEqual(captures.urls, [sourceURL])
+        XCTAssertEqual(model.loadedURL, sourceURL)
+        XCTAssertEqual(model.streamURLText, sourceURL.absoluteString)
+        XCTAssertTrue(model.player === player)
+        XCTAssertTrue(player.currentItem === item)
+        XCTAssertEqual(counts.catalog, 0)
+        XCTAssertEqual(counts.open, 0)
+    }
+
+    @MainActor
+    func testReplacementReleasesOldPlayerWhileWithdrawalRemainsUnconfirmed() async throws {
+        let client = FakePlaybackProgressClient(acknowledgeHLSCloses: false)
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        model.playbackSnapshotNowNanoseconds = { 10_000_000_000 }
+        let sourceURL = try XCTUnwrap(URL(string: "https://cache.local/hls/session-3/master.m3u8"))
+        let replacementURL = try XCTUnwrap(URL(string: "https://media.local/replacement.mp4"))
+        let summary = CacheServerSummary(
+            id: "server",
+            name: "Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [
+                CacheServerCapability.hlsPlaybackContext,
+                CacheServerCapability.hlsPlaybackReaderBinding,
+                CacheServerCapability.hlsRenditionCatalog,
+            ]
+        )
+        let session = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(serverID: "server", sessionID: "session-3", serverSummary: summary)
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: session
+        )
+        let firstReferences = WeakPlaybackReferences()
+        let replacementReferences = WeakPlaybackReferences()
+        var factoryURLs: [URL] = []
+        var factoryCallCount = 0
+        model.playbackControllerFactory = { url in
+            factoryURLs.append(url)
+            let item: AVPlayerItem
+            if factoryCallCount == 0 {
+                item = AVPlayerItem(url: url)
+            } else {
+                let composition = AVMutableComposition()
+                composition.insertEmptyTimeRange(
+                    CMTimeRange(start: .zero, duration: CMTime(seconds: 120, preferredTimescale: 600))
+                )
+                item = AVPlayerItem(asset: composition)
+            }
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            if factoryCallCount == 0 {
+                firstReferences.player = player
+                firstReferences.item = item
+                firstReferences.controller = controller
+            } else {
+                replacementReferences.player = player
+                replacementReferences.item = item
+                replacementReferences.controller = controller
+            }
+            factoryCallCount += 1
+            return (player, controller)
+        }
+
+        XCTAssertTrue(model.loadTransient(streamURLText: sourceURL.absoluteString, progressContext: context))
+        let firstFactoryURL = try XCTUnwrap(factoryURLs.first)
+        var firstController: PlaybackControlSpy? = try XCTUnwrap(firstReferences.controller)
+        firstController?.loadedMediaTimeRangesOverride = [
+            CMTimeRange(start: .zero, duration: CMTime(seconds: 30, preferredTimescale: 600))
+        ]
+        firstController?.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: firstController)
+        await Self.waitForHLSActivity(client: client, opens: 1, updates: 1)
+        XCTAssertNotNil(firstReferences.controller)
+
+        XCTAssertTrue(model.loadTransient(streamURLText: replacementURL.absoluteString))
+        firstController = nil
+        XCTAssertEqual(factoryURLs, [firstFactoryURL, replacementURL])
+        await Self.waitForHLSActivity(client: client, opens: 1, closes: 1)
+        await Self.waitForPlaybackRelease(firstReferences)
+
+        XCTAssertNil(firstReferences.player)
+        XCTAssertNil(firstReferences.item)
+        autoreleasepool {
+            Self.assertCurrentPlaybackOwner(model: model, references: replacementReferences)
+        }
+
+        model.clear()
+        await Self.waitForPlaybackRelease(replacementReferences)
+        XCTAssertNil(model.player)
+        XCTAssertNil(replacementReferences.player)
+        XCTAssertNil(replacementReferences.item)
+    }
+
+    @MainActor
+    func testClearReleasesCurrentHLSPlayerDuringUnconfirmedWithdrawal() async throws {
+        let client = FakePlaybackProgressClient(acknowledgeHLSCloses: false)
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        model.playbackSnapshotNowNanoseconds = { 10_000_000_000 }
+        let sourceURL = try XCTUnwrap(URL(string: "https://cache.local/hls/session-4/master.m3u8"))
+        let summary = CacheServerSummary(
+            id: "server",
+            name: "Cache",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: [
+                CacheServerCapability.hlsPlaybackContext,
+                CacheServerCapability.hlsPlaybackReaderBinding,
+                CacheServerCapability.hlsRenditionCatalog,
+            ]
+        )
+        let session = try XCTUnwrap(
+            PlayerHLSPlaybackSessionContext(serverID: "server", sessionID: "session-4", serverSummary: summary)
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: CacheServerEndpoint(host: "cache.local", port: 50_051),
+            playbackURI: sourceURL.absoluteString,
+            hlsSession: session
+        )
+        let references = WeakPlaybackReferences()
+        model.playbackControllerFactory = { url in
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+            controller.loadedMediaTimeRangesOverride = [
+                CMTimeRange(start: .zero, duration: CMTime(seconds: 30, preferredTimescale: 600))
+            ]
+            references.player = player
+            references.item = item
+            references.controller = controller
+            return (player, controller)
+        }
+
+        XCTAssertTrue(model.loadTransient(streamURLText: sourceURL.absoluteString, progressContext: context))
+        var controller: PlaybackControlSpy? = try XCTUnwrap(references.controller)
+        controller?.timeControlStatus = .playing
+        model.handlePlaybackTimeControlStatusChange(using: controller)
+        await Self.waitForHLSActivity(client: client, opens: 1, updates: 1)
+
+        model.clear()
+        controller = nil
+        await Self.waitForHLSActivity(client: client, opens: 1, closes: 1)
+        await Self.waitForPlaybackRelease(references)
+
+        XCTAssertNil(model.player)
+        XCTAssertNil(references.player)
+        XCTAssertNil(references.item)
+    }
+
+    @MainActor
+    private static func waitForHLSActivity(
+        client: FakePlaybackProgressClient,
+        opens: Int,
+        closes: Int = 0,
+        updates: Int = 0
+    ) async {
+        for _ in 0..<200 {
+            let counts = await client.hlsRequestCounts()
+            if counts.open >= opens, counts.close >= closes, counts.update >= updates {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    // Keep XCTest's bridged AVFoundation values scoped before the clear/release assertions.
+    @MainActor
+    private static func assertCurrentPlaybackOwner(
+        model: PlayerViewModel,
+        references: WeakPlaybackReferences
+    ) {
+        XCTAssertNotNil(references.player)
+        XCTAssertTrue(model.player === references.player)
+        XCTAssertTrue(model.player?.currentItem === references.item)
+    }
+
+    @MainActor
+    private static func waitForPlaybackRelease(_ references: WeakPlaybackReferences) async {
+        for _ in 0..<100 {
+            try? await Task.sleep(for: .milliseconds(10))
+            if playbackReferencesReleased(references) { return }
+        }
+    }
+
+    // Do not promote weak probes to strong locals before a suspension; that can keep AVFoundation objects alive in the poll.
+    @MainActor
+    private static func playbackReferencesReleased(_ references: WeakPlaybackReferences) -> Bool {
+        references.player == nil && references.item == nil
+    }
+
+    @MainActor
     func testClearRemovesSavedURLAndStopsPlayer() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         model.streamURLText = "https://example.com/movie.m3u8"
@@ -3174,6 +3651,20 @@ private final class PlaybackControllerCollection {
 }
 
 @MainActor
+private final class PlaybackFactoryCapture {
+    var urls: [URL] = []
+    var players: [AVPlayer] = []
+    var controllers: [PlaybackControlSpy] = []
+}
+
+@MainActor
+private final class WeakPlaybackReferences {
+    weak var player: AVPlayer?
+    weak var item: AVPlayerItem?
+    weak var controller: PlaybackControlSpy?
+}
+
+@MainActor
 private final class AsyncResumptionAttempt {
     var task: Task<Void, Never>?
     var result: Bool?
@@ -3186,6 +3677,16 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     var readinessStatus: AVPlayerItem.Status = .readyToPlay
     var timeControlStatus: AVPlayer.TimeControlStatus
     var defaultRate: Float = 1
+    var loadedMediaTimeRangesOverride: [CMTimeRange]?
+    var loadedMediaTimeRanges: [CMTimeRange] {
+        loadedMediaTimeRangesOverride
+            ?? currentItem?.loadedTimeRanges.prefix(HLSPlaybackSnapshot.maximumBufferedRangeCount + 1).map(
+                \.timeRangeValue)
+            ?? []
+    }
+    var actualPlaybackRate: Float? {
+        timeControlStatus == .playing ? defaultRate : nil
+    }
     var playbackTime: CMTime = .zero
     var positionSeconds: Double {
         get { playbackTime.seconds }
@@ -3270,13 +3771,27 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
 private actor FakePlaybackProgressClient: CacheControlClient {
     private let delayFirstReport: Bool
     private let failReports: Bool
+    private let hlsCatalogGeneration: UInt64
+    private let acknowledgeHLSCloses: Bool
     private var reports: [PlaybackProgressReport] = []
     private var reportCallCount = 0
     private var firstReportContinuation: CheckedContinuation<Void, Never>?
+    private var hlsCatalogRequestCount = 0
+    private var hlsOpenRequests: [HLSPlaybackContextOpenRequest] = []
+    private var hlsOpenedContextIDs: [String] = []
+    private var hlsUpdateRequests: [HLSPlaybackContextUpdateRequest] = []
+    private var hlsCloseRequests: [HLSPlaybackContextCloseRequest] = []
 
-    init(delayFirstReport: Bool = false, failReports: Bool = false) {
+    init(
+        delayFirstReport: Bool = false,
+        failReports: Bool = false,
+        hlsCatalogGeneration: UInt64 = 7,
+        acknowledgeHLSCloses: Bool = true
+    ) {
         self.delayFirstReport = delayFirstReport
         self.failReports = failReports
+        self.hlsCatalogGeneration = hlsCatalogGeneration
+        self.acknowledgeHLSCloses = acknowledgeHLSCloses
     }
 
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
@@ -3297,12 +3812,86 @@ private actor FakePlaybackProgressClient: CacheControlClient {
         )
     }
 
+    func getHLSRenditionCatalog(_ request: HLSRenditionCatalogRequest) async throws -> HLSRenditionCatalog {
+        hlsCatalogRequestCount += 1
+        return try HLSRenditionCatalog(
+            sessionID: request.sessionID,
+            sessionGeneration: hlsCatalogGeneration,
+            renditions: [
+                try HLSRenditionDescriptor(
+                    variantID: "h264",
+                    advertisedBandwidthBitsPerSecond: 1,
+                    hasSeparateAudio: false
+                )
+            ]
+        )
+    }
+
+    func openHLSPlaybackContext(
+        _ request: HLSPlaybackContextOpenRequest
+    ) async throws -> HLSPlaybackContextTicket {
+        hlsOpenRequests.append(request)
+        let contextID = Self.uuidString(0x100 + UInt64(hlsOpenRequests.count))
+        hlsOpenedContextIDs.append(contextID)
+        return HLSPlaybackContextTicket(
+            contextID: contextID,
+            challenge: Self.uuidString(0x200 + UInt64(hlsOpenRequests.count)),
+            sessionID: request.sessionID,
+            sessionGeneration: request.expectedSessionGeneration,
+            nextSequence: 1,
+            validityMillis: 5_000,
+            httpReaderID: request.httpReaderID
+        )
+    }
+
+    func updateHLSPlaybackContext(
+        _ request: HLSPlaybackContextUpdateRequest
+    ) async throws -> HLSPlaybackContextTicket {
+        hlsUpdateRequests.append(request)
+        return HLSPlaybackContextTicket(
+            contextID: request.contextID,
+            challenge: Self.uuidString(0x300 + request.sequence),
+            sessionID: request.sessionID,
+            sessionGeneration: request.expectedSessionGeneration,
+            nextSequence: request.sequence + 1,
+            validityMillis: 5_000,
+            httpReaderID: request.expectedHTTPReaderID
+        )
+    }
+
+    func closeHLSPlaybackContext(
+        _ request: HLSPlaybackContextCloseRequest
+    ) async throws -> HLSPlaybackContextCloseResponse {
+        hlsCloseRequests.append(request)
+        return HLSPlaybackContextCloseResponse(closed: acknowledgeHLSCloses)
+    }
+
     func reportsSnapshot() -> [PlaybackProgressReport] {
         reports
     }
 
     func reportCallCountSnapshot() -> Int {
         reportCallCount
+    }
+
+    func hlsRequestCounts() -> (catalog: Int, open: Int, update: Int, close: Int) {
+        (hlsCatalogRequestCount, hlsOpenRequests.count, hlsUpdateRequests.count, hlsCloseRequests.count)
+    }
+
+    func hlsOpenRequestsSnapshot() -> [HLSPlaybackContextOpenRequest] {
+        hlsOpenRequests
+    }
+
+    func hlsOpenedContextIDsSnapshot() -> [String] {
+        hlsOpenedContextIDs
+    }
+
+    func hlsCloseRequestsSnapshot() -> [HLSPlaybackContextCloseRequest] {
+        hlsCloseRequests
+    }
+
+    private static func uuidString(_ suffix: UInt64) -> String {
+        String(format: "00000000-0000-4000-8000-%012llx", suffix)
     }
 
     func resumeFirstReport() {

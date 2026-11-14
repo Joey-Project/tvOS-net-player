@@ -97,6 +97,55 @@ final class HLSPlaybackReaderURLBindingTests: XCTestCase {
         )
     }
 
+    func testStructuredSourceCanBindReaderBeforeCatalogGenerationExists() throws {
+        let original = try XCTUnwrap(URL(string: "https://cache.local/hls/session-1/master.m3u8"))
+        let readerToken = try XCTUnwrap(UUID(uuidString: readerID))
+        let bound = try XCTUnwrap(
+            HLSPlaybackReaderURLBinding.applying(
+                to: original,
+                server: server(supportsReaderBinding: true),
+                expectedServerID: "server",
+                sessionID: "session-1",
+                readerID: readerToken
+            )
+        )
+
+        XCTAssertEqual(
+            URLComponents(url: bound, resolvingAgainstBaseURL: false)?.queryItems?.last,
+            URLQueryItem(name: "playback_reader", value: readerID)
+        )
+        XCTAssertNil(
+            HLSPlaybackReaderURLBinding.applying(
+                to: original,
+                server: server(id: "other", supportsReaderBinding: true),
+                expectedServerID: "server",
+                sessionID: "session-1",
+                readerID: readerToken
+            )
+        )
+    }
+
+    func testGenerationIndependentBindingRejectsNilNonV4AndInvalidVariantUUIDs() throws {
+        let original = try XCTUnwrap(URL(string: "https://cache.local/hls/session-1/master.m3u8"))
+        let invalidTokens = [
+            try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000000")),
+            try XCTUnwrap(UUID(uuidString: "00000000-0000-1000-8000-0000000000a1")),
+            try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-0000-0000000000a1")),
+        ]
+
+        for token in invalidTokens {
+            XCTAssertNil(
+                HLSPlaybackReaderURLBinding.applying(
+                    to: original,
+                    server: server(supportsReaderBinding: true),
+                    expectedServerID: "server",
+                    sessionID: "session-1",
+                    readerID: token
+                )
+            )
+        }
+    }
+
     func testCapability22RejectsWrongOwnerOrUnrecognizedURLs() throws {
         let inputs = [
             "https://cache.local/hls/other-session/master.m3u8",

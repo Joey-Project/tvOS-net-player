@@ -36,18 +36,21 @@ use crate::{
     },
     hls_cache::{
         HlsCacheFillControl, HlsRangeEnsure, HlsStartupProbeEvidence, OpenedPrewarmedHlsResource,
+        media_url_origin, strong_etag,
     },
     hls_media_refresh::is_expired_range_error,
     hls_playback_context::is_canonical_uuid_v4,
     hls_range_cache::{
-        HlsRangeError, HlsRangePriority, HlsReadyRange, RANGE_FOREGROUND_CHUNK_BYTES,
-        RANGE_MAX_CHUNK_BYTES,
+        HlsRangeError, HlsRangePriority, HlsRangePriorityResolver, HlsReadyRange,
+        RANGE_FOREGROUND_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES,
     },
     library::OpenedMediaFile,
     mp4_segments::{
         MAX_SIDX_TRAILER_BYTES, Mp4SegmentRange, mp4_sidx_index, mp4_sidx_segment_ranges,
+        mp4_sidx_timing_ranges,
     },
     playback_policy::WeakNetworkPreference,
+    playback_request_urgency::{PlaybackRequestUrgency, PlaybackSidxMap, PlaybackSidxRange},
     suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock},
 };
 
@@ -502,6 +505,8 @@ async fn hls_segment_response(
                 length: cached.initialization_length,
                 total_length: cached.total_length,
                 segments: cached.segments,
+                playback_sidx_map: None,
+                playback_sidx_binding: None,
             }
         } else if !advertised_resource && !resource_has_upstream(&resource) {
             log_hls_media_not_found(HlsMediaNotFoundBranch::PlaylistResourceUnavailable);
@@ -512,16 +517,14 @@ async fn hls_segment_response(
             .prewarmed_resource(&session_id, &resource.id)
         {
             policy_recorder.record_cache_hit();
+            let (segments, playback_sidx_map) =
+                load_prewarmed_mp4_sidx_segments(&state, &session_id, &resource, &prewarmed).await;
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
-                segments: load_prewarmed_mp4_sidx_segments(
-                    &state,
-                    &session_id,
-                    &resource,
-                    &prewarmed,
-                )
-                .await,
+                segments,
+                playback_sidx_map,
+                playback_sidx_binding: None,
             }
         } else {
             let Ok(initialization) =
@@ -536,6 +539,19 @@ async fn hls_segment_response(
             };
             initialization
         };
+        if let (Some(playback_sidx_map), Some(binding)) = (
+            initialization.playback_sidx_map.clone(),
+            initialization.playback_sidx_binding.as_ref(),
+        ) {
+            state.state.hls_cache.register_playback_sidx_map(
+                &session_id,
+                generation,
+                &resource,
+                playback_sidx_map,
+                &binding.origin,
+                &binding.strong_etag,
+            );
+        }
         let playlist = match http_reader_id.as_deref() {
             Some(reader_id) => {
                 let uri_options = HlsPlaylistUriOptions::new(Some(reader_id));
@@ -742,6 +758,7 @@ async fn hls_segment_response(
             &state,
             &policy_recorder,
             generation,
+            http_reader_id,
             &variant_id,
             resource,
             &headers,
@@ -882,6 +899,7 @@ async fn foreground_hls_range_response(
     state: &MediaState,
     policy_recorder: &HlsNetworkPolicyRecorder,
     generation: u64,
+    http_reader_id: Option<String>,
     variant_id: &str,
     resource: HlsMediaResource,
     headers: &HeaderMap,
@@ -903,6 +921,16 @@ async fn foreground_hls_range_response(
         generation,
         resource.clone(),
     );
+    let priority_resolver = http_reader_id.as_deref().and_then(|reader_id| {
+        PlaybackRequestUrgency::new(
+            Arc::clone(&state.state),
+            reader_id,
+            &policy_recorder.session_id,
+            generation,
+            resource.clone(),
+        )
+        .map(|urgency| Arc::new(urgency).resolver())
+    });
     let mut total_length = resource.request.size;
     let mut initial_probe = None;
     if total_length.is_none() {
@@ -1009,12 +1037,13 @@ async fn foreground_hls_range_response(
     {
         Some((Some(probe.0), probe.1, None))
     } else {
-        match prepare_hls_media_stream_chunk(
+        match prepare_hls_media_stream_chunk_with_resolver(
             state,
             &policy_recorder.session_id,
             &resource,
             start..end,
             Arc::clone(&control),
+            priority_resolver.clone(),
         )
         .await
         {
@@ -1079,6 +1108,7 @@ async fn foreground_hls_range_response(
         first_bytes,
         first_was_fetched,
         ensure,
+        priority_resolver,
         upstream_tail: None,
         observation: HlsRangePolicyObservation::new(
             policy_recorder.clone(),
@@ -1159,12 +1189,13 @@ fn same_hls_range_resource_representation(
             .is_none_or(|expected_size| current_request.size == Some(expected_size))
 }
 
-async fn read_or_fill_hls_range<F>(
+async fn read_or_fill_hls_range_with_resolver<F>(
     state: &MediaState,
     session_id: &str,
     resource: &HlsMediaResource,
     requested: StdRange<u64>,
     control: &F,
+    priority_resolver: Option<HlsRangePriorityResolver>,
 ) -> Result<(Bytes, bool, u64), HlsRangeError>
 where
     F: Fn() -> HlsCacheFillControl + Send + Sync,
@@ -1187,15 +1218,28 @@ where
         ));
     }
 
-    let ready = ensure_hls_range_with_media_refresh(
-        state,
-        session_id,
-        resource,
-        requested.clone(),
-        HlsRangePriority::Foreground,
-        control,
-    )
-    .await?;
+    let ready = if let Some(priority_resolver) = priority_resolver {
+        ensure_hls_range_with_media_refresh_and_resolver(
+            state,
+            session_id,
+            resource,
+            requested.clone(),
+            HlsRangePriority::FarFuturePlayback,
+            control,
+            Some(priority_resolver),
+        )
+        .await?
+    } else {
+        ensure_hls_range_with_media_refresh(
+            state,
+            session_id,
+            resource,
+            requested.clone(),
+            HlsRangePriority::Foreground,
+            control,
+        )
+        .await?
+    };
     let bytes = state
         .state
         .hls_cache
@@ -1225,12 +1269,28 @@ where
     }
 }
 
+#[cfg(test)]
 async fn read_hls_media_stream_chunk<F>(
     state: &MediaState,
     session_id: &str,
     resource: &HlsMediaResource,
     requested: StdRange<u64>,
     control: &F,
+) -> Result<(Bytes, bool, u64), HlsRangeError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
+    read_hls_media_stream_chunk_with_resolver(state, session_id, resource, requested, control, None)
+        .await
+}
+
+async fn read_hls_media_stream_chunk_with_resolver<F>(
+    state: &MediaState,
+    session_id: &str,
+    resource: &HlsMediaResource,
+    requested: StdRange<u64>,
+    control: &F,
+    priority_resolver: Option<HlsRangePriorityResolver>,
 ) -> Result<(Bytes, bool, u64), HlsRangeError>
 where
     F: Fn() -> HlsCacheFillControl + Send + Sync,
@@ -1264,22 +1324,24 @@ where
         .start
         .saturating_add(HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES)
         .min(requested.end);
-    read_or_fill_hls_range(
+    read_or_fill_hls_range_with_resolver(
         state,
         session_id,
         resource,
         requested.start..fetch_end,
         control,
+        priority_resolver,
     )
     .await
 }
 
-async fn prepare_hls_media_stream_chunk<F>(
+async fn prepare_hls_media_stream_chunk_with_resolver<F>(
     state: &MediaState,
     session_id: &str,
     resource: &HlsMediaResource,
     requested: StdRange<u64>,
     control: Arc<F>,
+    priority_resolver: Option<HlsRangePriorityResolver>,
 ) -> Result<(Option<Bytes>, bool, u64, Option<HlsRangeEnsure>), HlsRangeError>
 where
     F: Fn() -> HlsCacheFillControl + Send + Sync + 'static,
@@ -1294,12 +1356,13 @@ where
         .hls_cache
         .read_resource_range_prefix(session_id, resource, requested.start..delivery_end)
         .await?;
-    let mut ensure = observe_hls_range_with_media_refresh(
+    let mut ensure = observe_hls_range_with_media_refresh_and_resolver(
         state,
         session_id,
         resource,
         requested.clone(),
         control.clone(),
+        priority_resolver,
     )
     .await?;
     let total = ensure
@@ -1319,12 +1382,13 @@ where
     Ok((None, true, total, Some(ensure)))
 }
 
-async fn observe_hls_range_with_media_refresh<F>(
+async fn observe_hls_range_with_media_refresh_and_resolver<F>(
     state: &MediaState,
     session_id: &str,
     resource: &HlsMediaResource,
     requested: StdRange<u64>,
     control: Arc<F>,
+    priority_resolver: Option<HlsRangePriorityResolver>,
 ) -> Result<HlsRangeEnsure, HlsRangeError>
 where
     F: Fn() -> HlsCacheFillControl + Send + Sync + 'static,
@@ -1341,14 +1405,25 @@ where
         .unwrap_or_else(|| resource.clone());
     let start = |resource: HlsMediaResource| {
         let task_control = Arc::clone(&control);
-        state.state.hls_cache.observe_resource_range(
-            state.state.hls_upstream_client.clone(),
-            session_id.to_owned(),
-            resource,
-            requested.clone(),
-            HlsRangePriority::Foreground,
-            move || task_control(),
-        )
+        if let Some(priority_resolver) = priority_resolver.clone() {
+            state.state.hls_cache.observe_resource_range_with_resolver(
+                state.state.hls_upstream_client.clone(),
+                session_id.to_owned(),
+                resource,
+                requested.clone(),
+                priority_resolver,
+                move || task_control(),
+            )
+        } else {
+            state.state.hls_cache.observe_resource_range(
+                state.state.hls_upstream_client.clone(),
+                session_id.to_owned(),
+                resource,
+                requested.clone(),
+                HlsRangePriority::Foreground,
+                move || task_control(),
+            )
+        }
     };
     let mut ensure = start(effective_resource.clone());
     match ensure.wait_for_headers().await {
@@ -1391,6 +1466,24 @@ async fn ensure_hls_range_with_media_refresh<F>(
 where
     F: Fn() -> HlsCacheFillControl + Send + Sync,
 {
+    ensure_hls_range_with_media_refresh_and_resolver(
+        state, session_id, resource, requested, priority, control, None,
+    )
+    .await
+}
+
+async fn ensure_hls_range_with_media_refresh_and_resolver<F>(
+    state: &MediaState,
+    session_id: &str,
+    resource: &HlsMediaResource,
+    requested: StdRange<u64>,
+    priority: HlsRangePriority,
+    control: &F,
+    priority_resolver: Option<HlsRangePriorityResolver>,
+) -> Result<HlsReadyRange, HlsRangeError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
     let failed_session = state.state.hls_sessions.get(session_id);
     let effective_resource = failed_session
         .as_ref()
@@ -1398,18 +1491,33 @@ where
         .map(|(_, current)| current)
         .filter(|current| same_hls_range_resource_representation(resource, current))
         .unwrap_or_else(|| resource.clone());
-    let result = state
-        .state
-        .hls_cache
-        .ensure_resource_range(
-            &state.state.hls_upstream_client,
-            session_id,
-            &effective_resource,
-            requested.clone(),
-            priority,
-            control,
-        )
-        .await;
+    let result = if let Some(priority_resolver) = priority_resolver.clone() {
+        state
+            .state
+            .hls_cache
+            .ensure_resource_range_with_resolver(
+                &state.state.hls_upstream_client,
+                session_id,
+                &effective_resource,
+                requested.clone(),
+                priority_resolver,
+                control,
+            )
+            .await
+    } else {
+        state
+            .state
+            .hls_cache
+            .ensure_resource_range(
+                &state.state.hls_upstream_client,
+                session_id,
+                &effective_resource,
+                requested.clone(),
+                priority,
+                control,
+            )
+            .await
+    };
     let error = match result {
         Err(error) if is_expired_range_error(&error) => error,
         result => return result,
@@ -1429,18 +1537,33 @@ where
         .media_resource_with_variant(&resource.id)
         .filter(|(_, replacement)| same_hls_range_resource_representation(resource, replacement))
         .ok_or(HlsRangeError::IdentityChanged)?;
-    state
-        .state
-        .hls_cache
-        .ensure_resource_range(
-            &state.state.hls_upstream_client,
-            session_id,
-            &replacement,
-            requested,
-            priority,
-            control,
-        )
-        .await
+    if let Some(priority_resolver) = priority_resolver {
+        state
+            .state
+            .hls_cache
+            .ensure_resource_range_with_resolver(
+                &state.state.hls_upstream_client,
+                session_id,
+                &replacement,
+                requested,
+                priority_resolver,
+                control,
+            )
+            .await
+    } else {
+        state
+            .state
+            .hls_cache
+            .ensure_resource_range(
+                &state.state.hls_upstream_client,
+                session_id,
+                &replacement,
+                requested,
+                priority,
+                control,
+            )
+            .await
+    }
 }
 
 fn range_header_is_well_formed(header: &HeaderValue) -> bool {
@@ -1565,6 +1688,7 @@ struct HlsCachedRangeStreamState<F> {
     first_bytes: Option<Bytes>,
     first_was_fetched: bool,
     ensure: Option<HlsRangeEnsure>,
+    priority_resolver: Option<HlsRangePriorityResolver>,
     upstream_tail: Option<BoxStream<'static, Result<Bytes, BoxError>>>,
     observation: HlsRangePolicyObservation,
 }
@@ -1616,13 +1740,14 @@ where
                                 .start
                                 .saturating_add(HLS_MEDIA_ORIGIN_FETCH_CHUNK_BYTES)
                                 .min(requested.end);
-                            ensure_hls_range_with_media_refresh(
+                            ensure_hls_range_with_media_refresh_and_resolver(
                                 &state.media_state,
                                 &state.session_id,
                                 &state.resource,
                                 requested.start..recovery_end,
                                 HlsRangePriority::Foreground,
                                 &state.control,
+                                state.priority_resolver.clone(),
                             )
                             .await?;
                             completed_pending_fetch = true;
@@ -1630,12 +1755,13 @@ where
                         Err(error) => return Err(error),
                     }
                 }
-                read_hls_media_stream_chunk(
+                read_hls_media_stream_chunk_with_resolver(
                     &state.media_state,
                     &state.session_id,
                     &state.resource,
                     requested,
                     &state.control,
+                    state.priority_resolver.clone(),
                 )
                 .await
                 .map(|(bytes, fetched, total)| (bytes, fetched || completed_pending_fetch, total))
@@ -2615,6 +2741,14 @@ struct Mp4Initialization {
     length: u64,
     total_length: u64,
     segments: Vec<HlsMediaSegment>,
+    playback_sidx_map: Option<PlaybackSidxMap>,
+    playback_sidx_binding: Option<PlaybackSidxBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaybackSidxBinding {
+    origin: String,
+    strong_etag: String,
 }
 
 struct Mp4InitializationProbe {
@@ -2815,10 +2949,25 @@ async fn load_hls_mp4_initialization_from_url(
             .is_none_or(|expected| expected == total_length);
     let exact_prefix =
         prefix_matches_resource && prefix_bytes == total_length.min(HLS_INITIALIZATION_SCAN_BYTES);
-    let segments = if prefix_matches_resource {
-        load_mp4_sidx_segments(state, resource, &final_url, &bytes, length, total_length).await
+    let playback_sidx_binding = strong_etag(&headers).and_then(|strong_etag| {
+        media_url_origin(&final_url).map(|origin| PlaybackSidxBinding {
+            origin,
+            strong_etag,
+        })
+    });
+    let (segments, playback_sidx_map) = if prefix_matches_resource {
+        load_mp4_sidx_segments(
+            state,
+            resource,
+            &final_url,
+            &bytes,
+            length,
+            total_length,
+            playback_sidx_binding.as_ref(),
+        )
+        .await
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     Ok(Mp4InitializationProbe {
@@ -2826,6 +2975,8 @@ async fn load_hls_mp4_initialization_from_url(
             length,
             total_length,
             segments,
+            playback_sidx_map,
+            playback_sidx_binding,
         },
         response_time,
         prefix_bytes,
@@ -2842,13 +2993,13 @@ async fn load_prewarmed_mp4_sidx_segments(
     session_id: &str,
     resource: &HlsMediaResource,
     prewarmed: &crate::hls_cache::PrewarmedHlsResource,
-) -> Vec<HlsMediaSegment> {
+) -> (Vec<HlsMediaSegment>, Option<PlaybackSidxMap>) {
     let Some(mut opened) = state
         .state
         .hls_cache
         .open_prewarmed_resource(session_id, &resource.id)
     else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if opened.prefix_length != prewarmed.prefix_length
         || opened.total_length != prewarmed.total_length
@@ -2858,11 +3009,11 @@ async fn load_prewarmed_mp4_sidx_segments(
             .size
             .is_some_and(|expected| expected != opened.total_length)
     {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let Ok(scan_length) = usize::try_from(opened.prefix_length.min(HLS_INITIALIZATION_SCAN_BYTES))
     else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let mut prefix = Vec::with_capacity(scan_length);
     if opened.file.seek(SeekFrom::Start(0)).is_err()
@@ -2873,7 +3024,7 @@ async fn load_prewarmed_mp4_sidx_segments(
         || prefix.len() != scan_length
         || mp4_initialization_length(&prefix) != Some(prewarmed.initialization_length)
     {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     load_mp4_sidx_segments(
         state,
@@ -2882,6 +3033,7 @@ async fn load_prewarmed_mp4_sidx_segments(
         &prefix,
         prewarmed.initialization_length,
         prewarmed.total_length,
+        None,
     )
     .await
 }
@@ -2893,21 +3045,22 @@ async fn load_mp4_sidx_segments(
     prefix: &[u8],
     initialization_length: u64,
     total_length: u64,
-) -> Vec<HlsMediaSegment> {
+    source_identity: Option<&PlaybackSidxBinding>,
+) -> (Vec<HlsMediaSegment>, Option<PlaybackSidxMap>) {
     let Some(index) = mp4_sidx_index(prefix, initialization_length, total_length) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let trailer = if index.trailing_length == 0 {
         Vec::new()
     } else {
         let Some(trailer_end) = index.trailing_offset.checked_add(index.trailing_length) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let Ok(start) = usize::try_from(index.trailing_offset) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let Ok(end) = usize::try_from(trailer_end) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         if let Some(trailer) = prefix.get(start..end) {
             trailer.to_vec()
@@ -2919,17 +3072,35 @@ async fn load_mp4_sidx_segments(
                 index.trailing_offset,
                 index.trailing_length,
                 total_length,
+                source_identity,
             )
             .await
             else {
-                return Vec::new();
+                return (Vec::new(), None);
             };
             trailer
         }
     };
-    mp4_sidx_segment_ranges(index, &trailer)
+    let timing_map = source_identity
+        .and_then(|_| mp4_sidx_timing_ranges(index.clone(), &trailer))
+        .and_then(|ranges| {
+            PlaybackSidxMap::new(
+                total_length,
+                ranges
+                    .into_iter()
+                    .map(|range| PlaybackSidxRange {
+                        bytes: range.bytes,
+                        start_ticks: range.start_ticks,
+                        end_ticks: range.end_ticks,
+                        timescale: range.timescale,
+                    })
+                    .collect(),
+            )
+        });
+    let segments = mp4_sidx_segment_ranges(index, &trailer)
         .map(|ranges| ranges.into_iter().map(hls_media_segment).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (segments, timing_map)
 }
 
 async fn fetch_mp4_sidx_trailer(
@@ -2939,6 +3110,7 @@ async fn fetch_mp4_sidx_trailer(
     offset: u64,
     length: u64,
     total_length: u64,
+    source_identity: Option<&PlaybackSidxBinding>,
 ) -> Option<Vec<u8>> {
     if length == 0 || length > MAX_SIDX_TRAILER_BYTES {
         return None;
@@ -2961,6 +3133,13 @@ async fn fetch_mp4_sidx_trailer(
             return None;
         }
         let headers = upstream.headers().clone();
+        if let Some(source_identity) = source_identity
+            && (media_url_origin(upstream.url().as_str()).as_deref()
+                != Some(source_identity.origin.as_str())
+                || strong_etag(&headers).as_deref() != Some(source_identity.strong_etag.as_str()))
+        {
+            return None;
+        }
         let (returned_range, returned_total) = content_range_byte_range(&headers)?;
         if returned_range.start != offset
             || returned_range.end != end
@@ -6158,6 +6337,521 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_far_future_seek_uses_verified_sidx_and_delivers_the_requested_body() {
+        let (upstream_url, requests, upstream_task) =
+            start_hls_sidx_upstream(SidxTailResponse::Valid).await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let data = indexed_fake_mp4();
+        let mut session = hls_session("http-seek", &upstream_url);
+        session.variant.video.request.size = Some(data.len() as u64);
+        session.variant.video.request.bandwidth = Some(100_000_000);
+        let resource = session.variant.video.clone();
+        let generation = insert_authorized_hls_session(&state, session);
+        let reader_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let ticket = state
+            .hls_playback_contexts
+            .open_with_reader_id("http-seek".to_owned(), generation, reader_id.to_owned())
+            .expect("reader context should bind to the registered generation");
+        state
+            .hls_playback_contexts
+            .update(
+                &ticket.context_id,
+                &ticket.challenge,
+                ticket.next_sequence,
+                crate::hls_playback_context::PlaybackTimingSample {
+                    playhead_seconds: 0.0,
+                    continuous_buffered_end_seconds: 10.0,
+                    playback_rate: 0.5,
+                },
+            )
+            .expect("fresh timing should be accepted for the reader");
+
+        // Make urgency deterministic; HTTP range bytes still come from the real test origin.
+        state.cdn_history.record_request(
+            &resource.request,
+            &upstream_url,
+            CdnObservation::playback_complete(
+                50_000_000,
+                Duration::from_millis(20),
+                Duration::from_millis(1),
+                Some(true),
+            ),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("media listener should bind");
+        let address = listener.local_addr().unwrap();
+        let router_state = state.clone();
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, crate::media_router(router_state))
+                .await
+                .expect("production media router should serve");
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("bounded HTTP client should build");
+        let base_url = format!("http://{address}");
+        let playlist = client
+            .get(format!(
+                "{base_url}/hls/http-seek/segments/video.m3u8?playback_reader={reader_id}"
+            ))
+            .send()
+            .await
+            .expect("production media playlist request should complete");
+        assert_eq!(StatusCode::OK, playlist.status());
+        assert!(
+            playlist
+                .text()
+                .await
+                .expect("indexed playlist should be readable")
+                .matches("#EXTINF:")
+                .count()
+                >= 2
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_sidx_map("http-seek", generation, &resource)
+                .is_some(),
+            "playlist path should register a map bound to its validated strong-ETag prefix"
+        );
+        assert!(
+            state
+                .current_hls_playback_context_for_reader(reader_id)
+                .is_some_and(|context| {
+                    context.session_id == "http-seek" && context.session_generation == generation
+                })
+        );
+
+        let second_media_length = 3 * 1024 * 1024 + 8;
+        let second_media_start = data.len() - terminal_mfra().len() - second_media_length;
+        let range_start = second_media_start + RANGE_FOREGROUND_CHUNK_BYTES as usize + 128;
+        let range_end = range_start + RANGE_FOREGROUND_CHUNK_BYTES as usize;
+        let first_media_start = second_media_start - (2 * 1024 * 1024 + 8);
+        let urgency = crate::playback_request_urgency::PlaybackRequestUrgency::new(
+            Arc::new(state.clone()),
+            reader_id,
+            "http-seek",
+            generation,
+            resource.clone(),
+        )
+        .expect("canonical reader should construct the urgency resolver");
+        assert_eq!(
+            HlsRangePriority::FarFuturePlayback,
+            urgency.priority_for_range(&(range_start as u64..range_end as u64), Duration::ZERO)
+        );
+        assert_eq!(
+            HlsRangePriority::Foreground,
+            urgency.priority_for_range(
+                &(first_media_start as u64..first_media_start as u64 + 4096),
+                Duration::ZERO
+            )
+        );
+        let mut audio_resource = resource.clone();
+        audio_resource.id = "audio.m4s".to_owned();
+        audio_resource.request.kind = BilibiliMediaRequestKind::Audio;
+        audio_resource.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        let audio_urgency = crate::playback_request_urgency::PlaybackRequestUrgency::new(
+            Arc::new(state.clone()),
+            reader_id,
+            "http-seek",
+            generation,
+            audio_resource,
+        )
+        .expect("audio resource should use the same canonical reader");
+        assert_eq!(
+            HlsRangePriority::Foreground,
+            audio_urgency
+                .priority_for_range(&(range_start as u64..range_end as u64), Duration::ZERO)
+        );
+        let response = client
+            .get(format!(
+                "{base_url}/hls/http-seek/segments/video.m4s?playback_reader={reader_id}"
+            ))
+            .header(RANGE, format!("bytes={range_start}-{}", range_end - 1))
+            .send()
+            .await
+            .expect("far-future range request should return a body");
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            Some((range_end - range_start) as u64),
+            response.content_length()
+        );
+        let body = response
+            .bytes()
+            .await
+            .expect("far-future response body should be delivered");
+        assert_eq!(&data[range_start..range_end], body.as_ref());
+
+        let observed_requests = requests.lock().unwrap().clone();
+        assert!(observed_requests.len() >= 3);
+        assert_eq!(
+            format!("bytes=0-{}", HLS_INITIALIZATION_SCAN_BYTES - 1),
+            observed_requests[0],
+            "real playlist request should first validate the initialization prefix"
+        );
+        let trailer_start = data.len() - terminal_mfra().len();
+        assert_eq!(
+            format!("bytes={trailer_start}-{}", data.len() - 1),
+            observed_requests[1],
+            "real playlist request should then validate the bounded SIDX tail"
+        );
+        assert!(
+            observed_requests[2..].iter().any(|range| {
+                parse_test_range(range, data.len()).is_some_and(|(start, end)| {
+                    start < range_end && end >= range_start && start >= second_media_start
+                })
+            }),
+            "HTTP body delivery should fetch the requested bytes inside the mapped seek span"
+        );
+        assert!(observed_requests[2..].iter().all(|range| {
+            parse_test_range(range, data.len()).is_some_and(|(start, end)| {
+                start >= second_media_start && end < data.len() - terminal_mfra().len()
+            })
+        }));
+
+        router_task.abort();
+        assert!(router_task.await.unwrap_err().is_cancelled());
+        upstream_task.abort();
+        assert!(upstream_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn http_far_future_seek_yields_to_preparation_then_ages_while_it_remains_active() {
+        timeout(Duration::from_secs(12), async {
+            let prep_start = crate::hls_range_cache::RANGE_STARTUP_CHUNK_BYTES as usize;
+            let gated_start = prep_start + RANGE_FOREGROUND_CHUNK_BYTES as usize;
+            let prep_end = gated_start + RANGE_FOREGROUND_CHUNK_BYTES as usize;
+            let (upstream_url, requests, prep_body_entered, release_prep_body, upstream_task) =
+                start_hls_sidx_upstream_with_gated_range(gated_start).await;
+            let temp = TempDir::new().expect("temp dir should be created");
+            let root_path = temp.path().canonicalize().unwrap();
+            let state = AppState::new(CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bbdown_cdn_parallelism: 2,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            });
+            let data = indexed_fake_mp4();
+            let mut session = hls_session("http-queue", &upstream_url);
+            session.variant.video.request.size = Some(data.len() as u64);
+            session.variant.video.request.bandwidth = Some(100_000_000);
+            let mut audio_request = session.variant.video.request.clone();
+            audio_request.kind = BilibiliMediaRequestKind::Audio;
+            audio_request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+            session.variant.audio = Some(HlsMediaResource {
+                id: "audio.m4s".to_owned(),
+                request: audio_request,
+            });
+            let resource = session.variant.video.clone();
+            let generation = insert_authorized_hls_session(&state, session);
+            let reader_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+            let ticket = state
+                .hls_playback_contexts
+                .open_with_reader_id("http-queue".to_owned(), generation, reader_id.to_owned())
+                .expect("reader context should bind to the current session generation");
+            state
+                .hls_playback_contexts
+                .update(
+                    &ticket.context_id,
+                    &ticket.challenge,
+                    ticket.next_sequence,
+                    crate::hls_playback_context::PlaybackTimingSample {
+                        playhead_seconds: 0.0,
+                        continuous_buffered_end_seconds: 10.0,
+                        playback_rate: 0.5,
+                    },
+                )
+                .expect("fresh playback timing should be accepted");
+            state.cdn_history.record_request(
+                &resource.request,
+                &upstream_url,
+                CdnObservation::playback_complete(
+                    50_000_000,
+                    Duration::from_millis(20),
+                    Duration::from_millis(1),
+                    Some(true),
+                ),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("media listener should bind");
+            let address = listener.local_addr().unwrap();
+            let router_state = state.clone();
+            let mut servers = ServerTasks::default();
+            servers.push(upstream_task);
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, crate::media_router(router_state))
+                    .await
+                    .expect("production media router should serve");
+            }));
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .build()
+                .expect("bounded HTTP client should build");
+            let base_url = format!("http://{address}");
+            let playlist = client
+                .get(format!(
+                    "{base_url}/hls/http-queue/segments/video.m3u8?playback_reader={reader_id}"
+                ))
+                .send()
+                .await
+                .expect("production playlist request should complete");
+            assert_eq!(StatusCode::OK, playlist.status());
+            let _ = playlist.text().await.expect("playlist should be readable");
+            assert!(
+                state
+                    .hls_cache
+                    .playback_sidx_map("http-queue", generation, &resource)
+                    .is_some()
+            );
+
+            let prep_range = prep_start as u64..prep_end as u64;
+            let prep_task_range = prep_range.clone();
+            let prep_state = state.hls_cache.clone();
+            let prep_client = state.hls_upstream_client.clone();
+            let prep_resource = resource.clone();
+            let prep_task = tokio::spawn(async move {
+                let prep_requests = [crate::hls_cache::PlaybackPreparationRequest {
+                    resource: &prep_resource,
+                    requested: prep_task_range,
+                }];
+                prep_state
+                    .prepare_playback_batch(
+                        &prep_client,
+                        crate::hls_cache::PlaybackPreparationBatch {
+                            session_id: "http-queue",
+                            requests: &prep_requests,
+                        },
+                        &|| HlsCacheFillControl::Continue,
+                    )
+                    .await
+            });
+            let gate_wait =
+                tokio::time::timeout(Duration::from_secs(2), prep_body_entered.notified()).await;
+            if gate_wait.is_err() {
+                let task_status = if prep_task.is_finished() {
+                    match prep_task.await {
+                        Ok(Ok(_)) => "completed without reaching the expected gate".to_owned(),
+                        Ok(Err(error)) => format!("failed before the gate: {error:?}"),
+                        Err(error) => format!("task join failed before the gate: {error}"),
+                    }
+                } else {
+                    "still running without reaching the expected gate".to_owned()
+                };
+                panic!(
+                    "preparation did not reach gated range; task={task_status}; origin_ranges={:?}",
+                    requests.lock().unwrap().as_slice()
+                );
+            }
+            let prepared_first_chunk = state
+                .hls_cache
+                .read_resource_range(
+                    "http-queue",
+                    &resource,
+                    prep_start as u64..gated_start as u64,
+                )
+                .await
+                .expect("preparation checkpoint should read")
+                .expect("preparation should publish its first chunk before waiting");
+            assert_eq!(
+                &data[prep_start..gated_start],
+                prepared_first_chunk.as_slice()
+            );
+
+            let second_media_start = data.len() - terminal_mfra().len() - (3 * 1024 * 1024 + 8);
+            let far_start = second_media_start + RANGE_FOREGROUND_CHUNK_BYTES as usize + 128;
+            let far_end = far_start + 1024;
+            let urgency = crate::playback_request_urgency::PlaybackRequestUrgency::new(
+                Arc::new(state.clone()),
+                reader_id,
+                "http-queue",
+                generation,
+                resource.clone(),
+            )
+            .expect("reader should construct the verified urgency resolver");
+            assert_eq!(
+                HlsRangePriority::FarFuturePlayback,
+                urgency.priority_for_range(&(far_start as u64..far_end as u64), Duration::ZERO)
+            );
+            let far_url =
+                format!("{base_url}/hls/http-queue/segments/video.m4s?playback_reader={reader_id}");
+            let far_client = client.clone();
+            let far_wait_started = std::time::Instant::now();
+            let far_task = tokio::spawn(async move {
+                far_client
+                    .get(far_url)
+                    .header(RANGE, format!("bytes={far_start}-{}", far_end - 1))
+                    .send()
+                    .await
+            });
+            let far_requested = far_start as u64..far_end as u64;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state.hls_cache.has_range_flight_overlapping_for_test(
+                    "http-queue",
+                    "video.m4s",
+                    &far_requested,
+                ) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("far-future HTTP request should register its cache flight");
+
+            let near_start = prep_end + 128;
+            let near_end = near_start + 1024;
+            let near = client
+                .get(format!(
+                    "{base_url}/hls/http-queue/segments/video.m4s?playback_reader={reader_id}"
+                ))
+                .header(RANGE, format!("bytes={near_start}-{}", near_end - 1))
+                .send()
+                .await
+                .expect("near video range should retain foreground service");
+            assert_eq!(StatusCode::PARTIAL_CONTENT, near.status());
+            assert_eq!(
+                &data[near_start..near_end],
+                near.bytes()
+                    .await
+                    .expect("near video body should arrive")
+                    .as_ref()
+            );
+            assert!(
+                !requests.lock().unwrap().iter().any(|range| {
+                    parse_test_range(range, data.len())
+                        .is_some_and(|(start, end)| start <= far_start && end >= far_start)
+                }),
+                "queued far-future bytes must not bypass active preparation"
+            );
+            assert!(!prep_task.is_finished());
+
+            let audio_start = 1024;
+            let audio_end = audio_start + 1024;
+            let audio = client
+                .get(format!(
+                    "{base_url}/hls/http-queue/segments/audio.m4s?playback_reader={reader_id}"
+                ))
+                .header(RANGE, format!("bytes={audio_start}-{}", audio_end - 1))
+                .send()
+                .await
+                .expect("audio without a verified map should retain foreground service");
+            assert_eq!(StatusCode::PARTIAL_CONTENT, audio.status());
+            assert_eq!(
+                &data[audio_start..audio_end],
+                audio
+                    .bytes()
+                    .await
+                    .expect("conservative audio body should arrive")
+                    .as_ref()
+            );
+            assert!(!prep_task.is_finished());
+
+            let far_response = tokio::time::timeout(Duration::from_secs(4), far_task)
+                .await
+                .expect("far-future request should age to successful foreground delivery")
+                .expect("far-future HTTP task should not panic")
+                .expect("far-future HTTP request should complete");
+            assert!(
+                far_wait_started.elapsed()
+                    >= crate::playback_request_urgency::PLAYBACK_FAR_FUTURE_WAIT_AGE,
+                "far-future request must wait through its promotion age"
+            );
+            assert!(
+                !prep_task.is_finished(),
+                "preparation should still own its gated transfer"
+            );
+            assert_eq!(StatusCode::PARTIAL_CONTENT, far_response.status());
+            assert_eq!(Some(1024), far_response.content_length());
+            assert_eq!(
+                &data[far_start..far_end],
+                far_response
+                    .bytes()
+                    .await
+                    .expect("aged seek body should be delivered")
+                    .as_ref()
+            );
+
+            let origin_ranges = requests.lock().unwrap().clone();
+            let prep_first = format!(
+                "bytes={prep_start}-{}",
+                prep_start + RANGE_FOREGROUND_CHUNK_BYTES as usize - 1
+            );
+            let prep_gated = format!(
+                "bytes={gated_start}-{}",
+                gated_start + RANGE_FOREGROUND_CHUNK_BYTES as usize - 1
+            );
+            let near_chunk_start = near_start / RANGE_FOREGROUND_CHUNK_BYTES as usize
+                * RANGE_FOREGROUND_CHUNK_BYTES as usize;
+            let near_chunk = format!(
+                "bytes={near_chunk_start}-{}",
+                near_chunk_start + RANGE_FOREGROUND_CHUNK_BYTES as usize - 1
+            );
+            let far_chunk_start = far_start / RANGE_FOREGROUND_CHUNK_BYTES as usize
+                * RANGE_FOREGROUND_CHUNK_BYTES as usize;
+            let far_chunk = format!(
+                "bytes={far_chunk_start}-{}",
+                far_chunk_start + RANGE_FOREGROUND_CHUNK_BYTES as usize - 1
+            );
+            let prep_first_index = origin_ranges
+                .iter()
+                .position(|range| range == &prep_first)
+                .expect("real preparation should fetch its first chunk");
+            let prep_gated_index = origin_ranges
+                .iter()
+                .position(|range| range == &prep_gated)
+                .expect("real preparation should hold its second chunk");
+            let near_index = origin_ranges
+                .iter()
+                .position(|range| range == &near_chunk)
+                .expect("foreground near-video transfer should reach the origin");
+            let far_index = origin_ranges
+                .iter()
+                .position(|range| range == &far_chunk)
+                .expect("aged far-future transfer should reach the origin");
+            assert!(prep_first_index < prep_gated_index);
+            let audio_prefix = format!("bytes=0-{}", prep_start - 1);
+            let audio_index = origin_ranges
+                .iter()
+                .position(|range| range == &audio_prefix)
+                .expect("audio fallback should fetch its validated startup prefix");
+            assert!(
+                prep_gated_index < near_index
+                    && near_index < audio_index
+                    && audio_index < far_index
+            );
+
+            release_prep_body.send_replace(true);
+            tokio::time::timeout(Duration::from_secs(2), prep_task)
+                .await
+                .expect("preparation should finish after its body gate opens")
+                .expect("preparation task should not panic")
+                .expect("preparation transfer should complete");
+            assert_eq!(
+                Some(data[prep_start..prep_end].to_vec()),
+                state
+                    .hls_cache
+                    .read_resource_range("http-queue", &resource, prep_range)
+                    .await
+                    .expect("completed preparation range should read")
+            );
+            servers.abort_and_join().await;
+        })
+        .await
+        .expect("HTTP preparation/seek contention should finish within its deadline");
+    }
+
+    #[tokio::test]
     async fn hls_media_playlist_rejects_sidx_when_declared_resource_size_mismatches() {
         let (upstream_url, requests, _upstream_task) =
             start_hls_sidx_upstream(SidxTailResponse::Valid).await;
@@ -7118,6 +7812,7 @@ mod tests {
             first_bytes: None,
             first_was_fetched: false,
             ensure: Some(observed),
+            priority_resolver: None,
             upstream_tail: None,
             observation: HlsRangePolicyObservation::new(policy_recorder, &variant_id, 3, false),
         });
@@ -8259,6 +8954,7 @@ mod tests {
             data: indexed_fake_mp4(),
             requests: Arc::clone(&requests),
             tail_response,
+            gated_body: None,
         });
         let task = tokio::spawn(async move {
             axum::serve(
@@ -8272,6 +8968,52 @@ mod tests {
         });
 
         (format!("http://{addr}/video.m4s"), requests, task)
+    }
+
+    async fn start_hls_sidx_upstream_with_gated_range(
+        gated_range_start: usize,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<Notify>,
+        watch::Sender<bool>,
+        JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body_entered = Arc::new(Notify::new());
+        let (release_body, release_rx) = watch::channel(false);
+        let state = Arc::new(SidxUpstreamState {
+            data: indexed_fake_mp4(),
+            requests: Arc::clone(&requests),
+            tail_response: SidxTailResponse::Valid,
+            gated_body: Some(SidxBodyGate {
+                range_start: gated_range_start,
+                body_entered: Arc::clone(&body_entered),
+                release: release_rx,
+            }),
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/video.m4s", get(upstream_sidx_get))
+                    .with_state(state),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (
+            format!("http://{addr}/video.m4s"),
+            requests,
+            body_entered,
+            release_body,
+            task,
+        )
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -8289,6 +9031,13 @@ mod tests {
         data: Vec<u8>,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
         tail_response: SidxTailResponse,
+        gated_body: Option<SidxBodyGate>,
+    }
+
+    struct SidxBodyGate {
+        range_start: usize,
+        body_entered: Arc<Notify>,
+        release: watch::Receiver<bool>,
     }
 
     async fn upstream_sidx_get(
@@ -8310,6 +9059,7 @@ mod tests {
             return Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_TYPE, "video/mp4")
+                .header(ETAG, "\"indexed-v1\"")
                 .header(
                     CONTENT_RANGE,
                     format!("bytes {start}-{end}/{}", state.data.len()),
@@ -8317,6 +9067,36 @@ mod tests {
                 .header(CONTENT_LENGTH, body.len().to_string())
                 .body(Body::from(body))
                 .expect("indexed prefix response should build");
+        }
+
+        if let Some(gate) = state
+            .gated_body
+            .as_ref()
+            .filter(|gate| gate.range_start == start)
+        {
+            let body = state.data[start..=end].to_vec();
+            let body_entered = Arc::clone(&gate.body_entered);
+            let mut release = gate.release.clone();
+            let stream = futures_util::stream::once(async move {
+                body_entered.notify_one();
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok::<_, Infallible>(Bytes::from(body))
+            });
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_TYPE, "video/mp4")
+                .header(ETAG, "\"indexed-v1\"")
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", state.data.len()),
+                )
+                .header(CONTENT_LENGTH, end - start + 1)
+                .body(Body::from_stream(stream))
+                .expect("gated indexed range response should build");
         }
 
         match state.tail_response {
@@ -8399,6 +9179,7 @@ mod tests {
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(CONTENT_TYPE, "video/mp4")
+                    .header(ETAG, "\"indexed-v1\"")
                     .header(
                         CONTENT_RANGE,
                         format!("bytes {start}-{end}/{}", state.data.len()),

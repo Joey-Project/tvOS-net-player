@@ -4,7 +4,7 @@ title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
 updated: 2026-11-14
-branch: codex/native-navigation-bridge-prototype
+branch: codex/hls-seek-recovery
 pr:
 supersedes: []
 superseded_by:
@@ -13,16 +13,23 @@ superseded_by:
 # HLS Playback Urgency Scheduler
 
 ## Summary
-- Continue from accepted master `e43562673e131ac3b2dcf7549443cb2aa91b31d6`
-  after PR #102. Preserve one player/item, default buffering, full-fill intent,
+- Continue from accepted master `ab8ebe3791f229aac6cbe153c294022f109efea9`
+  after PR #106. Preserve one player/item, default buffering, full-fill intent,
   media identity validation and the existing strict acceptance budgets.
 - Approved ordering is missing near-term video/audio first, eligible high
   preparation before far-future low, and eventual complete fills. Insufficient
   or stale origin evidence holds new high work while low supply continues.
 
 ## Current State
-- Reader binding, sleep-inclusive freshness and explicit withdrawal outcomes
-  are available. The automatic reporter and priority consumer are not enabled.
+- Structured HLS playback uses negotiated reader binding and automatic context
+  reporting. Reader IDs affect only the active factory URL, not saved source
+  identity. Catalog generations remain authoritative; unsupported metadata
+  leaves ordinary playback unchanged.
+- Timing-based range priority protects a rate-scaled 20-second wall-time window,
+  then eligible preparation before verified far playback reads. Pending spans
+  age into continuity service after 2 seconds without progress; later spans can
+  yield again after successful progress. Automatic high preparation is not
+  enabled by this slice. Content identity and cancellation checks are unchanged.
 - The current tvOS `VideoPlayer` and macOS `AVPlayerView` expose native seek
   controls outside AppCore. A time-jump notification can arrive after the
   player starts fetching the new position; local invalidation or a queued
@@ -30,9 +37,36 @@ superseded_by:
 - The server cannot distinguish a far-future prefetch from a user seek that
   produces the same media request while the old timing context is still valid.
   Missing/expired-context fallback alone does not cover this live-stale case.
-  Ambiguous HTTP requests must retain continuity protection.
-- Production playback, scheduling and wire schemas remain unchanged. The first
-  slice is an isolated native-control diagnostic, not permission to demote.
+  The approved seek-loading decision below changes the latency policy, not
+  these measured native-control limits or media correctness requirements.
+- PR #106 delivered the isolated diagnostic. Its acceptance did not enable
+  production request demotion; the next two slices are defined below.
+
+## Seek-Loading Decision
+- Joey explicitly accepts temporary loading after a user/native timeline seek.
+  An all-route asynchronous pre-seek barrier is therefore not a prerequisite
+  for timing-based quality-of-service scheduling. No such barrier is claimed.
+- Normal playback ordering remains missing near-term video/audio, eligible
+  high preparation, far-future low reads, then eventual full fills. High work
+  requires a safe continuous buffer and fresh representation-bound video plus
+  required-audio origin supply. Insufficient supply continues low playback.
+- An observed jump retires the prior local timing/preparation plan. New target
+  video/audio refilling takes priority until a safe buffer is restored. Native
+  seeks themselves do not wait for a remote Close acknowledgment.
+- A request can briefly retain its old classification before the observation
+  arrives. Bound that delay with request-age promotion and conservative
+  fallback, not an unbounded dependence on notification delivery. Missing,
+  expired or ambiguous reader/session/generation/range evidence remains
+  continuity-first. Existing identity, cancellation and content checks remain.
+- Keep withdrawal acknowledgment truthful: a timeout/unknown outcome is not
+  remote removal. Late open/update results cannot restore retired authority.
+- This concession applies to user seeks, not automatic upshifts. Retain native
+  controls, one player/item and default buffering; do not manufacture seeks or
+  discard buffered low content to make an upshift test pass.
+- Slice 1 wires production context reporting, priority classification and
+  bounded seek recovery. Slice 2 starts eligible high preparation and measures
+  high-low-high behavior and continuity against a prewarm-disabled baseline.
+  Merge each fully tested/current-head-reviewed PR before branching the next.
 
 ## Native-Reuse Decision
 - Retain native controls where possible. First build a small isolated bridge
@@ -46,28 +80,50 @@ superseded_by:
   native input routes, and must not grant production scheduler authority.
 - Keep mouse scrubbing, keyboard navigation, accessibility and system transport
   coverage separate. A successful representative key case does not close the
-  remaining native-control causality gap. Unknown routes remain protected.
+  remaining native-control causality gap. The later seek-loading decision uses
+  bounded recovery instead of claiming complete input interception.
 
 ## Next Steps
-1. Deliver the isolated diagnostic with full validation and current-head GitHub
-   Codex review. Keep physical mouse-drag, external/system transport and native
-   key-handler entry explicitly unverified; those gaps cannot become production
-   authority merely because the diagnostic itself passes its delivery gates.
-2. Use measured native-control boundaries to choose the smallest reliable bridge
-   while retaining native controls where possible. Complete bounded input-route
-   experiments only where they can answer a remaining design question. Integrate
-   real exact-ID Close only after the input boundary is sound; otherwise retain
-   server-side continuity protection. A late callback is not a pre-seek barrier.
-3. Consume validated SIDX ranges, exact reader/session/generation, fresh safe
+1. Integrate high preparation after the reporting and request-urgency slice.
+   Keep the diagnostic's unverified input-route coverage explicit. Reuse exact-ID withdrawal
+   for context retirement without blocking native seeks or pretending a late
+   callback is a pre-seek barrier. Preserve conservative fallback for evidence
+   that cannot support safe optional work.
+2. Consume validated SIDX ranges, exact reader/session/generation, fresh safe
    continuous buffers and fresh representation-bound video plus required-audio
    supply. Revalidate before admission and each new origin transfer; preserve
    same-flight foreground promotion and immediate priority cancellation.
-4. Require complete local CI, fixed-signed native3 with verified mute, GHA CI/UI,
+3. Require complete local CI, fixed-signed native3 with verified mute, GHA CI/UI,
    independent released artifact checks, current-head GitHub Codex review and
    all resolved conversations before normal SHA-bound protected merge. Do not
    alter helpers, deadlines or assertions to make the candidate pass.
-5. Complete PR #98's separate bounded OFF/ON comparison after production wiring;
+4. Complete PR #98's separate bounded OFF/ON comparison after production wiring;
    a failed preparation is not a measured negative latency result.
+
+## Production Slice Coverage
+- Shared-player tests exercise negotiated reader URLs, original source identity,
+  catalog-capability fallback, native time-jump context rotation, repeated state
+  observations, pause/buffering/end, replacement, weak ownership and unconfirmed
+  withdrawal. Prepared-resumption fixtures retain the actual server metadata;
+  identity and race checks remain strict.
+- Range tests cover rate-scaled safety windows, incomplete buffers, unknown
+  ranges, unaligned SIDX time origins, stale or ambiguous bindings, same-size
+  content-prefix replacement and no-progress promotion across queue polling.
+- Concurrent foreground resolver waiters keep a persistent semaphore queue
+  position while they remain foreground, and revalidate priority and control
+  after admission. Cancellation or demotion withdraws the pending acquisition.
+  Regressions exhaust all permits before queuing multiple readers, then verify
+  progress, cancellation cleanup and foreground precedence after demotion.
+- Real loopback HTTP tests register the map through the production playlist
+  path, check exact response bytes and origin Range traces, and exercise actual
+  preparation-batch contention. Preparation publishes a verified chunk before
+  its next transfer is gated; uncached near video and unmapped audio retain
+  foreground access, while a far request eventually ages into service without
+  pretending the still-active preparation has completed.
+- These controlled model and HTTP integration tests do not by themselves prove
+  full macOS AppCore-to-server engagement or faster automatic quality recovery.
+  Fixed-signed native media regression acceptance, production high preparation
+  and the separate OFF/ON measurement retain their distinct evidence boundaries.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
@@ -195,6 +251,7 @@ superseded_by:
   mouse, key-handler or system-transport coverage.
 
 ## Evidence
+- [Native navigation diagnostics PR #106](https://github.com/Joey-Project/tvOS-net-player/pull/106).
 - [Freshness and withdrawal PR #102](https://github.com/Joey-Project/tvOS-net-player/pull/102).
 - [Playback context foundation](2026-11-12-playback-urgency-context-b46407.md).
 - [Stable reader binding](2026-11-12-hls-reader-binding-b46408.md).
