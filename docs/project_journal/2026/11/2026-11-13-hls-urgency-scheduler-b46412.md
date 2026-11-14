@@ -197,6 +197,10 @@ superseded_by:
   cache transitions, completed source-range overlap and known player-request
   overlap. Initial-only, already-readable, failed, stale or ambiguous cases are
   inconclusive, not a successful comparison or evidence of slower preparation.
+- Capture the original before-state when a matching plan is admitted, even if
+  its spawned task has not recorded an origin request yet. Keep that snapshot
+  as the plan progresses and the native buffered end advances; admission alone
+  never satisfies completion, readability or transfer-overlap eligibility.
 - A structured cache read returning missing does not prove zero physical byte
   coverage. A stable exact range changing from missing to fully readable proves
   a positive lower bound on newly readable bytes, not an exact downloaded-byte

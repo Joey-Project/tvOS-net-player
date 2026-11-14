@@ -1039,6 +1039,38 @@ async fn close_generated_context(state: &AppState, context_id: &str) -> Result<(
         .map_err(|_| "in-process generated Close did not retire the test context".to_owned())
 }
 
+fn retain_plan_candidates(
+    ledger: &mut PlanLedger,
+    plans: &[HighPreparationPlanObservation],
+    candidate: Option<&BeforeWindow>,
+    binding: &ReaderBinding,
+) {
+    let Some(before) = candidate else {
+        return;
+    };
+    for plan in plans {
+        if plan.plan_id == 0
+            || (plan.requested_resource_ranges == 0
+                && plan.outcome != HighPreparationPlanOutcome::Admitted)
+            || !plan_matches_key(plan, &before.key)
+            || !plan_selected_ranges_match(plan, before, binding)
+        {
+            continue;
+        }
+        ledger.insert(
+            plan.plan_id,
+            CapturedPlan {
+                before: before.clone(),
+                observation: plan.clone(),
+                admitted_sample_monotonic_seconds: before.sample_monotonic_seconds,
+                terminal_observed_monotonic_seconds: None,
+                final_states: None,
+                stable_maps: false,
+            },
+        );
+    }
+}
+
 async fn refresh_plan_ledger(
     state: &AppState,
     observation: &HighPreparationObservation,
@@ -1046,28 +1078,12 @@ async fn refresh_plan_ledger(
     candidate: Option<BeforeWindow>,
     binding: &ReaderBinding,
 ) -> Result<(), String> {
-    if let Some(before) = candidate {
-        for plan in &observation.plan_history {
-            if plan.plan_id == 0
-                || plan.requested_resource_ranges == 0
-                || !plan_matches_key(plan, &before.key)
-                || !plan_selected_ranges_match(plan, &before, binding)
-            {
-                continue;
-            }
-            ledger.insert(
-                plan.plan_id,
-                CapturedPlan {
-                    before: before.clone(),
-                    observation: plan.clone(),
-                    admitted_sample_monotonic_seconds: before.sample_monotonic_seconds,
-                    terminal_observed_monotonic_seconds: None,
-                    final_states: None,
-                    stable_maps: false,
-                },
-            );
-        }
-    }
+    retain_plan_candidates(
+        ledger,
+        &observation.plan_history,
+        candidate.as_ref(),
+        binding,
+    );
 
     let updates = observation
         .plan_history
@@ -2323,6 +2339,249 @@ mod pure_helper_tests {
     use super::*;
 
     const TEST_READER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn test_binding() -> ReaderBinding {
+        ReaderBinding {
+            reader_id: TEST_READER.to_owned(),
+            context_id: "context".to_owned(),
+            session_id: "session".to_owned(),
+            session_generation: 7,
+        }
+    }
+
+    fn test_before(sample_monotonic_seconds: f64) -> BeforeWindow {
+        let kind = HighPreparationResourceKind::Video;
+        let request_kind = crate::bbdown_adapter::BilibiliMediaRequestKind::Video;
+        let resource = HlsMediaResource {
+            id: "video".to_owned(),
+            request: crate::bbdown_adapter::BilibiliMediaRequest {
+                kind: request_kind,
+                stream_id: None,
+                url: "https://media.example.test/video".to_owned(),
+                backup_urls: Vec::new(),
+                headers: Vec::new(),
+                mime_type: Some("video/mp4".to_owned()),
+                codecs: None,
+                bandwidth: Some(1_000),
+                width: None,
+                height: None,
+                frame_rate: None,
+                size: Some(20),
+                duration_seconds: Some(20),
+                cache_key: crate::bbdown_adapter::BilibiliMediaCacheKey {
+                    content_id: "content".to_owned(),
+                    media_kind: request_kind,
+                    stream_id: None,
+                    codecs: None,
+                    source_hash: "source".to_owned(),
+                },
+            },
+        };
+        let map = Arc::new(
+            PlaybackSidxMap::new(
+                20,
+                vec![
+                    crate::playback_request_urgency::PlaybackSidxRange {
+                        bytes: 0..10,
+                        start_ticks: 0,
+                        end_ticks: 10,
+                        timescale: 1,
+                    },
+                    crate::playback_request_urgency::PlaybackSidxRange {
+                        bytes: 10..20,
+                        start_ticks: 10,
+                        end_ticks: 20,
+                        timescale: 1,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        BeforeWindow {
+            key: WindowKey {
+                context_id: "context".to_owned(),
+                session_id: "session".to_owned(),
+                session_generation: 7,
+                variant_id: "variant".to_owned(),
+                start_bits: 30.0_f64.to_bits(),
+                end_bits: 40.0_f64.to_bits(),
+            },
+            accepted_identity: crate::bilibili_playback::BilibiliContentIdentity {
+                kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+                aid: Some(1),
+                bvid: None,
+                cid: Some(2),
+                epid: None,
+            },
+            start_seconds: 30.0,
+            end_seconds: 40.0,
+            sample_monotonic_seconds,
+            ranges: vec![CandidateRange {
+                kind,
+                resource,
+                map,
+                bytes: 0..10,
+                start_seconds: 30.0,
+                end_seconds: 40.0,
+                before: ReadState::Missing,
+            }],
+        }
+    }
+
+    fn test_plan(
+        before: &BeforeWindow,
+        plan_id: u64,
+        outcome: HighPreparationPlanOutcome,
+        requested_resource_ranges: u32,
+    ) -> HighPreparationPlanObservation {
+        HighPreparationPlanObservation {
+            plan_id,
+            context_id: Some(before.key.context_id.clone()),
+            http_reader_id: Some(TEST_READER.to_owned()),
+            session_id: Some(before.key.session_id.clone()),
+            session_generation: Some(before.key.session_generation),
+            target_variant_id: Some(before.key.variant_id.clone()),
+            window_start_seconds: Some(before.start_seconds),
+            window_end_seconds: Some(before.end_seconds),
+            initial_window_readable: Some(false),
+            selected_spans: vec![
+                crate::hls_high_preparation::HighPreparationResourceSpanObservation {
+                    kind: HighPreparationResourceKind::Video,
+                    start_seconds: 30.0,
+                    end_seconds: 40.0,
+                    byte_length: 10,
+                    readable: false,
+                },
+            ],
+            outcome,
+            defer_reason: None,
+            requested_resource_ranges,
+            readable_resource_ranges: 0,
+            deferred_resource_ranges: 0,
+            window_readable: outcome == HighPreparationPlanOutcome::Completed,
+        }
+    }
+
+    #[test]
+    fn admission_snapshot_retention_keeps_first_state_across_async_progress() {
+        let binding = test_binding();
+        let before = test_before(100.0);
+        let admitted = test_plan(&before, 12, HighPreparationPlanOutcome::Admitted, 0);
+        let mut ledger = PlanLedger::default();
+
+        retain_plan_candidates(&mut ledger, &[admitted], Some(&before), &binding);
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[&12].observation.requested_resource_ranges, 0);
+
+        let mut newer_same_key = test_before(101.0);
+        newer_same_key.ranges[0].before = ReadState::Readable;
+        let later_count = test_plan(&before, 12, HighPreparationPlanOutcome::Completed, 1);
+        retain_plan_candidates(
+            &mut ledger,
+            std::slice::from_ref(&later_count),
+            Some(&newer_same_key),
+            &binding,
+        );
+
+        let mut moved_candidate = test_before(101.0);
+        moved_candidate.key.start_bits = 50.0_f64.to_bits();
+        moved_candidate.key.end_bits = 60.0_f64.to_bits();
+        moved_candidate.start_seconds = 50.0;
+        moved_candidate.end_seconds = 60.0;
+        retain_plan_candidates(
+            &mut ledger,
+            std::slice::from_ref(&later_count),
+            Some(&moved_candidate),
+            &binding,
+        );
+
+        let captured = &ledger.entries[&12];
+        assert_eq!(
+            captured.observation.outcome,
+            HighPreparationPlanOutcome::Admitted
+        );
+        assert_eq!(captured.observation.requested_resource_ranges, 0);
+        assert_eq!(captured.before.sample_monotonic_seconds, 100.0);
+        assert_eq!(captured.before.ranges[0].before, ReadState::Missing);
+        assert!(Arc::ptr_eq(
+            &captured.before.ranges[0].map,
+            &before.ranges[0].map
+        ));
+        assert_eq!(captured.before.accepted_identity, before.accepted_identity);
+    }
+
+    #[test]
+    fn admission_snapshot_requires_exact_binding_window_and_selected_spans() {
+        let before = test_before(100.0);
+        let binding = test_binding();
+        let invalid = [
+            {
+                let mut plan = test_plan(&before, 1, HighPreparationPlanOutcome::Admitted, 0);
+                plan.context_id = Some("other-context".to_owned());
+                plan
+            },
+            {
+                let mut plan = test_plan(&before, 2, HighPreparationPlanOutcome::Admitted, 0);
+                plan.http_reader_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_owned());
+                plan
+            },
+            {
+                let mut plan = test_plan(&before, 3, HighPreparationPlanOutcome::Admitted, 0);
+                plan.session_generation = Some(8);
+                plan
+            },
+            {
+                let mut plan = test_plan(&before, 4, HighPreparationPlanOutcome::Admitted, 0);
+                plan.window_end_seconds = Some(41.0);
+                plan
+            },
+            {
+                let mut plan = test_plan(&before, 5, HighPreparationPlanOutcome::Admitted, 0);
+                plan.selected_spans[0].byte_length = 9;
+                plan
+            },
+        ];
+        let mut ledger = PlanLedger::default();
+        retain_plan_candidates(&mut ledger, &invalid, Some(&before), &binding);
+        assert!(ledger.entries.is_empty());
+    }
+
+    #[test]
+    fn zero_range_deferred_cancelled_and_failed_plans_are_not_retained() {
+        let before = test_before(100.0);
+        let binding = test_binding();
+        let plans = [
+            test_plan(&before, 0, HighPreparationPlanOutcome::Admitted, 0),
+            test_plan(&before, 1, HighPreparationPlanOutcome::Deferred, 0),
+            test_plan(&before, 2, HighPreparationPlanOutcome::Cancelled, 0),
+            test_plan(&before, 3, HighPreparationPlanOutcome::Failed, 0),
+        ];
+        let mut ledger = PlanLedger::default();
+        retain_plan_candidates(&mut ledger, &plans, Some(&before), &binding);
+        assert!(ledger.entries.is_empty());
+        assert_eq!(ledger.observed_candidates, 0);
+    }
+
+    #[test]
+    fn admission_snapshot_retention_stays_bounded_at_sixteen_plans() {
+        let before = test_before(100.0);
+        let binding = test_binding();
+        let plans = (1..=TRACKED_PLAN_LIMIT + 1)
+            .map(|plan_id| {
+                test_plan(
+                    &before,
+                    plan_id as u64,
+                    HighPreparationPlanOutcome::Admitted,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut ledger = PlanLedger::default();
+        retain_plan_candidates(&mut ledger, &plans, Some(&before), &binding);
+        assert_eq!(ledger.entries.len(), TRACKED_PLAN_LIMIT);
+        assert_eq!(ledger.observed_candidates, (TRACKED_PLAN_LIMIT + 1) as u64);
+        assert!(ledger.truncated);
+    }
 
     fn canonical_media_playlist() -> &'static str {
         concat!(
