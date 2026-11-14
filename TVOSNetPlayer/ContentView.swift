@@ -997,7 +997,8 @@ struct ContentView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 220)
+                .frame(height: 220)
+                .accessibilityIdentifier("bilibili-task-results-viewport")
             }
 
             if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {

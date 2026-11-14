@@ -44,6 +44,7 @@ use crate::{
 
 const ARM_REPORT_LIMIT: usize = 64 * 1024;
 const CONTROL_MESSAGE_LIMIT: usize = 4 * 1024;
+const CONTROL_FAILURE_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const CONTROL_SAMPLE_LIMIT: usize = 1_024;
 const CAUSAL_EVENT_LIMIT: usize = 96;
 const TRACKED_PLAN_LIMIT: usize = 16;
@@ -392,6 +393,286 @@ struct NativeSample {
     continuous_buffered_end_seconds: Option<f64>,
     playback_rate: Option<f64>,
     time_control_status: String,
+}
+
+#[derive(Serialize)]
+struct ControlFailureDiagnostic {
+    schema_version: u8,
+    phase: &'static str,
+    error_category: &'static str,
+    update_status_code: Option<&'static str>,
+    request_sequence: u64,
+    elapsed_ms: u64,
+    ticket_validity_ms: u64,
+    client_ticket_age_ms: u64,
+    probe_finished: bool,
+    snapshot_acquired_after_error: bool,
+    sample: SampleFailureSnapshot,
+}
+
+#[derive(Serialize)]
+struct SampleFailureSnapshot {
+    exists: Option<bool>,
+    file_type: &'static str,
+    size_bytes: Option<u64>,
+    within_size_limit: Option<bool>,
+    mode_is_private: Option<bool>,
+    owner_matches_process: Option<bool>,
+    json_valid: Option<bool>,
+    fields: Option<SampleFieldPresence>,
+    playback_state: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct SampleFieldPresence {
+    sample_request_id: bool,
+    context_id: bool,
+    challenge: bool,
+    reader_id: bool,
+    session_generation: bool,
+    sequence: bool,
+    sample_monotonic_seconds: bool,
+    playhead_seconds: bool,
+    continuous_buffered_end_seconds: bool,
+    playback_rate: bool,
+    time_control_status: bool,
+}
+
+struct ControlUpdateFailure {
+    message: String,
+    update_status_code: Option<&'static str>,
+}
+
+impl From<String> for ControlUpdateFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            update_status_code: None,
+        }
+    }
+}
+
+fn update_status_code_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
+}
+
+fn control_failure_details(error: &str) -> (&'static str, &'static str) {
+    match error {
+        "server ticket no longer matches its reader/context binding" => {
+            ("ticket_validation", "ticket_binding_mismatch")
+        }
+        "native challenge could not be encoded" => ("challenge_publish", "challenge_encode_failed"),
+        "native challenge exceeded its 4 KiB limit" => {
+            ("challenge_publish", "challenge_size_limit")
+        }
+        "private native challenge file could not be created" => {
+            ("challenge_publish", "challenge_create_failed")
+        }
+        "private native challenge file could not be persisted" => {
+            ("challenge_publish", "challenge_persist_failed")
+        }
+        "native challenge could not be atomically published" => {
+            ("challenge_publish", "challenge_publish_failed")
+        }
+        "server playback challenge had no validity window" => {
+            ("sample_wait", "challenge_validity_unavailable")
+        }
+        "native sample metadata could not be inspected" => {
+            ("sample_inspection", "sample_metadata_unavailable")
+        }
+        "native sample was not a bounded private regular file" => {
+            ("sample_inspection", "sample_file_rejected")
+        }
+        "native sample could not be opened without following links" => {
+            ("sample_inspection", "sample_open_failed")
+        }
+        "opened native sample metadata could not be verified" => {
+            ("sample_inspection", "sample_open_metadata_unavailable")
+        }
+        "native sample identity changed while it was opened" => {
+            ("sample_inspection", "sample_identity_changed")
+        }
+        "native sample could not be read within its bound" => {
+            ("sample_decode", "sample_read_failed")
+        }
+        "native sample exceeded its 4 KiB limit" => ("sample_decode", "sample_size_limit"),
+        "native sample did not match the continuous-control schema" => {
+            ("sample_decode", "sample_schema_invalid")
+        }
+        "native challenge response failed identity or freshness checks" => {
+            ("sample_validation", "sample_identity_or_freshness_rejected")
+        }
+        "native challenge response exceeded its bounded validity" => {
+            ("sample_validation", "sample_validity_expired")
+        }
+        "native playhead was unavailable" => ("sample_validation", "playhead_unavailable"),
+        "native continuous loaded end was unavailable" => {
+            ("sample_validation", "continuous_buffer_unavailable")
+        }
+        "native playback rate was unavailable" => {
+            ("sample_validation", "playback_rate_unavailable")
+        }
+        "native sample expired before its generated Update was submitted" => {
+            ("sample_validation", "sample_expired_before_update")
+        }
+        "in-process generated Update rejected the fresh native sample" => {
+            ("generated_update", "update_rejected")
+        }
+        "generated Update returned a stale or mismatched next ticket" => {
+            ("generated_update", "next_ticket_mismatch")
+        }
+        _ => ("unknown", "unclassified_control_error"),
+    }
+}
+
+fn sample_failure_snapshot(path: &Path) -> SampleFailureSnapshot {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SampleFailureSnapshot {
+                exists: Some(false),
+                file_type: "missing",
+                size_bytes: None,
+                within_size_limit: None,
+                mode_is_private: None,
+                owner_matches_process: None,
+                json_valid: None,
+                fields: None,
+                playback_state: None,
+            };
+        }
+        Err(_) => {
+            return SampleFailureSnapshot {
+                exists: None,
+                file_type: "unavailable",
+                size_bytes: None,
+                within_size_limit: None,
+                mode_is_private: None,
+                owner_matches_process: None,
+                json_valid: None,
+                fields: None,
+                playback_state: None,
+            };
+        }
+    };
+    let file_type = if metadata.file_type().is_file() {
+        "regular"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else if metadata.is_dir() {
+        "directory"
+    } else {
+        "other"
+    };
+    let size_bytes = metadata.len();
+    let device = metadata.dev();
+    let inode = metadata.ino();
+    let within_size_limit = size_bytes > 0 && size_bytes <= CONTROL_MESSAGE_LIMIT as u64;
+    let mode_is_private = metadata.permissions().mode() & 0o777 == 0o600;
+    let owner_matches_process = metadata.uid() == unsafe { libc::geteuid() };
+    let mut snapshot = SampleFailureSnapshot {
+        exists: Some(true),
+        file_type,
+        size_bytes: Some(size_bytes),
+        within_size_limit: Some(within_size_limit),
+        mode_is_private: Some(mode_is_private),
+        owner_matches_process: Some(owner_matches_process),
+        json_valid: None,
+        fields: None,
+        playback_state: None,
+    };
+    if file_type != "regular" || !within_size_limit || !mode_is_private || !owner_matches_process {
+        return snapshot;
+    }
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return snapshot,
+    };
+    let opened = match file.metadata() {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.dev() == device
+                && metadata.ino() == inode
+                && metadata.len() == size_bytes =>
+        {
+            metadata
+        }
+        _ => return snapshot,
+    };
+    let _ = opened;
+    let mut bytes = Vec::with_capacity(size_bytes as usize);
+    if Read::by_ref(&mut file)
+        .take(CONTROL_MESSAGE_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.is_empty()
+        || bytes.len() > CONTROL_MESSAGE_LIMIT
+    {
+        return snapshot;
+    }
+    let value: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            snapshot.json_valid = Some(false);
+            return snapshot;
+        }
+    };
+    let has = |field: &str| value.get(field).is_some();
+    snapshot.json_valid = Some(true);
+    snapshot.fields = Some(SampleFieldPresence {
+        sample_request_id: has("sample_request_id"),
+        context_id: has("context_id"),
+        challenge: has("challenge"),
+        reader_id: has("reader_id"),
+        session_generation: has("session_generation"),
+        sequence: has("sequence"),
+        sample_monotonic_seconds: has("sample_monotonic_seconds"),
+        playhead_seconds: has("playhead_seconds"),
+        continuous_buffered_end_seconds: has("continuous_buffered_end_seconds"),
+        playback_rate: has("playback_rate"),
+        time_control_status: has("time_control_status"),
+    });
+    snapshot.playback_state =
+        value
+            .get("time_control_status")
+            .map(|status| match status.as_str() {
+                Some("playing") => "playing",
+                Some("waiting") => "waiting",
+                Some("paused") => "paused",
+                Some(_) => "other",
+                None => "non_string",
+            });
+    snapshot
+}
+
+fn control_failure_diagnostic_json(diagnostic: &ControlFailureDiagnostic) -> String {
+    match serde_json::to_vec(diagnostic) {
+        Ok(bytes) if bytes.len() <= CONTROL_FAILURE_DIAGNOSTIC_LIMIT => String::from_utf8(bytes)
+            .unwrap_or_else(|_| "{\"error_category\":\"diagnostic_encoding_failed\"}".to_owned()),
+        _ => "{\"error_category\":\"diagnostic_encoding_failed\"}".to_owned(),
+    }
 }
 
 #[derive(Serialize)]
@@ -1128,13 +1409,15 @@ async fn submit_challenged_update(
     ticket: &HlsPlaybackContextTicket,
     ledger: &mut PlanLedger,
     capture_before_state: bool,
-) -> Result<Option<(HlsPlaybackContextTicket, HighPreparationObservation)>, String> {
+) -> Result<Option<(HlsPlaybackContextTicket, HighPreparationObservation)>, ControlUpdateFailure> {
     if ticket.context_id != binding.context_id
         || ticket.http_reader_id != binding.reader_id
         || ticket.session_id != binding.session_id
         || ticket.session_generation != binding.session_generation
     {
-        return Err("server ticket no longer matches its reader/context binding".to_owned());
+        return Err("server ticket no longer matches its reader/context binding"
+            .to_owned()
+            .into());
     }
     let request_id = Uuid::new_v4().to_string();
     let requested_at = monotonic_clock_seconds()?;
@@ -1181,7 +1464,11 @@ async fn submit_challenged_update(
     };
     let now = monotonic_clock_seconds()?;
     if !challenge_response_is_fresh(&native, &request_id, ticket, requested_at, now) {
-        return Err("native sample expired before its generated Update was submitted".to_owned());
+        return Err(
+            "native sample expired before its generated Update was submitted"
+                .to_owned()
+                .into(),
+        );
     }
     let next = CacheGrpcService::new(state.clone())
         .update_hls_playback_context(GrpcRequest::new(UpdateHlsPlaybackContextRequest {
@@ -1195,7 +1482,10 @@ async fn submit_challenged_update(
             }),
         }))
         .await
-        .map_err(|_| "in-process generated Update rejected the fresh native sample".to_owned())?
+        .map_err(|status| ControlUpdateFailure {
+            message: "in-process generated Update rejected the fresh native sample".to_owned(),
+            update_status_code: Some(update_status_code_name(status.code())),
+        })?
         .into_inner();
     if next.context_id != ticket.context_id
         || next.http_reader_id != binding.reader_id
@@ -1204,7 +1494,11 @@ async fn submit_challenged_update(
         || next.next_sequence != ticket.next_sequence.saturating_add(1)
         || next.challenge == ticket.challenge
     {
-        return Err("generated Update returned a stale or mismatched next ticket".to_owned());
+        return Err(
+            "generated Update returned a stale or mismatched next ticket"
+                .to_owned()
+                .into(),
+        );
     }
     let observation = state.hls_high_preparation.observation_for_tests();
     refresh_plan_ledger(state, &observation, ledger, candidate, binding).await?;
@@ -1504,7 +1798,10 @@ fn build_arm_report(
         return Err("continuous native automatic phase did not complete".to_owned());
     }
     if mode == ArmMode::Off && control_error.is_some() {
-        return Err("OFF arm did not complete every challenged generated Update".to_owned());
+        return Err(format!(
+            "OFF arm did not complete every challenged generated Update: {}",
+            control_error.unwrap_or("unclassified_control_error")
+        ));
     }
     let high_low_high_decoded = continuous
         .get("high_low_high_decoded")
@@ -2167,7 +2464,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         &binding,
         &probe,
         challenge_count,
-        control_error.as_deref(),
+        control_error,
         &fixture_report,
         &transfer_ledger,
         &observation,
@@ -2194,7 +2491,7 @@ async fn run_arm_phase(
     (
         Value,
         u64,
-        Option<String>,
+        Option<&'static str>,
         PlanLedger,
         HighPreparationObservation,
         ReaderBinding,
@@ -2238,12 +2535,14 @@ async fn run_arm_phase(
         session_generation: generation,
     };
     let mut ticket = ticket;
+    let mut ticket_received_at = Instant::now();
     let mut plans = PlanLedger::default();
     let mut observation = state.hls_high_preparation.observation_for_tests();
     let mut challenge_count = 0_u64;
     let mut control_error = None;
 
     while !probe.is_finished() {
+        let call_started = Instant::now();
         match submit_challenged_update(
             state,
             session,
@@ -2258,12 +2557,37 @@ async fn run_arm_phase(
         {
             Ok(Some((next, current_observation))) => {
                 ticket = next;
+                ticket_received_at = Instant::now();
                 observation = current_observation;
                 challenge_count = challenge_count.saturating_add(1);
             }
             Ok(None) => break,
             Err(error) => {
-                control_error = Some(error);
+                let (phase, category) = control_failure_details(&error.message);
+                let elapsed_ms = call_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let diagnostic = ControlFailureDiagnostic {
+                    schema_version: 1,
+                    phase,
+                    error_category: category,
+                    update_status_code: error.update_status_code,
+                    request_sequence: ticket.next_sequence,
+                    elapsed_ms,
+                    ticket_validity_ms: ticket
+                        .validity_millis
+                        .min(HIGH_PREPARATION_CONTROL_VALIDITY_MILLIS),
+                    client_ticket_age_ms: ticket_received_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    probe_finished: probe.is_finished(),
+                    snapshot_acquired_after_error: true,
+                    sample: sample_failure_snapshot(&control_directory.join("sample.json")),
+                };
+                eprintln!(
+                    "HIGH_PREPARATION_CONTROL_FAILURE {}",
+                    control_failure_diagnostic_json(&diagnostic)
+                );
+                control_error = Some(category);
                 break;
             }
         }
@@ -2931,7 +3255,7 @@ mod pure_helper_tests {
             validity_millis: 5_000,
             http_reader_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
         };
-        let sample = NativeSample {
+        let mut sample = NativeSample {
             sample_request_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_owned(),
             context_id: "context".to_owned(),
             challenge: "challenge".to_owned(),
@@ -2965,5 +3289,115 @@ mod pure_helper_tests {
             10.0,
             11.5
         ));
+        sample.time_control_status = "waiting".to_owned();
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.time_control_status = "playing".to_owned();
+        sample.continuous_buffered_end_seconds = None;
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.continuous_buffered_end_seconds = Some(30.0);
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            20.0
+        ));
+    }
+
+    #[test]
+    fn control_failure_diagnostic_is_bounded_and_redacts_sample_values() {
+        let path =
+            std::env::temp_dir().join(format!("high-preparation-sample-{}.json", Uuid::new_v4()));
+        let sample_json = r#"{
+            "sample_request_id":"private-request-token",
+            "context_id":"private-context-id",
+            "challenge":"private-challenge-token",
+            "reader_id":"private-reader-id",
+            "session_generation":1,
+            "sequence":2,
+            "sample_monotonic_seconds":3.0,
+            "playhead_seconds":4.0,
+            "continuous_buffered_end_seconds":5.0,
+            "playback_rate":1.0,
+            "time_control_status":"private-player-status"
+        }"#;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(sample_json.as_bytes()).unwrap();
+        drop(file);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let rejected_permissions = sample_failure_snapshot(&path);
+        assert_eq!(rejected_permissions.mode_is_private, Some(false));
+        assert_eq!(rejected_permissions.json_valid, None);
+        assert!(rejected_permissions.fields.is_none());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let diagnostic = ControlFailureDiagnostic {
+            schema_version: 1,
+            phase: "generated_update",
+            error_category: control_failure_details(
+                "in-process generated Update rejected the fresh native sample",
+            )
+            .1,
+            update_status_code: Some("failed_precondition"),
+            request_sequence: 2,
+            elapsed_ms: 120,
+            ticket_validity_ms: 5_000,
+            client_ticket_age_ms: 120,
+            probe_finished: false,
+            snapshot_acquired_after_error: true,
+            sample: sample_failure_snapshot(&path),
+        };
+        let encoded = control_failure_diagnostic_json(&diagnostic);
+        let _ = fs::remove_file(&path);
+
+        assert!(encoded.len() <= CONTROL_FAILURE_DIAGNOSTIC_LIMIT);
+        assert!(encoded.contains("update_rejected"));
+        assert!(encoded.contains("\"update_status_code\":\"failed_precondition\""));
+        assert!(encoded.contains("\"snapshot_acquired_after_error\":true"));
+        assert!(encoded.contains("\"time_control_status\":true"));
+        assert!(encoded.contains("\"playback_state\":\"other\""));
+        for private_value in [
+            "private-request-token",
+            "private-context-id",
+            "private-challenge-token",
+            "private-reader-id",
+            "private-player-status",
+        ] {
+            assert!(!encoded.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn control_failure_categories_are_static_and_unknown_errors_fail_closed() {
+        assert_eq!(
+            update_status_code_name(tonic::Code::FailedPrecondition),
+            "failed_precondition"
+        );
+        assert_eq!(
+            control_failure_details("in-process generated Update rejected the fresh native sample"),
+            ("generated_update", "update_rejected")
+        );
+        assert_eq!(
+            control_failure_details("unexpected error containing private data"),
+            ("unknown", "unclassified_control_error")
+        );
     }
 }

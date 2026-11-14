@@ -208,7 +208,8 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
         complete = (
             '{"status":"complete","cases":['
             '"high_preparation_mode_requires_bound_reader_and_fixed_phase_limits",'
-            f'"{runner.PROBE_SELF_TEST_CASE}"]}}'
+            f'"{runner.PROBE_SELF_TEST_CASE}",'
+            f'"{runner.PRIVATE_CONTROL_PUBLISH_CASE}"]}}'
         )
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(runner, "_run_bounded", return_value=(0, complete)) as run_bounded:
@@ -222,6 +223,16 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
 
             missing_case = complete.replace(f',"{runner.PROBE_SELF_TEST_CASE}"', "")
             with patch.object(runner, "_run_bounded", return_value=(0, missing_case)):
+                with self.assertRaises(runner.HighPreparationError):
+                    runner._verify_probe_self_test(
+                        binary,
+                        logs=Path(temporary),
+                        env={},
+                        deadline=time.monotonic() + 90,
+                    )
+
+            missing_private_publisher = complete.replace(f',"{runner.PRIVATE_CONTROL_PUBLISH_CASE}"', "")
+            with patch.object(runner, "_run_bounded", return_value=(0, missing_private_publisher)):
                 with self.assertRaises(runner.HighPreparationError):
                     runner._verify_probe_self_test(
                         binary,

@@ -417,6 +417,15 @@ final class UIPlaybackTests: XCTestCase {
             return
         }
 
+        let taskResultsViewport = identifiedElement("bilibili-task-results-viewport")
+        XCTAssertTrue(
+            waitUntil(timeout: min(5, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
+                taskResultsViewport.exists && taskResultsViewport.frame.height > 0
+            },
+            "The restored task results viewport must have a nonzero frame before remote navigation. "
+                + accessibilityDescription(taskResultsViewport)
+        )
+
         let addressField = app.textFields["cache-server-address"]
         guard moveFocus(until: addressField, direction: .up, limit: 50, deadline: restoredResultsDeadline) else {
             XCTFail(

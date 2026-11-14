@@ -819,6 +819,7 @@ private struct ProbeOptions {
         passed.append(contentsOf: try LoadedTimeRangeDiagnostics.runSelfTest())
         passed.append(contentsOf: try PlaybackTimelineDiagnostics.runSelfTest())
         passed.append(contentsOf: try RecoveryObservationTrigger.runSelfTest())
+        passed.append(contentsOf: try HighPreparationControl.runSelfTest())
         passed.append(contentsOf: try PlaybackPolicy.runSelfTest())
         passed.append(contentsOf: try PlayerSetup.runSelfTest())
         passed.append(contentsOf: try PlaybackProbe.runSelfTest())
@@ -943,13 +944,181 @@ private enum HighPreparationControl {
     }
 
     static func publish(_ value: [String: Any], fileName: String, directory: String) throws {
-        try requireDirectory(directory)
-        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        guard fileName == "ready.json" || fileName == "sample.json" else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 6)
+        }
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        } catch {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 7)
+        }
         guard data.count <= maximumMessageBytes else {
             throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 4)
         }
-        let destination = URL(fileURLWithPath: directory).appendingPathComponent(fileName)
-        try data.write(to: destination, options: .atomic)
+
+        var pathInfo = stat()
+        guard Darwin.lstat(directory, &pathInfo) == 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        guard pathInfo.st_mode & S_IFMT == S_IFDIR else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 5)
+        }
+        let directoryDescriptor = Darwin.open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directoryDescriptor >= 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        defer { _ = Darwin.close(directoryDescriptor) }
+
+        var openedDirectory = stat()
+        guard Darwin.fstat(directoryDescriptor, &openedDirectory) == 0,
+            openedDirectory.st_mode & S_IFMT == S_IFDIR,
+            openedDirectory.st_dev == pathInfo.st_dev, openedDirectory.st_ino == pathInfo.st_ino,
+            openedDirectory.st_uid == getuid(), openedDirectory.st_mode & 0o700 == 0o700,
+            openedDirectory.st_mode & 0o077 == 0
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 8)
+        }
+
+        let temporaryName = ".native-control-\(UUID().uuidString).tmp"
+        let descriptor = temporaryName.withCString {
+            Darwin.openat(
+                directoryDescriptor,
+                $0,
+                O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC,
+                mode_t(0o600)
+            )
+        }
+        guard descriptor >= 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        var staged = true
+        defer {
+            if staged {
+                _ = temporaryName.withCString { Darwin.unlinkat(directoryDescriptor, $0, 0) }
+            }
+        }
+        var fileDescriptor: Int32? = descriptor
+        defer {
+            if let fileDescriptor { _ = Darwin.close(fileDescriptor) }
+        }
+        guard Darwin.fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { bytes in
+                Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                let code = count == 0 ? EIO : errno
+                throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(code))
+            }
+            offset += count
+        }
+
+        var fileInfo = stat()
+        guard Darwin.fstat(descriptor, &fileInfo) == 0,
+            fileInfo.st_mode & S_IFMT == S_IFREG, fileInfo.st_uid == getuid(),
+            fileInfo.st_mode & 0o777 == 0o600, fileInfo.st_size == data.count
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 9)
+        }
+        guard Darwin.close(descriptor) == 0 else {
+            fileDescriptor = nil
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        fileDescriptor = nil
+
+        var currentDirectory = stat()
+        guard Darwin.lstat(directory, &currentDirectory) == 0,
+            currentDirectory.st_mode & S_IFMT == S_IFDIR,
+            currentDirectory.st_dev == openedDirectory.st_dev, currentDirectory.st_ino == openedDirectory.st_ino,
+            currentDirectory.st_uid == openedDirectory.st_uid,
+            currentDirectory.st_mode & 0o777 == openedDirectory.st_mode & 0o777
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 10)
+        }
+
+        let result = temporaryName.withCString { source in
+            fileName.withCString { destination in
+                Darwin.renameat(directoryDescriptor, source, directoryDescriptor, destination)
+            }
+        }
+        guard result == 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        staged = false
+    }
+
+    static func runSelfTest() throws -> [String] {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("high-preparation-control-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let originalMask = Darwin.umask(0)
+        _ = Darwin.umask(originalMask)
+        defer { _ = Darwin.umask(originalMask) }
+        for mask in [mode_t(0o022), mode_t(0o077)] {
+            _ = Darwin.umask(mask)
+            let value: [String: Any] = ["schema_version": 1, "status": "playing", "sequence": Int(mask)]
+            try publish(value, fileName: "sample.json", directory: directory.path)
+
+            let sample = directory.appendingPathComponent("sample.json")
+            var info = stat()
+            guard Darwin.lstat(sample.path, &info) == 0,
+                info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_mode & 0o777 == 0o600
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 11)
+            }
+            let firstData = try Data(contentsOf: sample)
+            guard let firstValue = try JSONSerialization.jsonObject(with: firstData) as? [String: Any],
+                firstValue["status"] as? String == "playing", firstValue["sequence"] as? Int == Int(mask),
+                try JSONSerialization.data(withJSONObject: firstValue, options: [.sortedKeys]) == firstData
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 12)
+            }
+            let firstInode = info.st_ino
+
+            let replacement: [String: Any] = ["schema_version": 1, "status": "replaced", "sequence": Int(mask) + 1]
+            try publish(replacement, fileName: "sample.json", directory: directory.path)
+            let replacementData = try Data(contentsOf: sample)
+            guard let replacementValue = try JSONSerialization.jsonObject(with: replacementData) as? [String: Any],
+                replacementValue["status"] as? String == "replaced",
+                replacementValue["sequence"] as? Int == Int(mask) + 1,
+                replacementData.count <= maximumMessageBytes,
+                try JSONSerialization.data(withJSONObject: replacementValue, options: [.sortedKeys]) == replacementData
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 13)
+            }
+            guard Darwin.lstat(sample.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                info.st_uid == getuid(), info.st_mode & 0o777 == 0o600, info.st_ino != firstInode
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 14)
+            }
+            let ready: [String: Any] = ["schema_version": 1, "status": "ready"]
+            try publish(ready, fileName: "ready.json", directory: directory.path)
+            let readyFile = directory.appendingPathComponent("ready.json")
+            guard Darwin.lstat(readyFile.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                info.st_uid == getuid(), info.st_mode & 0o777 == 0o600,
+                let readyValue = try JSONSerialization.jsonObject(with: Data(contentsOf: readyFile)) as? [String: Any],
+                readyValue["status"] as? String == "ready"
+            else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 16)
+            }
+            let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            guard Set(entries) == ["sample.json", "ready.json"] else {
+                throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 15)
+            }
+        }
+        return ["high_preparation_control_publishes_private_atomic_samples_under_umask_022_and_077"]
     }
 
     private static func requireDirectory(_ path: String) throws {

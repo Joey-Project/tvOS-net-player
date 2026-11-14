@@ -201,6 +201,10 @@ superseded_by:
   its spawned task has not recorded an origin request yet. Keep that snapshot
   as the plan progresses and the native buffered end advances; admission alone
   never satisfies completion, readability or transfer-overlap eligibility.
+- Retain a bounded, sanitized category for the first failed control update.
+  Diagnostic snapshots taken afterward are not the original failing sample;
+  unknown metadata stays unknown. Diagnostics never make a rejected update
+  acceptable or replace the required complete OFF/ON comparison.
 - A structured cache read returning missing does not prove zero physical byte
   coverage. A stable exact range changing from missing to fully readable proves
   a positive lower bound on newly readable bytes, not an exact downloaded-byte
@@ -218,6 +222,10 @@ superseded_by:
   self-test exercises capture, release and serialization; a missing capture
   cannot report either property as verified. The comparison preflight requires
   this lifecycle regression before starting native media work.
+- Control publication uses a fully written, current-owner regular file with
+  exact `0600` permissions before atomic replacement in the private directory.
+  The publisher self-test covers both `022` and `077` umasks, and comparison
+  preflight requires it. The strict reader contract remains unchanged.
 - The opt-in comparison entry is outside the legacy native regression module's
   test-name prefix. Discovery preflight checks the exact opt-in selector and
   unchanged three-case legacy ignored-test selection before playback. Missing
@@ -231,6 +239,10 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
+- The nested tvOS task-result scroll viewport has an explicit height so it
+  cannot collapse under its vertically scrolling parent. Relaunch validation
+  checks viewport geometry before normal remote navigation; explicit result
+  selection and Continue assertions remain unchanged.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
