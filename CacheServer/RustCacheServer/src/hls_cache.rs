@@ -61,7 +61,7 @@ use crate::{
     },
     playback_policy::PlaybackPolicy,
     playback_request_urgency::PlaybackSidxMap,
-    suspend_clock::{SuspendClock, SystemSuspendClock},
+    suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock},
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
         LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
@@ -98,6 +98,19 @@ const MAX_PLAYBACK_SIDX_MAP_BYTES: usize = 16 * 1024 * 1024;
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RangeFreshTiming {
+    started_at: Option<SuspendTimestamp>,
+    first_byte_at: Option<SuspendTimestamp>,
+    completed_at: Option<SuspendTimestamp>,
+}
+
+struct ObservedRangeBody {
+    bytes: Vec<u8>,
+    timing: RangeFreshTiming,
+}
+
+#[cfg(test)]
 type RangeChunkFetch = (
     Vec<u8>,
     String,
@@ -105,6 +118,15 @@ type RangeChunkFetch = (
     Option<String>,
     Duration,
     PersistedRangeManifest,
+);
+type ObservedRangeChunkFetch = (
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<String>,
+    Duration,
+    PersistedRangeManifest,
+    RangeFreshTiming,
 );
 type HlsRangeCompletion =
     Pin<Box<dyn Future<Output = Result<HlsRangePreparation, HlsRangeError>> + Send>>;
@@ -776,7 +798,7 @@ impl HlsCacheStore {
         }
     }
 
-    fn validate_playback_preparation_batch(
+    pub(crate) fn validate_playback_preparation_batch(
         &self,
         batch: &PlaybackPreparationBatch<'_>,
     ) -> Result<(), PlaybackPreparationError> {
@@ -4514,15 +4536,15 @@ impl HlsCacheStore {
         resource: &HlsMediaResource,
         range: Range<u64>,
         mut fetch: F,
-    ) -> Result<(u64, RangeChunkFetch), HlsRangeError>
+    ) -> Result<(u64, ObservedRangeChunkFetch), HlsRangeError>
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = Result<RangeChunkFetch, HlsRangeError>>,
+        Fut: Future<Output = Result<ObservedRangeChunkFetch, HlsRangeError>>,
     {
         let mut fetched = fetch().await?;
         let mut retried = false;
         loop {
-            let (bytes, final_url, etag, last_modified, _, expected) = &fetched;
+            let (bytes, final_url, etag, last_modified, _, expected, _) = &fetched;
             match self
                 .commit_range_extent_with_failure(
                     session_id,
@@ -6495,7 +6517,8 @@ impl HlsCacheStore {
                         )
                     })
                     .await;
-                let (durable_bytes, (bytes, final_url, _, _, elapsed, _)) = match committed {
+                let (durable_bytes, (bytes, final_url, _, _, elapsed, _, timing)) = match committed
+                {
                     Ok(committed) => committed,
                     Err(HlsRangeError::QuotaExceeded)
                         if maintenance_passes < RANGE_MAINTENANCE_PASSES_PER_ATTEMPT =>
@@ -6530,17 +6553,29 @@ impl HlsCacheStore {
                 drop(admission);
                 drop(permit);
                 progress(durable_bytes);
-                self.record_cdn_observation(
-                    resource,
-                    &final_url,
-                    passive_cache_observation(
-                        CdnObservationOutcome::Partial,
-                        bytes.len() as u64,
-                        Some(elapsed),
-                        Some(elapsed),
-                        Some(true),
-                    ),
+                let first_byte_latency = timing
+                    .started_at
+                    .zip(timing.first_byte_at)
+                    .and_then(|(started, first_byte)| first_byte.checked_elapsed_since(started));
+                let mut observation = passive_cache_observation(
+                    CdnObservationOutcome::Complete,
+                    bytes.len() as u64,
+                    Some(elapsed),
+                    first_byte_latency,
+                    Some(true),
                 );
+                if self
+                    .range_cache
+                    .check_priority_control(&chunk_key, current_priority, control)
+                    .is_ok()
+                {
+                    observation = observation.with_fresh_timing(
+                        timing.started_at,
+                        timing.first_byte_at,
+                        timing.completed_at,
+                    );
+                }
+                self.record_cdn_observation(resource, &final_url, observation);
                 let maintenance_budget = if current_priority == HlsRangePriority::Background {
                     RANGE_MAINTENANCE_PASSES_PER_ATTEMPT
                 } else {
@@ -6725,6 +6760,35 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        self.read_range_body_observed_with_resolver(
+            response,
+            expected_length,
+            key,
+            priority,
+            priority_resolver,
+            pending_since,
+            control,
+            None,
+        )
+        .await
+        .map(|observed| observed.bytes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_range_body_observed_with_resolver<F>(
+        &self,
+        response: reqwest::Response,
+        expected_length: u64,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        pending_since: Instant,
+        control: &F,
+        started_at: Option<SuspendTimestamp>,
+    ) -> Result<ObservedRangeBody, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
         if response
             .content_length()
             .is_some_and(|length| length != expected_length)
@@ -6738,6 +6802,8 @@ impl HlsCacheStore {
         })?;
         let mut bytes = Vec::with_capacity(capacity);
         let mut stream = response.bytes_stream();
+        let suspend_clock = SystemSuspendClock;
+        let mut first_byte_at = None;
         loop {
             let current_priority = priority_resolver.map_or(priority, |resolver| {
                 self.range_cache
@@ -6751,6 +6817,9 @@ impl HlsCacheStore {
             };
             let Some(next) = next else { break };
             let chunk = next.map_err(|error| HlsRangeError::Network(error.without_url()))?;
+            if !chunk.is_empty() && first_byte_at.is_none() {
+                first_byte_at = suspend_clock.now();
+            }
             if bytes.len().saturating_add(chunk.len()) > capacity {
                 return Err(HlsRangeError::InvalidResponse(
                     "upstream range body exceeds requested length".to_owned(),
@@ -6763,7 +6832,15 @@ impl HlsCacheStore {
                 "upstream range body is shorter than requested".to_owned(),
             ));
         }
-        Ok(bytes)
+        let completed_at = suspend_clock.now();
+        Ok(ObservedRangeBody {
+            bytes,
+            timing: RangeFreshTiming {
+                started_at,
+                first_byte_at,
+                completed_at,
+            },
+        })
     }
 
     // Candidate ranking depends on both chunk index and key while control remains caller-owned.
@@ -6827,6 +6904,11 @@ impl HlsCacheStore {
             readiness,
         )
         .await
+        .map(
+            |(bytes, final_url, etag, last_modified, elapsed, manifest, _)| {
+                (bytes, final_url, etag, last_modified, elapsed, manifest)
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6843,7 +6925,7 @@ impl HlsCacheStore {
         pending_since: Instant,
         flight_readiness: watch::Sender<Option<HlsRangeReadiness>>,
         readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
-    ) -> Result<RangeChunkFetch, HlsRangeError>
+    ) -> Result<ObservedRangeChunkFetch, HlsRangeError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
@@ -6937,6 +7019,7 @@ impl HlsCacheStore {
             }
 
             let started = Instant::now();
+            let suspend_started_at = SystemSuspendClock.now();
             let response = match self
                 .send_range_request_with_resolver(
                     client,
@@ -7165,8 +7248,8 @@ impl HlsCacheStore {
             if let Some(sender) = readiness.as_ref() {
                 sender.send_replace(Some(outcome));
             }
-            let body = match self
-                .read_range_body_with_resolver(
+            let observed_body = match self
+                .read_range_body_observed_with_resolver(
                     response,
                     length,
                     chunk_key,
@@ -7174,6 +7257,7 @@ impl HlsCacheStore {
                     priority_resolver,
                     pending_since,
                     control,
+                    suspend_started_at,
                 )
                 .await
             {
@@ -7210,12 +7294,13 @@ impl HlsCacheStore {
                 modified = loaded.manifest.last_modified.clone();
             }
             return Ok((
-                body,
+                observed_body.bytes,
                 final_url,
                 etag,
                 modified,
                 started.elapsed(),
                 loaded.manifest,
+                observed_body.timing,
             ));
         }
         Err(if range_unsupported_seen {
@@ -12479,7 +12564,15 @@ mod tests {
                                 "{case}"
                             );
                         }
-                        Ok(response)
+                        Ok((
+                            response.0,
+                            response.1,
+                            response.2,
+                            response.3,
+                            response.4,
+                            response.5,
+                            RangeFreshTiming::default(),
+                        ))
                     }
                 },
             );
@@ -12524,7 +12617,7 @@ mod tests {
                 .expect("new validator should publish after byte validation");
 
             release_old_response.notify_one();
-            let (durable_bytes, (published, _, published_etag, _, _, _)) =
+            let (durable_bytes, (published, _, published_etag, _, _, _, _)) =
                 fill.await.unwrap_or_else(|error| {
                     panic!("fresh response should publish for {case}: {error}")
                 });
@@ -12646,7 +12739,15 @@ mod tests {
                             .await
                             .expect("second verified validator change should publish");
                     }
-                    Ok(response)
+                    Ok((
+                        response.0,
+                        response.1,
+                        response.2,
+                        response.3,
+                        response.4,
+                        response.5,
+                        RangeFreshTiming::default(),
+                    ))
                 }
             },
         );
@@ -13237,6 +13338,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SampleResponseFault {
         ShortBody,
+        TruncatedBody,
         WrongRange,
         Status(StatusCode),
     }
@@ -13283,7 +13385,13 @@ mod tests {
                 .body(Body::empty())
                 .expect("sample status response should build");
         }
-        if is_sample && matches!(fixture.sample_fault, Some(SampleResponseFault::ShortBody)) {
+        let expected_body_length = body.len();
+        if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::ShortBody | SampleResponseFault::TruncatedBody)
+            )
+        {
             body.pop();
         }
         let (reported_start, reported_end) =
@@ -13292,6 +13400,15 @@ mod tests {
             } else {
                 (start, end)
             };
+        let declared_body_length = if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::TruncatedBody)
+            ) {
+            expected_body_length
+        } else {
+            body.len()
+        };
         let (prefix_etag, tail_etag) = if fixture
             .etag_epoch
             .as_ref()
@@ -13302,9 +13419,21 @@ mod tests {
             (fixture.prefix_etag, fixture.tail_etag)
         };
         let etag = if start == 0 { prefix_etag } else { tail_etag };
+        let response_body = if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::TruncatedBody)
+            ) {
+            Body::from_stream(futures_util::stream::iter([
+                Ok::<_, std::io::Error>(body),
+                Err(std::io::Error::other("fixture truncated the range body")),
+            ]))
+        } else {
+            Body::from(body)
+        };
         Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(CONTENT_LENGTH, body.len().to_string())
+            .header(CONTENT_LENGTH, declared_body_length.to_string())
             .header(
                 reqwest::header::CONTENT_RANGE,
                 format!(
@@ -13313,7 +13442,7 @@ mod tests {
                 ),
             )
             .header(reqwest::header::ETAG, etag)
-            .body(Body::from(body))
+            .body(response_body)
             .expect("range response should build")
     }
 
@@ -13378,6 +13507,41 @@ mod tests {
         )
         .await;
         (url, task, request_count)
+    }
+
+    async fn seed_origin_supply_test_prefix(
+        store: &HlsCacheStore,
+        session: &HlsPlaybackSession,
+        body: &[u8],
+        source_url: &str,
+    ) {
+        let resource = &session.variant.video;
+        let key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&session.id, resource, &key)
+            .expect("range manifest should be initialized");
+        let loaded = store
+            .publish_range_manifest(&session.id, resource, loaded, |manifest| {
+                manifest.total_length = Some(body.len() as u64);
+            })
+            .await
+            .expect("range total should be checkpointed");
+        let prefix_end = RANGE_STARTUP_CHUNK_BYTES.min(body.len() as u64);
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                0..prefix_end,
+                &body[..prefix_end as usize],
+                source_url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("startup prefix should be seeded");
     }
 
     async fn start_switchable_etag_range_upstream(
@@ -14392,6 +14556,216 @@ mod tests {
                 .range_cache
                 .enter(&session.id, HlsRangePriority::Foreground)
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_206_range_records_origin_supply_after_durable_publication() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-supply", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+
+        let ready = store
+            .ensure_resource_range(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                requested.clone(),
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("uncached range should be supplied over HTTP 206");
+
+        assert_eq!(requested, ready.requested);
+        assert_eq!(1, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            body[requested.start as usize..requested.end as usize],
+            store
+                .read_durable_range(&session.id, &session.variant.video, requested)
+                .await
+                .expect("published range should be readable")
+                .expect("range should be durable")
+        );
+        assert!(
+            store
+                .cached_resource(&session.id, &session.variant.video.id)
+                .is_none(),
+            "a complete 206 transfer must not mark the whole resource cached"
+        );
+        let supply = history
+            .recent_origin_supply(&session.variant.video.request)
+            .expect("durable 206 body should publish a fresh origin measurement");
+        assert!(supply.throughput_bps > 0);
+        assert!(supply.first_byte_latency.is_some());
+    }
+
+    #[tokio::test]
+    async fn range_cache_hit_does_not_record_origin_supply() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-cache-hit", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+        let loaded = store
+            .load_range_manifest_serialized(&session.id, &session.variant.video)
+            .await
+            .expect("range manifest should load")
+            .expect("range manifest should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                requested.clone(),
+                &body[requested.start as usize..requested.end as usize],
+                &url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("requested range should be seeded");
+
+        store
+            .ensure_resource_range(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                requested,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("cached range should be returned");
+
+        assert_eq!(0, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_206_range_does_not_record_origin_supply() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            Some(SampleResponseFault::TruncatedBody),
+            Some(requested.start as usize),
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-truncated", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+
+        assert!(
+            store
+                .ensure_resource_range(
+                    &reqwest::Client::new(),
+                    &session.id,
+                    &session.variant.video,
+                    requested,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .is_err(),
+            "truncated origin response should not be published"
+        );
+        assert_eq!(1, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
+        );
+    }
+
+    #[tokio::test]
+    async fn range_discovery_probe_does_not_record_origin_supply() {
+        let (url, _server) =
+            start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_range_probe)))
+                .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let session = sample_session("range-origin-probe", &url);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("range key should be valid");
+
+        let total = store
+            .discover_range_total(
+                &reqwest::Client::new(),
+                &session.variant.video,
+                &key,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("range discovery probe should succeed");
+
+        assert_eq!(fake_mp4().len() as u64, total);
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
         );
     }
 

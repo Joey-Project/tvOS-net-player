@@ -59,6 +59,9 @@ test-lan-playback:
 test-media-network:
     env -u CI -u LOCAL_BUILD_MODE python3 scripts/media-network-e2e.py
 
+test-media-high-preparation *args:
+    python3 scripts/media-high-preparation-e2e.py --run {{args}}
+
 test-tvos:
     scripts/test-tvos-simulator.sh
 
