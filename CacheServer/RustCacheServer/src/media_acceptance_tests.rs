@@ -66,6 +66,10 @@ use crate::{
 #[path = "media_high_preparation_tests.rs"]
 mod media_high_preparation_tests;
 
+pub(crate) async fn run_native_high_preparation_off_on_comparison() {
+    media_high_preparation_tests::run_native_high_preparation_off_on_comparison().await;
+}
+
 const ABR_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_adaptation_and_recovery";
 const EXTENDED_DIAGNOSTIC_CASE_FULL_NAME: &str =

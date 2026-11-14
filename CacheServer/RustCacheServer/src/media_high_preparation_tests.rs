@@ -2273,9 +2273,7 @@ async fn run_arm_phase(
     ))
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires the pinned muted macOS AVPlayer probe and local FFmpeg tools"]
-async fn native_high_preparation_off_on_comparison() {
+pub(super) async fn run_native_high_preparation_off_on_comparison() {
     let artifact_directory = std::env::var_os("LAN_MEDIA_HIGH_PREPARATION_ARTIFACTS")
         .map(PathBuf::from)
         .expect("the opt-in wrapper must provide a private reports directory");

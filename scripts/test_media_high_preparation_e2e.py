@@ -235,7 +235,10 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
              runner.FINALIZE_BUDGET_SECONDS, runner.ARTIFACT_BYTES),
             (3600, 1500, 1800, 60, 32 * 1024 * 1024),
         )
-        self.assertTrue(runner.TEST_NAME.endswith("native_high_preparation_off_on_comparison"))
+        self.assertEqual(
+            runner.TEST_NAME,
+            "media_high_preparation_native_tests::native_high_preparation_off_on_comparison",
+        )
         self.assertEqual(runner.REPORT_BYTES, 64 * 1024)
         self.assertEqual(runner.MAX_ARTIFACT_ENTRIES, 256)
 
@@ -250,9 +253,9 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
                     deadline=runner.time.monotonic() + 90,
                 )
         args, kwargs = run_bounded.call_args
-        self.assertEqual(args[0], [str(binary), runner.TEST_NAME, "--exact", "--list"])
+        self.assertEqual(args[0], [str(binary), runner.TEST_NAME, "--exact", "--ignored", "--list"])
         self.assertEqual(kwargs["max_output_bytes"], 64 * 1024)
-        with patch.object(runner, "_run_bounded", return_value=(0, f"prefix {runner.TEST_NAME}: test suffix\n")):
+        with patch.object(runner, "_run_bounded", return_value=(0, f"{runner.TEST_NAME}: test\nextra_test: test\n")):
             with self.assertRaises(runner.HighPreparationError):
                 runner._verify_test_filter(
                     binary,
@@ -260,6 +263,43 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
                     env={},
                     deadline=time.monotonic() + 90,
                 )
+
+    def test_legacy_ignored_filter_contains_exactly_the_existing_three_cases(self) -> None:
+        network = runner._load_network_runner()
+        binary = Path("/stable/cache-server-tests")
+        listing = "\n".join(f"{name}: test" for name in network.EXPECTED_TESTS) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(runner, "_run_bounded", return_value=(0, listing)) as run_bounded:
+                runner._verify_legacy_native_test_filter(
+                    binary,
+                    network=network,
+                    logs=Path(temporary),
+                    env={},
+                    deadline=time.monotonic() + 90,
+                )
+            args, kwargs = run_bounded.call_args
+            self.assertEqual(
+                args[0],
+                [
+                    str(binary), "media_acceptance_tests::", "--ignored", "--list",
+                    "--skip", network.EXTENDED_DIAGNOSTIC_TEST,
+                ],
+            )
+            self.assertEqual(kwargs["max_output_bytes"], 64 * 1024)
+            for invalid_listing in (
+                "\n".join(f"{name}: test" for name in network.EXPECTED_TESTS[:-1]) + "\n",
+                listing + f"{runner.TEST_NAME}: test\n",
+                listing + f"{network.EXPECTED_TESTS[0]}: test\n",
+            ):
+                with patch.object(runner, "_run_bounded", return_value=(0, invalid_listing)):
+                    with self.assertRaises(runner.HighPreparationError):
+                        runner._verify_legacy_native_test_filter(
+                            binary,
+                            network=network,
+                            logs=Path(temporary),
+                            env={},
+                            deadline=time.monotonic() + 90,
+                        )
 
     def test_default_artifact_path_is_portable_for_normal_and_nested_worktrees(self) -> None:
         for root in (Path("/checkout/tvOS-net-player"), Path("/checkout/.codex-tmp/feature")):

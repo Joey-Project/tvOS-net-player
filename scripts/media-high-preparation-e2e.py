@@ -33,7 +33,7 @@ MAX_PLAN_RECORDS = 16
 MAX_SERIALIZED_PLAN_RECORDS = 1
 MAX_SELECTED_SPANS = 4
 CAUSAL_EVENT_RING_LIMIT = 96
-TEST_NAME = "media_acceptance_tests::media_high_preparation_tests::native_high_preparation_off_on_comparison"
+TEST_NAME = "media_high_preparation_native_tests::native_high_preparation_off_on_comparison"
 PROBE_SELF_TEST_CASE = "high_preparation_player_verification_survives_cleanup"
 ARM_REPORTS = {"off": "off.json", "on": "on.json"}
 TRANSPORT_BOUNDARY = "in_process_generated_cache_service_trait"
@@ -175,16 +175,41 @@ def _verify_native_tools(env: dict[str, str]) -> None:
         raise HighPreparationError("Required local native media tools are unavailable: " + ", ".join(missing))
 
 
+def _listed_test_names(output: str) -> list[str]:
+    suffix = ": test"
+    return [line[:-len(suffix)] for line in output.splitlines() if line.endswith(suffix)]
+
+
 def _verify_test_filter(test_binary: Path, *, logs: Path, env: dict[str, str], deadline: float) -> None:
     code, output = _run_bounded(
-        [str(test_binary), TEST_NAME, "--exact", "--list"],
-        log_path=logs / "test-list.log",
+        [str(test_binary), TEST_NAME, "--exact", "--ignored", "--list"],
+        log_path=logs / "high-preparation-test-list.log",
         env=env,
         timeout_seconds=min(60, deadline - time.monotonic()),
         max_output_bytes=64 * 1024,
     )
-    if code != 0 or f"{TEST_NAME}: test" not in output.splitlines():
-        raise HighPreparationError("Stable test binary does not contain the exact opt-in test.")
+    listed = _listed_test_names(output)
+    if code != 0 or listed != [TEST_NAME]:
+        raise HighPreparationError("Stable test binary does not contain exactly the ignored opt-in test.")
+
+
+def _verify_legacy_native_test_filter(
+    test_binary: Path, *, network: Any, logs: Path, env: dict[str, str], deadline: float,
+) -> None:
+    code, output = _run_bounded(
+        [
+            str(test_binary), "media_acceptance_tests::", "--ignored", "--list",
+            "--skip", network.EXTENDED_DIAGNOSTIC_TEST,
+        ],
+        log_path=logs / "legacy-native-test-list.log",
+        env=env,
+        timeout_seconds=min(60, deadline - time.monotonic()),
+        max_output_bytes=64 * 1024,
+    )
+    listed = _listed_test_names(output)
+    expected = set(network.EXPECTED_TESTS)
+    if code != 0 or len(listed) != len(expected) or set(listed) != expected:
+        raise HighPreparationError("Legacy ignored-test filter must contain exactly its three existing native cases.")
 
 
 def _verify_probe_self_test(probe_binary: Path, *, logs: Path, env: dict[str, str], deadline: float) -> None:
@@ -257,6 +282,9 @@ def _build_and_run_locked(
             if compile_seconds > COMPILE_BUDGET_SECONDS:
                 raise HighPreparationError("Pinned product preparation exceeded its 25-minute compile budget.")
             probe, test_binary, identities = _products_from_receipt(local_build, receipt, config)
+            _verify_legacy_native_test_filter(
+                test_binary, network=network, logs=logs, env=env, deadline=total_deadline,
+            )
             _verify_test_filter(test_binary, logs=logs, env=env, deadline=total_deadline)
             _verify_probe_self_test(probe, logs=logs, env=env, deadline=total_deadline)
             mute_and_verify_system_audio(logs=logs, env=env, deadline=total_deadline)

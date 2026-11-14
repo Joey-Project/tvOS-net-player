@@ -214,6 +214,10 @@ superseded_by:
   self-test exercises capture, release and serialization; a missing capture
   cannot report either property as verified. The comparison preflight requires
   this lifecycle regression before starting native media work.
+- The opt-in comparison entry is outside the legacy native regression module's
+  test-name prefix. Discovery preflight checks the exact opt-in selector and
+  unchanged three-case legacy ignored-test selection before playback. Missing
+  opt-in configuration still fails; ordinary regression runs never select it.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
