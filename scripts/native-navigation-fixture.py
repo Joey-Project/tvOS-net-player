@@ -691,6 +691,8 @@ def run(argv: list[str] | None = None) -> int:
                 shutdown_reason = "media_cleanup_failure"
                 result_code = 1
                 print(f"native-navigation-fixture: {cleanup_error}", file=sys.stderr)
+        if error and result_code == 0:
+            result_code = 1
         try:
             _write_json(report_path, {
                 "schema_version": SCHEMA_VERSION,

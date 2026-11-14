@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -164,6 +165,105 @@ class FixtureTests(unittest.TestCase):
                         self.assertFalse(media_directory.exists())
                 finally:
                     real_cleanup()
+
+    def test_run_budget_failures_stop_serving_and_clean_media(self) -> None:
+        for budget in ("wall_limit", "aggregate_budget"):
+            with self.subTest(budget=budget):
+                output = self.root / f"budget-{budget}"
+                output.mkdir()
+                ready = threading.Event()
+                ready_path = output / "budget" / "ready.json"
+                servers: list[fixture.FixtureServer] = []
+                media_temps: list[tempfile.TemporaryDirectory[str]] = []
+                cleanup_calls: list[None] = []
+                run_results: list[int] = []
+                expected_error = (
+                    "fixture reached 900-second wall limit"
+                    if budget == "wall_limit"
+                    else "aggregate experiment output exceeded 256 MiB"
+                )
+
+                class CapturedServer(fixture.FixtureServer):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        servers.append(self)
+
+                real_temporary_directory = tempfile.TemporaryDirectory
+
+                def capture_media_temp(*args, **kwargs):
+                    media_temp = real_temporary_directory(*args, **kwargs)
+                    media_temps.append(media_temp)
+                    cleanup = media_temp.cleanup
+
+                    def tracked_cleanup() -> None:
+                        cleanup_calls.append(None)
+                        cleanup()
+
+                    media_temp.cleanup = tracked_cleanup  # type: ignore[method-assign]
+                    return media_temp
+
+                def capture_print(*args, **kwargs) -> None:
+                    if kwargs.get("file", sys.stdout) is not sys.stdout:
+                        return
+                    try:
+                        payload = json.loads(" ".join(str(arg) for arg in args))
+                    except (json.JSONDecodeError, TypeError):
+                        return
+                    if isinstance(payload, dict) and payload.get("ready") == str(ready_path):
+                        ready.set()
+
+                patches = [
+                    mock.patch.object(fixture.sys, "platform", "darwin"),
+                    mock.patch.object(fixture, "raw_clock_ns", return_value=123),
+                    mock.patch.object(fixture, "generate_media", return_value=Path("mock-media.m3u8")),
+                    mock.patch.object(fixture, "FixtureServer", CapturedServer),
+                    mock.patch.object(
+                        fixture.tempfile, "TemporaryDirectory", side_effect=capture_media_temp
+                    ),
+                    mock.patch("builtins.print", side_effect=capture_print),
+                ]
+                if budget == "wall_limit":
+                    patches.extend([
+                        mock.patch.object(fixture, "MAX_WALL_SECONDS", 10),
+                        mock.patch.object(
+                            fixture.time, "monotonic", side_effect=[100.0, 100.0, 111.0, 111.0]
+                        ),
+                    ])
+                else:
+                    patches.append(
+                        mock.patch.object(fixture, "_walk_bytes", return_value=fixture.MAX_TOTAL_BYTES + 1)
+                    )
+
+                run_thread = threading.Thread(
+                    target=lambda: run_results.append(
+                        fixture.run(["--output-root", str(output), "--run-id", "budget"])
+                    )
+                )
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    run_thread.start()
+                    try:
+                        self.assertTrue(ready.wait(2))
+                    finally:
+                        if servers and not ready.is_set():
+                            servers[0].fixture_state.stop_event.set()
+                        run_thread.join(3)
+
+                try:
+                    self.assertFalse(run_thread.is_alive())
+                    self.assertEqual(run_results, [1])
+                    self.assertEqual(cleanup_calls, [None])
+                    self.assertEqual(len(media_temps), 1)
+                    self.assertFalse(Path(media_temps[0].name).exists())
+                    self.assertTrue(servers[0]._BaseServer__is_shut_down.is_set())
+                    report = json.loads((output / "budget" / "report.json").read_text(encoding="ascii"))
+                    self.assertEqual(report["error"], expected_error)
+                    self.assertEqual(report["shutdown_reason"], budget)
+                    self.assertTrue(report["media_cleaned"])
+                finally:
+                    for media_temp in media_temps:
+                        media_temp.cleanup()
 
     def test_range_parser_accepts_single_byte_ranges(self) -> None:
         self.assertIsNone(fixture.parse_byte_range(None, 64))
