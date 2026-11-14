@@ -23,4 +23,5 @@ xcrun swift-format lint \
   "${ROOT_DIR}/TVOSNetPlayer" \
   "${ROOT_DIR}/TVOSNetPlayerTests" \
   "${ROOT_DIR}/TVOSNetPlayerUITests" \
-  "${ROOT_DIR}/scripts/probe-lan-playback.swift"
+  "${ROOT_DIR}/scripts/probe-lan-playback.swift" \
+  "${ROOT_DIR}/scripts/native-navigation-probe.swift"

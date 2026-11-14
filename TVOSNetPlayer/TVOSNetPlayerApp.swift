@@ -4,6 +4,38 @@ import TVOSNetPlayerCore
 
 @main
 struct TVOSNetPlayerApp: App {
+    private let launch: NativeNavigationProbeLaunch
+
+    init() {
+        launch = NativeNavigationProbeLaunch.parse(
+            arguments: ProcessInfo.processInfo.arguments,
+            isSimulator: Self.isSimulatorBuild
+        )
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            switch launch {
+            case .production:
+                ProductionAppRoot()
+            case let .diagnostic(configuration):
+                NativeNavigationProbeRoot(configuration: configuration)
+            case let .invalid(message):
+                NativeNavigationProbeLaunchError(message: message)
+            }
+        }
+    }
+
+    private static var isSimulatorBuild: Bool {
+        #if targetEnvironment(simulator)
+            true
+        #else
+            false
+        #endif
+    }
+}
+
+private struct ProductionAppRoot: View {
     @StateObject private var model: PlayerViewModel
     @StateObject private var cacheModel: CacheLibraryViewModel
     @StateObject private var discoveryModel: CacheServerDiscoveryViewModel
@@ -49,16 +81,14 @@ struct TVOSNetPlayerApp: App {
         _bilibiliLoginModel = StateObject(wrappedValue: BilibiliLoginViewModel())
     }
 
-    var body: some Scene {
-        WindowGroup {
-            ContentView(
-                model: model,
-                cacheModel: cacheModel,
-                discoveryModel: discoveryModel,
-                bilibiliModel: bilibiliModel,
-                bilibiliLoginModel: bilibiliLoginModel
-            )
-        }
+    var body: some View {
+        ContentView(
+            model: model,
+            cacheModel: cacheModel,
+            discoveryModel: discoveryModel,
+            bilibiliModel: bilibiliModel,
+            bilibiliLoginModel: bilibiliLoginModel
+        )
     }
 
     private static var isUITesting: Bool {

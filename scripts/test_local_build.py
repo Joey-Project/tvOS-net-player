@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -59,6 +61,345 @@ class LocalBuildTests(unittest.TestCase):
 
     def write_config(self) -> None:
         self.config_path.write_text(json.dumps(self.config))
+
+    def test_native_navigation_receipt_isolated_from_legacy_receipt(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        configured_root = self.root / "LocalBuild"
+        diagnostic_root = configured_root / local_build.DIAGNOSTIC_ROOT
+        source = {"repository": "/repo", "head": "abc", "dirty": False}
+        legacy_product = {
+            "path": str(configured_root / local_build.PRODUCTS["probe"]),
+            "source": source,
+            "cdhash": "legacy-cdhash",
+        }
+        legacy_bytes = (json.dumps({
+            "schema_version": 1,
+            "products": {"probe": legacy_product},
+        }, indent=2, sort_keys=True) + "\n").encode()
+        legacy_receipt_path = configured_root / "receipt.json"
+        legacy_receipt_path.parent.mkdir(parents=True)
+        legacy_receipt_path.write_bytes(legacy_bytes)
+
+        stable_path = diagnostic_root / local_build.DIAGNOSTIC_PRODUCTS[target]
+        built_product = {
+            "path": str(stable_path),
+            "identifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+            "cdhash": "native-cdhash",
+            "source": source,
+        }
+
+        def build(received_target, config, root, old_receipt, *, product_path):
+            self.assertEqual(received_target, target)
+            self.assertEqual(root, diagnostic_root)
+            self.assertEqual(product_path, local_build.DIAGNOSTIC_PRODUCTS[target])
+            self.assertEqual(old_receipt, {"schema_version": 1, "products": {}})
+            return built_product
+
+        with mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_build", side_effect=build), \
+                mock.patch.object(local_build, "_source_binding", return_value=source):
+            receipt = local_build.prepare_diagnostic_targets({target}, config_file=self.config_path)
+
+        self.assertEqual(receipt["products"], {target: built_product})
+        self.assertEqual(receipt["receipt_path"], str(diagnostic_root / "receipt.json"))
+        self.assertTrue((diagnostic_root / "receipt.json").is_file())
+        self.assertEqual(legacy_receipt_path.read_bytes(), legacy_bytes)
+        self.assertFalse((configured_root / ".build-session.lock").exists())
+        self.assertFalse((diagnostic_root / ".build-session.lock").exists())
+
+    def test_legacy_receipt_still_rejects_diagnostic_product_key(self) -> None:
+        root = self.root / "LocalBuild"
+        product = {
+            "path": str(root / local_build.DIAGNOSTIC_ROOT / local_build.DIAGNOSTIC_PRODUCTS[local_build.NATIVE_NAVIGATION_TARGET]),
+            "source": {"repository": "/repo", "head": "abc", "dirty": False},
+            "cdhash": "native-cdhash",
+        }
+        root.mkdir(parents=True)
+        (root / "receipt.json").write_text(json.dumps({
+            "schema_version": 1,
+            "products": {local_build.NATIVE_NAVIGATION_TARGET: product},
+        }))
+        with self.assertRaisesRegex(local_build.BuildError, "invalid product entry"):
+            local_build._read_receipt(root)
+
+    def test_legacy_status_ignores_existing_diagnostic_product(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        configured_root = self.root / "LocalBuild"
+        diagnostic_path = configured_root / local_build.DIAGNOSTIC_ROOT / local_build.DIAGNOSTIC_PRODUCTS[target]
+        diagnostic_path.parent.mkdir(parents=True)
+        diagnostic_path.write_text("synthetic signed executable placeholder")
+        source = {"repository": "/repo", "head": "abc", "dirty": False}
+        legacy_product = {
+            "path": str(configured_root / local_build.PRODUCTS["probe"]),
+            "source": source,
+            "cdhash": "legacy-cdhash",
+        }
+        legacy_receipt = {
+            "schema_version": 1,
+            "products": {"probe": legacy_product},
+        }
+        legacy_receipt_path = configured_root / "receipt.json"
+        legacy_receipt_path.write_text(json.dumps(legacy_receipt))
+        legacy_bytes = legacy_receipt_path.read_bytes()
+
+        with mock.patch.object(local_build, "load_config", return_value={"durable_root": configured_root}), \
+                mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_source_binding", return_value=source), \
+                mock.patch.object(local_build, "verify_product", return_value={"cdhash": "legacy-cdhash"}):
+            result = local_build.status()
+
+        self.assertEqual(set(result["products"]), {"probe"})
+        self.assertEqual(legacy_receipt_path.read_bytes(), legacy_bytes)
+        self.assertTrue(diagnostic_path.is_file())
+
+    def test_native_navigation_build_compiles_and_signs_to_isolated_path(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        stable_path = root / local_build.DIAGNOSTIC_PRODUCTS[target]
+        commands: list[list[str]] = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[0] == "xcrun":
+                output = Path(args[args.index("-o") + 1])
+                output.write_bytes(b"synthetic executable")
+            return ""
+
+        with mock.patch.object(local_build, "_run", side_effect=run), \
+                mock.patch.object(local_build, "verify_product", return_value={"path": "/staging", "cdhash": "native-cdhash"}), \
+                mock.patch.object(local_build, "_source_binding", return_value={"repository": "/repo", "head": "abc", "dirty": False}):
+            details = local_build._build(
+                target,
+                self.config,
+                root,
+                {"products": {}},
+                product_path=local_build.DIAGNOSTIC_PRODUCTS[target],
+            )
+
+        compile_command, executable_signing, bundle_signing = commands
+        self.assertEqual(compile_command[:4], ["xcrun", "swiftc", "-swift-version", "6"])
+        self.assertIn("-strict-concurrency=complete", compile_command)
+        self.assertIn("-warnings-as-errors", compile_command)
+        self.assertIn(str(SCRIPT.with_name("native-navigation-probe.swift")), compile_command)
+        self.assertEqual(executable_signing[0:2], ["codesign", "--force"])
+        self.assertEqual(bundle_signing[0:2], ["codesign", "--force"])
+        self.assertEqual(executable_signing[executable_signing.index("--sign") + 1], self.config["identity_sha1"])
+        self.assertEqual(bundle_signing[bundle_signing.index("--sign") + 1], self.config["identity_sha1"])
+        self.assertEqual(executable_signing[executable_signing.index("--identifier") + 1], local_build.DIAGNOSTIC_IDENTIFIERS[target])
+        self.assertEqual(bundle_signing[bundle_signing.index("--identifier") + 1], local_build.DIAGNOSTIC_IDENTIFIERS[target])
+        self.assertEqual(Path(executable_signing[-1]).name, "native-navigation-probe")
+        self.assertEqual(Path(executable_signing[-1]).parent.name, "MacOS")
+        self.assertEqual(Path(bundle_signing[-1]).name, "NativeNavigationProbe.app")
+        self.assertEqual(details["path"], str(stable_path))
+        self.assertTrue(stable_path.is_dir())
+        self.assertTrue((stable_path / "Contents/MacOS/native-navigation-probe").is_file())
+        with (stable_path / "Contents/Info.plist").open("rb") as stream:
+            info = local_build.plistlib.load(stream)
+        self.assertEqual(info["CFBundleIdentifier"], local_build.DIAGNOSTIC_IDENTIFIERS[target])
+        self.assertEqual(info["CFBundleExecutable"], "native-navigation-probe")
+        self.assertEqual(info["CFBundleDisplayName"], "Native Navigation Probe")
+
+    def test_native_navigation_migrates_only_receipted_legacy_path_when_app_is_absent(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        diagnostic_root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        legacy_path = diagnostic_root / local_build.LEGACY_NATIVE_NAVIGATION_PRODUCT
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"known legacy product")
+        source = {"repository": "/repo", "head": "abc", "dirty": False}
+        legacy_product = {
+            "path": str(legacy_path), "identifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+            "team_id": "TESTTEAM01", "certificate_sha1": "A" * 40,
+            "designated_requirement": 'identifier "native-navigation"', "cdhash": "old-cdhash",
+            "source": source,
+        }
+        receipt_path = diagnostic_root / "receipt.json"
+        receipt_path.write_text(json.dumps({"schema_version": 1, "products": {target: legacy_product}}))
+        app_path = diagnostic_root / local_build.DIAGNOSTIC_PRODUCTS[target]
+        built_product = {
+            "path": str(app_path), "identifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+            "cdhash": "new-cdhash", "executable_cdhash": "new-cdhash", "source": source,
+        }
+
+        def build(received_target, config, root, old_receipt, *, product_path):
+            self.assertEqual(received_target, target)
+            self.assertEqual(root, diagnostic_root)
+            self.assertEqual(product_path, local_build.DIAGNOSTIC_PRODUCTS[target])
+            self.assertEqual(old_receipt["products"][target], legacy_product)
+            self.assertFalse(app_path.exists())
+            return built_product
+
+        with mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_build", side_effect=build), \
+                mock.patch.object(local_build, "_source_binding", return_value=source):
+            with local_build.prepared_diagnostic_targets({target}, config_file=self.config_path) as receipt:
+                self.assertEqual(receipt["products"][target], built_product)
+        self.assertEqual(legacy_path.read_bytes(), b"known legacy product")
+        self.assertEqual(json.loads(receipt_path.read_text())["products"][target]["path"], str(app_path))
+
+    def test_legacy_probe_rebuilds_when_receipt_product_is_missing(self) -> None:
+        target = "probe"
+        root = self.root / "LocalBuild"
+        destination = root / local_build.PRODUCTS[target]
+        previous = {"path": str(destination), "designated_requirement": 'identifier "playback-probe"'}
+
+        def run(args, **kwargs):
+            if args[0] == "xcrun":
+                Path(args[args.index("-o") + 1]).write_bytes(b"rebuilt probe")
+            return ""
+
+        with mock.patch.object(local_build, "_run", side_effect=run), \
+                mock.patch.object(local_build, "verify_product", return_value={"path": "/staging", "cdhash": "new-cdhash"}), \
+                mock.patch.object(local_build, "_source_binding", return_value={"repository": "/repo", "head": "abc", "dirty": False}):
+            details = local_build._build(target, self.config, root, {"products": {target: previous}})
+
+        self.assertEqual(details["path"], str(destination))
+        self.assertEqual(destination.read_bytes(), b"rebuilt probe")
+
+    def test_native_navigation_rebuilds_when_receipt_binds_missing_current_bundle(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        destination = root / local_build.DIAGNOSTIC_PRODUCTS[target]
+        previous = {"path": str(destination), "designated_requirement": 'identifier "native-navigation"'}
+
+        def run(args, **kwargs):
+            if args[0] == "xcrun":
+                Path(args[args.index("-o") + 1]).write_bytes(b"rebuilt executable")
+            return ""
+
+        with mock.patch.object(local_build, "_run", side_effect=run), \
+                mock.patch.object(local_build, "verify_product", return_value={"path": "/staging", "cdhash": "new-cdhash", "executable_cdhash": "new-cdhash"}), \
+                mock.patch.object(local_build, "_source_binding", return_value={"repository": "/repo", "head": "abc", "dirty": False}):
+            details = local_build._build(
+                target,
+                self.config,
+                root,
+                {"products": {target: previous}},
+                product_path=local_build.DIAGNOSTIC_PRODUCTS[target],
+            )
+
+        self.assertEqual(details["path"], str(destination))
+        self.assertEqual((destination / "Contents/MacOS/native-navigation-probe").read_bytes(), b"rebuilt executable")
+
+    def test_native_navigation_build_verifies_legacy_receipt_before_migration(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        legacy_path = root / local_build.LEGACY_NATIVE_NAVIGATION_PRODUCT
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"known legacy product")
+        source = {"repository": "/repo", "head": "abc", "dirty": False}
+        previous = {
+            "path": str(legacy_path), "identifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+            "team_id": "TESTTEAM01", "certificate_sha1": "A" * 40,
+            "designated_requirement": 'identifier "native-navigation"', "cdhash": "old-cdhash",
+            "source": source,
+        }
+        app_path = root / local_build.DIAGNOSTIC_PRODUCTS[target]
+
+        def run(args, **kwargs):
+            if args[0] == "xcrun":
+                Path(args[args.index("-o") + 1]).write_bytes(b"synthetic executable")
+            return ""
+
+        with mock.patch.object(local_build, "_verify_legacy_native_navigation_product") as verify_legacy, \
+                mock.patch.object(local_build, "_run", side_effect=run), \
+                mock.patch.object(local_build, "verify_product", return_value={"path": "/staging", "cdhash": "new-cdhash", "executable_cdhash": "new-cdhash"}), \
+                mock.patch.object(local_build, "_source_binding", return_value=source):
+            details = local_build._build(
+                target, self.config, root, {"products": {target: previous}},
+                product_path=local_build.DIAGNOSTIC_PRODUCTS[target],
+            )
+        verify_legacy.assert_called_once_with(legacy_path, self.config, previous)
+        self.assertEqual(details["path"], str(app_path))
+        self.assertTrue(app_path.is_dir())
+        self.assertEqual(legacy_path.read_bytes(), b"known legacy product")
+
+    def test_native_navigation_refuses_existing_app_when_receipt_still_binds_legacy_path(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        destination = root / local_build.DIAGNOSTIC_PRODUCTS[target]
+        destination.mkdir(parents=True)
+        previous = {"path": str(root / local_build.LEGACY_NATIVE_NAVIGATION_PRODUCT), "cdhash": "old"}
+        with self.assertRaisesRegex(local_build.BuildError, "not bound to this stable path"):
+            local_build._build(target, self.config, root, {"products": {target: previous}}, product_path=local_build.DIAGNOSTIC_PRODUCTS[target])
+
+    def test_native_navigation_refuses_unknown_receipt_path(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        root = self.root / "LocalBuild" / local_build.DIAGNOSTIC_ROOT
+        previous = {"path": str(root / "unknown/native-navigation-probe"), "cdhash": "old"}
+        with self.assertRaisesRegex(local_build.BuildError, "unknown product path"):
+            local_build._build(target, self.config, root, {"products": {target: previous}}, product_path=local_build.DIAGNOSTIC_PRODUCTS[target])
+
+    def test_native_navigation_product_verifies_bundle_and_executable_signatures(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        app = self.root / "NativeNavigationProbe.app"
+        executable = app / "Contents/MacOS/native-navigation-probe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"synthetic executable")
+        with (app / "Contents/Info.plist").open("wb") as stream:
+            local_build.plistlib.dump({
+                "CFBundleIdentifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+                "CFBundleExecutable": "native-navigation-probe",
+                "CFBundlePackageType": "APPL",
+                "CFBundleName": "Native Navigation Probe",
+                "CFBundleDisplayName": "Native Navigation Probe",
+            }, stream)
+        signature = (
+            local_build.DIAGNOSTIC_IDENTIFIERS[target], "TESTTEAM01", "A" * 40,
+            'identifier "native-navigation"', SYNTHETIC_CDHASH,
+        )
+        with mock.patch.object(local_build, "_codesign_details", return_value=signature) as signed_details:
+            details = local_build.verify_product(target, app, self.config)
+        self.assertEqual(signed_details.call_count, 2)
+        self.assertEqual(details["cdhash"], SYNTHETIC_CDHASH)
+        self.assertEqual(details["executable_cdhash"], SYNTHETIC_CDHASH)
+
+    def test_native_navigation_print_path_is_the_app_bundle(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        product_path = "/stable/Diagnostics/NativeNavigation/NativeNavigationProbe.app"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), \
+                mock.patch.object(local_build, "_prepare_selection", return_value={
+                    "products": {target: {"path": product_path}},
+                }):
+            result = local_build.main(["prepare", target, "--print-path", target])
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), f"{product_path}\n")
+
+    def test_build_rejects_mixing_native_diagnostic_with_legacy_products(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+                mock.patch.object(local_build, "prepare_targets") as prepare_legacy, \
+                mock.patch.object(local_build, "prepare_diagnostic_targets") as prepare_diagnostic:
+            result = local_build.main(["build", "probe", local_build.NATIVE_NAVIGATION_TARGET])
+        self.assertEqual(result, 1)
+        self.assertIn("must be built separately", stderr.getvalue())
+        prepare_legacy.assert_not_called()
+        prepare_diagnostic.assert_not_called()
+
+    def test_native_navigation_status_has_a_separate_command(self) -> None:
+        with mock.patch.object(local_build, "native_navigation_status", return_value={"products": {}}) as diagnostic_status, \
+                mock.patch.object(local_build, "status") as legacy_status:
+            result = local_build.main(["native-navigation-status"])
+        self.assertEqual(result, 0)
+        diagnostic_status.assert_called_once_with()
+        legacy_status.assert_not_called()
+
+    def test_run_accepts_native_navigation_target_and_uses_diagnostic_lock_scope(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        context = mock.MagicMock()
+        context.__enter__.return_value = {
+            "products": {target: {"path": "/stable/Diagnostics/NativeNavigation/NativeNavigationProbe.app"}},
+        }
+        with mock.patch.object(local_build, "prepared_diagnostic_targets", return_value=context) as prepare, \
+                mock.patch.object(local_build, "_native_navigation_executable", return_value=Path("/stable/Diagnostics/NativeNavigation/NativeNavigationProbe.app/Contents/MacOS/native-navigation-probe")) as executable_path, \
+                mock.patch.object(local_build.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            result = local_build.main(["run", target, "--", "--self-test"])
+        self.assertEqual(result, 0)
+        prepare.assert_called_once_with({target})
+        executable_path.assert_called_once_with(Path("/stable/Diagnostics/NativeNavigation/NativeNavigationProbe.app"))
+        run.assert_called_once_with([
+            "/stable/Diagnostics/NativeNavigation/NativeNavigationProbe.app/Contents/MacOS/native-navigation-probe", "--self-test",
+        ], check=False)
 
     def run_server_wrapper(self, system: str, *, ci: str = "", mode: str = "") -> tuple[str, list[str]]:
         bin_dir = self.root / "bin"

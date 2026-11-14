@@ -24,6 +24,8 @@
 		D00000000000000000000014 /* TVOSNetPlayerCacheClient in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000002 /* TVOSNetPlayerCacheClient */; };
 		D00000000000000000000015 /* UIPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* UIPlaybackTests.swift */; };
 		D00000000000000000000016 /* UIPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* UIPlaybackTests.swift */; };
+		D00000000000000000000017 /* NativeNavigationProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000016 /* NativeNavigationProbe.swift */; };
+		D00000000000000000000018 /* NativeNavigationProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000017 /* NativeNavigationProbeTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -73,6 +75,8 @@
 		B00000000000000000000013 /* AppShellIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShellIntegrationTests.swift; sourceTree = "<group>"; };
 		B00000000000000000000014 /* UIPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPlaybackTests.swift; sourceTree = "<group>"; };
 		B00000000000000000000015 /* UIPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPlaybackTests.swift; sourceTree = "<group>"; };
+		B00000000000000000000016 /* NativeNavigationProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNavigationProbe.swift; sourceTree = "<group>"; };
+		B00000000000000000000017 /* NativeNavigationProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNavigationProbeTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000001 /* TVOSNetPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TVOSNetPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000002 /* TVOSNetPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TVOSNetPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000003 /* MacOSNetPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacOSNetPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -155,6 +159,7 @@
 			children = (
 				B00000000000000000000001 /* TVOSNetPlayerApp.swift */,
 				B00000000000000000000002 /* ContentView.swift */,
+				B00000000000000000000016 /* NativeNavigationProbe.swift */,
 				B00000000000000000000004 /* Info.plist */,
 				B00000000000000000000005 /* Assets.xcassets */,
 			);
@@ -183,6 +188,7 @@
 			isa = PBXGroup;
 			children = (
 				B0000000000000000000000B /* AppCoreIntegrationTests.swift */,
+				B00000000000000000000017 /* NativeNavigationProbeTests.swift */,
 			);
 			path = TVOSNetPlayerTests;
 			sourceTree = "<group>";
@@ -480,6 +486,7 @@
 			files = (
 				D00000000000000000000001 /* TVOSNetPlayerApp.swift in Sources */,
 				D00000000000000000000002 /* ContentView.swift in Sources */,
+				D00000000000000000000017 /* NativeNavigationProbe.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -488,6 +495,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				D0000000000000000000000D /* AppCoreIntegrationTests.swift in Sources */,
+				D00000000000000000000018 /* NativeNavigationProbeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
