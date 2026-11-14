@@ -63,6 +63,9 @@ use crate::{
     transcoding::HlsTranscodingPlan,
 };
 
+#[path = "media_high_preparation_tests.rs"]
+mod media_high_preparation_tests;
+
 const ABR_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_adaptation_and_recovery";
 const EXTENDED_DIAGNOSTIC_CASE_FULL_NAME: &str =

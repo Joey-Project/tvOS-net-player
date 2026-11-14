@@ -3001,6 +3001,8 @@ impl CacheService for CacheGrpcService {
                 "The HLS playback session changed while the context was updated.",
             ));
         }
+        self.state
+            .maybe_start_hls_high_preparation(&ticket.http_reader_id);
         Ok(Response::new(proto_playback_context_ticket(ticket)))
     }
 

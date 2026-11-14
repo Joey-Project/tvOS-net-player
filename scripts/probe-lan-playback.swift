@@ -9,6 +9,18 @@ private struct VideoSize: Equatable {
     let height: Int
 }
 
+private func isCanonicalUUIDv4(_ value: String) -> Bool {
+    guard value == value.lowercased(),
+        let uuid = UUID(uuidString: value),
+        uuid.uuidString.lowercased() == value
+    else {
+        return false
+    }
+    let bytes = Array(value.utf8)
+    return bytes.count == 36 && bytes[14] == 0x34
+        && [0x38, 0x39, 0x61, 0x62].contains(bytes[19])
+}
+
 private enum RecoveryObservationTrigger {
     static func isFreshEmptyRegularFile(at path: String) -> Bool {
         var pathInfo = stat()
@@ -337,6 +349,9 @@ private struct ProbeOptions {
     let duration: TimeInterval
     let deadline: TimeInterval
     let validateOnly: Bool
+    let highPreparationContinuous: Bool
+    let readerID: String?
+    let controlDirectory: String?
     let expectedVideoSizes: [VideoSize]
     let readyMarkerPath: String?
     let recoveryObservationTriggerPath: String?
@@ -348,6 +363,9 @@ private struct ProbeOptions {
         var duration = 60.0
         var deadline = 120.0
         var validateOnly = false
+        var highPreparationContinuous = false
+        var readerID: String?
+        var controlDirectory: String?
         var expectedVideoSizes: [VideoSize]?
         var readyMarkerPath: String?
         var recoveryObservationTriggerPath: String?
@@ -373,6 +391,14 @@ private struct ProbeOptions {
                 index += 1
                 continue
             }
+            if option == "--high-preparation-continuous" {
+                guard !highPreparationContinuous else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 2)
+                }
+                highPreparationContinuous = true
+                index += 1
+                continue
+            }
             guard index + 1 < arguments.count else {
                 throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 1)
             }
@@ -393,6 +419,16 @@ private struct ProbeOptions {
                     throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 4)
                 }
                 deadline = parsed
+            case "--reader-id":
+                guard readerID == nil else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 2)
+                }
+                readerID = value
+            case "--control-directory":
+                guard controlDirectory == nil, value.hasPrefix("/"), !value.isEmpty else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 13)
+                }
+                controlDirectory = value
             case "--expect-video-sizes":
                 guard expectedVideoSizes == nil else {
                     throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 2)
@@ -424,10 +460,37 @@ private struct ProbeOptions {
         guard let urlValue, let components = URLComponents(string: urlValue),
             let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
             components.host != nil, components.user == nil, components.password == nil,
-            components.query == nil, components.fragment == nil,
+            components.fragment == nil,
             let url = components.url, isLANHost(components.host ?? "")
         else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 6)
+        }
+        if highPreparationContinuous {
+            guard duration == 600, deadline == 720,
+                let readerID, isCanonicalUUIDv4(readerID),
+                controlDirectory != nil,
+                expectedVideoSizes == [
+                    VideoSize(width: 640, height: 360),
+                    VideoSize(width: 320, height: 180),
+                    VideoSize(width: 640, height: 360),
+                ],
+                !controlsAfterVideoSizeExpectations,
+                readyMarkerPath != nil, recoveryObservationTriggerPath == nil,
+                minimumSteadyPlaySeconds == nil
+            else {
+                throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 13)
+            }
+            let queryItems = components.queryItems ?? []
+            guard queryItems.count == 1,
+                queryItems[0].name == "playback_reader",
+                queryItems[0].value == readerID
+            else {
+                throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 14)
+            }
+        } else {
+            guard components.query == nil, readerID == nil, controlDirectory == nil else {
+                throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 6)
+            }
         }
         guard deadline >= duration + 15 else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 7)
@@ -457,6 +520,9 @@ private struct ProbeOptions {
             duration: duration,
             deadline: deadline,
             validateOnly: validateOnly,
+            highPreparationContinuous: highPreparationContinuous,
+            readerID: readerID,
+            controlDirectory: controlDirectory,
             expectedVideoSizes: expectedVideoSizes ?? [],
             readyMarkerPath: readyMarkerPath,
             recoveryObservationTriggerPath: recoveryObservationTriggerPath,
@@ -562,6 +628,42 @@ private struct ProbeOptions {
         try accept("local_hostname", url: "http://media.local/live.m3u8")
         try accept("minimum_duration_deadline", url: "http://localhost/live.m3u8", duration: 30, deadline: 45)
         try accept("custom_duration_deadline", url: "https://localhost/live.m3u8", duration: 300, deadline: 360)
+        let readerID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let highPreparationOptions = try parse([
+            "--url", "http://127.0.0.1/hls/session/master.m3u8?playback_reader=\(readerID)",
+            "--duration", "600",
+            "--deadline", "720",
+            "--expect-video-sizes", "640x360,320x180,640x360",
+            "--ready-marker", "/tmp/high-preparation-decoder-ready.json",
+            "--reader-id", readerID,
+            "--control-directory", "/tmp/high-preparation-control",
+            "--high-preparation-continuous",
+            "--validate-only",
+        ])
+        guard highPreparationOptions.highPreparationContinuous,
+            highPreparationOptions.readerID == readerID,
+            highPreparationOptions.controlDirectory == "/tmp/high-preparation-control",
+            highPreparationOptions.readyMarkerPath == "/tmp/high-preparation-decoder-ready.json",
+            highPreparationOptions.duration == 600, highPreparationOptions.deadline == 720
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 8)
+        }
+        passed.append("high_preparation_mode_requires_bound_reader_and_fixed_phase_limits")
+        try reject(
+            "high_preparation_reader_query_must_match_argument",
+            arguments: [
+                "--url",
+                "http://127.0.0.1/hls/session/master.m3u8?playback_reader=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "--duration", "600",
+                "--deadline", "720",
+                "--expect-video-sizes", "640x360,320x180,640x360",
+                "--ready-marker", "/tmp/high-preparation-decoder-ready.json",
+                "--reader-id", readerID,
+                "--control-directory", "/tmp/high-preparation-control",
+                "--high-preparation-continuous",
+            ],
+            expectedCode: 14
+        )
         let sizeOptions = try parse([
             "--url", "http://192.168.1.8/live.m3u8",
             "--expect-video-sizes", "1920x1080,1280x720,1920x1080",
@@ -747,6 +849,115 @@ private struct ProbeFailure: Error, Sendable {
     init(phase: String, error: Error) {
         let nsError = error as NSError
         self.init(phase: phase, domain: nsError.domain, code: nsError.code)
+    }
+}
+
+private struct HighPreparationChallenge: Decodable {
+    let schemaVersion: Int
+    let sampleRequestID: String
+    let contextID: String
+    let challenge: String
+    let readerID: String
+    let sessionGeneration: UInt64
+    let sequence: UInt64
+    let validityMillis: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case sampleRequestID = "sample_request_id"
+        case contextID = "context_id"
+        case challenge
+        case readerID = "reader_id"
+        case sessionGeneration = "session_generation"
+        case sequence
+        case validityMillis = "validity_millis"
+    }
+
+    var isValid: Bool {
+        schemaVersion == 1
+            && isCanonicalUUIDv4(sampleRequestID)
+            && UUID(uuidString: contextID) != nil
+            && UUID(uuidString: challenge) != nil
+            && isCanonicalUUIDv4(readerID)
+            && sessionGeneration > 0
+            && sequence > 0
+            && (1...5_000).contains(validityMillis)
+    }
+}
+
+private enum HighPreparationControl {
+    static let maximumMessageBytes = 4_096
+    static let maximumResponses = 1_024
+
+    static func requireReadyDirectory(_ path: String) throws {
+        try requireDirectory(path)
+    }
+
+    static func readChallenge(directory: String) throws -> HighPreparationChallenge? {
+        try requireDirectory(directory)
+        let path = URL(fileURLWithPath: directory).appendingPathComponent("challenge.json").path
+        var entry = stat()
+        guard Darwin.lstat(path, &entry) == 0 else {
+            if errno == ENOENT { return nil }
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        guard entry.st_mode & S_IFMT == S_IFREG,
+            entry.st_size > 0, entry.st_size <= maximumMessageBytes
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 1)
+        }
+
+        let descriptor = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+        }
+        defer { _ = Darwin.close(descriptor) }
+        var opened = stat()
+        guard Darwin.fstat(descriptor, &opened) == 0,
+            opened.st_mode & S_IFMT == S_IFREG,
+            opened.st_dev == entry.st_dev, opened.st_ino == entry.st_ino,
+            opened.st_size == entry.st_size
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 2)
+        }
+
+        var bytes = [UInt8](repeating: 0, count: Int(opened.st_size))
+        var offset = 0
+        while offset < bytes.count {
+            let count = bytes.withUnsafeMutableBufferPointer { buffer in
+                Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+            }
+            offset += count
+        }
+
+        let challenge = try JSONDecoder().decode(HighPreparationChallenge.self, from: Data(bytes))
+        guard challenge.isValid else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 3)
+        }
+        return challenge
+    }
+
+    static func publish(_ value: [String: Any], fileName: String, directory: String) throws {
+        try requireDirectory(directory)
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        guard data.count <= maximumMessageBytes else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 4)
+        }
+        let destination = URL(fileURLWithPath: directory).appendingPathComponent(fileName)
+        try data.write(to: destination, options: .atomic)
+    }
+
+    private static func requireDirectory(_ path: String) throws {
+        var info = stat()
+        guard Darwin.lstat(path, &info) == 0,
+            info.st_mode & S_IFMT == S_IFDIR
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 5)
+        }
     }
 }
 
@@ -1406,6 +1617,9 @@ private final class PlaybackProbe {
     private var endedEarly = false
     private var endObserver: NSObjectProtocol?
     private var readyMarkerPublished = false
+    private var highPreparationReadyPublished = false
+    private var highPreparationChallengeCount = 0
+    private var lastHighPreparationRequestID: String?
 
     init(options: ProbeOptions) {
         self.options = options
@@ -1417,7 +1631,10 @@ private final class PlaybackProbe {
             let status = try await execute()
             captureFinalPlayerState()
             cleanup()
-            return (status == "completed" ? 0 : 3, result(status: status, error: nil))
+            let acceptedStatus =
+                status == "completed"
+                || (options.highPreparationContinuous && status == "inconclusive")
+            return (acceptedStatus ? 0 : 3, result(status: status, error: nil))
         } catch let failure as ProbeFailure {
             captureFinalPlayerState()
             cleanup()
@@ -1431,6 +1648,9 @@ private final class PlaybackProbe {
     }
 
     private func execute() async throws -> String {
+        if options.highPreparationContinuous {
+            return try await executeHighPreparationContinuous()
+        }
         let playerItem = AVPlayerItem(url: options.url)
         playerItem.add(output)
         item = playerItem
@@ -1564,6 +1784,165 @@ private final class PlaybackProbe {
             return audioTrackPresent ? "failed" : "lack_audio"
         }
         return "completed"
+    }
+
+    private func executeHighPreparationContinuous() async throws -> String {
+        guard let controlDirectory = options.controlDirectory,
+            let readerID = options.readerID
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 6)
+        }
+        try HighPreparationControl.requireReadyDirectory(controlDirectory)
+
+        let playerItem = AVPlayerItem(url: options.url)
+        playerItem.add(output)
+        item = playerItem
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.endedEarly = true
+            }
+        }
+        let avPlayer = AVPlayer(playerItem: playerItem)
+        try PlayerSetup.configure(avPlayer)
+        player = avPlayer
+
+        try await waitUntilReady()
+        itemReadyAtMetadataCapture = true
+        let tracks = playerItem.tracks
+        let videoTracks = tracks.filter { $0.assetTrack?.mediaType == .video }
+        let audioTracks = tracks.filter { $0.assetTrack?.mediaType == .audio }
+        videoTrackCount = videoTracks.count
+        audioTrackCount = audioTracks.count
+        enabledVideoTrackCount = videoTracks.filter { $0.isEnabled }.count
+        enabledAudioTrackCount = audioTracks.filter { $0.isEnabled }.count
+        videoTrackPresent = enabledVideoTrackCount > 0
+        let duration = CMTimeGetSeconds(playerItem.duration)
+        itemDurationSeconds = duration.isFinite ? duration : nil
+        let presentationSize = playerItem.presentationSize
+        presentationWidth = Int(presentationSize.width)
+        presentationHeight = Int(presentationSize.height)
+
+        guard
+            case .ready = PlaybackPolicy.readiness(
+                itemReady: true,
+                durationSeconds: duration,
+                requestedDuration: options.duration
+            )
+        else {
+            throw ProbeFailure(phase: "ready", domain: "PlaybackPolicy", code: 2)
+        }
+        try await inspectAudioEvidence(for: playerItem)
+        try startPlayback(avPlayer, phase: "continuous_play")
+
+        let playbackStart = DispatchTime.now().uptimeNanoseconds
+        let playbackEnd = playbackStart + UInt64(options.duration * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds < playbackEnd {
+            try checkDeadline(phase: "continuous_play")
+            if endedEarly {
+                throw ProbeFailure(phase: "continuous_play", domain: "ProbePlayback", code: 1)
+            }
+            try publishHighPreparationReadyIfPlaying(
+                player: avPlayer,
+                readerID: readerID,
+                directory: controlDirectory
+            )
+            try respondToHighPreparationChallenge(player: avPlayer, directory: controlDirectory)
+            try sampleFrame(phase: "continuous_high_preparation")
+            try await Task.sleep(for: .milliseconds(33))
+        }
+
+        return videoSizeExpectations.isComplete && decodedFrames > 0 ? "completed" : "inconclusive"
+    }
+
+    private func publishHighPreparationReadyIfPlaying(
+        player: AVPlayer,
+        readerID: String,
+        directory: String
+    ) throws {
+        guard !highPreparationReadyPublished,
+            player.timeControlStatus == .playing,
+            abs(Double(player.rate) - 1) < 0.01
+        else {
+            return
+        }
+        let playhead = CMTimeGetSeconds(player.currentTime())
+        guard playhead.isFinite, playhead > 0 else { return }
+        let sampleTime = try monotonicClockSeconds()
+        let ranges = item?.loadedTimeRanges.map(\.timeRangeValue) ?? []
+        let bufferEnd = PlaybackTimelineDiagnostics.loadedEndSeconds(
+            playheadSeconds: playhead,
+            ranges: ranges
+        )
+        try HighPreparationControl.publish(
+            [
+                "schema_version": 1,
+                "status": "playing",
+                "reader_id": readerID,
+                "sample_monotonic_seconds": sampleTime,
+                "playhead_seconds": playhead,
+                "continuous_buffered_end_seconds": bufferEnd as Any? ?? NSNull(),
+                "playback_rate": Double(player.rate),
+            ],
+            fileName: "ready.json",
+            directory: directory
+        )
+        highPreparationReadyPublished = true
+    }
+
+    private func respondToHighPreparationChallenge(player: AVPlayer, directory: String) throws {
+        guard let challenge = try HighPreparationControl.readChallenge(directory: directory),
+            challenge.sampleRequestID != lastHighPreparationRequestID
+        else {
+            return
+        }
+        guard challenge.readerID == options.readerID,
+            highPreparationChallengeCount < HighPreparationControl.maximumResponses
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 7)
+        }
+
+        let playhead = CMTimeGetSeconds(player.currentTime())
+        let ranges = item?.loadedTimeRanges.map(\.timeRangeValue) ?? []
+        let bufferEnd =
+            playhead.isFinite && playhead >= 0
+            ? PlaybackTimelineDiagnostics.loadedEndSeconds(playheadSeconds: playhead, ranges: ranges)
+            : nil
+        let rate = Double(player.rate)
+        let status: String
+        switch player.timeControlStatus {
+        case .paused:
+            status = "paused"
+        case .waitingToPlayAtSpecifiedRate:
+            status = "waiting"
+        case .playing:
+            status = "playing"
+        @unknown default:
+            status = "other"
+        }
+        try HighPreparationControl.publish(
+            [
+                "schema_version": 1,
+                "sample_request_id": challenge.sampleRequestID,
+                "context_id": challenge.contextID,
+                "challenge": challenge.challenge,
+                "reader_id": challenge.readerID,
+                "session_generation": challenge.sessionGeneration,
+                "sequence": challenge.sequence,
+                "sample_monotonic_seconds": try monotonicClockSeconds(),
+                "playhead_seconds": playhead.isFinite && playhead >= 0 ? playhead as Any : NSNull(),
+                "continuous_buffered_end_seconds": bufferEnd as Any? ?? NSNull(),
+                "playback_rate": rate.isFinite ? rate as Any : NSNull(),
+                "time_control_status": status,
+            ],
+            fileName: "sample.json",
+            directory: directory
+        )
+        lastHighPreparationRequestID = challenge.sampleRequestID
+        highPreparationChallengeCount += 1
     }
 
     private func inspectAudioEvidence(for playerItem: AVPlayerItem) async throws {
@@ -1954,6 +2333,23 @@ private final class PlaybackProbe {
                 "truncated": finalPlayerErrorLogTruncated,
             ],
         ]
+        if options.highPreparationContinuous {
+            value["high_preparation_continuous"] = [
+                "mode": "continuous_native_control_v1",
+                "reader_id": options.readerID as Any? ?? NSNull(),
+                "ready_marker_published": highPreparationReadyPublished,
+                "challenge_sample_count": highPreparationChallengeCount,
+                "challenge_sample_limit": HighPreparationControl.maximumResponses,
+                "challenge_samples_truncated": highPreparationChallengeCount >= HighPreparationControl.maximumResponses,
+                "high_low_high_decoded": videoSizeExpectations.isComplete,
+                "muted_verified": player?.isMuted == true,
+                "automatic_waiting_enabled": player?.automaticallyWaitsToMinimizeStalling == true,
+                "seek_count": 0,
+                "rate_change_count": 0,
+                "item_replacement_count": 0,
+                "buffer_cap_set": false,
+            ]
+        }
         if let error {
             value["error"] = ["phase": error.phase, "domain": error.safeDomain, "code": error.code]
         }
@@ -2069,7 +2465,9 @@ private final class PlaybackProbe {
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
         }
-        player?.replaceCurrentItem(with: nil)
+        if !options.highPreparationContinuous {
+            player?.replaceCurrentItem(with: nil)
+        }
         item = nil
         player = nil
     }
