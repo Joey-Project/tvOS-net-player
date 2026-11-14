@@ -34,6 +34,7 @@ MAX_SERIALIZED_PLAN_RECORDS = 1
 MAX_SELECTED_SPANS = 4
 CAUSAL_EVENT_RING_LIMIT = 96
 TEST_NAME = "media_acceptance_tests::media_high_preparation_tests::native_high_preparation_off_on_comparison"
+PROBE_SELF_TEST_CASE = "high_preparation_player_verification_survives_cleanup"
 ARM_REPORTS = {"off": "off.json", "on": "on.json"}
 TRANSPORT_BOUNDARY = "in_process_generated_cache_service_trait"
 NEWLY_READABLE_SEMANTICS = "one_byte_lower_bound_per_exact_range_none_to_full_some_transition"
@@ -198,7 +199,11 @@ def _verify_probe_self_test(probe_binary: Path, *, logs: Path, env: dict[str, st
         value = json.loads(output)
     except json.JSONDecodeError as error:
         raise HighPreparationError("Probe self-test did not return JSON.") from error
-    if code != 0 or value.get("status") != "complete" or "high_preparation_mode_requires_bound_reader_and_fixed_phase_limits" not in value.get("cases", []):
+    required_cases = {
+        "high_preparation_mode_requires_bound_reader_and_fixed_phase_limits",
+        PROBE_SELF_TEST_CASE,
+    }
+    if code != 0 or value.get("status") != "complete" or not required_cases.issubset(value.get("cases", [])):
         raise HighPreparationError("Probe self-test did not validate the continuous-only mode.")
 
 

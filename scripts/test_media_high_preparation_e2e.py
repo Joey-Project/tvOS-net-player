@@ -202,6 +202,33 @@ def arm(arm_name: str, *, eligible: bool = False, session_id: str | None = None)
 
 
 class MediaHighPreparationRunnerTests(unittest.TestCase):
+    def test_probe_preflight_requires_cleanup_verification_self_test_case(self) -> None:
+        binary = Path("/stable/probe")
+        complete = (
+            '{"status":"complete","cases":['
+            '"high_preparation_mode_requires_bound_reader_and_fixed_phase_limits",'
+            f'"{runner.PROBE_SELF_TEST_CASE}"]}}'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(runner, "_run_bounded", return_value=(0, complete)) as run_bounded:
+                runner._verify_probe_self_test(
+                    binary,
+                    logs=Path(temporary),
+                    env={},
+                    deadline=time.monotonic() + 90,
+                )
+            self.assertEqual(run_bounded.call_args.args[0], [str(binary), "--self-test"])
+
+            missing_case = complete.replace(f',"{runner.PROBE_SELF_TEST_CASE}"', "")
+            with patch.object(runner, "_run_bounded", return_value=(0, missing_case)):
+                with self.assertRaises(runner.HighPreparationError):
+                    runner._verify_probe_self_test(
+                        binary,
+                        logs=Path(temporary),
+                        env={},
+                        deadline=time.monotonic() + 90,
+                    )
+
     def test_opt_in_runner_has_bounded_budgets_and_exact_test_filter(self) -> None:
         self.assertEqual(
             (runner.TOTAL_BUDGET_SECONDS, runner.COMPILE_BUDGET_SECONDS, runner.RUNTIME_BUDGET_SECONDS,

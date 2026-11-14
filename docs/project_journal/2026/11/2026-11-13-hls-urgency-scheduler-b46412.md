@@ -209,6 +209,11 @@ superseded_by:
 - Keep pinned signing, stable executables, verified system/player mute, bounded
   output and deadlines. Standard native3 and accepted producer helpers remain
   unchanged; the new comparison does not replace those regression gates.
+- Continuous-mode verification captures actual player mute and automatic-waiting
+  properties before cleanup, then serializes that snapshot. The signed probe
+  self-test exercises capture, release and serialization; a missing capture
+  cannot report either property as verified. The comparison preflight requires
+  this lifecycle regression before starting native media work.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

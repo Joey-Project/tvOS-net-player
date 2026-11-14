@@ -821,6 +821,7 @@ private struct ProbeOptions {
         passed.append(contentsOf: try RecoveryObservationTrigger.runSelfTest())
         passed.append(contentsOf: try PlaybackPolicy.runSelfTest())
         passed.append(contentsOf: try PlayerSetup.runSelfTest())
+        passed.append(contentsOf: try PlaybackProbe.runSelfTest())
         return ["schema_version": 1, "status": "complete", "passed": passed.count, "cases": passed]
     }
 }
@@ -1610,6 +1611,8 @@ private final class PlaybackProbe {
     private var audioTrackEvidenceSource = "not_inspected"
     private var audioEvidenceLookupError: [String: Any]?
     private var finalPlayerState: [String: Any]?
+    private var finalHighPreparationMutedVerification: Bool?
+    private var finalHighPreparationAutomaticWaitingVerification: Bool?
     private var recoveryObservation: [String: Any]?
     private var steadyPlayEndObservation: [String: Any]?
     private var finalPlayerErrorLog: [[String: Any]] = []
@@ -1624,6 +1627,48 @@ private final class PlaybackProbe {
     init(options: ProbeOptions) {
         self.options = options
         videoSizeExpectations = VideoSizeExpectationTracker(expectedSizes: options.expectedVideoSizes)
+    }
+
+    static func runSelfTest() throws -> [String] {
+        let readerID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let options = try ProbeOptions.parse([
+            "--url", "http://127.0.0.1/hls/session/master.m3u8?playback_reader=\(readerID)",
+            "--duration", "600",
+            "--deadline", "720",
+            "--expect-video-sizes", "640x360,320x180,640x360",
+            "--ready-marker", "/tmp/high-preparation-decoder-ready.json",
+            "--reader-id", readerID,
+            "--control-directory", "/tmp/high-preparation-control",
+            "--high-preparation-continuous",
+        ])
+
+        let probe = PlaybackProbe(options: options)
+        let player = AVPlayer()
+        player.isMuted = true
+        player.automaticallyWaitsToMinimizeStalling = true
+        probe.player = player
+        probe.captureFinalPlayerState()
+        probe.cleanup()
+
+        guard probe.player == nil else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 15)
+        }
+        let serialized = probe.result(status: "inconclusive", error: nil)
+        guard let report = serialized["high_preparation_continuous"] as? [String: Any],
+            report["muted_verified"] as? Bool == true,
+            report["automatic_waiting_enabled"] as? Bool == true
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 16)
+        }
+
+        let uncaptured = PlaybackProbe(options: options).result(status: "inconclusive", error: nil)
+        guard let uncapturedReport = uncaptured["high_preparation_continuous"] as? [String: Any],
+            uncapturedReport["muted_verified"] as? Bool == false,
+            uncapturedReport["automatic_waiting_enabled"] as? Bool == false
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 17)
+        }
+        return ["high_preparation_player_verification_survives_cleanup"]
     }
 
     func run() async -> (Int32, [String: Any]) {
@@ -2342,8 +2387,8 @@ private final class PlaybackProbe {
                 "challenge_sample_limit": HighPreparationControl.maximumResponses,
                 "challenge_samples_truncated": highPreparationChallengeCount >= HighPreparationControl.maximumResponses,
                 "high_low_high_decoded": videoSizeExpectations.isComplete,
-                "muted_verified": player?.isMuted == true,
-                "automatic_waiting_enabled": player?.automaticallyWaitsToMinimizeStalling == true,
+                "muted_verified": finalHighPreparationMutedVerification == true,
+                "automatic_waiting_enabled": finalHighPreparationAutomaticWaitingVerification == true,
                 "seek_count": 0,
                 "rate_change_count": 0,
                 "item_replacement_count": 0,
@@ -2359,6 +2404,10 @@ private final class PlaybackProbe {
     private func captureFinalPlayerState() {
         captureFinalPlayerErrorLog()
         finalPlayerState = playerStateSnapshot()
+        if options.highPreparationContinuous, let player {
+            finalHighPreparationMutedVerification = player.isMuted
+            finalHighPreparationAutomaticWaitingVerification = player.automaticallyWaitsToMinimizeStalling
+        }
     }
 
     private func observeRecoveryTriggerIfReady() throws {
