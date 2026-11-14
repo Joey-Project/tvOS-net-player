@@ -3,7 +3,7 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-13
+updated: 2026-11-14
 branch: codex/native-navigation-bridge-prototype
 pr:
 supersedes: []
@@ -49,12 +49,15 @@ superseded_by:
   remaining native-control causality gap. Unknown routes remain protected.
 
 ## Next Steps
-1. Finish physical mouse-drag and external/system transport coverage, and close
-   the missing native-handler-entry observation. Keep broad PR/merge readiness
-   separate; a working key-release experiment is not an all-route seek fence.
+1. Deliver the isolated diagnostic with full validation and current-head GitHub
+   Codex review. Keep physical mouse-drag, external/system transport and native
+   key-handler entry explicitly unverified; those gaps cannot become production
+   authority merely because the diagnostic itself passes its delivery gates.
 2. Use measured native-control boundaries to choose the smallest reliable bridge
-   or a narrowly scoped custom control. Integrate real exact-ID Close only after
-   the input boundary is sound. Do not claim a late callback is a pre-seek barrier.
+   while retaining native controls where possible. Complete bounded input-route
+   experiments only where they can answer a remaining design question. Integrate
+   real exact-ID Close only after the input boundary is sound; otherwise retain
+   server-side continuity protection. A late callback is not a pre-seek barrier.
 3. Consume validated SIDX ranges, exact reader/session/generation, fresh safe
    continuous buffers and fresh representation-bound video plus required-audio
    supply. Revalidate before admission and each new origin transfer; preserve
@@ -65,6 +68,26 @@ superseded_by:
    alter helpers, deadlines or assertions to make the candidate pass.
 5. Complete PR #98's separate bounded OFF/ON comparison after production wiring;
    a failed preparation is not a measured negative latency result.
+
+## Public API Boundary
+- The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
+  restoration callbacks, but no equivalent pre-seek decision callback. The
+  tvOS `timeToSeekAfterUserNavigatedFrom:to:` delegate returns a time
+  synchronously and covers documented user navigation, not an asynchronous
+  all-route withdrawal acknowledgment.
+- Public seek completion handlers, time-jump notifications and remote-command
+  registration do not document a guarantee that all native media requests wait
+  for application approval. An overridable `AVPlayer` seek method alone does
+  not establish that every AVKit or accessibility path calls that override.
+- These are documented-contract limits, not proof that every possible bridge
+  is impossible. Keep AX, mouse, system transport and keyboard coverage separate.
+  Do not add private hooks or replace the production native controls as part of
+  this diagnostic slice.
+- AppCore observes `.AVPlayerItemTimeJumped` through Combine before scheduling
+  MainActor handling. The probe's explicit main-queue notification observer is a
+  different observation point; its measured timing is not AppCore sink timing.
+- References: Xcode 26.5 `AVPlayerView.h`, `AVPlayerViewController.h`,
+  `AVPlayer.h`, and `AVPlayerItem.h`; [Apple navigation delegate contract](https://developer.apple.com/documentation/avkit/avplayerviewcontrollerdelegate).
 
 ## Prototype Checks
 - Full Python helper discovery in the implementation worktree: 257 tests passed,
