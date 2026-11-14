@@ -109,6 +109,11 @@ superseded_by:
 - Range tests cover rate-scaled safety windows, incomplete buffers, unknown
   ranges, unaligned SIDX time origins, stale or ambiguous bindings, same-size
   content-prefix replacement and no-progress promotion across queue polling.
+- Concurrent foreground resolver waiters keep a persistent semaphore queue
+  position while they remain foreground, and revalidate priority and control
+  after admission. Cancellation or demotion withdraws the pending acquisition.
+  Regressions exhaust all permits before queuing multiple readers, then verify
+  progress, cancellation cleanup and foreground precedence after demotion.
 - Real loopback HTTP tests register the map through the production playlist
   path, check exact response bytes and origin Range traces, and exercise actual
   preparation-batch contention. Preparation publishes a verified chunk before

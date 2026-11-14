@@ -609,19 +609,48 @@ impl HlsRangeCache {
                     if foreground_waiter.is_none() {
                         foreground_waiter = Some(self.register_foreground_waiter());
                     }
-                    if let Some(permit) =
-                        self.try_acquire_scheduled_chunk_permit(HlsRangePriority::Foreground, true)
-                    {
+                    let permit = {
+                        let acquire = self.chunk_permits.clone().acquire_owned();
+                        tokio::pin!(acquire);
+                        loop {
+                            let current_priority =
+                                self.resolve_priority_for_chunk(key, priority_for, pending_since);
+                            self.check_priority_control(key, current_priority, control)?;
+                            if current_priority != HlsRangePriority::Foreground {
+                                break None;
+                            }
+                            tokio::select! {
+                                permit = &mut acquire => {
+                                    let permit = permit.map_err(|_| HlsRangeError::SessionRemoving)?;
+                                    let current_priority =
+                                        self.resolve_priority_for_chunk(key, priority_for, pending_since);
+                                    self.check_priority_control(key, current_priority, control)?;
+                                    if current_priority == HlsRangePriority::Foreground {
+                                        break Some(permit);
+                                    }
+                                    drop(permit);
+                                    break None;
+                                }
+                                changed_result = changed.changed() => {
+                                    if changed_result.is_err() {
+                                        return Err(HlsRangeError::SessionRemoving);
+                                    }
+                                }
+                                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                            }
+                        }
+                    };
+                    if let Some(permit) = permit {
+                        let permit = self.track_chunk_permit(HlsRangePriority::Foreground, permit);
                         drop(foreground_waiter.take());
                         return Ok(permit);
                     }
+                    drop(foreground_waiter.take());
+                    continue;
                 }
                 HlsRangePriority::FarFuturePlayback => {
                     drop(foreground_waiter.take());
-                    if let Some(permit) = self.try_acquire_scheduled_chunk_permit(
-                        HlsRangePriority::FarFuturePlayback,
-                        false,
-                    ) {
+                    if let Some(permit) = self.try_acquire_far_future_chunk_permit() {
                         return Ok(permit);
                     }
                 }
@@ -641,28 +670,17 @@ impl HlsRangeCache {
         }
     }
 
-    fn try_acquire_scheduled_chunk_permit(
-        self: &Arc<Self>,
-        priority: HlsRangePriority,
-        owns_foreground_waiter: bool,
-    ) -> Option<HlsRangeChunkPermit> {
+    fn try_acquire_far_future_chunk_permit(self: &Arc<Self>) -> Option<HlsRangeChunkPermit> {
         let mut state = self.lock_state();
-        let other_foreground_waiters = state
-            .waiting_foreground
-            .saturating_sub(usize::from(owns_foreground_waiter));
-        if priority == HlsRangePriority::Foreground && other_foreground_waiters > 0 {
-            return None;
-        }
-        if priority == HlsRangePriority::FarFuturePlayback
-            && (state.waiting_foreground > 0
-                || state.waiting_preparation > 0
-                || state.active_foreground > 0
-                || state.active_foreground_permits > 0
-                || state.active_preparation_transfers > 0)
+        if state.waiting_foreground > 0
+            || state.waiting_preparation > 0
+            || state.active_foreground > 0
+            || state.active_foreground_permits > 0
+            || state.active_preparation_transfers > 0
         {
             return None;
         }
-        if priority == HlsRangePriority::FarFuturePlayback && self.parallelism >= 2 {
+        if self.parallelism >= 2 {
             let foreground_capacity = self
                 .chunk_permits
                 .available_permits()
@@ -673,16 +691,11 @@ impl HlsRangeCache {
         }
         let permit = Arc::clone(&self.chunk_permits).try_acquire_owned().ok()?;
         state.active_chunk_permits += 1;
-        match priority {
-            HlsRangePriority::Foreground => state.active_foreground_permits += 1,
-            HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
-            HlsRangePriority::FarFuturePlayback | HlsRangePriority::Background => {}
-        }
         drop(state);
         Some(HlsRangeChunkPermit {
             _permit: permit,
             cache: Arc::clone(self),
-            priority,
+            priority: HlsRangePriority::FarFuturePlayback,
             promoted_preparation_flight: None,
         })
     }
@@ -1589,14 +1602,17 @@ mod publication_state_tests {
 
 #[cfg(test)]
 mod preparation_scheduler_tests {
-    use super::{HlsRangeCache, HlsRangeError, HlsRangePriority, RangeChunkKey, RangeResourceKey};
+    use super::{
+        HlsRangeCache, HlsRangeError, HlsRangePriority, HlsRangePriorityResolver, RangeChunkKey,
+        RangeResourceKey,
+    };
     use crate::hls_cache::HlsCacheFillControl;
     use std::{
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, oneshot};
 
@@ -1671,6 +1687,243 @@ mod preparation_scheduler_tests {
         })
         .await
         .expect("range scheduler state should reach the expected value");
+    }
+
+    #[tokio::test]
+    async fn multiple_resolver_foreground_waiters_do_not_stall_after_release() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let held_one = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "held-one", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground permit should be acquired");
+        let held_two = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "held-two", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground permit should be acquired");
+        let resolver: HlsRangePriorityResolver = Arc::new(|_, _| HlsRangePriority::Foreground);
+        let pending_since = Instant::now();
+        let first_cache = Arc::clone(&cache);
+        let first_resolver = Arc::clone(&resolver);
+        let first = tokio::spawn(async move {
+            first_cache
+                .acquire_chunk_permit_with_resolver(
+                    &chunk_key("session", "resolver-one", 0),
+                    &first_resolver,
+                    pending_since,
+                    &continue_control(),
+                )
+                .await
+        });
+        let second_cache = Arc::clone(&cache);
+        let second = tokio::spawn(async move {
+            second_cache
+                .acquire_chunk_permit_with_resolver(
+                    &chunk_key("session", "resolver-two", 0),
+                    &resolver,
+                    pending_since,
+                    &continue_control(),
+                )
+                .await
+        });
+
+        wait_for_state(&cache, |state| state.waiting_foreground == 2).await;
+        assert_eq!(0, cache.chunk_permits.available_permits());
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        drop(held_one);
+        drop(held_two);
+        let mut first = first;
+        let mut second = second;
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(&mut first, &mut second)
+        })
+        .await;
+        let (first, second) = match joined {
+            Ok(joined) => joined,
+            Err(_) => {
+                first.abort();
+                second.abort();
+                let _ = first.await;
+                let _ = second.await;
+                panic!("both foreground resolver waiters should progress after release");
+            }
+        };
+        let first = first
+            .expect("first resolver task should not panic")
+            .expect("first foreground resolver should acquire a permit");
+        let second = second
+            .expect("second resolver task should not panic")
+            .expect("second foreground resolver should acquire a permit");
+        {
+            let state = cache.lock_state();
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+
+        drop(first);
+        drop(second);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(2, cache.chunk_permits.available_permits());
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_resolver_foreground_releases_waiter_and_permit_state() {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let held = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "held", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("foreground permit should be acquired");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = cancel_control(Arc::clone(&cancelled));
+        let resolver: HlsRangePriorityResolver = Arc::new(|_, _| HlsRangePriority::Foreground);
+        let task_cache = Arc::clone(&cache);
+        let task = tokio::spawn(async move {
+            task_cache
+                .acquire_chunk_permit_with_resolver(
+                    &chunk_key("session", "cancelled-resolver", 0),
+                    &resolver,
+                    Instant::now(),
+                    &control,
+                )
+                .await
+        });
+
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+        assert_eq!(0, cache.chunk_permits.available_permits());
+        cancelled.store(true, Ordering::SeqCst);
+        cache.signal_change();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled queued resolver should stop promptly")
+            .expect("cancelled resolver task should not panic");
+        assert!(matches!(result, Err(HlsRangeError::Cancelled)));
+        wait_for_state(&cache, |state| state.waiting_foreground == 0).await;
+        assert_eq!(1, cache.lock_state().active_chunk_permits);
+
+        drop(held);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        let recovered = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "after-cancel", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("a fresh foreground request should acquire the released permit");
+        drop(recovered);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(1, cache.chunk_permits.available_permits());
+    }
+
+    #[tokio::test]
+    async fn resolver_foreground_demotion_withdraws_queue_before_foreground_admission() {
+        let cache = Arc::new(HlsRangeCache::new(2, 0));
+        let held_one = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "held-one", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("first foreground permit should be acquired");
+        let held_two = cache
+            .acquire_chunk_permit(
+                &chunk_key("session", "held-two", 0),
+                HlsRangePriority::Foreground,
+                &continue_control(),
+            )
+            .await
+            .expect("second foreground permit should be acquired");
+        let demote_to_far = Arc::new(AtomicBool::new(false));
+        let far_flag = Arc::clone(&demote_to_far);
+        let far_resolver: HlsRangePriorityResolver = Arc::new(move |_, _| {
+            if far_flag.load(Ordering::SeqCst) {
+                HlsRangePriority::FarFuturePlayback
+            } else {
+                HlsRangePriority::Foreground
+            }
+        });
+        let far_cache = Arc::clone(&cache);
+        let far_waiter = tokio::spawn(async move {
+            far_cache
+                .acquire_chunk_permit_with_resolver(
+                    &chunk_key("session", "demoted-far", 0),
+                    &far_resolver,
+                    Instant::now(),
+                    &continue_control(),
+                )
+                .await
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+
+        demote_to_far.store(true, Ordering::SeqCst);
+        cache.signal_change();
+        wait_for_state(&cache, |state| state.waiting_foreground == 0).await;
+        assert!(!far_waiter.is_finished());
+
+        let foreground_resolver: HlsRangePriorityResolver =
+            Arc::new(|_, _| HlsRangePriority::Foreground);
+        let foreground_cache = Arc::clone(&cache);
+        let foreground_waiter = tokio::spawn(async move {
+            foreground_cache
+                .acquire_chunk_permit_with_resolver(
+                    &chunk_key("session", "foreground-after-demotion", 0),
+                    &foreground_resolver,
+                    Instant::now(),
+                    &continue_control(),
+                )
+                .await
+        });
+        wait_for_state(&cache, |state| state.waiting_foreground == 1).await;
+
+        drop(held_one);
+        let foreground = tokio::time::timeout(Duration::from_secs(2), foreground_waiter)
+            .await
+            .expect("foreground should take the newly released permit ahead of far work")
+            .expect("foreground waiter task should not panic")
+            .expect("foreground waiter should acquire a permit");
+        assert!(!far_waiter.is_finished());
+        {
+            let state = cache.lock_state();
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(2, state.active_chunk_permits);
+            assert_eq!(2, state.active_foreground_permits);
+        }
+
+        drop(foreground);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 1).await;
+        assert!(!far_waiter.is_finished());
+        drop(held_two);
+        let far = tokio::time::timeout(Duration::from_secs(2), far_waiter)
+            .await
+            .expect("demoted far work should become eligible after foreground releases")
+            .expect("far waiter task should not panic")
+            .expect("demoted far waiter should acquire a permit");
+        {
+            let state = cache.lock_state();
+            assert_eq!(0, state.waiting_foreground);
+            assert_eq!(1, state.active_chunk_permits);
+            assert_eq!(0, state.active_foreground_permits);
+        }
+        assert_eq!(1, cache.chunk_permits.available_permits());
+
+        drop(far);
+        wait_for_state(&cache, |state| state.active_chunk_permits == 0).await;
+        assert_eq!(2, cache.chunk_permits.available_permits());
     }
 
     #[tokio::test]
