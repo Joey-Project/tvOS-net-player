@@ -20,6 +20,37 @@ fixture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fixture)
 
 
+class FakeClock:
+    def __init__(self, now: float = 0.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class RecordingStopEvent:
+    def __init__(self, *, cancel: bool = False):
+        self.cancel = cancel
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return self.cancel
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout or 0.0)
+        return self.cancel
+
+
+class CancelDuringWait(RecordingStopEvent):
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout or 0.0)
+        self.cancel = True
+        return True
+
+
 class FixtureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -250,6 +281,169 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(options.max_media_bytes_per_second, 16 * 1024)
         self.assertLess(options.max_media_bytes_per_second * 8, 300_000)
         self.assertLess(options.max_media_bytes, 600 * 300_000 // 8)
+
+    def test_transfer_pacing_does_not_bank_initial_or_midstream_idle_time(self) -> None:
+        clock = FakeClock()
+        stop_event = RecordingStopEvent()
+        limiter = fixture.TransferLimiter(1024 * 1024, 16 * 1024, stop_event, clock=clock)
+        clock.advance(120)
+
+        self.assertTrue(limiter.wait_for_slot(fixture.CHUNK_BYTES))
+        self.assertTrue(limiter.wait_for_slot(fixture.CHUNK_BYTES))
+        clock.advance(100)
+        self.assertTrue(limiter.wait_for_slot(fixture.CHUNK_BYTES))
+        self.assertTrue(limiter.wait_for_slot(fixture.CHUNK_BYTES))
+
+        self.assertEqual(stop_event.waits, [4.0, 4.0])
+
+    def test_transfer_pacing_serializes_aggregate_concurrent_chunks(self) -> None:
+        clock = FakeClock()
+        stop_event = RecordingStopEvent()
+        limiter = fixture.TransferLimiter(1024 * 1024, 16 * 1024, stop_event, clock=clock)
+        start = threading.Barrier(5)
+        results: list[bool] = []
+        result_lock = threading.Lock()
+
+        def reserve_chunk() -> None:
+            start.wait()
+            result = limiter.wait_for_slot(fixture.CHUNK_BYTES)
+            with result_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=reserve_chunk) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results, [True] * 4)
+        self.assertEqual(sorted(stop_event.waits), [4.0, 8.0, 12.0])
+        self.assertEqual(limiter.written_bytes, 0)
+
+    def test_transfer_cancellation_does_not_count_reserved_bytes_as_written(self) -> None:
+        clock = FakeClock()
+        stop_event = CancelDuringWait()
+        limiter = fixture.TransferLimiter(1024, 16 * 1024, stop_event, clock=clock)
+
+        self.assertTrue(limiter.wait_for_slot(fixture.CHUNK_BYTES))
+        limiter.account_written(fixture.CHUNK_BYTES)
+        self.assertFalse(limiter.wait_for_slot(1024))
+        self.assertEqual(stop_event.waits, [4.0])
+        self.assertEqual(limiter.written_bytes, fixture.CHUNK_BYTES)
+
+    def test_run_drains_http_handlers_before_final_counters_and_failure(self) -> None:
+        for event_limit, trigger_exception in ((2, False), (1, False), (2, True), (1, True)):
+            expected_count = event_limit
+            expected_failure = event_limit == 1
+            with self.subTest(event_limit=event_limit, trigger_exception=trigger_exception):
+                output = self.root / f"drain-{event_limit}-{trigger_exception}"
+                output.mkdir()
+                finish_entered = threading.Event()
+                release_finish = threading.Event()
+                shutdown_entered = threading.Event()
+                fail_loop = threading.Event()
+                servers = []
+                run_results: list[int] = []
+
+                class CapturedServer(fixture.FixtureServer):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        servers.append(self)
+
+                    def shutdown(self):
+                        shutdown_entered.set()
+                        return super().shutdown()
+
+                def generate(media_dir: Path, _output_root: Path, *, started: float) -> Path:
+                    del started
+                    playlist = media_dir / "master.m3u8"
+                    playlist.write_text(
+                        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n"
+                        "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\n"
+                        "segment0000.m4s\n#EXT-X-ENDLIST\n",
+                        encoding="ascii",
+                    )
+                    (media_dir / "init.mp4").write_bytes(b"init")
+                    (media_dir / "segment0000.m4s").write_bytes(b"segment")
+                    return playlist
+
+                original_emit = fixture.EventLog.emit
+
+                def delayed_finish(log, kind: str, **fields: object) -> None:
+                    if kind == "request_finish":
+                        finish_entered.set()
+                        if not release_finish.wait(2):
+                            raise AssertionError("test did not release request handler")
+                    original_emit(log, kind, **fields)
+
+                original_walk_bytes = fixture._walk_bytes
+
+                def fail_during_run(root: Path) -> int:
+                    if fail_loop.is_set() and root == output / "drain":
+                        raise OSError("synthetic serving-loop failure")
+                    return original_walk_bytes(root)
+
+                ready = threading.Event()
+                ready_lines: list[str] = []
+
+                def capture_print(*args, **_kwargs) -> None:
+                    ready_lines.append(" ".join(str(arg) for arg in args))
+                    ready.set()
+
+                run_thread = threading.Thread(
+                    target=lambda: run_results.append(
+                        fixture.run(["--output-root", str(output), "--run-id", "drain"])
+                    )
+                )
+                with mock.patch.object(fixture.sys, "platform", "darwin"), \
+                    mock.patch.object(fixture, "raw_clock_ns", return_value=123), \
+                    mock.patch.object(fixture, "generate_media", side_effect=generate), \
+                    mock.patch.object(fixture, "FixtureServer", CapturedServer), \
+                    mock.patch.object(fixture, "_walk_bytes", side_effect=fail_during_run), \
+                    mock.patch.object(fixture, "MAX_EVENTS", event_limit), \
+                    mock.patch.object(fixture.EventLog, "emit", delayed_finish), \
+                    mock.patch("builtins.print", side_effect=capture_print):
+                    run_thread.start()
+                    self.assertTrue(ready.wait(2))
+                    ready_value = json.loads(ready_lines[0])
+                    request_result: list[bytes] = []
+                    request_thread = threading.Thread(
+                        target=lambda: request_result.append(
+                            urllib.request.urlopen(
+                                ready_value["url"].removesuffix("master.m3u8") + "segment0000.m4s",
+                                timeout=2,
+                            ).read()
+                        )
+                    )
+                    request_thread.start()
+                    self.assertTrue(finish_entered.wait(2))
+                    if trigger_exception:
+                        fail_loop.set()
+                    else:
+                        servers[0].fixture_state.stop_event.set()
+                    self.assertTrue(shutdown_entered.wait(2))
+                    release_finish.set()
+                    request_thread.join(2)
+                    run_thread.join(2)
+
+                self.assertFalse(request_thread.is_alive())
+                self.assertFalse(run_thread.is_alive())
+                self.assertEqual(request_result, [b"segment"])
+                self.assertEqual(run_results, [1 if expected_failure or trigger_exception else 0])
+                report = json.loads((output / "drain" / "report.json").read_text(encoding="ascii"))
+                self.assertEqual(report["event_count"], expected_count)
+                self.assertEqual(report["media_bytes_written"], len(b"segment"))
+                self.assertEqual(
+                    bool(report["error"] and "event log budget exceeded" in report["error"]),
+                    expected_failure,
+                )
+                self.assertEqual(
+                    bool(report["error"] and "synthetic serving-loop failure" in report["error"]),
+                    trigger_exception,
+                )
+                self.assertEqual(report["shutdown_reason"], "fixture_log_failure" if expected_failure else "requested")
 
     def test_generation_stops_when_media_growth_exceeds_cap(self) -> None:
         output = self.root / "output"

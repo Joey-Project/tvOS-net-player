@@ -128,14 +128,22 @@ class EventLog:
 
 
 class TransferLimiter:
-    def __init__(self, max_bytes: int, bytes_per_second: int | None, stop_event: threading.Event | None = None):
+    def __init__(
+        self,
+        max_bytes: int,
+        bytes_per_second: int | None,
+        stop_event: threading.Event | None = None,
+        *,
+        clock=time.monotonic,
+    ):
         self.max_bytes = max_bytes
         self.bytes_per_second = bytes_per_second
         self.stop_event = stop_event or threading.Event()
+        self._clock = clock
         self._lock = threading.Lock()
         self._reserved = 0
         self._sent = 0
-        self._started = time.monotonic()
+        self._next_send_time = 0.0
 
     def reserve(self, amount: int) -> bool:
         with self._lock:
@@ -144,16 +152,23 @@ class TransferLimiter:
             self._reserved += amount
             return True
 
-    def account(self, amount: int) -> bool:
+    def wait_for_slot(self, amount: int) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if self.bytes_per_second is None:
+            return True
+        with self._lock:
+            now = self._clock()
+            slot = max(now, self._next_send_time)
+            self._next_send_time = slot + amount / self.bytes_per_second
+        delay = slot - now
+        if delay > 0 and self.stop_event.wait(delay):
+            return False
+        return not self.stop_event.is_set()
+
+    def account_written(self, amount: int) -> None:
         with self._lock:
             self._sent += amount
-            sent = self._sent
-        if self.bytes_per_second:
-            due = self._started + sent / self.bytes_per_second
-            delay = due - time.monotonic()
-            if delay > 0 and self.stop_event.wait(delay):
-                return False
-        return not self.stop_event.is_set()
 
     @property
     def written_bytes(self) -> int:
@@ -329,11 +344,12 @@ class FixtureHandler(BaseHTTPRequestHandler):
                         chunk = source.read(min(CHUNK_BYTES, remaining))
                         if not chunk:
                             raise OSError("fixture file changed while serving")
-                        self.wfile.write(chunk)
-                        transferred += len(chunk)
-                        if not self.state.limiter.account(len(chunk)):
+                        if not self.state.limiter.wait_for_slot(len(chunk)):
                             self.close_connection = True
                             break
+                        self.wfile.write(chunk)
+                        transferred += len(chunk)
+                        self.state.limiter.account_written(len(chunk))
                         remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.close_connection = True
@@ -405,6 +421,14 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def _quiesce_server(server: FixtureServer, server_thread: threading.Thread | None) -> None:
+    if server_thread is not None and server_thread.is_alive():
+        server.shutdown()
+    server.server_close()
+    if server_thread is not None:
+        server_thread.join()
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -578,6 +602,8 @@ def run(argv: list[str] | None = None) -> int:
     media_dir: Path | None = None
     server: FixtureServer | None = None
     server_thread: threading.Thread | None = None
+    event_log: EventLog | None = None
+    limiter: TransferLimiter | None = None
     error: str | None = None
     shutdown_reason = "requested"
     event_count = 0
@@ -627,39 +653,34 @@ def run(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             shutdown_reason = "keyboard_interrupt"
             stop_event.set()
-        if event_log.failure_reason:
-            error = event_log.failure_reason
-            shutdown_reason = "fixture_log_failure"
-        event_count = event_log.event_count
-        media_bytes_written = limiter.written_bytes
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=2)
-        server = None
-        if error:
-            result_code = 1
     except KeyboardInterrupt:
         error = "interrupted"
         shutdown_reason = "keyboard_interrupt"
         result_code = 130
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if server_thread is not None:
-            server_thread.join(timeout=2)
         print("native-navigation-fixture: interrupted", file=sys.stderr)
     except (FixtureError, OSError, subprocess.SubprocessError) as exc:
         error = str(exc)
         result_code = 1
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if server_thread is not None:
-            server_thread.join(timeout=2)
         print(f"native-navigation-fixture: {error}", file=sys.stderr)
     finally:
         if server is not None:
-            server.server_close()
+            stop_event.set()
+            try:
+                _quiesce_server(server, server_thread)
+            except OSError as exc:
+                shutdown_error = f"fixture server shutdown failed: {exc}"
+                error = f"{error}; {shutdown_error}" if error else shutdown_error
+                result_code = 1
+            server = None
+        if event_log is not None:
+            event_count = event_log.event_count
+            failure_reason = event_log.failure_reason
+            if failure_reason:
+                error = f"{error}; {failure_reason}" if error and failure_reason not in error else failure_reason
+                shutdown_reason = "fixture_log_failure"
+                result_code = 1
+        if limiter is not None:
+            media_bytes_written = limiter.written_bytes
         if media_temp is not None:
             try:
                 media_temp.cleanup()

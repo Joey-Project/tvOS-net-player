@@ -111,6 +111,10 @@ superseded_by:
   records `native_time_jump` separately from periodic `time_jump`; callback entry
   and the pre-actor-hop position read have separate raw clock markers. No
   production source, buffering or transport schema changed.
+- Fixture pacing now schedules bounded shared send slots before socket writes
+  instead of accumulating credit from all elapsed idle time. Actual written
+  bytes are accounted separately from pacing reservations. Final event/byte
+  totals and late log-budget failures are observed after request handlers drain.
 
 ## Prototype Commands
 - Start `python3 scripts/native-navigation-fixture.py --output-root
@@ -184,6 +188,11 @@ superseded_by:
   a MainActor task. The diagnostic's explicit main-queue observer is not the
   identical Combine sink or AppCore-handler entry point. No production handler
   timing claim or permission to demote ambiguous requests follows from this test.
+- Those historical GUI cases used the earlier elapsed-time limiter, which could
+  accumulate idle credit. Their target-not-yet-requested prechecks and measured
+  callback clocks remain specific observations, not constrained-bandwidth
+  acceptance. The corrected fixture does not retroactively establish missing
+  mouse, key-handler or system-transport coverage.
 
 ## Evidence
 - [Freshness and withdrawal PR #102](https://github.com/Joey-Project/tvOS-net-player/pull/102).
