@@ -8,15 +8,36 @@ public enum HLSPlaybackReaderURLBinding {
         server: CacheServerSummary
     ) -> URL? {
         guard server.supportsHLSPlaybackReaderBinding else { return url }
-
-        let readerID = owner.ownerToken.uuidString.lowercased()
         guard owner.serverID.utf8.elementsEqual(server.id.utf8),
             (try? HLSPlaybackContextOpenRequest(
                 sessionID: owner.sessionID,
                 expectedSessionGeneration: owner.sessionGeneration,
-                httpReaderID: readerID
+                httpReaderID: owner.ownerToken.uuidString.lowercased()
             ).validate()) != nil,
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let boundURL = applying(
+                to: url,
+                server: server,
+                expectedServerID: owner.serverID,
+                sessionID: owner.sessionID,
+                readerID: owner.ownerToken
+            )
+        else {
+            return nil
+        }
+        return boundURL
+    }
+
+    public static func applying(
+        to url: URL,
+        server: CacheServerSummary,
+        expectedServerID: String,
+        sessionID: String,
+        readerID: UUID
+    ) -> URL? {
+        guard server.supportsHLSPlaybackReaderBinding else { return url }
+        guard server.id.utf8.elementsEqual(expectedServerID.utf8),
+            (try? HLSRenditionCatalogRequest(sessionID: sessionID).validate()) != nil,
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
             let scheme = components.scheme?.lowercased(),
             scheme == "http" || scheme == "https",
             let host = components.host,
@@ -24,10 +45,29 @@ public enum HLSPlaybackReaderURLBinding {
             components.user == nil,
             components.password == nil,
             components.fragment == nil,
-            matchesMasterPath(components.percentEncodedPath, sessionID: owner.sessionID)
+            matchesMasterPath(components.percentEncodedPath, sessionID: sessionID)
         else {
             return nil
         }
+
+        guard let canonicalReaderID = canonicalReaderID(readerID) else { return nil }
+        return appendingReaderID(canonicalReaderID, to: url)
+    }
+
+    private static func canonicalReaderID(_ readerID: UUID) -> String? {
+        let value = readerID.uuidString.lowercased()
+        let bytes = Array(value.utf8)
+        guard bytes.count == 36,
+            bytes[14] == 52,
+            [56, 57, 97, 98].contains(bytes[19])
+        else {
+            return nil
+        }
+        return value
+    }
+
+    private static func appendingReaderID(_ readerID: String, to url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
 
         let existingReaderItems = components.queryItems?.filter { $0.name == "playback_reader" } ?? []
         guard existingReaderItems.isEmpty else {

@@ -41,12 +41,12 @@ use crate::{
         HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
     },
     hls_range_cache::{
-        HlsRangeCache, HlsRangeError, HlsRangePreparation, HlsRangePriority, HlsRangeReadiness,
-        HlsRangeResourceStatus, HlsReadyRange, HlsSessionRemovalGuard, PersistedRangeExtent,
-        PersistedRangeManifest, PersistedRangeOrigin, RANGE_FOREGROUND_CHUNK_BYTES,
-        RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS, RANGE_MAX_MANIFEST_BYTES, RANGE_MAX_SIZE,
-        RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES, RangeChunkKey, RangeResourceKey,
-        SessionPublicationMode,
+        HlsRangeCache, HlsRangeError, HlsRangePreparation, HlsRangePriority,
+        HlsRangePriorityResolver, HlsRangeReadiness, HlsRangeResourceStatus, HlsReadyRange,
+        HlsSessionRemovalGuard, PersistedRangeExtent, PersistedRangeManifest, PersistedRangeOrigin,
+        RANGE_FOREGROUND_CHUNK_BYTES, RANGE_MAX_CHUNK_BYTES, RANGE_MAX_CHUNKS,
+        RANGE_MAX_MANIFEST_BYTES, RANGE_MAX_SIZE, RANGE_MIN_CHUNK_BYTES, RANGE_STARTUP_CHUNK_BYTES,
+        RangeChunkKey, RangeResourceKey, SessionPublicationMode,
     },
     hls_readiness::{
         CacheWindowInspection, CacheWindowReason, CacheWindowState, HLS_READINESS_BUDGET_BYTES,
@@ -60,6 +60,7 @@ use crate::{
         hls_target_duration_for_ranges, mp4_fragment_ranges,
     },
     playback_policy::PlaybackPolicy,
+    playback_request_urgency::PlaybackSidxMap,
     suspend_clock::{SuspendClock, SystemSuspendClock},
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
@@ -92,6 +93,8 @@ const HLS_PLAYBACK_PREPARATION_MAX_LOGICAL_BYTES: u64 = 8 * 1024 * 1024;
 const HLS_PLAYBACK_PREPARATION_MAX_SPAN_BYTES: u64 = 16 * 1024 * 1024;
 const HLS_PLAYBACK_PREPARATION_MAX_ATTEMPTS: usize = 128;
 const HLS_PLAYBACK_PREPARATION_MAX_REQUESTS: usize = 128;
+const MAX_PLAYBACK_SIDX_MAPS: usize = 64;
+const MAX_PLAYBACK_SIDX_MAP_BYTES: usize = 16 * 1024 * 1024;
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -272,6 +275,7 @@ pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
     cdn_history: Arc<CdnHistory>,
     range_cache: Arc<HlsRangeCache>,
+    playback_sidx_maps: Arc<Mutex<HashMap<PlaybackSidxMapKey, PlaybackSidxMapEntry>>>,
     range_checkpoint_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::Mutex<()>>>>>,
     range_maintenance_locks: Arc<Mutex<HashMap<RangeResourceKey, Weak<tokio::sync::RwLock<()>>>>>,
     readiness_permits: Arc<Semaphore>,
@@ -281,6 +285,23 @@ pub(crate) struct HlsCacheStore {
     range_hash_bytes_read: Arc<AtomicU64>,
     #[cfg(test)]
     readiness_job_hook: Arc<Mutex<Option<ReadinessJobHook>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PlaybackSidxMapKey {
+    session_id: String,
+    resource_id: String,
+}
+
+struct PlaybackSidxMapEntry {
+    session_generation: u64,
+    cache_key: BilibiliMediaCacheKey,
+    total_length: u64,
+    prefix_length: u64,
+    prefix_sha256: String,
+    source_origin: String,
+    strong_etag: String,
+    map: Arc<PlaybackSidxMap>,
 }
 
 pub(crate) struct HlsRangeEnsure {
@@ -480,6 +501,7 @@ impl HlsCacheStore {
             root_path: Arc::new(root_path.into()),
             cdn_history: Arc::new(CdnHistory::default()),
             range_cache: Arc::new(HlsRangeCache::new(2, 0)),
+            playback_sidx_maps: Arc::new(Mutex::new(HashMap::new())),
             range_checkpoint_locks: Arc::new(Mutex::new(HashMap::new())),
             range_maintenance_locks: Arc::new(Mutex::new(HashMap::new())),
             readiness_permits: Arc::new(Semaphore::new(2)),
@@ -532,6 +554,128 @@ impl HlsCacheStore {
         self.range_cache.range_activity_counts()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_range_flight_overlapping_for_test(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+        requested: &Range<u64>,
+    ) -> bool {
+        self.range_cache
+            .has_flight_overlapping_for_test(session_id, resource_id, requested)
+    }
+
+    pub(crate) fn register_playback_sidx_map(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        resource: &HlsMediaResource,
+        map: PlaybackSidxMap,
+        source_origin: &str,
+        strong_etag: &str,
+    ) {
+        if session_generation == 0
+            || resource
+                .request
+                .size
+                .is_some_and(|total| total != map.total_length())
+            || map.allocated_bytes() > MAX_PLAYBACK_SIDX_MAP_BYTES
+            || !strong_etag_string_is_valid(strong_etag)
+            || media_url_origin(source_origin).as_deref() != Some(source_origin)
+            || !std::iter::once(resource.request.url.as_str())
+                .chain(resource.request.backup_urls.iter().map(String::as_str))
+                .any(|candidate| media_url_origin(candidate).as_deref() == Some(source_origin))
+        {
+            self.remove_playback_sidx_maps(session_id, Some(&resource.id));
+            return;
+        }
+        let verified_binding = self
+            .load_range_manifest(session_id, resource)
+            .ok()
+            .flatten()
+            .and_then(|loaded| {
+                let manifest = loaded.manifest;
+                let prefix_sha256 = manifest.prefix_sha256.clone()?;
+                let source_is_validated = manifest.validated_origins.iter().any(|origin| {
+                    origin.origin == source_origin
+                        && origin.prefix_sha256 == prefix_sha256
+                        && origin.strong_etag.as_deref() == Some(strong_etag)
+                });
+                (manifest.total_length == Some(map.total_length())
+                    && manifest.prefix_length > 0
+                    && manifest.strong_etag.as_deref() == Some(strong_etag)
+                    && manifest.validator_origin.as_deref() == Some(source_origin)
+                    && source_is_validated)
+                    .then_some((manifest.prefix_length, prefix_sha256))
+            });
+        let Some((prefix_length, prefix_sha256)) = verified_binding else {
+            self.remove_playback_sidx_maps(session_id, Some(&resource.id));
+            return;
+        };
+        let key = PlaybackSidxMapKey {
+            session_id: session_id.to_owned(),
+            resource_id: resource.id.clone(),
+        };
+        let mut maps = self
+            .playback_sidx_maps
+            .lock()
+            .expect("HLS playback SIDX map registry poisoned");
+        maps.retain(|existing, entry| {
+            existing.session_id != session_id || entry.session_generation == session_generation
+        });
+        maps.remove(&key);
+        let current_bytes = maps
+            .values()
+            .map(|entry| entry.map.allocated_bytes())
+            .fold(0_usize, usize::saturating_add);
+        if maps.len() >= MAX_PLAYBACK_SIDX_MAPS
+            || current_bytes.saturating_add(map.allocated_bytes()) > MAX_PLAYBACK_SIDX_MAP_BYTES
+        {
+            return;
+        }
+        maps.insert(
+            key,
+            PlaybackSidxMapEntry {
+                session_generation,
+                cache_key: resource.request.cache_key.clone(),
+                total_length: map.total_length(),
+                prefix_length,
+                prefix_sha256,
+                source_origin: source_origin.to_owned(),
+                strong_etag: strong_etag.to_owned(),
+                map: Arc::new(map),
+            },
+        );
+    }
+
+    pub(crate) fn playback_sidx_map(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        resource: &HlsMediaResource,
+    ) -> Option<Arc<PlaybackSidxMap>> {
+        let key = PlaybackSidxMapKey {
+            session_id: session_id.to_owned(),
+            resource_id: resource.id.clone(),
+        };
+        let mut maps = self
+            .playback_sidx_maps
+            .lock()
+            .expect("HLS playback SIDX map registry poisoned");
+        maps.retain(|existing, entry| {
+            existing.session_id != session_id || entry.session_generation == session_generation
+        });
+        let entry = maps.get(&key)?;
+        (entry.session_generation == session_generation
+            && entry.cache_key == resource.request.cache_key
+            && entry.total_length == entry.map.total_length()
+            && resource
+                .request
+                .size
+                .is_none_or(|total| total == entry.total_length))
+        .then(|| Arc::clone(&entry.map))
+    }
+
     pub(crate) async fn drain_range_writers(&self) {
         self.range_cache.drain().await;
     }
@@ -550,6 +694,38 @@ impl HlsCacheStore {
     {
         self.ensure_range_inner(client, session_id, resource, requested, priority, control)
             .await
+    }
+
+    pub(crate) async fn ensure_resource_range_with_resolver<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        requested: Range<u64>,
+        priority_for: HlsRangePriorityResolver,
+        control: &F,
+    ) -> Result<HlsReadyRange, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        let requested_snapshot = requested.clone();
+        let preparation = self
+            .ensure_range_inner_observed(
+                client,
+                session_id,
+                resource,
+                requested,
+                HlsRangePriority::FarFuturePlayback,
+                control,
+                Some(priority_for),
+                None,
+            )
+            .await?;
+        Ok(HlsReadyRange {
+            requested: requested_snapshot,
+            total_length: preparation.total_length,
+            strong_etag: preparation.strong_etag,
+        })
     }
 
     // Staged internal entrypoint until the #98 caller is integrated.
@@ -847,6 +1023,42 @@ impl HlsCacheStore {
                     requested,
                     priority,
                     &control,
+                    None,
+                    Some(sender),
+                )
+                .await
+        });
+        HlsRangeEnsure {
+            readiness,
+            completion: Some(completion),
+            completed: None,
+        }
+    }
+
+    pub(crate) fn observe_resource_range_with_resolver<F>(
+        &self,
+        client: reqwest::Client,
+        session_id: String,
+        resource: HlsMediaResource,
+        requested: Range<u64>,
+        priority_for: HlsRangePriorityResolver,
+        control: F,
+    ) -> HlsRangeEnsure
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync + 'static,
+    {
+        let (sender, readiness) = watch::channel(None);
+        let store = self.clone();
+        let completion = Box::pin(async move {
+            store
+                .ensure_range_inner_observed(
+                    &client,
+                    &session_id,
+                    &resource,
+                    requested,
+                    HlsRangePriority::FarFuturePlayback,
+                    &control,
+                    Some(priority_for),
                     Some(sender),
                 )
                 .await
@@ -2131,11 +2343,15 @@ impl HlsCacheStore {
         }
         let session_dir = self.session_dir(session_id)?;
         self.reject_cache_path_symlink(&session_dir)?;
-        match fs::remove_dir_all(session_dir) {
+        let result = match fs::remove_dir_all(session_dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.remove_playback_sidx_maps(session_id, None);
         }
+        result
     }
 
     #[cfg(test)]
@@ -3609,7 +3825,9 @@ impl HlsCacheStore {
         )?;
         self.remove_managed_cache_file_if_exists(
             &self.resource_range_full_get_temp_path(session_id, resource_id)?,
-        )
+        )?;
+        self.remove_playback_sidx_maps(session_id, Some(resource_id));
+        Ok(())
     }
 
     fn remove_prewarmed_resource(&self, session_id: &str, resource_id: &str) -> io::Result<()> {
@@ -3618,7 +3836,51 @@ impl HlsCacheStore {
         )?;
         self.remove_managed_cache_file_if_exists(
             &self.resource_prewarm_metadata_path(session_id, resource_id)?,
-        )
+        )?;
+        self.remove_playback_sidx_maps(session_id, Some(resource_id));
+        Ok(())
+    }
+
+    fn remove_playback_sidx_maps(&self, session_id: &str, resource_id: Option<&str>) {
+        self.playback_sidx_maps
+            .lock()
+            .expect("HLS playback SIDX map registry poisoned")
+            .retain(|key, _| {
+                key.session_id != session_id
+                    || resource_id.is_some_and(|resource_id| key.resource_id != resource_id)
+            });
+    }
+
+    fn invalidate_playback_sidx_map_if_identity_changed(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+        manifest: &PersistedRangeManifest,
+    ) {
+        let key = PlaybackSidxMapKey {
+            session_id: session_id.to_owned(),
+            resource_id: resource_id.to_owned(),
+        };
+        let mut maps = self
+            .playback_sidx_maps
+            .lock()
+            .expect("HLS playback SIDX map registry poisoned");
+        let identity_matches = maps.get(&key).is_some_and(|entry| {
+            entry.total_length == entry.map.total_length()
+                && manifest.total_length == Some(entry.total_length)
+                && manifest.prefix_length == entry.prefix_length
+                && manifest.prefix_sha256.as_deref() == Some(entry.prefix_sha256.as_str())
+                && manifest.strong_etag.as_deref() == Some(entry.strong_etag.as_str())
+                && manifest.validator_origin.as_deref() == Some(entry.source_origin.as_str())
+                && manifest.validated_origins.iter().any(|origin| {
+                    origin.origin == entry.source_origin
+                        && origin.prefix_sha256 == entry.prefix_sha256
+                        && origin.strong_etag.as_deref() == Some(entry.strong_etag.as_str())
+                })
+        });
+        if !identity_matches {
+            maps.remove(&key);
+        }
     }
 
     fn remove_transcode_generated_resources(&self, session_id: &str) -> io::Result<()> {
@@ -3804,6 +4066,32 @@ impl HlsCacheStore {
         loop {
             self.range_cache
                 .check_priority_control(key, priority, control)?;
+            tokio::select! {
+                guard = &mut acquire => return Ok(guard),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    async fn acquire_range_read_admission_with_resolver<F>(
+        &self,
+        key: &RangeChunkKey,
+        priority_for: &HlsRangePriorityResolver,
+        pending_since: Instant,
+        control: &F,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        let lock = self.range_maintenance_lock(&key.resource);
+        let acquire = lock.read_owned();
+        tokio::pin!(acquire);
+        loop {
+            let current_priority =
+                self.range_cache
+                    .resolve_priority_for_chunk(key, priority_for, pending_since);
+            self.range_cache
+                .check_priority_control(key, current_priority, control)?;
             tokio::select! {
                 guard = &mut acquire => return Ok(guard),
                 () = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -4545,6 +4833,7 @@ impl HlsCacheStore {
         {
             return Err(identity_error_at("extent-checkpoint-content").into());
         }
+        self.invalidate_playback_sidx_map_if_identity_changed(session_id, &resource.id, &manifest);
         self.write_json_atomically(&manifest_path, &manifest)?;
         sync_directory(manifest_path.parent().ok_or_else(|| {
             HlsRangeError::Io(io::Error::new(
@@ -5025,6 +5314,7 @@ impl HlsCacheStore {
         self.remove_managed_cache_file_if_exists(
             &self.resource_range_manifest_path(session_id, &resource.id)?,
         )?;
+        self.remove_playback_sidx_maps(session_id, Some(&resource.id));
         sync_directory(final_path.parent().ok_or_else(|| {
             HlsRangeError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -5035,6 +5325,18 @@ impl HlsCacheStore {
     }
 
     fn load_range_manifest(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+    ) -> Result<Option<LoadedRangeManifest>, HlsRangeError> {
+        let result = self.load_range_manifest_unchecked(session_id, resource);
+        if !matches!(&result, Ok(Some(_))) {
+            self.remove_playback_sidx_maps(session_id, Some(&resource.id));
+        }
+        result
+    }
+
+    fn load_range_manifest_unchecked(
         &self,
         session_id: &str,
         resource: &HlsMediaResource,
@@ -5078,6 +5380,7 @@ impl HlsCacheStore {
         if manifest.data_identity.as_deref() != Some(data_identity.as_str()) {
             return Err(identity_error_at("manifest-data-object-binding"));
         }
+        self.invalidate_playback_sidx_map_if_identity_changed(session_id, &resource.id, &manifest);
         Ok(Some(LoadedRangeManifest {
             manifest,
             bytes_digest: sha256_hex(&bytes),
@@ -5483,7 +5786,7 @@ impl HlsCacheStore {
         let requested_snapshot = requested.clone();
         let preparation = self
             .ensure_range_inner_observed(
-                client, session_id, resource, requested, priority, control, None,
+                client, session_id, resource, requested, priority, control, None, None,
             )
             .await?;
         Ok(HlsReadyRange {
@@ -5502,6 +5805,7 @@ impl HlsCacheStore {
         requested: Range<u64>,
         priority: HlsRangePriority,
         control: &F,
+        priority_resolver: Option<HlsRangePriorityResolver>,
         readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
     ) -> Result<HlsRangePreparation, HlsRangeError>
     where
@@ -5536,8 +5840,13 @@ impl HlsCacheStore {
         let key = self.range_resource_key(session_id, resource)?;
         let mut total = loaded.manifest.total_length.or(resource.request.size);
         if total.is_none() {
+            let probe_priority = if priority_resolver.is_some() {
+                HlsRangePriority::Foreground
+            } else {
+                priority
+            };
             total = Some(
-                self.discover_range_total(client, resource, &key, priority, control)
+                self.discover_range_total(client, resource, &key, probe_priority, control)
                     .await?,
             );
         }
@@ -5559,16 +5868,22 @@ impl HlsCacheStore {
         }
         if loaded.manifest.prefix_sha256.is_none() {
             let result = self
-                .ensure_range_span(
+                .ensure_range_span_observed_with_resolver(
                     client,
                     session_id,
                     resource,
                     &key,
                     0..total.min(RANGE_STARTUP_CHUNK_BYTES),
                     0,
-                    priority,
+                    if priority_resolver.is_some() {
+                        HlsRangePriority::Foreground
+                    } else {
+                        priority
+                    },
                     control,
                     &|_| {},
+                    priority_resolver.as_ref(),
+                    None,
                 )
                 .await;
             if let Err(error) = result {
@@ -5585,10 +5900,11 @@ impl HlsCacheStore {
             .load_range_manifest_serialized(session_id, resource)
             .await?
             .ok_or(HlsRangeError::IdentityChanged)?;
-        let chunks = if matches!(
-            priority,
-            HlsRangePriority::Foreground | HlsRangePriority::PlaybackPreparation
-        ) {
+        let chunks = if priority_resolver.is_some()
+            || matches!(
+                priority,
+                HlsRangePriority::Foreground | HlsRangePriority::PlaybackPreparation
+            ) {
             planned_foreground_range_chunks(total, &requested, &loaded.manifest.extents)
         } else {
             planned_range_chunks(total)
@@ -5618,8 +5934,9 @@ impl HlsCacheStore {
             .map(|(position, (index, chunk))| {
                 let key = key.clone();
                 let readiness = readiness.clone().filter(|_| position == 0);
+                let priority_resolver = priority_resolver.clone();
                 async move {
-                    self.ensure_range_span_observed(
+                    self.ensure_range_span_observed_with_resolver(
                         client,
                         session_id,
                         resource,
@@ -5629,6 +5946,7 @@ impl HlsCacheStore {
                         priority,
                         control,
                         &|_| {},
+                        priority_resolver.as_ref(),
                         readiness,
                     )
                     .await
@@ -6012,6 +6330,41 @@ impl HlsCacheStore {
         F: Fn() -> HlsCacheFillControl + Send + Sync,
         P: Fn(u64) + Send + Sync,
     {
+        self.ensure_range_span_observed_with_resolver(
+            client,
+            session_id,
+            resource,
+            resource_key,
+            range,
+            chunk_index,
+            priority,
+            control,
+            progress,
+            None,
+            readiness,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_range_span_observed_with_resolver<F, P>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        resource_key: &RangeResourceKey,
+        range: Range<u64>,
+        chunk_index: u64,
+        priority: HlsRangePriority,
+        control: &F,
+        progress: &P,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
+    ) -> Result<(), HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(u64) + Send + Sync,
+    {
         let loaded = self
             .load_range_manifest_serialized(session_id, resource)
             .await?
@@ -6037,13 +6390,36 @@ impl HlsCacheStore {
         let _reservation =
             self.range_cache
                 .reserve(resource_key.clone(), range.end, current_length, usage)?;
+        let pending_since = Instant::now();
         let mut maintenance_passes = 0;
         loop {
+            let mut current_priority = priority_resolver.map_or(priority, |resolver| {
+                self.range_cache
+                    .resolve_priority_for_chunk(&chunk_key, resolver, pending_since)
+            });
             self.range_cache
-                .check_priority_control(&chunk_key, priority, control)?;
-            let admission = self
-                .acquire_range_read_admission(&chunk_key, priority, control)
-                .await?;
+                .check_priority_control(&chunk_key, current_priority, control)?;
+            let admission = if let Some(resolver) = priority_resolver {
+                self.acquire_range_read_admission_with_resolver(
+                    &chunk_key,
+                    resolver,
+                    pending_since,
+                    control,
+                )
+                .await?
+            } else {
+                self.acquire_range_read_admission(&chunk_key, priority, control)
+                    .await?
+            };
+            if let Some(resolver) = priority_resolver {
+                current_priority = self.range_cache.resolve_priority_for_chunk(
+                    &chunk_key,
+                    resolver,
+                    pending_since,
+                );
+                self.range_cache
+                    .check_priority_control(&chunk_key, current_priority, control)?;
+            }
             let publication_lock = self.range_publication_lock(resource_key);
             let (flight, already_covered) = {
                 let _publication = publication_lock.lock().await;
@@ -6057,7 +6433,10 @@ impl HlsCacheStore {
                     (None, true)
                 } else {
                     (
-                        Some(self.range_cache.claim_chunk(chunk_key.clone(), priority)?),
+                        Some(
+                            self.range_cache
+                                .claim_chunk(chunk_key.clone(), current_priority)?,
+                        ),
                         false,
                     )
                 }
@@ -6075,10 +6454,20 @@ impl HlsCacheStore {
             }
             let flight = flight.ok_or(HlsRangeError::IdentityChanged)?;
             if flight.is_owner() {
-                let permit = self
-                    .range_cache
-                    .acquire_chunk_permit(&chunk_key, priority, control)
-                    .await?;
+                let permit = if let Some(resolver) = priority_resolver {
+                    self.range_cache
+                        .acquire_chunk_permit_with_resolver(
+                            &chunk_key,
+                            resolver,
+                            pending_since,
+                            control,
+                        )
+                        .await?
+                } else {
+                    self.range_cache
+                        .acquire_chunk_permit(&chunk_key, current_priority, control)
+                        .await?
+                };
                 if self
                     .read_durable_range(session_id, resource, range.clone())
                     .await?
@@ -6091,14 +6480,16 @@ impl HlsCacheStore {
                 }
                 let committed = self
                     .fetch_and_commit_range_extent(session_id, resource, range.clone(), || {
-                        self.fetch_range_chunk_observed(
+                        self.fetch_range_chunk_observed_with_resolver(
                             client,
                             session_id,
                             resource,
                             &chunk_key,
                             chunk_index,
-                            priority,
+                            current_priority,
                             control,
+                            priority_resolver,
+                            pending_since,
                             flight.readiness_sender(),
                             readiness.clone(),
                         )
@@ -6113,7 +6504,12 @@ impl HlsCacheStore {
                         drop(flight);
                         drop(admission);
                         self.compact_one_complete_range_parent(
-                            session_id, resource, &chunk_key, priority, control, true,
+                            session_id,
+                            resource,
+                            &chunk_key,
+                            current_priority,
+                            control,
+                            true,
                         )
                         .await?;
                         maintenance_passes += 1;
@@ -6145,7 +6541,7 @@ impl HlsCacheStore {
                         Some(true),
                     ),
                 );
-                let maintenance_budget = if priority == HlsRangePriority::Background {
+                let maintenance_budget = if current_priority == HlsRangePriority::Background {
                     RANGE_MAINTENANCE_PASSES_PER_ATTEMPT
                 } else {
                     1
@@ -6156,7 +6552,12 @@ impl HlsCacheStore {
                     }
                     match self
                         .compact_one_complete_range_parent(
-                            session_id, resource, &chunk_key, priority, control, false,
+                            session_id,
+                            resource,
+                            &chunk_key,
+                            current_priority,
+                            control,
+                            false,
                         )
                         .await
                     {
@@ -6186,7 +6587,11 @@ impl HlsCacheStore {
                     }
                 }
                 () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    self.range_cache.check_priority_control(&chunk_key, priority, control)?;
+                    let current_priority = priority_resolver.map_or(priority, |resolver| {
+                        self.range_cache
+                            .resolve_priority_for_chunk(&chunk_key, resolver, pending_since)
+                    });
+                    self.range_cache.check_priority_control(&chunk_key, current_priority, control)?;
                 }
             }
             drop(flight);
@@ -6204,6 +6609,36 @@ impl HlsCacheStore {
         range: Range<u64>,
         key: &RangeChunkKey,
         priority: HlsRangePriority,
+        control: &F,
+    ) -> Result<reqwest::Response, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        self.send_range_request_with_resolver(
+            client,
+            resource,
+            url,
+            range,
+            key,
+            priority,
+            None,
+            Instant::now(),
+            control,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_range_request_with_resolver<F>(
+        &self,
+        client: &reqwest::Client,
+        resource: &HlsMediaResource,
+        url: &str,
+        range: Range<u64>,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        pending_since: Instant,
         control: &F,
     ) -> Result<reqwest::Response, HlsRangeError>
     where
@@ -6240,8 +6675,12 @@ impl HlsCacheStore {
         let send = request.send();
         tokio::pin!(send);
         loop {
+            let current_priority = priority_resolver.map_or(priority, |resolver| {
+                self.range_cache
+                    .resolve_priority_for_chunk(key, resolver, pending_since)
+            });
             self.range_cache
-                .check_priority_control(key, priority, control)?;
+                .check_priority_control(key, current_priority, control)?;
             tokio::select! {
                 response = &mut send => return response.map_err(|error| HlsRangeError::Network(error.without_url())),
                 () = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -6255,6 +6694,32 @@ impl HlsCacheStore {
         expected_length: u64,
         key: &RangeChunkKey,
         priority: HlsRangePriority,
+        control: &F,
+    ) -> Result<Vec<u8>, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        self.read_range_body_with_resolver(
+            response,
+            expected_length,
+            key,
+            priority,
+            None,
+            Instant::now(),
+            control,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_range_body_with_resolver<F>(
+        &self,
+        response: reqwest::Response,
+        expected_length: u64,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        pending_since: Instant,
         control: &F,
     ) -> Result<Vec<u8>, HlsRangeError>
     where
@@ -6274,8 +6739,12 @@ impl HlsCacheStore {
         let mut bytes = Vec::with_capacity(capacity);
         let mut stream = response.bytes_stream();
         loop {
+            let current_priority = priority_resolver.map_or(priority, |resolver| {
+                self.range_cache
+                    .resolve_priority_for_chunk(key, resolver, pending_since)
+            });
             self.range_cache
-                .check_priority_control(key, priority, control)?;
+                .check_priority_control(key, current_priority, control)?;
             let next = tokio::select! {
                 next = stream.next() => next,
                 () = tokio::time::sleep(Duration::from_millis(50)) => continue,
@@ -6327,6 +6796,7 @@ impl HlsCacheStore {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_range_chunk_observed<F>(
         &self,
@@ -6343,14 +6813,52 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        self.fetch_range_chunk_observed_with_resolver(
+            client,
+            session_id,
+            resource,
+            chunk_key,
+            chunk_index,
+            priority,
+            control,
+            None,
+            Instant::now(),
+            flight_readiness,
+            readiness,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_range_chunk_observed_with_resolver<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        chunk_key: &RangeChunkKey,
+        chunk_index: u64,
+        priority: HlsRangePriority,
+        control: &F,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        pending_since: Instant,
+        flight_readiness: watch::Sender<Option<HlsRangeReadiness>>,
+        readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
+    ) -> Result<RangeChunkFetch, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
         let candidates = self
             .cdn_history
             .rank_request_for_range(&resource.request, chunk_index);
         let mut last_error = None;
         let mut range_unsupported_seen = false;
         for url in candidates.into_iter().filter(|url| !url.trim().is_empty()) {
+            let current_priority = priority_resolver.map_or(priority, |resolver| {
+                self.range_cache
+                    .resolve_priority_for_chunk(chunk_key, resolver, pending_since)
+            });
             self.range_cache
-                .check_priority_control(chunk_key, priority, control)?;
+                .check_priority_control(chunk_key, current_priority, control)?;
             let origin = media_url_origin(&url).ok_or_else(|| {
                 HlsRangeError::InvalidResponse("invalid CDN candidate origin".to_owned())
             })?;
@@ -6376,7 +6884,11 @@ impl HlsCacheStore {
                         None,
                         chunk_key,
                         &loaded.manifest,
-                        priority,
+                        if priority_resolver.is_some() {
+                            HlsRangePriority::Foreground
+                        } else {
+                            current_priority
+                        },
                         control,
                     )
                     .await
@@ -6426,13 +6938,15 @@ impl HlsCacheStore {
 
             let started = Instant::now();
             let response = match self
-                .send_range_request(
+                .send_range_request_with_resolver(
                     client,
                     resource,
                     &url,
                     chunk_key.range.clone(),
                     chunk_key,
-                    priority,
+                    current_priority,
+                    priority_resolver,
+                    pending_since,
                     control,
                 )
                 .await
@@ -6563,7 +7077,11 @@ impl HlsCacheStore {
                             chunk_key,
                             &loaded.manifest,
                             baseline_etag.as_deref().unwrap_or_default(),
-                            priority,
+                            if priority_resolver.is_some() {
+                                HlsRangePriority::Foreground
+                            } else {
+                                current_priority
+                            },
                             control,
                         )
                         .await;
@@ -6587,7 +7105,11 @@ impl HlsCacheStore {
                         Some(&observed_origin),
                         chunk_key,
                         &loaded.manifest,
-                        priority,
+                        if priority_resolver.is_some() {
+                            HlsRangePriority::Foreground
+                        } else {
+                            current_priority
+                        },
                         control,
                     )
                     .await
@@ -6644,7 +7166,15 @@ impl HlsCacheStore {
                 sender.send_replace(Some(outcome));
             }
             let body = match self
-                .read_range_body(response, length, chunk_key, priority, control)
+                .read_range_body_with_resolver(
+                    response,
+                    length,
+                    chunk_key,
+                    current_priority,
+                    priority_resolver,
+                    pending_since,
+                    control,
+                )
                 .await
             {
                 Ok(body) => body,
@@ -8583,7 +9113,7 @@ fn range_size_is_resumable(total: u64) -> bool {
     total > 0 && total <= RANGE_MAX_SIZE
 }
 
-fn media_url_origin(value: &str) -> Option<String> {
+pub(crate) fn media_url_origin(value: &str) -> Option<String> {
     let url = url::Url::parse(value).ok()?;
     let host = url.host_str()?;
     Some(format!(
@@ -8594,7 +9124,7 @@ fn media_url_origin(value: &str) -> Option<String> {
     ))
 }
 
-fn strong_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn strong_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let value = headers.get(reqwest::header::ETAG)?;
     if parse_entity_tag(value.as_bytes()) != Some(false) || value.as_bytes().len() > 512 {
         return None;
@@ -10431,6 +10961,96 @@ mod tests {
             assert!(!etag_header_syntax_valid(&headers), "{invalid:?}");
             assert_eq!(None, strong_etag(&headers));
         }
+    }
+
+    #[tokio::test]
+    async fn sidx_map_is_retired_when_same_size_manifest_identity_changes() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://cdn.example/video.m4s";
+        let source_origin = "https://cdn.example:443";
+        let strong_etag = "\"same-size-v1\"";
+        let total_length = RANGE_STARTUP_CHUNK_BYTES + 128;
+        let mut session = sample_session("sidx-map-identity", source_url);
+        session.variant.video.request.size = Some(total_length);
+        let original_cache_key = session.variant.video.request.cache_key.clone();
+        let body = (0..total_length as usize)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        seed_range_prefix(
+            &store,
+            &session,
+            source_url,
+            &body,
+            RANGE_STARTUP_CHUNK_BYTES,
+            strong_etag,
+        )
+        .await;
+
+        let map = PlaybackSidxMap::new(
+            total_length,
+            vec![
+                crate::playback_request_urgency::PlaybackSidxRange {
+                    bytes: RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + 64,
+                    start_ticks: 0,
+                    end_ticks: 10_000,
+                    timescale: 1_000,
+                },
+                crate::playback_request_urgency::PlaybackSidxRange {
+                    bytes: RANGE_STARTUP_CHUNK_BYTES + 64..total_length,
+                    start_ticks: 10_000,
+                    end_ticks: 30_000,
+                    timescale: 1_000,
+                },
+            ],
+        )
+        .expect("validated SIDX map should be bounded");
+        store.register_playback_sidx_map(
+            &session.id,
+            1,
+            &session.variant.video,
+            map,
+            source_origin,
+            strong_etag,
+        );
+        assert!(
+            store
+                .playback_sidx_map(&session.id, 1, &session.variant.video)
+                .is_some()
+        );
+
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("verified range manifest should load")
+            .expect("seeded range manifest should exist");
+        let mut changed = loaded.manifest;
+        changed.generation += 1;
+        changed.strong_etag = Some("\"same-size-v2\"".to_owned());
+        changed.prefix_sha256 = Some("a".repeat(64));
+        for origin in &mut changed.validated_origins {
+            origin.prefix_sha256 = "a".repeat(64);
+            origin.strong_etag = changed.strong_etag.clone();
+        }
+        store
+            .write_json_atomically(
+                &store
+                    .resource_range_manifest_path(&session.id, &session.variant.video.id)
+                    .expect("manifest path should be valid"),
+                &changed,
+            )
+            .expect("same-size refreshed manifest should be written");
+
+        let reloaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("refreshed range manifest should load")
+            .expect("refreshed range manifest should exist");
+        assert_eq!(Some(total_length), reloaded.manifest.total_length);
+        assert_eq!(original_cache_key, session.variant.video.request.cache_key);
+        assert!(
+            store
+                .playback_sidx_map(&session.id, 1, &session.variant.video)
+                .is_none()
+        );
     }
 
     async fn seed_range_prefix(

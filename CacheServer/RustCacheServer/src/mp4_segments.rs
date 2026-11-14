@@ -20,6 +20,14 @@ pub(crate) struct Mp4SegmentRange {
     pub(crate) duration_millis: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Mp4SidxTimingRange {
+    pub(crate) bytes: std::ops::Range<u64>,
+    pub(crate) start_ticks: u64,
+    pub(crate) end_ticks: u64,
+    pub(crate) timescale: u64,
+}
+
 pub(crate) fn hls_target_duration_for_ranges(ranges: &[Mp4SegmentRange]) -> Option<u64> {
     if ranges.is_empty() || ranges.len() > MAX_HLS_BANDWIDTH_RANGES {
         return None;
@@ -77,10 +85,12 @@ pub(crate) fn hls_peak_bandwidth_for_ranges(
     (peak > 0).then_some(peak)
 }
 
+#[derive(Clone)]
 pub(crate) struct Mp4SidxIndex {
     pub(crate) trailing_offset: u64,
     pub(crate) trailing_length: u64,
     ranges: Vec<Mp4SegmentRange>,
+    timing_ranges: Vec<Mp4SidxTimingRange>,
     first_reference_offset: u64,
     total_length: u64,
 }
@@ -193,6 +203,37 @@ pub(crate) fn mp4_sidx_segment_ranges(
     Some(ranges)
 }
 
+pub(crate) fn mp4_sidx_timing_ranges(
+    index: Mp4SidxIndex,
+    trailer: &[u8],
+) -> Option<Vec<Mp4SidxTimingRange>> {
+    if u64::try_from(trailer.len()).ok()? != index.trailing_length {
+        return None;
+    }
+    if index.trailing_length == 0 {
+        if !trailer.is_empty()
+            || index
+                .ranges
+                .last()?
+                .offset
+                .checked_add(index.ranges.last()?.length)?
+                != index.total_length
+        {
+            return None;
+        }
+        return Some(index.timing_ranges);
+    }
+
+    if !is_valid_terminal_mfra_bytes(trailer)? {
+        return None;
+    }
+    let last = index.timing_ranges.last()?;
+    if last.bytes.end != index.trailing_offset {
+        return None;
+    }
+    Some(index.timing_ranges)
+}
+
 fn parse_sidx(
     payload: &[u8],
     box_offset: u64,
@@ -236,6 +277,8 @@ fn parse_sidx(
     let mut reference_offset = first_reference_offset;
     let mut cumulative_duration = 0_u64;
     let mut ranges = Vec::with_capacity(reference_count);
+    let mut timing_ranges = Vec::with_capacity(reference_count);
+    let mut presentation_time = earliest;
     for _ in 0..reference_count {
         let size_and_type = read_u32(payload, cursor)?;
         cursor = cursor.checked_add(4)?;
@@ -255,6 +298,7 @@ fn parse_sidx(
             return None;
         }
         cumulative_duration = cumulative_duration.checked_add(duration)?;
+        let presentation_end = presentation_time.checked_add(duration)?;
         let duration_millis = duration
             .checked_mul(1_000)?
             .checked_add(timescale.checked_sub(1)?)?
@@ -280,6 +324,13 @@ fn parse_sidx(
             length: segment_end.checked_sub(segment_offset)?,
             duration_millis,
         });
+        timing_ranges.push(Mp4SidxTimingRange {
+            bytes: reference_offset..reference_end,
+            start_ticks: presentation_time,
+            end_ticks: presentation_end,
+            timescale,
+        });
+        presentation_time = presentation_end;
         reference_offset = reference_end;
     }
     earliest.checked_add(cumulative_duration)?;
@@ -290,6 +341,7 @@ fn parse_sidx(
         trailing_offset: reference_offset,
         trailing_length: 0,
         ranges,
+        timing_ranges,
         first_reference_offset,
         total_length,
     })

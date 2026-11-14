@@ -215,19 +215,19 @@ just test-media-network
 
 共享 Swift 客户端与 AppCore 提供显式调用的只读升档评估：高档窗口已完整缓存时可给出缓存侧机会；尚未缓存时，只有近期视频/音频供给、目标码率、实际播放速度和现有连续缓冲共同支持准备时间估算，才建议预热。源站路径默认保护至少 20 秒媒体内容，这是评估安全余量，不设置 AVPlayer 的前向缓冲上限；未知、过期或身份不匹配的证据维持当前策略。这些建议不触发下载或播放器切换，不是播放安全保证；实际切换与回升延迟优化尚未接入。设计见 [shared upshift assessment](docs/project_journal/2026/11/2026-11-10-hls-upshift-policy-b46401.md)。
 
-共享播放器可显式采集原生播放快照，保留真实播放速度、当前位置、连续缓冲边界和观察年龄；不会把跨越空洞的未来缓冲、默认倍速或历史进度当作当前播放证据。快照不证明当前画质、目标解码能力或升档安全性，不自动查询服务器或改变播放。边界见 [native playback snapshot](docs/project_journal/2026/11/2026-11-10-hls-playback-context-b46402.md)。
+共享播放器可采集原生播放快照，保留真实播放速度、当前位置、连续缓冲边界和观察年龄；不会把跨越空洞的未来缓冲、默认倍速或历史进度当作当前播放证据。快照本身不证明当前画质、目标解码能力或升档安全性，也不改变播放；符合条件的结构化 HLS 播放会使用下述自动上报路径。边界见 [native playback snapshot](docs/project_journal/2026/11/2026-11-10-hls-playback-context-b46402.md)。
 
-只读 `CacheService.GetHlsRenditionCatalog`（能力 20）返回已注册且允许服务的 session 在普通 HLS master 中公布的候选，复用资源可用性与弱网筛选规则。master 声明的总带宽与各视频/独立音频资源的名义码率分开记录，缺失值不推算；格式提示和声明尺寸不证明解码支持或当前画质。响应最多 128 个候选、64 KiB，不返回源站 URL、请求头或凭据，不恢复源、不下载，也不更新播放使用记录。共享 Swift 客户端仅显式查询，旧服务器使用兼容的 unsupported-operation 结果；目录快照不是缓存租约或切档许可，主动预热与接续仍需后续实现。边界见 [rendition catalog](docs/project_journal/2026/11/2026-11-11-hls-rendition-catalog-b46403.md)。
+只读 `CacheService.GetHlsRenditionCatalog`（能力 20）返回已注册且允许服务的 session 在普通 HLS master 中公布的候选，复用资源可用性与弱网筛选规则。master 声明的总带宽与各视频/独立音频资源的名义码率分开记录，缺失值不推算；格式提示和声明尺寸不证明解码支持或当前画质。响应最多 128 个候选、64 KiB，不返回源站 URL、请求头或凭据，不恢复源、不下载，也不更新播放使用记录。共享 Swift 客户端既可显式查询，也会在自动上报前通过目录确认真实 generation；旧服务器使用兼容的 unsupported-operation 结果。目录快照不是缓存租约或切档许可，自动高清预热仍需后续实现。边界见 [rendition catalog](docs/project_journal/2026/11/2026-11-11-hls-rendition-catalog-b46403.md)。
 
 共享 AppCore 的显式评估入口把目录、就绪度和原生快照绑定到当前播放器、媒体项、endpoint 及结构化 HLS session。新评估、重载、seek、暂停、变速或停止后，旧异步结果不能被继续使用；缺少 session 元数据时保持原播放，不从 URL 猜测身份。快照年龄包含两次 RPC 的等待，调用方消费结果前仍须重新核对当前归属和新鲜度。该入口不会自动调用、预热或切源，server ID 和进程内 generation 也不是跨重启凭证。边界见 [owned assessment](docs/project_journal/2026/11/2026-11-11-hls-owned-assessment-b46404.md)。
 
-播放状态上下文通过能力 21 的显式 Open/Update/Close RPC 上报，绑定已注册的 session/generation；共享 AppCore 收到服务器短期票据后才采集当前位置、连续缓冲边界和实际播放速度。每次更新消费一次性 challenge，旧状态仍按原 challenge 的五秒期限过期，不会因返回下一张票据而续命。多个播放实例、过期状态或迟到结果不能被当成一个安全缓冲；上下文不是媒体 HTTP 请求的身份绑定、缓存租约、带宽保证或切档许可。本阶段不自动上报、不调整下载优先级，也不触发预热或切源；后续按“近期补缺优先、源站带宽允许时高清优先于远期低清”的顺序接入。边界与分 PR 计划见 [playback context foundation](docs/project_journal/2026/11/2026-11-12-playback-urgency-context-b46407.md)。
+播放状态上下文通过能力 21 的 Open/Update/Close RPC 上报，绑定已注册的 session/generation。结构化 HLS 播放带有真实服务器能力信息时，共享 AppCore 会在实际播放期间自动上报，并在暂停、缓冲、结束、换源或观察到跳转时撤销旧计划；普通 URL 和不支持的服务器保持原播放路径，不从 URL 猜测 generation。收到短期票据后才采集当前位置、连续缓冲边界和实际播放速度，每次更新消费一次性 challenge；旧状态仍按原 challenge 的五秒期限过期，不会因返回下一张票据而续命。迟到结果不能恢复已撤销的本地归属，Close 超时或未知结果也不能当作服务器已确认移除。上下文不是缓存租约、带宽保证或切档许可，不会自动预热或切源。基础协议见 [playback context foundation](docs/project_journal/2026/11/2026-11-12-playback-urgency-context-b46407.md)，生产接入边界见 [seek recovery and urgency scheduling](docs/project_journal/2026/11/2026-11-13-hls-urgency-scheduler-b46412.md)。
 
-能力 22 为显式上下文增加独立的 HTTP 读者关联：一个已加载播放项使用稳定的 `http_reader_id`，不随短期票据轮换；服务器在生成的 master、视频/音频 playlist、初始化和媒体 URI 中显式传递 `playback_reader`。缺失、格式错误、重复、未知、过期或代际不符的关联不能降低普通播放请求的保护优先级；该 ID 不是认证凭证或缓存租约。兼容的 URL helper 仅在调用方显式协商后构造绑定地址，不自动修改已保存源地址、续接身份或播放器项。本片仍不自动上报、不启用下载调度或升档。见 [stable HLS reader binding](docs/project_journal/2026/11/2026-11-12-hls-reader-binding-b46408.md)。
+能力 22 提供独立的 HTTP 读者关联：一个已加载播放项使用稳定的 `http_reader_id`，不随短期票据轮换；服务器在生成的 master、视频/音频 playlist、初始化和媒体 URI 中显式传递 `playback_reader`。缺失、格式错误、重复、未知、过期或代际不符的关联不能降低普通播放请求的保护优先级；该 ID 不是认证凭证或缓存租约。共享播放器只在真实协商能力允许时，把关联参数用于本次播放器的媒体 URL，保留原始地址、保存内容与续接身份，不通过重建播放器项来补加关联。见 [stable HLS reader binding](docs/project_journal/2026/11/2026-11-12-hls-reader-binding-b46408.md)。
 
 上下文过期、近期源站带宽证据和用于带宽资格判断的真实传输耗时使用计入系统休眠的服务端时钟；传输结束时刻在后续校验或发布之前采集。Darwin/Linux 使用对应的原生时钟，不支持、不可读、倒退或溢出时不提供新的正面调度证据，不用普通 uptime 或墙钟兜底。原有历史 CDN 排序计时路径保持兼容，不作为上述资格的兜底。共享 AppCore 的快照、上报和评估使用同一个进程内连续时钟起点，不与服务端时间戳比较。
 
-显式撤销确认区分“无需远端操作”“已确认”和“尚未确认”：只有对应 context 的有效 Close 回执才证明服务端已处理撤销；超时、取消、失败或丢失的 Open 响应都不算确认。原有 `withdraw()` 仍是有界的尽力清理。新的确认接口不自动改变 seek/pause；后续调度消费者必须在新播放位置的媒体请求之前建立远端操作屏障，或证明等价的保守请求规则，不能只依赖本地 revision 已改变。实现边界见 [sleep-aware freshness and withdrawal](docs/project_journal/2026/11/2026-11-13-hls-freshness-barrier-b46409.md)。
+显式撤销确认区分“无需远端操作”“已确认”和“尚未确认”：只有对应 context 的有效 Close 回执才证明服务端已处理撤销；超时、取消、失败或丢失的 Open 响应都不算确认。原有 `withdraw()` 仍是有界的尽力清理。当前 seek-loading 策略允许用户原生跳转后短暂加载，因此不要求全入口远端前置屏障；本地 revision 改变仍不等于远端已撤销，调度通过有界等待提权和保守回退避免旧计划长期阻塞新位置。实现边界见 [sleep-aware freshness and withdrawal](docs/project_journal/2026/11/2026-11-13-hls-freshness-barrier-b46409.md) 和 [seek recovery](docs/project_journal/2026/11/2026-11-13-hls-urgency-scheduler-b46412.md)。
 
 本机运行使用上述固定签名的 probe 和 Rust test 程序，整个执行期间持有构建锁；不运行未签名的 Cargo 临时可执行文件，不读取 Bilibili 凭据，也不重启日常 App/server。整体预算为编译 25 分钟、执行 24 分钟和收尾 1 分钟，合计最多 50 分钟；报告和日志合计仍限制为 32 MiB。长测的媒体源上限为 1,280 MiB、托管缓存上限为 2 GiB，执行前须至少有 6 GiB 可用空间；短测的资源上限不变。它与完整 App UI、带凭据的真实长播、全量离线及实机验收分别记录，不能互相替代；当前进度见 [native media journal](docs/project_journal/2026/11/2026-11-09-native-abr-recovery-b46397.md)。
 
@@ -237,7 +237,9 @@ GHA 的 `Native media network acceptance` job 使用同一套严格用例和报�
 
 HLS 前台读取与后台整片填充分开选择传输粒度：建立原有 512 KiB 启动身份后，前台按最多约 64 KiB 的小 Range 获取当前需要的字节，后台继续使用较大的逻辑块补齐缺口。已验证的连续缓存使用独立、有界的较大交付窗口，避免每个小请求都重新哈希整个大块；缓存未命中时不等待大窗口下载。两者共享经过验证的缓存，保留原有 ETag、跨 CDN 抽样、取消、配额和抢占规则；截断响应不会作为有效缓存交付。首次启动和跨 CDN 身份验证仍可能需要较大读取，64 KiB 不是端到端响应时间保证。小块合并保持有界，不修改 gRPC 或持久化 schema。设计与验证边界见 [foreground Range cache journal](docs/project_journal/2026/10/2026-10-24-foreground-range-cache-foundation-b46393.md)；这项基础改造不单独证明原生 ABR 降档和恢复已通过。
 
-内部播放预热采用独立于整片填充的有界调度：当前播放读取优先，其次是利用空余容量的高档预热，最后是后台整片填充和旧任务。预热不要求所有前台请求都结束，但并发受限，并为前台保留容量；前台等待下载容量时，不相关的预热需要让出。单并发配置仍允许空闲预热，并在前台到达时让出。它不新增播放器、不限制客户端缓冲、不改公开控制面或持久化 schema，也尚未开启自动生产预热；单靠调度基础不能证明画质回升更快。边界与后续对照测试见 [playback preparation scheduling](docs/project_journal/2026/11/2026-11-12-playback-preparation-scheduling-b46406.md)。
+内部播放预热采用独立于整片填充的有界调度：近期视频/音频补缺优先，其次是符合条件的预热，再是能证明处于远期的播放读取，最后是后台整片填充和旧任务。远期分类需要有效的 reader/session/generation、已验证的 SIDX 字节时间映射及源站供给证据；初始化、混合范围、身份不明或证据过期时保留播放优先级。安全窗口为上报位置之后约 20 秒实际播放时间，并按真实倍速换算，且连续缓冲须覆盖该窗口；它不是 AVPlayer 的缓冲上限，也不丢弃已有低清缓冲。每个新下载小块和排队等待都会重新判断；远期请求连续约两秒没有进展时可提权取得一小块，失败重试不重置等待时间，成功推进后后续远期部分可再次让路，避免整条长响应永久占住高优先级。两秒是调度等待阈值，不保证两秒内完成下载或跳转。
+
+用户原生拖动后允许短暂加载：观察到新位置后撤销旧计划，优先恢复新位置的视频与音频缓冲；不要求所有原生入口都能在发出媒体请求前被拦截。这个取舍不允许自动升档引入黑屏或明显停顿，也不放宽内容身份、ETag/跨 CDN 抽样、取消、配额或截断校验。单并发配置仍须在近期补缺出现时让出预热资源。本片没有开启自动生产预热或强制切档；调度基础通过不等于已经证明画质回升更快。边界与后续对照测试见 [playback preparation scheduling](docs/project_journal/2026/11/2026-11-12-playback-preparation-scheduling-b46406.md) 和 [seek recovery](docs/project_journal/2026/11/2026-11-13-hls-urgency-scheduler-b46412.md)。
 
 前台 HTTP 响应还会先确认本次请求范围内首个缓存缺口的上游响应，包括已有缓存前缀、但缺失后半段的情况。通过状态、范围和必要身份校验后可以先返回 LAN 响应头，不必等待该缺口的完整响应体；内容仍须完整验证并原子写入后才能作为缓存交付。如果所有候选在响应头阶段失败，会返回经过清理的非成功响应，而不是先发成功状态再中断响应体。已接受响应头后才发生的截断或网络失败仍属于传输错误，不能改写已发出的状态。全缓存命中不访问上游，共享下载继续保留取消和资源释放约束；设计与验收边界见 [header-outcome journal](docs/project_journal/2026/11/2026-11-09-foreground-header-outcomes-b46396.md)。这不是 AVPlayer 自动恢复高码率的通过结论。
 

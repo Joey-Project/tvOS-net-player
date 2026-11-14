@@ -3,7 +3,7 @@ use std::{
     io,
     ops::Range,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;
@@ -57,8 +57,12 @@ pub(crate) struct PersistedRangeExtent {
 pub(crate) enum HlsRangePriority {
     Foreground,
     PlaybackPreparation,
+    FarFuturePlayback,
     Background,
 }
+
+pub(crate) type HlsRangePriorityResolver =
+    Arc<dyn Fn(&Range<u64>, Duration) -> HlsRangePriority + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionPublicationMode {
@@ -335,6 +339,21 @@ impl HlsRangeCache {
             .count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_flight_overlapping_for_test(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+        requested: &Range<u64>,
+    ) -> bool {
+        self.lock_state().flights.keys().any(|flight| {
+            flight.resource.session_id == session_id
+                && flight.resource.resource_id == resource_id
+                && flight.range.start < requested.end
+                && requested.start < flight.range.end
+        })
+    }
+
     pub(crate) fn enter(
         self: &Arc<Self>,
         session_id: &str,
@@ -569,6 +588,127 @@ impl HlsRangeCache {
         }
     }
 
+    pub(crate) async fn acquire_chunk_permit_with_resolver<F>(
+        self: &Arc<Self>,
+        key: &RangeChunkKey,
+        priority_for: &HlsRangePriorityResolver,
+        pending_since: Instant,
+        control: &F,
+    ) -> Result<HlsRangeChunkPermit, HlsRangeError>
+    where
+        F: Fn() -> crate::hls_cache::HlsCacheFillControl + Send + Sync,
+    {
+        let mut foreground_waiter = None;
+        let mut changed = self.changed.subscribe();
+        loop {
+            let priority = self.resolve_priority_for_chunk(key, priority_for, pending_since);
+            self.check_priority_control(key, priority, control)?;
+
+            match priority {
+                HlsRangePriority::Foreground => {
+                    if foreground_waiter.is_none() {
+                        foreground_waiter = Some(self.register_foreground_waiter());
+                    }
+                    if let Some(permit) =
+                        self.try_acquire_scheduled_chunk_permit(HlsRangePriority::Foreground, true)
+                    {
+                        drop(foreground_waiter.take());
+                        return Ok(permit);
+                    }
+                }
+                HlsRangePriority::FarFuturePlayback => {
+                    drop(foreground_waiter.take());
+                    if let Some(permit) = self.try_acquire_scheduled_chunk_permit(
+                        HlsRangePriority::FarFuturePlayback,
+                        false,
+                    ) {
+                        return Ok(permit);
+                    }
+                }
+                HlsRangePriority::PlaybackPreparation | HlsRangePriority::Background => {
+                    return self.acquire_chunk_permit(key, priority, control).await;
+                }
+            }
+
+            tokio::select! {
+                changed_result = changed.changed() => {
+                    if changed_result.is_err() {
+                        return Err(HlsRangeError::SessionRemoving);
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    fn try_acquire_scheduled_chunk_permit(
+        self: &Arc<Self>,
+        priority: HlsRangePriority,
+        owns_foreground_waiter: bool,
+    ) -> Option<HlsRangeChunkPermit> {
+        let mut state = self.lock_state();
+        let other_foreground_waiters = state
+            .waiting_foreground
+            .saturating_sub(usize::from(owns_foreground_waiter));
+        if priority == HlsRangePriority::Foreground && other_foreground_waiters > 0 {
+            return None;
+        }
+        if priority == HlsRangePriority::FarFuturePlayback
+            && (state.waiting_foreground > 0
+                || state.waiting_preparation > 0
+                || state.active_foreground > 0
+                || state.active_foreground_permits > 0
+                || state.active_preparation_transfers > 0)
+        {
+            return None;
+        }
+        if priority == HlsRangePriority::FarFuturePlayback && self.parallelism >= 2 {
+            let foreground_capacity = self
+                .chunk_permits
+                .available_permits()
+                .saturating_add(state.active_foreground_permits);
+            if foreground_capacity <= 1 {
+                return None;
+            }
+        }
+        let permit = Arc::clone(&self.chunk_permits).try_acquire_owned().ok()?;
+        state.active_chunk_permits += 1;
+        match priority {
+            HlsRangePriority::Foreground => state.active_foreground_permits += 1,
+            HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
+            HlsRangePriority::FarFuturePlayback | HlsRangePriority::Background => {}
+        }
+        drop(state);
+        Some(HlsRangeChunkPermit {
+            _permit: permit,
+            cache: Arc::clone(self),
+            priority,
+            promoted_preparation_flight: None,
+        })
+    }
+
+    fn flight_has_foreground_interest(&self, key: &RangeChunkKey) -> bool {
+        self.lock_state()
+            .flights
+            .get(key)
+            .is_some_and(|flight| flight.foreground_interest > 0)
+    }
+
+    pub(crate) fn resolve_priority_for_chunk(
+        &self,
+        key: &RangeChunkKey,
+        priority_for: &HlsRangePriorityResolver,
+        pending_since: Instant,
+    ) -> HlsRangePriority {
+        let waited = Instant::now().saturating_duration_since(pending_since);
+        let priority = priority_for(&key.range, waited);
+        if priority != HlsRangePriority::Foreground && self.flight_has_foreground_interest(key) {
+            HlsRangePriority::Foreground
+        } else {
+            priority
+        }
+    }
+
     fn try_acquire_chunk_permit(
         self: &Arc<Self>,
         priority: HlsRangePriority,
@@ -589,12 +729,26 @@ impl HlsRangeCache {
                 return None;
             }
         }
+        if priority == HlsRangePriority::FarFuturePlayback {
+            let foreground_capacity = self
+                .chunk_permits
+                .available_permits()
+                .saturating_add(state.active_foreground_permits);
+            if state.waiting_foreground > 0
+                || state.waiting_preparation > 0
+                || state.active_foreground > 0
+                || state.active_preparation_transfers > 0
+                || (self.parallelism >= 2 && foreground_capacity <= 1)
+            {
+                return None;
+            }
+        }
         let permit = Arc::clone(&self.chunk_permits).try_acquire_owned().ok()?;
         state.active_chunk_permits += 1;
         match priority {
             HlsRangePriority::Foreground => state.active_foreground_permits += 1,
             HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
-            HlsRangePriority::Background => {}
+            HlsRangePriority::FarFuturePlayback | HlsRangePriority::Background => {}
         }
         drop(state);
         Some(HlsRangeChunkPermit {
@@ -647,6 +801,7 @@ impl HlsRangeCache {
         match priority {
             HlsRangePriority::Foreground => state.active_foreground_permits += 1,
             HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
+            HlsRangePriority::FarFuturePlayback => {}
             HlsRangePriority::Background => unreachable!(),
         }
         let promoted_preparation_flight = if promoted {
@@ -716,7 +871,7 @@ impl HlsRangeCache {
         match priority {
             HlsRangePriority::Foreground => state.active_foreground_permits += 1,
             HlsRangePriority::PlaybackPreparation => state.active_preparation_transfers += 1,
-            HlsRangePriority::Background => {}
+            HlsRangePriority::FarFuturePlayback | HlsRangePriority::Background => {}
         }
         drop(state);
         HlsRangeChunkPermit {
@@ -785,7 +940,8 @@ impl HlsRangeCache {
         let promoted_preparation_permit =
             flight.is_some_and(|flight| flight.promoted_preparation_permit);
         if priority == HlsRangePriority::Background {
-            let foreground_active = state.active_foreground > 0;
+            let foreground_active =
+                state.active_foreground > 0 || state.active_foreground_permits > 0;
             let foreground_waiting = state.waiting_foreground > 0;
             let preparation_active = state.active_preparation_batches > 0;
             drop(state);
@@ -1089,7 +1245,7 @@ impl Drop for HlsRangeChunkPermit {
                 state.active_preparation_transfers =
                     state.active_preparation_transfers.saturating_sub(1);
             }
-            HlsRangePriority::Background => {}
+            HlsRangePriority::FarFuturePlayback | HlsRangePriority::Background => {}
         }
         drop(state);
         self.cache.signal_change();

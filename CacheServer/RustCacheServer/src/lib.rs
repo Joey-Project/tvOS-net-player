@@ -27,6 +27,7 @@ pub mod media;
 mod mp4_segments;
 pub mod playback;
 mod playback_policy;
+mod playback_request_urgency;
 mod resolver_catalog;
 mod resolver_health;
 mod resolver_routing;

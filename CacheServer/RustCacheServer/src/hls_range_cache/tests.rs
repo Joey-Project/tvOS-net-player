@@ -702,6 +702,88 @@ async fn observed_range_that_is_already_durable_does_not_fetch_upstream() {
 }
 
 #[tokio::test]
+async fn far_future_wait_age_survives_scheduler_polling_until_foreground_promotion() {
+    timeout(TEST_DEADLINE, async {
+        let cache = Arc::new(HlsRangeCache::new(1, 0));
+        let held_key = RangeChunkKey {
+            resource: RangeResourceKey {
+                session_id: "far-future-aging".to_owned(),
+                resource_id: "held".to_owned(),
+                representation: "test-representation".to_owned(),
+            },
+            total_length: 4096,
+            range: 0..512,
+        };
+        let held = cache
+            .acquire_chunk_permit(&held_key, HlsRangePriority::Foreground, &|| {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("foreground work should occupy the only permit");
+        let key = RangeChunkKey {
+            resource: RangeResourceKey {
+                session_id: "far-future-aging".to_owned(),
+                resource_id: "seek".to_owned(),
+                representation: "test-representation".to_owned(),
+            },
+            total_length: 4096,
+            range: 1024..1536,
+        };
+        let promote_after = Duration::from_millis(120);
+        let resolver: HlsRangePriorityResolver = Arc::new(move |_, waited| {
+            if waited >= promote_after {
+                HlsRangePriority::Foreground
+            } else {
+                HlsRangePriority::FarFuturePlayback
+            }
+        });
+        let pending_since = std::time::Instant::now();
+        let task_cache = Arc::clone(&cache);
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            task_cache
+                .acquire_chunk_permit_with_resolver(&task_key, &resolver, pending_since, &|| {
+                    HlsCacheFillControl::Continue
+                })
+                .await
+        });
+
+        timeout(TEST_DEADLINE, async {
+            loop {
+                if cache.lock_state().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("repeated queue polling should eventually age the original pending span");
+        assert!(
+            pending_since.elapsed() >= promote_after,
+            "polling must not restart the pending-span age"
+        );
+
+        drop(held);
+        let promoted = timeout(TEST_DEADLINE, task)
+            .await
+            .expect("promoted seek should acquire the released permit")
+            .expect("seek scheduler task should not panic")
+            .expect("aged far-future seek should be admitted as foreground");
+        assert_eq!(1, cache.lock_state().active_foreground_permits);
+        drop(promoted);
+        timeout(TEST_DEADLINE, async {
+            while cache.lock_state().waiting_foreground != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground wait accounting should clear after admission");
+    })
+    .await
+    .expect("far-future age promotion should complete within its deadline");
+}
+
+#[tokio::test]
 async fn accepted_headers_can_be_followed_by_truncation_without_publication() {
     timeout(TEST_DEADLINE, async {
         let total = (RANGE_STARTUP_CHUNK_BYTES * 2) as usize;

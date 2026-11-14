@@ -2987,12 +2987,14 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let taskContext = try XCTUnwrap(model.playbackProgressContext(serverAddressText: "unused.local:50051"))
         XCTAssertEqual(taskContext.hlsSession?.serverID, "fake-cache-server")
         XCTAssertEqual(taskContext.hlsSession?.sessionID, task.playbackSession?.id)
+        XCTAssertEqual(taskContext.hlsSession?.serverSummary?.id, "fake-cache-server")
 
         let selectedPresentation = try XCTUnwrap(model.playableTaskResults.first { $0.id == selected.id })
         let selectedContext = try XCTUnwrap(
             model.playbackProgressContext(for: selectedPresentation, serverAddressText: "unused.local:50051")
         )
         XCTAssertEqual(selectedContext.hlsSession?.sessionID, selected.playbackSession?.id)
+        XCTAssertEqual(selectedContext.hlsSession?.serverSummary?.id, "fake-cache-server")
         XCTAssertNotEqual(selectedContext.hlsSession?.sessionID, decoy.playbackSession?.id)
     }
 
@@ -8386,7 +8388,15 @@ private struct SavedPlaybackActivationFixture {
             else { return nil }
             return PlayerHLSPlaybackSessionContext(
                 serverID: identity.task.serverID,
-                sessionID: session.id
+                sessionID: session.id,
+                serverSummary: CacheServerSummary.fixture(
+                    mediaBaseURIs: ["http://mac-mini.local:8080"],
+                    capabilities: [
+                        CacheServerCapability.bilibiliResolutionV2,
+                        CacheServerCapability.bilibiliExecutionV2,
+                        CacheServerCapability.taskOutputV2,
+                    ]
+                )
             )
         }
         return ClientPreparedResumption(
@@ -9782,13 +9792,13 @@ private func playbackSession(id: String, variantID: String) -> CacheBilibiliPlay
 }
 
 private extension CacheServerSummary {
-    static func fixture(mediaBaseURIs: [String]) -> Self {
+    static func fixture(mediaBaseURIs: [String], capabilities: [String] = []) -> Self {
         Self(
             id: "fake-cache-server",
             name: "Fake cache server",
             version: "test",
             mediaBaseURIs: mediaBaseURIs,
-            capabilities: []
+            capabilities: capabilities
         )
     }
 }

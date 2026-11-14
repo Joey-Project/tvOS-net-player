@@ -555,6 +555,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let watchReconciliationNow: @Sendable () -> ContinuousClock.Instant
     private var activeEndpoint: CacheServerEndpoint?
     private var activeServerID: String?
+    private var activeServerSummary: CacheServerSummary?
     private var restoredTaskIdentity: ClientResumptionTaskIdentity?
     private var restoreAttemptIdentity: ClientResumptionTaskIdentity?
     private var restoreGeneration = 0
@@ -1135,7 +1136,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 playbackSession,
                 for: $0,
                 loadedURL: playbackURL,
-                serverID: taskIdentity.serverID
+                serverID: taskIdentity.serverID,
+                serverSummary: activeServerSummary
             )
         }
         let libraryItemID = currentTask.playableBilibiliLibraryItemID ?? ""
@@ -1193,7 +1195,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 rawSession,
                 for: $0,
                 loadedURL: playbackURL,
-                serverID: taskIdentity.serverID
+                serverID: taskIdentity.serverID,
+                serverSummary: activeServerSummary
             )
         }
 
@@ -1302,6 +1305,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             currentTask = nil
             activeEndpoint = nil
             activeServerID = nil
+            activeServerSummary = nil
             mediaBaseURIs = []
             restoredTaskIdentity = nil
             activePlaybackTaskID = nil
@@ -1383,6 +1387,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopTaskResultPaging()
         activeEndpoint = nil
         activeServerID = nil
+        activeServerSummary = nil
         mediaBaseURIs = []
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
@@ -1436,6 +1441,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             activeEndpoint = record.task.endpoint
             activeServerID = liveServerID
+            activeServerSummary = serverInfo
             mediaBaseURIs = serverInfo.mediaBaseURIs
             restoredTaskIdentity = record.task
             resumptionStore?.rememberTask(record.task)
@@ -2055,7 +2061,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     embeddedSession,
                     for: source,
                     loadedURL: safeURL,
-                    serverID: record.task.serverID
+                    serverID: record.task.serverID,
+                    serverSummary: serverInfo
                 )
             }
         )
@@ -2265,6 +2272,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopTaskResultPaging()
         activeEndpoint = endpoint
         activeServerID = nil
+        activeServerSummary = nil
         mediaBaseURIs = []
         currentTask = nil
         clearResolutionSession()
@@ -2303,6 +2311,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             mediaBaseURIs = serverInfo.mediaBaseURIs
             activeServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            activeServerSummary = serverInfo
             installResolutionPage(
                 page,
                 source: source,
@@ -2436,6 +2445,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopTaskResultPaging()
         activeEndpoint = endpoint
         activeServerID = nil
+        activeServerSummary = nil
         mediaBaseURIs = []
         isResolving = true
         isSubmitting = false
@@ -2467,6 +2477,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             activeEndpoint = endpoint
             activeServerID = serverInfo.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            activeServerSummary = serverInfo
             mediaBaseURIs = serverInfo.mediaBaseURIs
             installResolutionPage(
                 page,
@@ -2896,6 +2907,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         invalidateSavedPlaybackValidation(clearCached: true)
         activeEndpoint = nil
         activeServerID = nil
+        activeServerSummary = nil
         mediaBaseURIs = []
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
@@ -5596,7 +5608,8 @@ private func hlsPlaybackSessionContext(
     _ session: CacheBilibiliPlaybackSession?,
     for source: CachePlaybackSource,
     loadedURL: URL,
-    serverID: String
+    serverID: String,
+    serverSummary: CacheServerSummary?
 ) -> PlayerHLSPlaybackSessionContext? {
     let protocolName = source.playbackProtocol.lowercased().filter(\.isLetter)
     let playbackProtocol =
@@ -5613,7 +5626,11 @@ private func hlsPlaybackSessionContext(
     else {
         return nil
     }
-    return PlayerHLSPlaybackSessionContext(serverID: serverID, sessionID: session.id)
+    return PlayerHLSPlaybackSessionContext(
+        serverID: serverID,
+        sessionID: session.id,
+        serverSummary: serverSummary
+    )
 }
 
 private func samePlaybackSourceBytes(_ lhs: CachePlaybackSource, _ rhs: CachePlaybackSource) -> Bool {
