@@ -30,6 +30,7 @@ def arm(arm_name: str, *, eligible: bool = False, session_id: str | None = None)
         "status": "inconclusive" if arm_name == "on" and not eligible else "complete",
         "eligible": eligible,
         "transport_boundary": runner.TRANSPORT_BOUNDARY,
+        "fixture_generation_timeout_seconds": runner.FIXTURE_GENERATION_TIMEOUT_SECONDS,
         "fixture_is_fresh": True,
         "cache_is_fresh": True,
         "reader": reader,
@@ -345,6 +346,19 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
     def test_arm_contract_accepts_only_bound_continuous_muted_report(self) -> None:
         runner.validate_arm_report(arm("off"), expected_arm="off")
         runner.validate_arm_report(arm("on", eligible=True), expected_arm="on")
+
+    def test_arm_contract_requires_the_approved_fixture_generation_timeout(self) -> None:
+        self.assertEqual(runner.FIXTURE_GENERATION_TIMEOUT_SECONDS, 240)
+        for invalid_value in (120, 480, 240.0, "240", True, None):
+            with self.subTest(fixture_generation_timeout_seconds=invalid_value):
+                value = arm("off")
+                value["fixture_generation_timeout_seconds"] = invalid_value
+                with self.assertRaises(runner.HighPreparationError):
+                    runner.validate_arm_report(value, expected_arm="off")
+        value = arm("off")
+        del value["fixture_generation_timeout_seconds"]
+        with self.assertRaises(runner.HighPreparationError):
+            runner.validate_arm_report(value, expected_arm="off")
 
     def test_arm_contract_rejects_mutated_player_controls(self) -> None:
         value = arm("on")

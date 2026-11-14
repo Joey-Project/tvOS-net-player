@@ -218,6 +218,15 @@ superseded_by:
   test-name prefix. Discovery preflight checks the exact opt-in selector and
   unchanged three-case legacy ignored-test selection before playback. Missing
   opt-in configuration still fails; ordinary regression runs never select it.
+- Each opt-in arm allows 240 seconds for its FFmpeg fixture-generation child,
+  as explicitly approved after a 120-second pre-playback fixture timeout.
+  Both arms use the same limit and report it. Legacy long-fixture generation
+  stays at 120 seconds; inspection, playback, output and overall budgets remain
+  unchanged. A fixture timeout is not an ABR measurement.
+- macOS UI terminal-seek setup anchors at the head and navigates while paused.
+  It does not depend on a play/pause round trip finishing inside a ten-second
+  media tail at 2x speed. Natural completion, paused terminal clamping, Resume
+  and speed assertions remain required; production player behavior is unchanged.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

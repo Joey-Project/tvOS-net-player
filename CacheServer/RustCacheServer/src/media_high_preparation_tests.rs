@@ -52,6 +52,7 @@ const HIGH_PREPARATION_CONTROL_INTERVAL: Duration = Duration::from_secs(2);
 const HIGH_PREPARATION_PROTECTED_WALL_SECONDS: f64 = 20.0;
 const HIGH_PREPARATION_WINDOW_SECONDS: f64 = 20.0;
 const ARM_TRANSPORT_BOUNDARY: &str = "in_process_generated_cache_service_trait";
+const OPT_IN_FIXTURE_GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArmMode {
@@ -79,6 +80,7 @@ struct ArmReport {
     status: &'static str,
     eligible: bool,
     transport_boundary: &'static str,
+    fixture_generation_timeout_seconds: u64,
     fixture_is_fresh: bool,
     cache_is_fresh: bool,
     reader: ReaderReport,
@@ -1578,6 +1580,7 @@ fn build_arm_report(
         status,
         eligible,
         transport_boundary: ARM_TRANSPORT_BOUNDARY,
+        fixture_generation_timeout_seconds: OPT_IN_FIXTURE_GENERATION_TIMEOUT.as_secs(),
         fixture_is_fresh: true,
         cache_is_fresh: true,
         reader: ReaderReport {
@@ -1989,6 +1992,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         &directories.fixtures,
         LONG_RECOVERY_MEDIA_DURATION_SECONDS,
         &fixture_report,
+        OPT_IN_FIXTURE_GENERATION_TIMEOUT,
     )
     .await
     .map_err(|error| format!("phase=fixture-preparation; {error}"))?;
@@ -2487,6 +2491,7 @@ mod pure_helper_tests {
 
     #[test]
     fn maximum_bounded_arm_report_stays_within_serialization_limit() {
+        assert_eq!(OPT_IN_FIXTURE_GENERATION_TIMEOUT.as_secs(), 240);
         let span = |index: usize| SelectedSpanReport {
             kind: if index.is_multiple_of(2) {
                 "Video"
@@ -2549,6 +2554,7 @@ mod pure_helper_tests {
             status: "inconclusive",
             eligible: false,
             transport_boundary: ARM_TRANSPORT_BOUNDARY,
+            fixture_generation_timeout_seconds: OPT_IN_FIXTURE_GENERATION_TIMEOUT.as_secs(),
             fixture_is_fresh: true,
             cache_is_fresh: true,
             reader: ReaderReport {
@@ -2643,6 +2649,11 @@ mod pure_helper_tests {
         };
 
         let encoded = serde_json::to_vec(&report).expect("bounded arm report serializes");
+        let value: Value = serde_json::from_slice(&encoded).expect("bounded arm report parses");
+        assert_eq!(
+            value["fixture_generation_timeout_seconds"].as_u64(),
+            Some(240)
+        );
         assert!(
             encoded.len() <= ARM_REPORT_LIMIT,
             "maximum bounded report serialized to {} bytes",

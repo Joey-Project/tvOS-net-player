@@ -23,6 +23,7 @@ TOTAL_BUDGET_SECONDS = 60 * 60
 COMPILE_BUDGET_SECONDS = 25 * 60
 RUNTIME_BUDGET_SECONDS = 30 * 60
 FINALIZE_BUDGET_SECONDS = 60
+FIXTURE_GENERATION_TIMEOUT_SECONDS = 240
 ARTIFACT_BYTES = 32 * 1024 * 1024
 COMMAND_LOG_BYTES = 8 * 1024 * 1024
 REPORT_BYTES = 64 * 1024
@@ -400,6 +401,9 @@ def validate_arm_report(value: Any, *, expected_arm: str) -> None:
         raise HighPreparationError("ON eligibility and explicit inconclusive status disagree.")
     if value.get("fixture_is_fresh") is not True or value.get("cache_is_fresh") is not True:
         raise HighPreparationError("Each arm must use an independent fresh fixture and cache.")
+    fixture_generation_timeout = value.get("fixture_generation_timeout_seconds")
+    if type(fixture_generation_timeout) is not int or fixture_generation_timeout != FIXTURE_GENERATION_TIMEOUT_SECONDS:
+        raise HighPreparationError("Arm report fixture-generation timeout differs from the approved opt-in limit.")
     reader = value.get("reader")
     if not isinstance(reader, dict) or not isinstance(reader.get("id"), str):
         raise HighPreparationError("Arm report is missing its native reader binding.")

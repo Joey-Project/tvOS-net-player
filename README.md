@@ -239,7 +239,7 @@ GHA 的 `Native media network acceptance` job 使用同一套严格用例和报�
 just test-media-high-preparation
 ```
 
-两轮各使用新的缓存、夹具和原生播放器，保持相同的故障条件、默认缓冲与自动选档，仅切换服务端准备协调器；每轮自动播放 600 秒。固定签名编译、执行与收尾合计最多一小时，有界日志和报告合计最多 32 MiB。原生采样在每次新 challenge 之后获取，测试通过进程内的真实生成服务方法更新上下文，不代表完整 AppCore 或外部 gRPC 链路验收。恢复期准备未实际产生新的可读缓存、证据不足或匹配不明确时，结果为 inconclusive，并以退出码 2 结束，不能当作优化成功或更慢的证据。边界见 [native comparison contract](docs/project_journal/2026/11/2026-11-13-hls-urgency-scheduler-b46412.md#native-comparison-contract)。
+两轮各使用新的缓存、夹具和原生播放器，保持相同的故障条件、默认缓冲与自动选档，仅切换服务端准备协调器；每轮自动播放 600 秒。此 opt-in 入口每轮的 FFmpeg 素材生成子进程最多 240 秒，原三项回归的素材生成时限不变（长输入仍为 120 秒）；播放、检查和整体时限不因此增加。固定签名编译、执行与收尾合计最多一小时，有界日志和报告合计最多 32 MiB。原生采样在每次新 challenge 之后获取，测试通过进程内的真实生成服务方法更新上下文，不代表完整 AppCore 或外部 gRPC 链路验收。恢复期准备未实际产生新的可读缓存、证据不足或匹配不明确时，结果为 inconclusive，并以退出码 2 结束，不能当作优化成功或更慢的证据。边界见 [native comparison contract](docs/project_journal/2026/11/2026-11-13-hls-urgency-scheduler-b46412.md#native-comparison-contract)。
 
 ## LAN Cache Server
 

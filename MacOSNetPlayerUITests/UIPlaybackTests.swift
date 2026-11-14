@@ -268,6 +268,39 @@ final class UIPlaybackTests: XCTestCase {
             waitUntilTimelineState(state, equals: "paused", timeout: 10),
             "The replay must pause before seeking near EOF. \(accessibilityDescription(state))"
         )
+        // Anchor at the head so the fixture's non-ten-second tail avoids a 2x near-EOF click-latency race.
+        let backward = app.buttons["playback-skip-backward"]
+        for _ in 0..<12 {
+            let position = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+            if position.current <= 0.1 {
+                break
+            }
+            clickVisible(backward)
+            XCTAssertNotNil(
+                waitForTimeline(timeout: 10) {
+                    if position.current <= 8 {
+                        return $0 <= 0.1
+                    }
+                    return $0 >= position.current - 12 && $0 <= position.current - 8
+                },
+                "Paused Backward did not reach the head from \(position.current). "
+                    + accessibilityDescription(timeline)
+            )
+            XCTAssertTrue(
+                waitUntilTimelineState(state, equals: "paused", timeout: 10),
+                "Seeking to the head must remain paused. \(accessibilityDescription(state))"
+            )
+        }
+        let head = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        XCTAssertLessThanOrEqual(
+            head.current, 0.1,
+            "The replay must be anchored at the head before the bounded EOF seek. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "The head anchor must remain paused. \(accessibilityDescription(state))"
+        )
+
         let forward = app.buttons["playback-skip-forward"]
         for _ in 0..<12 {
             let position = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
@@ -288,26 +321,12 @@ final class UIPlaybackTests: XCTestCase {
             )
         }
 
-        var nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        let nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
         XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The bounded seek loop reached EOF too early.")
         XCTAssertLessThanOrEqual(
             nearEnd.duration - nearEnd.current, 10,
             "Twelve Forward actions did not reach the final ten seconds. \(accessibilityDescription(timeline))"
         )
-        if nearEnd.duration - nearEnd.current >= 10 {
-            let exactStepStart = nearEnd
-            clickVisible(toggle)
-            XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 10))
-            XCTAssertNotNil(
-                waitForTimeline(timeout: 10) {
-                    $0 >= exactStepStart.current + 1 && $0 < exactStepStart.duration - 1
-                },
-                "Playback did not advance into the final ten seconds. \(accessibilityDescription(timeline))"
-            )
-            clickVisible(toggle)
-            XCTAssertTrue(waitUntilTimelineState(state, equals: "paused", timeout: 10))
-            nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
-        }
         XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The video must be paused before EOF.")
         XCTAssertLessThan(
             nearEnd.duration - nearEnd.current, 10,

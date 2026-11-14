@@ -991,6 +991,11 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         &directories.fixtures,
         fixture_duration,
         &report,
+        if case.uses_long_profile() {
+            LONG_RECOVERY_FFMPEG_TIMEOUT
+        } else {
+            FFMPEG_TIMEOUT
+        },
     )
     .await
     .map_err(|error| format!("phase=fixture-preparation; {error}"))?;
@@ -1619,6 +1624,7 @@ async fn generate_and_inspect_fixture(
     directory: &Path,
     duration: u32,
     report: &ReportStore,
+    generation_timeout: Duration,
 ) -> Result<MediaFixture, String> {
     let mut command = Command::new(ffmpeg);
     let video_input = format!("testsrc2=size=640x360:rate=30:duration={duration}");
@@ -1688,17 +1694,7 @@ async fn generate_and_inspect_fixture(
     }
     push_audio_output(&mut arguments, "audio.mp4", duration, audio_limit);
     command.current_dir(directory).args(arguments);
-    let generated = run_process(
-        command,
-        "fixture-generation",
-        if case.uses_long_profile() {
-            LONG_RECOVERY_FFMPEG_TIMEOUT
-        } else {
-            FFMPEG_TIMEOUT
-        },
-        1024,
-    )
-    .await?;
+    let generated = run_process(command, "fixture-generation", generation_timeout, 1024).await?;
     if !generated.success {
         return Err(format!(
             "FFmpeg fixture generation failed with exit code {}; {}",
