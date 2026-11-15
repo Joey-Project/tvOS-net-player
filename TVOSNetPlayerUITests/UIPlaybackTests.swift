@@ -402,7 +402,7 @@ final class UIPlaybackTests: XCTestCase {
                 observedFalseWatchState = true
                 return true
             }
-            guard status(appStatus, contains: "Playing Silent task reconciliation fixture.") else { return false }
+            guard playbackState.value as? String == "playing" else { return false }
             guard !attemptedCachedResultNavigation else {
                 return play.exists && play.isHittable && status(cachedResultStatus, contains: "Cached")
             }
@@ -735,10 +735,32 @@ final class UIPlaybackTests: XCTestCase {
             serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))")
         remote.press(.select)
         addressField.typeText(serverAddress)
-        if app.keyboards.firstMatch.exists {
+        let addressKeyboard = app.keyboards.firstMatch
+        let addressEntryDeadline = Date().addingTimeInterval(10)
+        guard
+            waitUntil(
+                timeout: max(0, addressEntryDeadline.timeIntervalSinceNow),
+                condition: { addressField.value as? String == serverAddress }
+            )
+        else {
+            throw SourceInputError(
+                description: "Cache server address did not match before keyboard dismissal. "
+                    + "field=\(accessibilityDescription(addressField)), focused=\(addressField.hasFocus), "
+                    + "keyboardPresent=\(addressKeyboard.exists)"
+            )
+        }
+        if addressKeyboard.exists {
             remote.press(.menu)
         }
-        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, addressEntryDeadline.timeIntervalSinceNow)) { !addressKeyboard.exists }
+        )
+        guard addressField.value as? String == serverAddress else {
+            throw SourceInputError(
+                description: "Cache server address changed during keyboard dismissal. "
+                    + "field=\(accessibilityDescription(addressField)), keyboardPresent=\(addressKeyboard.exists)"
+            )
+        }
 
         let sourceField = app.textFields["bilibili-source"]
         XCTAssertTrue(

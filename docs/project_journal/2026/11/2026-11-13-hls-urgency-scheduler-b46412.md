@@ -260,12 +260,11 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS task results share the cache-controls vertical scroll viewport. Its
-  outer `VStack` materializes the bounded form controls so native directional
-  focus can discover them beyond an empty-library placeholder. Cache rows use
-  an explicit `LazyVStack`; task results materialize only the first row as a
-  bounded focus landing point and keep subsequent rows in a `LazyVStack` within
-  the same scroll view, not an additional scroll view or eager result list.
+- tvOS task results share one native cache-controls `List` viewport. Cache,
+  candidate and task-result rows are direct `ForEach` children of flat list
+  sections so the system owns row virtualization and directional focus.
+  Bounded form groups remain separate from repeated rows, without nested
+  result scrollers, eager first-row exceptions or truncated accumulated data.
   The first cache-status text is a readable native focus stop, allowing Up to
   traverse long noninteractive metadata back to the fixed connection controls.
   Its focus binding changes only foreground and background colors; padding and
@@ -293,6 +292,11 @@ superseded_by:
   fixture before focusing the final fixture, without activating the waypoint.
   Real per-result focus and readiness, exact second-result selection and
   Continue assertions remain intact, with the existing deadlines unchanged.
+  Task UI setup confirms the complete server address before and after keyboard
+  dismissal within one shared ten-second input window. Silent reconciliation
+  observes the actual playing state rather than mutable playback status text,
+  while still requiring the exact result to become Cached, healthy watch UI
+  and continued timeline advancement.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
