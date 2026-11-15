@@ -262,13 +262,17 @@ superseded_by:
   and speed assertions remain required; production player behavior is unchanged.
 - tvOS task results share the cache-controls vertical scroll viewport. Its
   outer `VStack` materializes the bounded form controls so native directional
-  focus can discover them beyond an empty-library placeholder. Cache rows and
-  task-result rows use separate explicit `LazyVStack` containers within that
-  same scroll view, not additional scroll views or eager result wrappers.
+  focus can discover them beyond an empty-library placeholder. Cache rows use
+  an explicit `LazyVStack`; task results materialize only the first row as a
+  bounded focus landing point and keep subsequent rows in a `LazyVStack` within
+  the same scroll view, not an additional scroll view or eager result list.
   The first cache-status text is a readable native focus stop, allowing Up to
   traverse long noninteractive metadata back to the fixed connection controls.
   Its focus binding changes only foreground and background colors; padding and
   bounds stay stable and native directional movement remains system-managed.
+  Each task-result row places its full-width primary Play action above the
+  separate status and metadata view. Accessible result and artifact identifiers,
+  existing availability rules and native directional movement are retained.
   The existing 500-point cache-column width and paginated loading are
   retained without truncating accumulated results or eagerly building every
   loaded row. Relaunch validation checks the actual shared viewport's positive

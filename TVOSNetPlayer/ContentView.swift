@@ -751,7 +751,6 @@ struct ContentView: View {
             .disabled(!bilibiliModel.canCancel)
             .accessibilityIdentifier("bilibili-cancel")
         }
-
         HStack(spacing: 12) {
             Button {
                 Task {
@@ -972,31 +971,11 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
             }
             if !bilibiliModel.taskResults.isEmpty {
+                taskResultRow(bilibiliModel.taskResults[0])
+
                 LazyVStack(alignment: .leading, spacing: 20) {
-                    ForEach(bilibiliModel.taskResults) { result in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(alignment: .center, spacing: 10) {
-                                BilibiliTaskResultRow(result: result)
-
-                                Button {
-                                    Task {
-                                        await playBilibiliTaskResult(result)
-                                    }
-                                } label: {
-                                    Label("Play", systemImage: "play.fill")
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(!bilibiliModel.canPlay(result: result))
-                                .accessibilityIdentifier("bilibili-result-play-\(result.id)")
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .focusSection()
-
-                            ForEach(result.artifacts) { artifact in
-                                BilibiliTaskArtifactRow(artifact: artifact)
-                            }
-                        }
-                        .frame(width: cacheControlsColumnWidth, alignment: .leading)
+                    ForEach(bilibiliModel.taskResults.dropFirst()) { result in
+                        taskResultRow(result)
                     }
                 }
                 .frame(width: cacheControlsColumnWidth, alignment: .leading)
@@ -1022,6 +1001,32 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
             }
         }
+    }
+
+    @ViewBuilder
+    private func taskResultRow(_ result: BilibiliTaskResultPresentation) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                Task {
+                    await playBilibiliTaskResult(result)
+                }
+            } label: {
+                Label("Play", systemImage: "play.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .frame(width: cacheControlsColumnWidth, alignment: .leading)
+            .disabled(!bilibiliModel.canPlay(result: result))
+            .accessibilityIdentifier("bilibili-result-play-\(result.id)")
+
+            BilibiliTaskResultRow(result: result)
+
+            ForEach(result.artifacts) { artifact in
+                BilibiliTaskArtifactRow(artifact: artifact)
+            }
+        }
+        .frame(width: cacheControlsColumnWidth, alignment: .leading)
+        .focusSection()
     }
 
     @ViewBuilder
