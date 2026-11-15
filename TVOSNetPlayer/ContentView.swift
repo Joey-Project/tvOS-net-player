@@ -969,35 +969,34 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
             }
             if !bilibiliModel.taskResults.isEmpty {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(bilibiliModel.taskResults) { result in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(alignment: .center, spacing: 10) {
-                                    BilibiliTaskResultRow(result: result)
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(bilibiliModel.taskResults) { result in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .center, spacing: 10) {
+                                BilibiliTaskResultRow(result: result)
 
-                                    Button {
-                                        Task {
-                                            await playBilibiliTaskResult(result)
-                                        }
-                                    } label: {
-                                        Label("Play", systemImage: "play.fill")
+                                Button {
+                                    Task {
+                                        await playBilibiliTaskResult(result)
                                     }
-                                    .buttonStyle(.bordered)
-                                    .disabled(!bilibiliModel.canPlay(result: result))
-                                    .accessibilityIdentifier("bilibili-result-play-\(result.id)")
+                                } label: {
+                                    Label("Play", systemImage: "play.fill")
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .focusSection()
+                                .buttonStyle(.bordered)
+                                .disabled(!bilibiliModel.canPlay(result: result))
+                                .accessibilityIdentifier("bilibili-result-play-\(result.id)")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .focusSection()
 
-                                ForEach(result.artifacts) { artifact in
-                                    BilibiliTaskArtifactRow(artifact: artifact)
-                                }
+                            ForEach(result.artifacts) { artifact in
+                                BilibiliTaskArtifactRow(artifact: artifact)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .frame(height: 220)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier("bilibili-task-results-viewport")
             }
 

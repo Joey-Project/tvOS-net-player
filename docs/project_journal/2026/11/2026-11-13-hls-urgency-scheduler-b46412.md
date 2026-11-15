@@ -240,10 +240,12 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- The nested tvOS task-result scroll viewport has an explicit height so it
-  cannot collapse under its vertically scrolling parent. Relaunch validation
-  checks viewport geometry before normal remote navigation; explicit result
-  selection and Continue assertions remain unchanged.
+- tvOS task results use the existing outer vertical scroller, with a
+  full-column-width lazy result stack and rows. A nested result scroller can
+  collapse to zero width after restoration even with a fixed height. Relaunch
+  validation checks positive width and height within its existing five-second
+  geometry allowance and overall recovery deadline before normal remote
+  navigation; explicit result selection and Continue assertions remain unchanged.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

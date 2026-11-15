@@ -420,7 +420,9 @@ final class UIPlaybackTests: XCTestCase {
         let taskResultsViewport = identifiedElement("bilibili-task-results-viewport")
         XCTAssertTrue(
             waitUntil(timeout: min(5, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
-                taskResultsViewport.exists && taskResultsViewport.frame.height > 0
+                taskResultsViewport.exists
+                    && taskResultsViewport.frame.width > 0
+                    && taskResultsViewport.frame.height > 0
             },
             "The restored task results viewport must have a nonzero frame before remote navigation. "
                 + accessibilityDescription(taskResultsViewport)
