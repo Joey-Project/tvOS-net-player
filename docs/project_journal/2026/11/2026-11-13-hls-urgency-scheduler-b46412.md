@@ -216,6 +216,10 @@ superseded_by:
   bindings, media URIs or paths. Projection truncation is explicit; source
   history completeness remains unknown. Schema-1 reports without this optional
   diagnostic object retain unknown diagnostics, not fabricated zero counts.
+- Integration-test terminal-observation timeouts report aggregate counters and
+  at most eight sanitized plan summaries, without raw media addresses or
+  request headers. The existing six-second wait and completed-plan,
+  before-readability and aligned audio/video range assertions remain unchanged.
 - No matching exact before-state plan does not prove no coordinator admission
   or no media transfer. Associated transfer arrays can be empty because no
   qualifying plan was selected, while the bounded event rings still observed
@@ -266,10 +270,14 @@ superseded_by:
   overall recovery deadline. Catalog and task data readiness use the persistent
   app-status summary before remote navigation materializes their controls.
   Per-result readiness is checked while the corresponding row is materialized,
-  not by requiring offscreen lazy rows to exist simultaneously. Task status
-  controls form a bounded sibling group; accumulated result rows remain outside
-  that eager group. Status accessibility and watch checks must remain meaningful
-  when results arrive asynchronously. Remote navigation recovers a known address
+  not by requiring offscreen lazy rows to exist simultaneously. Connection
+  controls and transient task-watch status, errors and reconnect actions remain
+  outside the virtualized scrolling body so their focus and accessibility do not
+  disappear when results arrive. Progress, detailed task status and accumulated
+  result rows remain in the body; rows stay outside its bounded status group.
+  Offscreen terminal data readiness uses the persistent app-status summary,
+  followed by real navigation to verify the actual cached result while playback
+  continues. Remote navigation recovers the persistent address
   landmark rather than assuming Submit or Load More retains focus after those
   updates. Second-page library navigation passes through the last first-page
   fixture before focusing the final fixture, without activating the waypoint.

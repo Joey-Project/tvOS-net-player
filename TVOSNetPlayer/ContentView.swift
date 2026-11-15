@@ -164,14 +164,11 @@ struct ContentView: View {
     }
 
     private var cacheControls: some View {
-        ScrollView(.vertical) {
-            LazyVStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 16) {
                 Text(cacheModel.serverName)
                     .font(.title2.weight(.semibold))
-                Text(cacheModel.statusMessage)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("cache-library-status")
+                    .lineLimit(1)
 
                 VStack(alignment: .leading, spacing: 10) {
                     TextField(
@@ -192,6 +189,7 @@ struct ContentView: View {
                         Text(errorMessage)
                             .font(.callout)
                             .foregroundStyle(.red)
+                            .lineLimit(2)
                     }
                 }
 
@@ -220,114 +218,127 @@ struct ContentView: View {
                     }
                 }
 
-                discoveryControls
+                taskWatchControls
+            }
+            .fixedSize(horizontal: false, vertical: true)
 
-                bilibiliLoginControls
-
-                if !cacheModel.cacheRoots.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(cacheModel.cacheRoots) { root in
-                            CacheRootRow(root: root)
-                        }
-                    }
-                }
-
-                if let hlsCacheSummary = cacheModel.hlsCacheSummary {
-                    Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    Text(cacheModel.statusMessage)
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                }
+                        .accessibilityIdentifier("cache-library-status")
 
-                if !cacheModel.hlsCacheStatusBadges.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(cacheModel.hlsCacheStatusBadges) { badge in
-                            CacheStatusBadgeRow(badge: badge)
+                    discoveryControls
+
+                    bilibiliLoginControls
+
+                    if !cacheModel.cacheRoots.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(cacheModel.cacheRoots) { root in
+                                CacheRootRow(root: root)
+                            }
                         }
                     }
-                }
 
-                HStack(spacing: 12) {
-                    TextField("Search cached videos", text: $cacheModel.searchText)
-                        .textContentType(.none)
-                        .submitLabel(.search)
-                        .accessibilityIdentifier("cache-library-search")
-                        .onSubmit {
+                    if let hlsCacheSummary = cacheModel.hlsCacheSummary {
+                        Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+
+                    if !cacheModel.hlsCacheStatusBadges.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(cacheModel.hlsCacheStatusBadges) { badge in
+                                CacheStatusBadgeRow(badge: badge)
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 12) {
+                        TextField("Search cached videos", text: $cacheModel.searchText)
+                            .textContentType(.none)
+                            .submitLabel(.search)
+                            .accessibilityIdentifier("cache-library-search")
+                            .onSubmit {
+                                Task {
+                                    await cacheModel.refresh()
+                                }
+                            }
+                            .focused($focusedControl, equals: .cacheSearchField)
+
+                        Button {
                             Task {
                                 await cacheModel.refresh()
                             }
+                        } label: {
+                            Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
                         }
-                        .focused($focusedControl, equals: .cacheSearchField)
-
-                    Button {
-                        Task {
-                            await cacheModel.refresh()
-                        }
-                    } label: {
-                        Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
+                        .buttonStyle(.bordered)
+                        .disabled(!cacheModel.canRefresh)
+                        .focused($focusedControl, equals: .cacheSearchButton)
+                        .accessibilityIdentifier("cache-library-search-submit")
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(!cacheModel.canRefresh)
-                    .focused($focusedControl, equals: .cacheSearchButton)
-                    .accessibilityIdentifier("cache-library-search-submit")
-                }
 
-                Divider()
+                    Divider()
 
-                if cacheModel.items.isEmpty {
-                    VStack(spacing: 12) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(.white.opacity(0.08))
-                            Text("No cached videos")
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 220)
-
-                        cacheLoadMoreButton
-                    }
-                } else {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(cacheModel.items) { item in
-                            HStack(alignment: .center, spacing: 10) {
-                                Button {
-                                    Task {
-                                        await playCachedItem(item)
-                                    }
-                                } label: {
-                                    CacheLibraryRow(item: item)
-                                }
-                                .buttonStyle(.bordered)
-                                .accessibilityLabel(item.displayTitle)
-                                .accessibilityIdentifier("cache-library-item")
-                                .disabled(
-                                    cacheModel.isLoading
-                                        || cacheModel.deletingItemIDs.contains(item.id)
-                                        || !item.hasPlayableVariant
-                                )
-
-                                Button {
-                                    pendingDeleteItem = item
-                                } label: {
-                                    Label(
-                                        cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
-                                        systemImage: "trash"
-                                    )
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(!cacheModel.canDelete(item))
+                    if cacheModel.items.isEmpty {
+                        VStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(.white.opacity(0.08))
+                                Text("No cached videos")
+                                    .foregroundStyle(.secondary)
                             }
-                        }
+                            .frame(maxWidth: .infinity, minHeight: 220)
 
-                        cacheLoadMoreButton
+                            cacheLoadMoreButton
+                        }
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(cacheModel.items) { item in
+                                HStack(alignment: .center, spacing: 10) {
+                                    Button {
+                                        Task {
+                                            await playCachedItem(item)
+                                        }
+                                    } label: {
+                                        CacheLibraryRow(item: item)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .accessibilityLabel(item.displayTitle)
+                                    .accessibilityIdentifier("cache-library-item")
+                                    .disabled(
+                                        cacheModel.isLoading
+                                            || cacheModel.deletingItemIDs.contains(item.id)
+                                            || !item.hasPlayableVariant
+                                    )
+
+                                    Button {
+                                        pendingDeleteItem = item
+                                    } label: {
+                                        Label(
+                                            cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                            systemImage: "trash"
+                                        )
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(!cacheModel.canDelete(item))
+                                }
+                            }
+
+                            cacheLoadMoreButton
+                        }
                     }
+                    Divider()
+                    bilibiliControls
                 }
-                Divider()
-                bilibiliControls
+                .padding(.vertical, 4)
             }
-            .padding(.vertical, 4)
+            .accessibilityIdentifier("cache-controls-scroll")
+            .frame(maxHeight: .infinity, alignment: .top)
         }
-        .accessibilityIdentifier("cache-controls-scroll")
     }
 
     private var isUITesting: Bool {
@@ -667,30 +678,6 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .accessibilityIdentifier("bilibili-task-status")
-                if bilibiliModel.isReconnecting {
-                    Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .accessibilityElement(children: .combine)
-                        .accessibilityIdentifier("bilibili.watch.status")
-                }
-                if let message = bilibiliModel.watchErrorMessage {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .accessibilityIdentifier("bilibili.watch.error")
-                }
-                if bilibiliModel.canRetryTaskUpdates {
-                    Button {
-                        bilibiliModel.retryTaskUpdates()
-                    } label: {
-                        Label("Reconnect Updates", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("bilibili.watch.retry")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .focusSection()
-                }
                 if let summary = bilibiliModel.activePlaybackPolicySummary {
                     Text(summary)
                         .font(.caption)
@@ -1015,6 +1002,39 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .disabled(!bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults)
                 .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var taskWatchControls: some View {
+        if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
+            VStack(alignment: .leading, spacing: 6) {
+                if bilibiliModel.isReconnecting {
+                    Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("bilibili.watch.status")
+                }
+                if let message = bilibiliModel.watchErrorMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("bilibili.watch.error")
+                }
+                if bilibiliModel.canRetryTaskUpdates {
+                    Button {
+                        bilibiliModel.retryTaskUpdates()
+                    } label: {
+                        Label("Reconnect Updates", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("bilibili.watch.retry")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focusSection()
+                }
             }
         }
     }

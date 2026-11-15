@@ -1871,7 +1871,37 @@ mod integration_tests {
             }
         })
         .await
-        .expect("admitted plan should reach a terminal observation")
+        .unwrap_or_else(|_| {
+            let observation = state.hls_high_preparation.observation_for_tests();
+            let recent_plans = observation
+                .plan_history
+                .iter()
+                .rev()
+                .take(8)
+                .map(|plan| {
+                    format!(
+                        "context={:?}, window={:?}..{:?}, outcome={:?}, defer={:?}, requested={}, readable={}, deferred={}",
+                        plan.context_id,
+                        plan.window_start_seconds,
+                        plan.window_end_seconds,
+                        plan.outcome,
+                        plan.defer_reason,
+                        plan.requested_resource_ranges,
+                        plan.readable_resource_ranges,
+                        plan.deferred_resource_ranges,
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "admitted plan did not reach a terminal observation within {timeout:?}; aggregate: admitted={}, completed={}, deferred={}, requested={}, readable={}, deferred_ranges={}; recent plans: {recent_plans:?}",
+                observation.admitted_plans,
+                observation.completed_plans,
+                observation.deferred_plans,
+                observation.requested_resource_ranges,
+                observation.readable_resource_ranges,
+                observation.deferred_resource_ranges,
+            );
+        })
     }
 
     async fn wait_for_idle_coordinator(state: &AppState, timeout: Duration) {

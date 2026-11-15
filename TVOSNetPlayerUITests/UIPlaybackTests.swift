@@ -208,14 +208,15 @@ final class UIPlaybackTests: XCTestCase {
             "Remote focus could not materialize the automatic-recovery result. "
                 + taskWatchFocusDescription(target: play)
         )
-        let taskStatus = identifiedElement("bilibili-task-status")
+        let appStatus = identifiedElement("app-status")
         XCTAssertTrue(
             waitUntil(timeout: max(0, terminalDeadline.timeIntervalSinceNow)) {
-                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
+                status(appStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
+                    && play.exists && play.isHittable
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
-                + accessibilityDescription(taskStatus)
+                + accessibilityDescription(appStatus)
         )
         XCTAssertFalse(reconnecting.exists, "The terminal task must stop showing a reconnecting state.")
         XCTAssertFalse(
@@ -289,13 +290,25 @@ final class UIPlaybackTests: XCTestCase {
                 + taskWatchFocusDescription(target: reconnect)
         )
         XCUIRemote.shared.press(.select)
-        let taskStatus = identifiedElement("bilibili-task-status")
+        let terminalDeadline = Date().addingTimeInterval(60)
         XCTAssertTrue(
-            waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Playing Manual recovery fixture.")
-                    && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
+            moveFocus(until: addressField, direction: .up, limit: 40, deadline: terminalDeadline),
+            "Remote focus could not recover the persistent server address after manual reconnect. "
+                + taskWatchFocusDescription(target: addressField)
+        )
+        XCTAssertTrue(
+            moveFocus(until: play, direction: .down, limit: 80, deadline: terminalDeadline),
+            "Remote focus could not materialize the cached result after manual reconnect. "
+                + taskWatchFocusDescription(target: play)
+        )
+        let appStatus = identifiedElement("app-status")
+        let resultStatus = identifiedElement("bilibili-result-status-ui-e2e-manual-result")
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, terminalDeadline.timeIntervalSinceNow)) {
+                status(appStatus, contains: "Playing Manual recovery fixture.")
+                    && play.exists && play.isHittable && status(resultStatus, contains: "Cached")
             },
-            "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
+            "Manual reconnect did not finish observing the original task. " + accessibilityDescription(appStatus)
         )
         XCTAssertFalse(watchError.exists, "Successful manual reconnection must clear the stale watch warning.")
         XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists)
@@ -381,13 +394,54 @@ final class UIPlaybackTests: XCTestCase {
         let duration = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline)).duration
         XCTAssertGreaterThanOrEqual(duration, 90, "The task media must cover the bounded reconciliation window.")
 
-        let reconciled = waitUntil(timeout: 75) {
+        let reconciliationDeadline = Date().addingTimeInterval(75)
+        let cachedResultStatus = identifiedElement("bilibili-result-status-ui-e2e-silent-result")
+        var attemptedCachedResultNavigation = false
+        let reconciled = waitUntil(timeout: max(0, reconciliationDeadline.timeIntervalSinceNow)) {
             if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
                 observedFalseWatchState = true
                 return true
             }
-            return status(taskStatus, contains: "Playing Silent task reconciliation fixture.")
-                && status(identifiedElement("bilibili-result-status-ui-e2e-silent-result"), contains: "Cached")
+            guard status(appStatus, contains: "Playing Silent task reconciliation fixture.") else { return false }
+            guard !attemptedCachedResultNavigation else {
+                return play.exists && play.isHittable && status(cachedResultStatus, contains: "Cached")
+            }
+
+            attemptedCachedResultNavigation = true
+            guard addressField.exists else { return false }
+            guard
+                moveFocus(
+                    until: addressField,
+                    direction: .up,
+                    limit: 40,
+                    deadline: reconciliationDeadline,
+                    observe: {
+                        observedFalseWatchState =
+                            observedFalseWatchState
+                            || status(reconnecting, contains: "Reconnecting task updates")
+                            || watchError.exists || retry.exists
+                    }
+                )
+            else { return false }
+            guard
+                moveFocus(
+                    until: play,
+                    direction: .down,
+                    limit: 80,
+                    deadline: reconciliationDeadline,
+                    observe: {
+                        observedFalseWatchState =
+                            observedFalseWatchState
+                            || status(reconnecting, contains: "Reconnecting task updates")
+                            || watchError.exists || retry.exists
+                    }
+                )
+            else { return false }
+            observedFalseWatchState =
+                observedFalseWatchState
+                || status(reconnecting, contains: "Reconnecting task updates")
+                || watchError.exists || retry.exists
+            return play.exists && play.isHittable && status(cachedResultStatus, contains: "Cached")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
         XCTAssertTrue(
@@ -944,9 +998,11 @@ final class UIPlaybackTests: XCTestCase {
         until element: XCUIElement,
         direction: XCUIRemote.Button,
         limit: Int,
-        deadline: Date? = nil
+        deadline: Date? = nil,
+        observe: (() -> Void)? = nil
     ) -> Bool {
         for _ in 0..<limit {
+            observe?()
             if let deadline, Date() >= deadline { return false }
             let isFocused = element.exists && element.hasFocus
             if let deadline, Date() >= deadline { return false }
@@ -959,6 +1015,7 @@ final class UIPlaybackTests: XCTestCase {
             guard remaining > 0 else { return false }
             RunLoop.current.run(until: Date().addingTimeInterval(min(0.15, remaining)))
         }
+        observe?()
         guard deadline.map({ Date() < $0 }) ?? true else { return false }
         let isFocused = element.exists && element.hasFocus
         return (deadline.map { Date() < $0 } ?? true) && isFocused
