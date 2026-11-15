@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
     @State private var needsSavedPlaybackRevalidation = false
     @FocusState private var focusedControl: FocusedControl?
+    private let cacheControlsColumnWidth: CGFloat = 500
     private let autoDiscoveryRetryDelay: Duration = .seconds(30)
 
     private enum FocusedControl: Hashable {
@@ -58,7 +59,7 @@ struct ContentView: View {
 
                 HStack(alignment: .top, spacing: 34) {
                     cacheControls
-                        .frame(width: 500)
+                        .frame(width: cacheControlsColumnWidth)
 
                     VStack(alignment: .leading, spacing: 22) {
                         manualStreamControls
@@ -969,34 +970,36 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
             }
             if !bilibiliModel.taskResults.isEmpty {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(bilibiliModel.taskResults) { result in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(alignment: .center, spacing: 10) {
-                                BilibiliTaskResultRow(result: result)
+                ScrollView(.vertical) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(bilibiliModel.taskResults) { result in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .center, spacing: 10) {
+                                    BilibiliTaskResultRow(result: result)
 
-                                Button {
-                                    Task {
-                                        await playBilibiliTaskResult(result)
+                                    Button {
+                                        Task {
+                                            await playBilibiliTaskResult(result)
+                                        }
+                                    } label: {
+                                        Label("Play", systemImage: "play.fill")
                                     }
-                                } label: {
-                                    Label("Play", systemImage: "play.fill")
+                                    .buttonStyle(.bordered)
+                                    .disabled(!bilibiliModel.canPlay(result: result))
+                                    .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                                 }
-                                .buttonStyle(.bordered)
-                                .disabled(!bilibiliModel.canPlay(result: result))
-                                .accessibilityIdentifier("bilibili-result-play-\(result.id)")
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .focusSection()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .focusSection()
 
-                            ForEach(result.artifacts) { artifact in
-                                BilibiliTaskArtifactRow(artifact: artifact)
+                                ForEach(result.artifacts) { artifact in
+                                    BilibiliTaskArtifactRow(artifact: artifact)
+                                }
                             }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .frame(width: cacheControlsColumnWidth, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: cacheControlsColumnWidth, height: 220)
                 .accessibilityIdentifier("bilibili-task-results-viewport")
             }
 

@@ -251,12 +251,14 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS task results use the existing outer vertical scroller, with a
-  full-column-width lazy result stack and rows. A nested result scroller can
-  collapse to zero width after restoration even with a fixed height. Relaunch
-  validation checks positive width and height within its existing five-second
-  geometry allowance and overall recovery deadline before normal remote
-  navigation; explicit result selection and Continue assertions remain unchanged.
+- tvOS task results retain a bounded, paginated lazy result scroller. Both its
+  viewport and content explicitly use the existing 500-point cache-column width,
+  with a 220-point viewport height. A height-only nested scroller can collapse
+  to zero width after restoration; a direct offscreen lazy stack can omit result
+  rows from accessibility. Explicit dimensions retain the prior focus and
+  virtualization behavior. Relaunch validation checks positive width and height
+  within its existing five-second geometry allowance and overall recovery
+  deadline; row readiness, result selection and Continue assertions remain intact.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
