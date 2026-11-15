@@ -418,7 +418,7 @@ final class UIPlaybackTests: XCTestCase {
                     observe: {
                         observedFalseWatchState =
                             observedFalseWatchState
-                            || status(reconnecting, contains: "Reconnecting task updates")
+                            || self.status(reconnecting, contains: "Reconnecting task updates")
                             || watchError.exists || retry.exists
                     }
                 )
@@ -432,7 +432,7 @@ final class UIPlaybackTests: XCTestCase {
                     observe: {
                         observedFalseWatchState =
                             observedFalseWatchState
-                            || status(reconnecting, contains: "Reconnecting task updates")
+                            || self.status(reconnecting, contains: "Reconnecting task updates")
                             || watchError.exists || retry.exists
                     }
                 )
