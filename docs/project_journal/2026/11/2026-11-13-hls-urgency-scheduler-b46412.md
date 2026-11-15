@@ -3,7 +3,7 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-14
+updated: 2026-11-15
 branch: codex/hls-high-preparation
 pr:
 supersedes: []
@@ -100,8 +100,8 @@ superseded_by:
 4. Require complete local CI, fixed-signed native3 with verified mute, GHA CI/UI,
    independent released artifact checks, current-head GitHub Codex review and
    all resolved conversations for follow-up changes before normal SHA-bound
-   protected merge. Do not alter accepted helpers, deadlines or assertions to
-   make a candidate pass.
+   protected merge. Keep independent controls, playback deadlines and assertions
+   intact; the separately approved fixture-generation allowance is specified below.
 
 ## High Preparation Slice Design
 - Continue from PR #107's production reporting and bounded request urgency.
@@ -230,11 +230,12 @@ superseded_by:
   test-name prefix. Discovery preflight checks the exact opt-in selector and
   unchanged three-case legacy ignored-test selection before playback. Missing
   opt-in configuration still fails; ordinary regression runs never select it.
-- Each opt-in arm allows 240 seconds for its FFmpeg fixture-generation child,
-  as explicitly approved after a 120-second pre-playback fixture timeout.
-  Both arms use the same limit and report it. Legacy long-fixture generation
-  stays at 120 seconds; inspection, playback, output and overall budgets remain
-  unchanged. A fixture timeout is not an ABR measurement.
+- Each opt-in arm and the legacy long-recovery fixture allow 240 seconds for
+  FFmpeg generation. Joey explicitly approved extending the legacy allowance
+  after it also exceeded 120 seconds before playback. Both opt-in arms use the
+  same limit and report it. Short-fixture generation remains at 100 seconds;
+  inspection, playback, faults, assertions, output, compilation and overall
+  budgets are unchanged. A fixture timeout is not an ABR measurement.
 - macOS UI terminal-seek setup anchors at the head and navigates while paused.
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume

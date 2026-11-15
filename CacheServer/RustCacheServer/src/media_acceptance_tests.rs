@@ -106,7 +106,7 @@ const ABR_CASE_TIMEOUT: Duration = Duration::from_secs(225);
 const LONG_RECOVERY_CASE_TIMEOUT: Duration = Duration::from_secs(840);
 const TRANSCODE_CASE_TIMEOUT: Duration = Duration::from_secs(225);
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(100);
-const LONG_RECOVERY_FFMPEG_TIMEOUT: Duration = Duration::from_secs(120);
+const LONG_RECOVERY_FFMPEG_TIMEOUT: Duration = Duration::from_secs(240);
 const LONG_RECOVERY_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const DECODER_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const BASELINE_WINDOW: Duration = Duration::from_secs(6);
@@ -5544,7 +5544,7 @@ mod origin_pacing_tests {
         assert_eq!(TRANSCODE_PROBE_DURATION_SECONDS, 30);
         assert_eq!(transcoding.probe_duration_seconds(), 30);
         assert_eq!(transcoding.probe_deadline_seconds(), 45);
-        assert_eq!(LONG_RECOVERY_FFMPEG_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(LONG_RECOVERY_FFMPEG_TIMEOUT, Duration::from_secs(240));
         assert_eq!(LONG_RECOVERY_FFPROBE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(FFMPEG_TIMEOUT, Duration::from_secs(100));
         assert_eq!(playlist_response_limit(true), 512 * 1024);
