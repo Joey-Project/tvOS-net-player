@@ -660,55 +660,58 @@ struct ContentView: View {
         }
 
         if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
-            ProgressView(value: bilibiliModel.progress)
-            Text(bilibiliModel.statusMessage)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .accessibilityIdentifier("bilibili-task-status")
-            if bilibiliModel.isReconnecting {
-                Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("bilibili.watch.status")
-            }
-            if let message = bilibiliModel.watchErrorMessage {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .accessibilityIdentifier("bilibili.watch.error")
-            }
-            if bilibiliModel.canRetryTaskUpdates {
-                Button {
-                    bilibiliModel.retryTaskUpdates()
-                } label: {
-                    Label("Reconnect Updates", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .accessibilityIdentifier("bilibili.watch.retry")
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .focusSection()
-            }
-            if let summary = bilibiliModel.activePlaybackPolicySummary {
-                Text(summary)
-                    .font(.caption)
+            VStack(alignment: .leading, spacing: 8) {
+                ProgressView(value: bilibiliModel.progress)
+                Text(bilibiliModel.statusMessage)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-            }
-            if let badge = bilibiliModel.progressiveCacheStatusBadge {
-                Label(badge.label, systemImage: badge.systemImage)
+                    .accessibilityIdentifier("bilibili-task-status")
+                if bilibiliModel.isReconnecting {
+                    Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("bilibili.watch.status")
+                }
+                if let message = bilibiliModel.watchErrorMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("bilibili.watch.error")
+                }
+                if bilibiliModel.canRetryTaskUpdates {
+                    Button {
+                        bilibiliModel.retryTaskUpdates()
+                    } label: {
+                        Label("Reconnect Updates", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("bilibili.watch.retry")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focusSection()
+                }
+                if let summary = bilibiliModel.activePlaybackPolicySummary {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                if let badge = bilibiliModel.progressiveCacheStatusBadge {
+                    Label(badge.label, systemImage: badge.systemImage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
+                    let fillProgress = fillStatus.progressFraction
+                {
+                    ProgressView(value: fillProgress)
+                    Text(
+                        "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                    )
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
-                let fillProgress = fillStatus.progressFraction
-            {
-                ProgressView(value: fillProgress)
-                Text(
-                    "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                }
             }
             bilibiliTaskResults
         }

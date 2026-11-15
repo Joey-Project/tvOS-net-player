@@ -167,16 +167,32 @@ final class UIPlaybackTests: XCTestCase {
         try prepareTaskWatchScenario(source: "BV1QtjA6BEB8")
         XCUIRemote.shared.press(.select)
 
+        let reconnectDeadline = Date().addingTimeInterval(60)
         let reconnecting = identifiedElement("bilibili.watch.status")
         XCTAssertTrue(
-            waitUntil(timeout: 60) { status(reconnecting, contains: "Reconnecting task updates") },
+            waitUntil(timeout: max(0, reconnectDeadline.timeIntervalSinceNow)) {
+                status(reconnecting, contains: "Reconnecting task updates")
+            },
             "The submitted task did not show reconnecting task updates within 60 seconds. "
                 + accessibilityDescription(identifiedElement("bilibili-task-status"))
         )
         XCTAssertTrue(status(reconnecting, contains: "Reconnecting task updates"))
+        let terminalDeadline = Date().addingTimeInterval(60)
+        let addressField = app.textFields["cache-server-address"]
+        let play = app.buttons["bilibili-result-play-ui-e2e-automatic-result"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 40, deadline: terminalDeadline),
+            "Remote focus could not reach the server address before materializing task results. "
+                + taskWatchFocusDescription(target: addressField)
+        )
+        XCTAssertTrue(
+            moveFocus(until: play, direction: .down, limit: 80, deadline: terminalDeadline),
+            "Remote focus could not materialize the automatic-recovery result. "
+                + taskWatchFocusDescription(target: play)
+        )
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
-            waitUntil(timeout: 60) {
+            waitUntil(timeout: max(0, terminalDeadline.timeIntervalSinceNow)) {
                 status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
@@ -194,29 +210,46 @@ final class UIPlaybackTests: XCTestCase {
         try prepareTaskWatchScenario(source: "BV1uW4y1s7zN")
         XCUIRemote.shared.press(.select)
 
+        let deadline = Date().addingTimeInterval(100)
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 40, deadline: deadline),
+            "Remote focus could not reach the server address before materializing task status. "
+                + taskWatchFocusDescription(target: addressField)
+        )
+        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
+        XCTAssertTrue(
+            moveFocus(until: play, direction: .down, limit: 80, deadline: deadline),
+            "Remote focus could not materialize the manual-recovery result. "
+                + taskWatchFocusDescription(target: play)
+        )
         let watchError = identifiedElement("bilibili.watch.error")
         let reconnect = identifiedElement("bilibili.watch.retry")
         let reconnecting = identifiedElement("bilibili.watch.status")
         XCTAssertTrue(
-            waitUntil(timeout: 100) { watchError.exists && reconnect.exists && !reconnecting.exists },
+            waitUntil(timeout: max(0, deadline.timeIntervalSinceNow)) {
+                watchError.exists && reconnect.exists && !reconnecting.exists
+            },
             "Automatic task-watch retries did not stop with an error and manual reconnect control. "
                 + accessibilityDescription(identifiedElement("bilibili-task-status"))
         )
         XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
         XCTAssertFalse(reconnecting.exists)
 
-        let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(
             moveFocus(until: addressField, direction: .up, limit: 40),
             "Remote focus could not recover the cache server address landmark. "
                 + taskWatchFocusDescription(target: addressField)
         )
-        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
         XCTAssertTrue(
             focusDown(until: play, limit: 80),
             "Remote focus could not reach the visible result Play control. " + taskWatchFocusDescription(target: play)
         )
-        XCTAssertTrue(play.isEnabled, "The fixture's task media must be playable while updates are unavailable.")
+        XCTAssertTrue(
+            play.exists && play.hasFocus && play.isHittable && play.isEnabled,
+            "The fixture's Play control must remain focused, hittable, and playable after task updates settle. "
+                + taskWatchFocusDescription(target: play)
+        )
         XCUIRemote.shared.press(.select)
 
         let timeline = identifiedElement("playback-timeline")
@@ -266,15 +299,38 @@ final class UIPlaybackTests: XCTestCase {
         let watchError = identifiedElement("bilibili.watch.error")
         let retry = identifiedElement("bilibili.watch.retry")
         let play = app.buttons["bilibili-result-play-ui-e2e-silent-result"]
+        let appStatus = identifiedElement("app-status")
         var observedFalseWatchState = false
-        let playable = waitUntil(timeout: 20) {
+        let initialReadyOrWatchFailure = waitUntil(timeout: 20) {
             if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
                 observedFalseWatchState = true
                 return true
             }
-            return play.exists && play.isEnabled
-                && status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
+            return status(appStatus, contains: "Silent task reconciliation fixture is ready to play.")
         }
+        XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
+        XCTAssertTrue(
+            initialReadyOrWatchFailure && !observedFalseWatchState,
+            "The silent task did not report initial data readiness within 20 seconds. "
+                + accessibilityDescription(appStatus)
+        )
+        guard initialReadyOrWatchFailure && !observedFalseWatchState else { return }
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 40),
+            "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
+        )
+        XCTAssertTrue(
+            focusDown(until: play, limit: 80),
+            "Remote focus could not materialize the silent task result. " + taskWatchFocusDescription(target: play)
+        )
+        let playable =
+            play.exists && play.hasFocus && play.isHittable && play.isEnabled
+            && status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
+        observedFalseWatchState =
+            observedFalseWatchState
+            || status(reconnecting, contains: "Reconnecting task updates")
+            || watchError.exists || retry.exists
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
         XCTAssertTrue(
             playable && !observedFalseWatchState,
@@ -284,16 +340,11 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.exists)
         XCTAssertFalse(retry.exists)
 
-        let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(
-            moveFocus(until: addressField, direction: .up, limit: 40),
-            "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
+            play.exists && play.hasFocus && play.isHittable && play.isEnabled,
+            "The silent task Play control must remain focused, hittable, and playable before selection. "
+                + taskWatchFocusDescription(target: play)
         )
-        XCTAssertTrue(
-            focusDown(until: play, limit: 80),
-            "Remote focus could not reach the silent task Play control. " + taskWatchFocusDescription(target: play)
-        )
-        XCTAssertTrue(play.isEnabled, "The silent task media must remain playable while its watch is open.")
         XCUIRemote.shared.press(.select)
 
         let timeline = identifiedElement("playback-timeline")
@@ -361,8 +412,14 @@ final class UIPlaybackTests: XCTestCase {
             XCTFail("The task summary did not report both cached results. " + accessibilityDescription(appStatus))
             return
         }
+        let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(
-            moveFocus(until: decoyPlay, direction: .up, limit: 50, deadline: initialResultsDeadline)
+            moveFocus(until: addressField, direction: .up, limit: 40, deadline: initialResultsDeadline),
+            "Remote focus could not recover the address landmark before entering the lazy result rows. "
+                + taskWatchFocusDescription(target: addressField)
+        )
+        XCTAssertTrue(
+            moveFocus(until: decoyPlay, direction: .down, limit: 50, deadline: initialResultsDeadline)
                 && waitUntil(
                     timeout: max(0, initialResultsDeadline.timeIntervalSinceNow),
                     condition: {
@@ -462,7 +519,6 @@ final class UIPlaybackTests: XCTestCase {
                 + accessibilityDescription(cacheControlsViewport)
         )
 
-        let addressField = app.textFields["cache-server-address"]
         guard moveFocus(until: addressField, direction: .up, limit: 50, deadline: restoredResultsDeadline) else {
             XCTFail(
                 "Remote focus could not recover the cache-server address landmark before restoring the result view. "
