@@ -26,6 +26,7 @@ struct ContentView: View {
     private enum FocusedControl: Hashable {
         case cacheServerField
         case refreshButton
+        case cacheLibraryStatus
         case cacheSearchField
         case cacheSearchButton
         case cacheLoadMoreButton
@@ -223,11 +224,25 @@ struct ContentView: View {
             .fixedSize(horizontal: false, vertical: true)
 
             ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 20) {
                     Text(cacheModel.statusMessage)
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(
+                            focusedControl == .cacheLibraryStatus ? Color.white : Color.secondary
+                        )
                         .accessibilityIdentifier("cache-library-status")
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(
+                                    focusedControl == .cacheLibraryStatus
+                                        ? Color.white.opacity(0.16)
+                                        : Color.clear
+                                )
+                        }
+                        .focusable()
+                        .focused($focusedControl, equals: .cacheLibraryStatus)
 
                     discoveryControls
 
@@ -957,31 +972,34 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
             }
             if !bilibiliModel.taskResults.isEmpty {
-                ForEach(bilibiliModel.taskResults) { result in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(alignment: .center, spacing: 10) {
-                            BilibiliTaskResultRow(result: result)
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    ForEach(bilibiliModel.taskResults) { result in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .center, spacing: 10) {
+                                BilibiliTaskResultRow(result: result)
 
-                            Button {
-                                Task {
-                                    await playBilibiliTaskResult(result)
+                                Button {
+                                    Task {
+                                        await playBilibiliTaskResult(result)
+                                    }
+                                } label: {
+                                    Label("Play", systemImage: "play.fill")
                                 }
-                            } label: {
-                                Label("Play", systemImage: "play.fill")
+                                .buttonStyle(.bordered)
+                                .disabled(!bilibiliModel.canPlay(result: result))
+                                .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                             }
-                            .buttonStyle(.bordered)
-                            .disabled(!bilibiliModel.canPlay(result: result))
-                            .accessibilityIdentifier("bilibili-result-play-\(result.id)")
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .focusSection()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .focusSection()
 
-                        ForEach(result.artifacts) { artifact in
-                            BilibiliTaskArtifactRow(artifact: artifact)
+                            ForEach(result.artifacts) { artifact in
+                                BilibiliTaskArtifactRow(artifact: artifact)
+                            }
                         }
+                        .frame(width: cacheControlsColumnWidth, alignment: .leading)
                     }
-                    .frame(width: cacheControlsColumnWidth, alignment: .leading)
                 }
+                .frame(width: cacheControlsColumnWidth, alignment: .leading)
             }
 
             if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {

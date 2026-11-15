@@ -260,10 +260,16 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS task results share the cache-controls vertical scroll viewport. Result
-  rows are direct lazy children of its outer `LazyVStack`, through transparent
-  view-builder sections rather than an inner scroll view or an eager list
-  wrapper. The existing 500-point cache-column width and paginated loading are
+- tvOS task results share the cache-controls vertical scroll viewport. Its
+  outer `VStack` materializes the bounded form controls so native directional
+  focus can discover them beyond an empty-library placeholder. Cache rows and
+  task-result rows use separate explicit `LazyVStack` containers within that
+  same scroll view, not additional scroll views or eager result wrappers.
+  The first cache-status text is a readable native focus stop, allowing Up to
+  traverse long noninteractive metadata back to the fixed connection controls.
+  Its focus binding changes only foreground and background colors; padding and
+  bounds stay stable and native directional movement remains system-managed.
+  The existing 500-point cache-column width and paginated loading are
   retained without truncating accumulated results or eagerly building every
   loaded row. Relaunch validation checks the actual shared viewport's positive
   width and height within its existing five-second geometry allowance and
@@ -272,7 +278,7 @@ superseded_by:
   Per-result readiness is checked while the corresponding row is materialized,
   not by requiring offscreen lazy rows to exist simultaneously. Connection
   controls and transient task-watch status, errors and reconnect actions remain
-  outside the virtualized scrolling body so their focus and accessibility do not
+  outside the scrolling body so their focus and accessibility do not
   disappear when results arrive. Progress, detailed task status and accumulated
   result rows remain in the body; rows stay outside its bounded status group.
   Offscreen terminal data readiness uses the persistent app-status summary,
