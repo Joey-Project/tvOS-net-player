@@ -263,10 +263,12 @@ superseded_by:
   retained without truncating accumulated results or eagerly building every
   loaded row. Relaunch validation checks the actual shared viewport's positive
   width and height within its existing five-second geometry allowance and
-  overall recovery deadline. Initial restored-data readiness uses the persistent
-  app-status summary, without requiring offscreen lazy rows to exist first.
-  Real remote navigation, per-result focus and readiness, exact second-result
-  selection and Continue assertions remain intact.
+  overall recovery deadline. Catalog and task data readiness use the persistent
+  app-status summary before remote navigation materializes their controls.
+  Per-result readiness is checked while the corresponding row is materialized,
+  not by requiring offscreen lazy rows to exist simultaneously. Real remote
+  navigation, per-result focus and readiness, exact second-result selection and
+  Continue assertions remain intact, with the existing deadlines unchanged.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
