@@ -270,9 +270,11 @@ superseded_by:
   controls form a bounded sibling group; accumulated result rows remain outside
   that eager group. Status accessibility and watch checks must remain meaningful
   when results arrive asynchronously. Remote navigation recovers a known address
-  landmark rather than assuming Submit retains focus after those updates. Real
-  per-result focus and readiness, exact second-result selection and Continue
-  assertions remain intact, with the existing deadlines unchanged.
+  landmark rather than assuming Submit or Load More retains focus after those
+  updates. Second-page library navigation passes through the last first-page
+  fixture before focusing the final fixture, without activating the waypoint.
+  Real per-result focus and readiness, exact second-result selection and
+  Continue assertions remain intact, with the existing deadlines unchanged.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

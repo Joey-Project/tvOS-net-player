@@ -127,6 +127,24 @@ final class UIPlaybackTests: XCTestCase {
                 + accessibilityDescription(identifiedElement("app-status"))
         )
 
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 80),
+            "Remote navigation could not recover the cache server address landmark after paging. "
+                + connectionFocusDescription()
+        )
+        let firstPageFixture = libraryItem(named: "Fixture 050")
+        XCTAssertTrue(
+            focusDown(until: firstPageFixture, limit: 80),
+            "Remote navigation did not materialize and focus Fixture 050 from the address landmark. "
+                + libraryFocusDescription()
+        )
+        XCTAssertTrue(
+            firstPageFixture.exists && firstPageFixture.hasFocus && firstPageFixture.isHittable
+                && firstPageFixture.isEnabled,
+            "Fixture 050 must be materialized, focused, hittable, and enabled before continuing navigation. "
+                + accessibilityDescription(firstPageFixture)
+        )
+
         let fixture = libraryItem(named: "Fixture 055")
         XCTAssertTrue(
             focusDown(until: fixture, limit: 20),
