@@ -205,6 +205,17 @@ superseded_by:
   Diagnostic snapshots taken afterward are not the original failing sample;
   unknown metadata stays unknown. Diagnostics never make a rejected update
   acceptable or replace the required complete OFF/ON comparison.
+- Arm reports separately project the coordinator's existing admission,
+  completion and deferral counters plus at most 16 recent plan summaries.
+  These logical observations never change eligibility or expose raw reader
+  bindings, media URIs or paths. Projection truncation is explicit; source
+  history completeness remains unknown. Schema-1 reports without this optional
+  diagnostic object retain unknown diagnostics, not fabricated zero counts.
+- No matching exact before-state plan does not prove no coordinator admission
+  or no media transfer. Associated transfer arrays can be empty because no
+  qualifying plan was selected, while the bounded event rings still observed
+  traffic. Counter summaries, matched-plan evidence and wire transfers remain
+  separate observations.
 - A structured cache read returning missing does not prove zero physical byte
   coverage. A stable exact range changing from missing to fully readable proves
   a positive lower bound on newly readable bytes, not an exact downloaded-byte

@@ -35,8 +35,8 @@ use crate::{
     grpc_services::CacheGrpcService,
     hls::HlsMediaResource,
     hls_high_preparation::{
-        HighPreparationObservation, HighPreparationPlanObservation, HighPreparationPlanOutcome,
-        HighPreparationResourceKind,
+        HighPreparationDeferReason, HighPreparationObservation, HighPreparationPlanObservation,
+        HighPreparationPlanOutcome, HighPreparationResourceKind,
     },
     hls_playback_context::PlaybackTimingSample,
     playback_request_urgency::PlaybackSidxMap,
@@ -92,6 +92,7 @@ struct ArmReport {
     plan_history_retention: PlanHistoryRetentionReport,
     transfer_event_retention: TransferEventRetentionReport,
     logical_range_counts: LogicalRangeCounts,
+    coordinator_diagnostics: CoordinatorDiagnosticsReport,
     attribution: AttributionReport,
     first_recovery_high_origin_request: Option<RecoveryRangeRequest>,
     first_recovery_high_completed_source_body: Option<FirstCompletedSourceBody>,
@@ -132,6 +133,32 @@ struct LogicalRangeCounts {
     requested_resource_ranges: u64,
     readable_resource_ranges: u64,
     deferred_resource_ranges: u64,
+}
+
+#[derive(Serialize)]
+struct CoordinatorDiagnosticsReport {
+    admitted_plans: u64,
+    completed_plans: u64,
+    deferred_plans: u64,
+    requested_resource_ranges: u64,
+    readable_resource_ranges: u64,
+    deferred_resource_ranges: u64,
+    recent_plans: Vec<CoordinatorPlanSummaryReport>,
+    projected_history_truncated: bool,
+    source_history_completeness: &'static str,
+}
+
+#[derive(Serialize)]
+struct CoordinatorPlanSummaryReport {
+    plan_id: u64,
+    outcome: &'static str,
+    defer_reason: Option<&'static str>,
+    window_start_seconds: Option<f64>,
+    window_end_seconds: Option<f64>,
+    requested_resource_ranges: u32,
+    readable_resource_ranges: u32,
+    deferred_resource_ranges: u32,
+    selected_span_count: usize,
 }
 
 #[derive(Serialize)]
@@ -974,6 +1001,70 @@ fn plan_outcome_name(outcome: HighPreparationPlanOutcome) -> &'static str {
         HighPreparationPlanOutcome::Deferred => "Deferred",
         HighPreparationPlanOutcome::Cancelled => "Cancelled",
         HighPreparationPlanOutcome::Failed => "Failed",
+    }
+}
+
+fn defer_reason_name(reason: HighPreparationDeferReason) -> &'static str {
+    match reason {
+        HighPreparationDeferReason::Disabled => "Disabled",
+        HighPreparationDeferReason::InvalidReader => "InvalidReader",
+        HighPreparationDeferReason::NoCurrentContext => "NoCurrentContext",
+        HighPreparationDeferReason::SessionUnavailable => "SessionUnavailable",
+        HighPreparationDeferReason::MissingContentIdentity => "MissingContentIdentity",
+        HighPreparationDeferReason::IneligiblePrimary => "IneligiblePrimary",
+        HighPreparationDeferReason::InsufficientBuffer => "InsufficientBuffer",
+        HighPreparationDeferReason::MissingOriginSupply => "MissingOriginSupply",
+        HighPreparationDeferReason::MissingSidxMap => "MissingSidxMap",
+        HighPreparationDeferReason::UnsafeWindow => "UnsafeWindow",
+        HighPreparationDeferReason::RangeBatchLimit => "RangeBatchLimit",
+        HighPreparationDeferReason::NoRuntime => "NoRuntime",
+        HighPreparationDeferReason::ReaderStateLimit => "ReaderStateLimit",
+        HighPreparationDeferReason::Cooldown => "Cooldown",
+        HighPreparationDeferReason::AlreadyActive => "AlreadyActive",
+        HighPreparationDeferReason::GlobalJobLimit => "GlobalJobLimit",
+        HighPreparationDeferReason::WindowAlreadyReadable => "WindowAlreadyReadable",
+        HighPreparationDeferReason::WindowNoLongerRelevant => "WindowNoLongerRelevant",
+        HighPreparationDeferReason::CacheInspectionUnavailable => "CacheInspectionUnavailable",
+        HighPreparationDeferReason::JobDeadlineExceeded => "JobDeadlineExceeded",
+        HighPreparationDeferReason::OwnershipChanged => "OwnershipChanged",
+        HighPreparationDeferReason::Seek => "Seek",
+        HighPreparationDeferReason::PausedOrStopped => "PausedOrStopped",
+        HighPreparationDeferReason::Preempted => "Preempted",
+        HighPreparationDeferReason::RangeFailure => "RangeFailure",
+        HighPreparationDeferReason::WindowNotReadable => "WindowNotReadable",
+    }
+}
+
+fn coordinator_diagnostics(
+    observation: &HighPreparationObservation,
+) -> CoordinatorDiagnosticsReport {
+    let retained_from = observation
+        .plan_history
+        .len()
+        .saturating_sub(TRACKED_PLAN_LIMIT);
+    CoordinatorDiagnosticsReport {
+        admitted_plans: observation.admitted_plans,
+        completed_plans: observation.completed_plans,
+        deferred_plans: observation.deferred_plans,
+        requested_resource_ranges: observation.requested_resource_ranges,
+        readable_resource_ranges: observation.readable_resource_ranges,
+        deferred_resource_ranges: observation.deferred_resource_ranges,
+        recent_plans: observation.plan_history[retained_from..]
+            .iter()
+            .map(|plan| CoordinatorPlanSummaryReport {
+                plan_id: plan.plan_id,
+                outcome: plan_outcome_name(plan.outcome),
+                defer_reason: plan.defer_reason.map(defer_reason_name),
+                window_start_seconds: plan.window_start_seconds.filter(|value| value.is_finite()),
+                window_end_seconds: plan.window_end_seconds.filter(|value| value.is_finite()),
+                requested_resource_ranges: plan.requested_resource_ranges,
+                readable_resource_ranges: plan.readable_resource_ranges,
+                deferred_resource_ranges: plan.deferred_resource_ranges,
+                selected_span_count: plan.selected_spans.len(),
+            })
+            .collect(),
+        projected_history_truncated: observation.plan_history.len() > TRACKED_PLAN_LIMIT,
+        source_history_completeness: "unknown",
     }
 }
 
@@ -1928,6 +2019,7 @@ fn build_arm_report(
         plan_history_retention,
         transfer_event_retention,
         logical_range_counts,
+        coordinator_diagnostics: coordinator_diagnostics(observation),
         attribution: AttributionReport {
             exclusive_attribution: "not_proven",
             causal_faster_selection_claim: false,
@@ -3190,6 +3282,29 @@ mod pure_helper_tests {
                 readable_resource_ranges: 32,
                 deferred_resource_ranges: 32,
             },
+            coordinator_diagnostics: CoordinatorDiagnosticsReport {
+                admitted_plans: 16,
+                completed_plans: 8,
+                deferred_plans: 8,
+                requested_resource_ranges: 64,
+                readable_resource_ranges: 32,
+                deferred_resource_ranges: 32,
+                recent_plans: (0..TRACKED_PLAN_LIMIT)
+                    .map(|_| CoordinatorPlanSummaryReport {
+                        plan_id: u64::MAX,
+                        outcome: "Deferred",
+                        defer_reason: Some("CacheInspectionUnavailable"),
+                        window_start_seconds: Some(f64::MAX),
+                        window_end_seconds: Some(-f64::MAX),
+                        requested_resource_ranges: u32::MAX,
+                        readable_resource_ranges: u32::MAX,
+                        deferred_resource_ranges: u32::MAX,
+                        selected_span_count: 1_024,
+                    })
+                    .collect(),
+                projected_history_truncated: false,
+                source_history_completeness: "unknown",
+            },
             attribution: AttributionReport {
                 exclusive_attribution: "not_proven",
                 causal_faster_selection_claim: false,
@@ -3237,11 +3352,84 @@ mod pure_helper_tests {
             value["fixture_generation_timeout_seconds"].as_u64(),
             Some(240)
         );
+        assert_eq!(
+            value["coordinator_diagnostics"]["admitted_plans"].as_u64(),
+            Some(16)
+        );
+        assert_eq!(
+            value["coordinator_diagnostics"]["recent_plans"]
+                .as_array()
+                .map(Vec::len),
+            Some(TRACKED_PLAN_LIMIT)
+        );
         assert!(
             encoded.len() <= ARM_REPORT_LIMIT,
             "maximum bounded report serialized to {} bytes",
             encoded.len()
         );
+    }
+
+    #[test]
+    fn coordinator_diagnostics_distinguish_deferred_from_no_admission() {
+        let before = test_before(100.0);
+        let mut no_admission = HighPreparationObservation::default();
+        let no_admission_report = coordinator_diagnostics(&no_admission);
+        assert_eq!(no_admission_report.admitted_plans, 0);
+        assert_eq!(no_admission_report.deferred_plans, 0);
+        assert!(no_admission_report.recent_plans.is_empty());
+
+        no_admission.deferred_plans = 1;
+        let mut deferred = test_plan(&before, 29, HighPreparationPlanOutcome::Deferred, 0);
+        deferred.defer_reason = Some(HighPreparationDeferReason::GlobalJobLimit);
+        deferred.deferred_resource_ranges = 2;
+        no_admission.plan_history.push(deferred);
+        let deferred_report = coordinator_diagnostics(&no_admission);
+        assert_eq!(deferred_report.admitted_plans, 0);
+        assert_eq!(deferred_report.deferred_plans, 1);
+        assert_eq!(deferred_report.recent_plans[0].outcome, "Deferred");
+        assert_eq!(
+            deferred_report.recent_plans[0].defer_reason,
+            Some("GlobalJobLimit")
+        );
+        let serialized = serde_json::to_value(&deferred_report).expect("diagnostics serialize");
+        assert_eq!(serialized["deferred_plans"].as_u64(), Some(1));
+        assert_eq!(
+            serialized["recent_plans"][0]["defer_reason"],
+            "GlobalJobLimit"
+        );
+    }
+
+    #[test]
+    fn coordinator_diagnostics_are_bounded_and_exclude_plan_identities() {
+        let before = test_before(100.0);
+        let observation = HighPreparationObservation {
+            plan_history: (0..TRACKED_PLAN_LIMIT + 2)
+                .map(|index| {
+                    let mut plan = test_plan(
+                        &before,
+                        index as u64,
+                        HighPreparationPlanOutcome::Admitted,
+                        1,
+                    );
+                    plan.context_id = Some("private-context-marker".to_owned());
+                    plan.http_reader_id = Some("private-reader-marker".to_owned());
+                    plan.session_id = Some("private-session-marker".to_owned());
+                    plan
+                })
+                .collect(),
+            ..HighPreparationObservation::default()
+        };
+
+        let diagnostic = coordinator_diagnostics(&observation);
+        let encoded = serde_json::to_vec(&diagnostic).expect("diagnostics serialize");
+        assert_eq!(diagnostic.recent_plans.len(), TRACKED_PLAN_LIMIT);
+        assert!(diagnostic.projected_history_truncated);
+        assert_eq!(diagnostic.source_history_completeness, "unknown");
+        assert!(encoded.len() <= ARM_REPORT_LIMIT);
+        let encoded = String::from_utf8(encoded).expect("JSON is UTF-8");
+        assert!(!encoded.contains("private-context-marker"));
+        assert!(!encoded.contains("private-reader-marker"));
+        assert!(!encoded.contains("private-session-marker"));
     }
 
     #[test]

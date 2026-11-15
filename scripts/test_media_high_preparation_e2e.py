@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import tempfile
 import sys
@@ -357,6 +358,82 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
     def test_arm_contract_accepts_only_bound_continuous_muted_report(self) -> None:
         runner.validate_arm_report(arm("off"), expected_arm="off")
         runner.validate_arm_report(arm("on", eligible=True), expected_arm="on")
+
+    def test_optional_coordinator_diagnostics_are_bounded_and_do_not_change_eligibility(self) -> None:
+        value = arm("on")
+        value["coordinator_diagnostics"] = {
+            "admitted_plans": 1,
+            "completed_plans": 0,
+            "deferred_plans": 1,
+            "requested_resource_ranges": 0,
+            "readable_resource_ranges": 0,
+            "deferred_resource_ranges": 0,
+            "recent_plans": [{
+                "plan_id": 3,
+                "outcome": "Deferred",
+                "defer_reason": "GlobalJobLimit",
+                "window_start_seconds": 10.0,
+                "window_end_seconds": 30.0,
+                "requested_resource_ranges": 0,
+                "readable_resource_ranges": 0,
+                "deferred_resource_ranges": 0,
+                "selected_span_count": 0,
+            }],
+            "projected_history_truncated": False,
+            "source_history_completeness": "unknown",
+        }
+        runner.validate_arm_report(value, expected_arm="on")
+        self.assertFalse(value["eligible"])
+        self.assertEqual(value["status"], "inconclusive")
+
+        invalid_cases = (
+            (
+                "counter_type",
+                lambda diagnostic: diagnostic.update(admitted_plans=True),
+                "Coordinator diagnostic counters are outside their unsigned bounds.",
+            ),
+            (
+                "retention_bound",
+                lambda diagnostic: diagnostic.update(
+                    recent_plans=[{}] * (runner.MAX_COORDINATOR_DIAGNOSTIC_PLANS + 1)
+                ),
+                "Coordinator plan summaries exceed their retention bound.",
+            ),
+            (
+                "history_completeness",
+                lambda diagnostic: diagnostic.update(source_history_completeness="complete"),
+                "Coordinator history completeness metadata is invalid.",
+            ),
+            (
+                "unexpected_identity",
+                lambda diagnostic: diagnostic.update(unbounded_identity="private"),
+                "Coordinator diagnostics are malformed or contain unexpected fields.",
+            ),
+            (
+                "outcome_type",
+                lambda diagnostic: diagnostic["recent_plans"][0].update(outcome=[]),
+                "Coordinator plan outcome is unknown.",
+            ),
+            (
+                "defer_reason_type",
+                lambda diagnostic: diagnostic["recent_plans"][0].update(defer_reason={}),
+                "Coordinator plan defer reason is unknown.",
+            ),
+            (
+                "window_number_bound",
+                lambda diagnostic: diagnostic["recent_plans"][0].update(window_start_seconds=10**1000),
+                "Coordinator plan window is not finite numeric data.",
+            ),
+        )
+        for case_name, mutate, expected_error in invalid_cases:
+            invalid = arm("off")
+            invalid_diagnostic = copy.deepcopy(value["coordinator_diagnostics"])
+            mutate(invalid_diagnostic)
+            invalid["coordinator_diagnostics"] = invalid_diagnostic
+            with self.subTest(case=case_name):
+                with self.assertRaises(runner.HighPreparationError) as error:
+                    runner.validate_arm_report(invalid, expected_arm="off")
+                self.assertEqual(str(error.exception), expected_error)
 
     def test_arm_contract_requires_the_approved_fixture_generation_timeout(self) -> None:
         self.assertEqual(runner.FIXTURE_GENERATION_TIMEOUT_SECONDS, 240)

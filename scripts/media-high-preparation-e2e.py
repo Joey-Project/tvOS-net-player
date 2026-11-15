@@ -33,7 +33,18 @@ MAX_ARTIFACT_ENTRIES = 256
 MAX_PLAN_RECORDS = 16
 MAX_SERIALIZED_PLAN_RECORDS = 1
 MAX_SELECTED_SPANS = 4
+MAX_COORDINATOR_DIAGNOSTIC_PLANS = 16
 CAUSAL_EVENT_RING_LIMIT = 96
+COORDINATOR_PLAN_OUTCOMES = {"Admitted", "Completed", "Deferred", "Cancelled", "Failed"}
+COORDINATOR_DEFER_REASONS = {
+    "Disabled", "InvalidReader", "NoCurrentContext", "SessionUnavailable",
+    "MissingContentIdentity", "IneligiblePrimary", "InsufficientBuffer",
+    "MissingOriginSupply", "MissingSidxMap", "UnsafeWindow", "RangeBatchLimit",
+    "NoRuntime", "ReaderStateLimit", "Cooldown", "AlreadyActive", "GlobalJobLimit",
+    "WindowAlreadyReadable", "WindowNoLongerRelevant", "CacheInspectionUnavailable",
+    "JobDeadlineExceeded", "OwnershipChanged", "Seek", "PausedOrStopped", "Preempted",
+    "RangeFailure", "WindowNotReadable",
+}
 TEST_NAME = "media_high_preparation_native_tests::native_high_preparation_off_on_comparison"
 PROBE_SELF_TEST_CASE = "high_preparation_player_verification_survives_cleanup"
 PRIVATE_CONTROL_PUBLISH_CASE = "high_preparation_control_publishes_private_atomic_samples_under_umask_022_and_077"
@@ -513,6 +524,59 @@ def validate_arm_report(value: Any, *, expected_arm: str) -> None:
         raise HighPreparationError("Arm report omitted the named logical resource-range counters.")
     if "downloaded_bytes" in logical or "origin_attempts" in logical:
         raise HighPreparationError("Logical coordinator counters were mislabeled as transfer evidence.")
+    coordinator = value.get("coordinator_diagnostics")
+    if "coordinator_diagnostics" in value:
+        expected_coordinator_keys = {
+            "admitted_plans", "completed_plans", "deferred_plans", "requested_resource_ranges",
+            "readable_resource_ranges", "deferred_resource_ranges", "recent_plans",
+            "projected_history_truncated", "source_history_completeness",
+        }
+        if not isinstance(coordinator, dict) or set(coordinator) != expected_coordinator_keys:
+            raise HighPreparationError("Coordinator diagnostics are malformed or contain unexpected fields.")
+        for key in (
+            "admitted_plans", "completed_plans", "deferred_plans", "requested_resource_ranges",
+            "readable_resource_ranges", "deferred_resource_ranges",
+        ):
+            if type(coordinator.get(key)) is not int or not 0 <= coordinator[key] <= (2**64 - 1):
+                raise HighPreparationError("Coordinator diagnostic counters are outside their unsigned bounds.")
+        recent = coordinator.get("recent_plans")
+        if not isinstance(recent, list) or len(recent) > MAX_COORDINATOR_DIAGNOSTIC_PLANS:
+            raise HighPreparationError("Coordinator plan summaries exceed their retention bound.")
+        expected_plan_keys = {
+            "plan_id", "outcome", "defer_reason", "window_start_seconds", "window_end_seconds",
+            "requested_resource_ranges", "readable_resource_ranges", "deferred_resource_ranges",
+            "selected_span_count",
+        }
+        for plan in recent:
+            if not isinstance(plan, dict) or set(plan) != expected_plan_keys:
+                raise HighPreparationError("Coordinator plan summary is malformed or contains unexpected fields.")
+            if type(plan.get("plan_id")) is not int or not 0 <= plan["plan_id"] <= (2**64 - 1):
+                raise HighPreparationError("Coordinator plan identifier is outside its unsigned bound.")
+            if type(plan.get("outcome")) is not str or plan["outcome"] not in COORDINATOR_PLAN_OUTCOMES:
+                raise HighPreparationError("Coordinator plan outcome is unknown.")
+            if plan.get("defer_reason") is not None and (
+                type(plan["defer_reason"]) is not str
+                or plan["defer_reason"] not in COORDINATOR_DEFER_REASONS
+            ):
+                raise HighPreparationError("Coordinator plan defer reason is unknown.")
+            for key in ("window_start_seconds", "window_end_seconds"):
+                number = plan.get(key)
+                if number is not None and (
+                    type(number) not in (int, float)
+                    or (type(number) is int and abs(number) > 2**53)
+                    or (type(number) is float and not math.isfinite(number))
+                ):
+                    raise HighPreparationError("Coordinator plan window is not finite numeric data.")
+            for key in (
+                "requested_resource_ranges", "readable_resource_ranges", "deferred_resource_ranges",
+            ):
+                if type(plan.get(key)) is not int or not 0 <= plan[key] <= (2**32 - 1):
+                    raise HighPreparationError("Coordinator plan range count is outside its unsigned bound.")
+            if type(plan.get("selected_span_count")) is not int or not 0 <= plan["selected_span_count"] <= 1024:
+                raise HighPreparationError("Coordinator selected-span count exceeds its bound.")
+        if type(coordinator.get("projected_history_truncated")) is not bool \
+            or coordinator.get("source_history_completeness") != "unknown":
+            raise HighPreparationError("Coordinator history completeness metadata is invalid.")
     attribution = value.get("attribution")
     if not isinstance(attribution, dict) or attribution.get("exclusive_attribution") != "not_proven":
         raise HighPreparationError("Arm report must preserve the exclusive-attribution limitation.")
