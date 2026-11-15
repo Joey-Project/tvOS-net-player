@@ -406,26 +406,31 @@ final class UIPlaybackTests: XCTestCase {
             "Playback started automatically before explicit Continue."
         )
         let restoredResultsDeadline = Date().addingTimeInterval(75)
+        // Lazy offscreen result rows cannot be relied on as the initial accessibility landmark.
+        let restoredTaskSummary = identifiedElement("app-status")
         guard
             waitUntil(
                 timeout: 75,
                 condition: {
-                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
+                    status(restoredTaskSummary, contains: "2 Bilibili results are cached for LAN playback.")
                 })
         else {
-            XCTFail("The cached task summary was not restored after relaunch. " + accessibilityDescription(taskStatus))
+            XCTFail(
+                "The cached task summary was not restored after relaunch. "
+                    + accessibilityDescription(restoredTaskSummary)
+            )
             return
         }
 
-        let taskResultsViewport = identifiedElement("bilibili-task-results-viewport")
+        let cacheControlsViewport = identifiedElement("cache-controls-scroll")
         XCTAssertTrue(
             waitUntil(timeout: min(5, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
-                taskResultsViewport.exists
-                    && taskResultsViewport.frame.width > 0
-                    && taskResultsViewport.frame.height > 0
+                cacheControlsViewport.exists
+                    && cacheControlsViewport.frame.width > 0
+                    && cacheControlsViewport.frame.height > 0
             },
-            "The restored task results viewport must have a nonzero frame before remote navigation. "
-                + accessibilityDescription(taskResultsViewport)
+            "The shared cache-controls scroll viewport must have a nonzero frame before remote navigation. "
+                + accessibilityDescription(cacheControlsViewport)
         )
 
         let addressField = app.textFields["cache-server-address"]

@@ -2371,6 +2371,57 @@ fn validate_optional_segment_query(
     Ok(())
 }
 
+fn native_high_preparation_fixture_identity() -> crate::bilibili_playback::BilibiliContentIdentity {
+    crate::bilibili_playback::BilibiliContentIdentity {
+        kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+        aid: Some(1),
+        bvid: Some("BV1xx411c7mD".to_owned()),
+        cid: Some(2),
+        epid: None,
+    }
+}
+
+fn validate_native_high_preparation_fixture_identity(
+    session: &HlsPlaybackSession,
+) -> Result<(), String> {
+    let expected = native_high_preparation_fixture_identity();
+    let Some(identity) = session.accepted_identity.as_ref() else {
+        return Err(
+            "native high-preparation fixture session is missing its complete synthetic VideoPage identity (aid=1, cid=2)"
+                .to_owned(),
+        );
+    };
+    if identity != &expected || !identity.is_complete() || !identity.is_refresh_complete() {
+        return Err(
+            "native high-preparation fixture session requires its complete synthetic VideoPage identity (aid=1, cid=2)"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn build_native_high_preparation_fixture_session(
+    session_id: &str,
+    title: &str,
+    selected_variant: &crate::bbdown_adapter::BilibiliPlaybackVariant,
+    abr: &crate::bbdown_adapter::BilibiliPlaybackAbrMetadata,
+    variants: &[crate::bbdown_adapter::BilibiliPlaybackVariant],
+    policy: PlaybackPolicy,
+) -> Result<HlsPlaybackSession, String> {
+    let mut session = HlsPlaybackSession::from_playback_entry_with_policy(
+        session_id,
+        title,
+        selected_variant,
+        abr,
+        variants,
+        policy,
+    )
+    .map_err(|_| "production HLS arm session could not be constructed".to_owned())?;
+    session.accepted_identity = Some(native_high_preparation_fixture_identity());
+    validate_native_high_preparation_fixture_identity(&session)?;
+    Ok(session)
+}
+
 async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
     if std::env::var("LAN_MEDIA_HIGH_PREPARATION_SYSTEM_MUTED").as_deref() != Ok("verified") {
         return Err("system audio mute was not verified before native playback".to_owned());
@@ -2445,15 +2496,14 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         .first()
         .ok_or_else(|| "arm fixture did not contain the high primary variant".to_owned())?;
     let abr = make_abr_metadata(NativeCase::ProgressiveAbr, &fixture)?;
-    let session = HlsPlaybackSession::from_playback_entry_with_policy(
+    let session = build_native_high_preparation_fixture_session(
         &task_id,
         "Native high-preparation comparison",
         selected,
         &abr,
         &variants,
         policy,
-    )
-    .map_err(|_| "production HLS arm session could not be constructed".to_owned())?;
+    )?;
     let master_url = format!("http://{media_address}/hls/{task_id}/master.m3u8");
     publish_playable_session(&state, &session, &task_id, &master_url)?;
     let generation = state
@@ -2763,6 +2813,105 @@ mod pure_helper_tests {
             session_id: "session".to_owned(),
             session_generation: 7,
         }
+    }
+
+    fn fixture_adapter_variant() -> crate::bbdown_adapter::BilibiliPlaybackVariant {
+        use crate::bbdown_adapter::{
+            BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
+            BilibiliPlaybackVariant, BilibiliPlaybackVariantKind,
+        };
+
+        let request_kind = BilibiliMediaRequestKind::Video;
+        BilibiliPlaybackVariant {
+            id: "high".to_owned(),
+            kind: BilibiliPlaybackVariantKind::Dash,
+            content_id: "native-media-acceptance".to_owned(),
+            bandwidth: Some(1_000_000),
+            codecs: vec!["avc1.640028".to_owned()],
+            mime_types: vec!["video/mp4".to_owned()],
+            width: Some(640),
+            height: Some(360),
+            frame_rate: Some("30".to_owned()),
+            duration_seconds: Some(60),
+            abr: None,
+            video: Some(BilibiliMediaRequest {
+                kind: request_kind,
+                stream_id: None,
+                url: "http://127.0.0.1:12345/high.mp4".to_owned(),
+                backup_urls: Vec::new(),
+                headers: Vec::new(),
+                mime_type: Some("video/mp4".to_owned()),
+                codecs: Some("avc1.640028".to_owned()),
+                bandwidth: Some(1_000_000),
+                width: Some(640),
+                height: Some(360),
+                frame_rate: Some("30".to_owned()),
+                size: Some(20),
+                duration_seconds: Some(60),
+                cache_key: BilibiliMediaCacheKey {
+                    content_id: "native-media-acceptance".to_owned(),
+                    media_kind: request_kind,
+                    stream_id: None,
+                    codecs: Some("avc1.640028".to_owned()),
+                    source_hash: "fixture-high".to_owned(),
+                },
+            }),
+            audio: None,
+            flv_segments: Vec::new(),
+        }
+    }
+
+    fn fixture_session(session_id: &str) -> HlsPlaybackSession {
+        let variant = fixture_adapter_variant();
+        let abr = crate::bbdown_adapter::BilibiliPlaybackAbrMetadata { groups: Vec::new() };
+        build_native_high_preparation_fixture_session(
+            session_id,
+            "Native high-preparation fixture",
+            &variant,
+            &abr,
+            std::slice::from_ref(&variant),
+            PlaybackPolicy::default(),
+        )
+        .expect("synthetic fixture session should pass identity preflight")
+    }
+
+    #[test]
+    fn arm_fixture_sessions_share_complete_synthetic_identity_but_not_session_ids() {
+        let off = fixture_session("off-fixture-session");
+        let on = fixture_session("on-fixture-session");
+        let expected = native_high_preparation_fixture_identity();
+
+        assert!(expected.is_complete());
+        assert!(expected.is_refresh_complete());
+        assert_eq!(Some(&expected), off.accepted_identity.as_ref());
+        assert_eq!(Some(&expected), on.accepted_identity.as_ref());
+        assert_ne!(off.id, on.id);
+        assert_eq!(off.variant.id, on.variant.id);
+    }
+
+    #[test]
+    fn fixture_identity_preflight_rejects_missing_and_incomplete_identity() {
+        let mut missing = fixture_session("missing-identity-session");
+        missing.accepted_identity = None;
+        assert!(
+            validate_native_high_preparation_fixture_identity(&missing)
+                .expect_err("missing identity must fail preflight")
+                .contains("missing its complete synthetic VideoPage identity")
+        );
+
+        let mut incomplete = fixture_session("incomplete-identity-session");
+        incomplete.accepted_identity = Some(crate::bilibili_playback::BilibiliContentIdentity {
+            kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+            aid: Some(1),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: None,
+            epid: None,
+        });
+        assert!(
+            validate_native_high_preparation_fixture_identity(&incomplete)
+                .expect_err("incomplete identity must fail preflight")
+                .contains("requires its complete synthetic VideoPage identity")
+        );
     }
 
     fn test_before(sample_monotonic_seconds: f64) -> BeforeWindow {

@@ -183,6 +183,11 @@ superseded_by:
   with fresh sequential OFF and ON fixture/cache/player instances. The existing
   capacity/failure stimulus and 600-second automatic phase are identical; OFF
   disables only the preparation coordinator, not context or reader scheduling.
+- Both arms attach the same complete synthetic content identity before session
+  publication, while retaining distinct session and reader bindings. Fixture
+  construction rejects missing, incomplete or unexpected identity before player
+  startup. Pure regressions exercise the same constructor used by the native
+  arms; production identity requirements and preparation eligibility are unchanged.
 - Real generated service methods run in process and consume a new native
   challenge-followed timing sample for every update. This does not establish
   external gRPC transport, the complete AppCore reporter loop, GUI interaction,
@@ -251,14 +256,17 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS task results retain a bounded, paginated lazy result scroller. Both its
-  viewport and content explicitly use the existing 500-point cache-column width,
-  with a 220-point viewport height. A height-only nested scroller can collapse
-  to zero width after restoration; a direct offscreen lazy stack can omit result
-  rows from accessibility. Explicit dimensions retain the prior focus and
-  virtualization behavior. Relaunch validation checks positive width and height
-  within its existing five-second geometry allowance and overall recovery
-  deadline; row readiness, result selection and Continue assertions remain intact.
+- tvOS task results share the cache-controls vertical scroll viewport. Result
+  rows are direct lazy children of its outer `LazyVStack`, through transparent
+  view-builder sections rather than an inner scroll view or an eager list
+  wrapper. The existing 500-point cache-column width and paginated loading are
+  retained without truncating accumulated results or eagerly building every
+  loaded row. Relaunch validation checks the actual shared viewport's positive
+  width and height within its existing five-second geometry allowance and
+  overall recovery deadline. Initial restored-data readiness uses the persistent
+  app-status summary, without requiring offscreen lazy rows to exist first.
+  Real remote navigation, per-result focus and readiness, exact second-result
+  selection and Continue assertions remain intact.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
