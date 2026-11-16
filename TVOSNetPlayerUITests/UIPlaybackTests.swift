@@ -14,6 +14,7 @@ final class UIPlaybackTests: XCTestCase {
     private var app: XCUIApplication!
     private var serverAddress = ""
     private var didLaunchApp = false
+    private var lifecycleStateHistory: [String] = []
 
     override func setUp() async throws {
         try await super.setUp()
@@ -35,7 +36,10 @@ final class UIPlaybackTests: XCTestCase {
             serverAddress = address
             app = XCUIApplication()
             app.launchArguments = ["--ui-testing"]
+            lifecycleStateHistory = []
+            recordLifecycleState("setup-before-launch")
             app.launch()
+            recordLifecycleState("setup-after-launch")
             didLaunchApp = true
         }
     }
@@ -44,12 +48,17 @@ final class UIPlaybackTests: XCTestCase {
         await MainActor.run {
             if didLaunchApp {
                 if testRun?.failureCount ?? 0 > 0 {
+                    recordLifecycleState("failure-teardown")
                     let screenshot = XCTAttachment(screenshot: app.screenshot())
                     screenshot.name = "Failure screenshot"
                     screenshot.lifetime = .keepAlways
                     add(screenshot)
 
-                    let accessibilityTree = XCTAttachment(string: app.debugDescription)
+                    let diagnosticPrefix = lifecycleStateHistory.joined(separator: "\n")
+                    let accessibilityTree = XCTAttachment(
+                        string: "Lifecycle state history (state only):\n\(diagnosticPrefix)\n\n"
+                            + app.debugDescription
+                    )
                     accessibilityTree.name = "Failure accessibility tree"
                     accessibilityTree.lifetime = .keepAlways
                     add(accessibilityTree)
@@ -563,9 +572,14 @@ final class UIPlaybackTests: XCTestCase {
             waitUntil(timeout: 20) { app.state == .runningBackground || app.state == .notRunning },
             "The player did not leave the foreground before termination. State: \(app.state)"
         )
+        recordLifecycleState("home-background-wait-complete")
+        recordLifecycleState("before-terminate")
         app.terminate()
+        recordLifecycleState("after-terminate")
         app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
+        recordLifecycleState("before-relaunch")
         app.launch()
+        recordLifecycleState("after-relaunch")
 
         let emptyPlayer = identifiedElement("player-empty-state")
         XCTAssertTrue(emptyPlayer.waitForExistence(timeout: 25))
@@ -976,6 +990,14 @@ final class UIPlaybackTests: XCTestCase {
 
     private func identifiedElement(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).element
+    }
+
+    private func recordLifecycleState(_ milestone: String) {
+        guard lifecycleStateHistory.count < 8 else { return }
+        let state = app.state
+        let entry = "\(milestone): state=\(state)"
+        lifecycleStateHistory.append(entry)
+        XCTContext.runActivity(named: "Relaunch lifecycle: \(entry)") { _ in }
     }
 
     private func status(_ element: XCUIElement, contains expectedText: String) -> Bool {

@@ -102,6 +102,10 @@ superseded_by:
    all resolved conversations for follow-up changes before normal SHA-bound
    protected merge. Keep independent controls, playback deadlines and assertions
    intact; the separately approved fixture-generation allowance is specified below.
+5. Reduce load sensitivity in pure timing and lifecycle tests with controlled
+   clocks and explicit synchronization. Keep functional correctness separate
+   from measured performance; real I/O and native playback retain bounded
+   observation windows and their independently approved acceptance budgets.
 
 ## High Preparation Slice Design
 - Continue from PR #107's production reporting and bounded request urgency.
@@ -292,6 +296,19 @@ superseded_by:
 - Keep native `AVPlayer` controls, one player/item, default buffering, scheduler
   eligibility and the separate native media comparison unchanged. UI navigation
   validation does not establish ABR improvement or audible audio acceptance.
+
+## Load-Tolerant Test Timing
+- The successful-live-context fixture sends generated timing updates every two
+  seconds instead of allowing its five-second context to expire during I/O.
+  The heartbeat ends with the observation future; cancellation tests retain
+  their original expiry, seek and generation-replacement expectations.
+- The positive preparation case observes for 16 seconds, covering the existing
+  15-second production job deadline without extending it. It still requires
+  `Completed`, the same audio/video window and readable cached resources.
+- Sustained host load is not itself proof of a failure's cause. Pure clock logic
+  should use controlled time where possible; real transfer and native-media
+  acceptance keep actual elapsed-time measurements and finite deadlines. Do not
+  use a blanket timeout increase to convert incomplete work into a pass.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

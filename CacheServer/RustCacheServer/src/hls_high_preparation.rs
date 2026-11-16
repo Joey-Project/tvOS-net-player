@@ -2304,19 +2304,46 @@ mod integration_tests {
                 .any(|range| range.resource == "audio")
         );
         harness.close_context(&opened.context_id).await;
+        let measured_context_started_at = std::time::Instant::now();
         let measured_context = harness.open_context().await;
         let origin_before_preparation = harness.origin.ranges().len();
         let measured_update = harness
             .update_context(&measured_context, 0.0, 20.0, 1.0)
             .await;
-        let plan = wait_for_terminal_plan(
-            &harness.state,
-            &measured_update.context_id,
-            Duration::from_secs(6),
-        )
-        .await;
+        let heartbeat = async {
+            let mut ticket = measured_update.clone();
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                ticket = harness.update_context(&ticket, 0.0, 20.0, 1.0).await;
+            }
+        };
+        let plan = tokio::select! {
+            plan = wait_for_terminal_plan(
+                &harness.state,
+                &measured_update.context_id,
+                Duration::from_secs(16),
+            ) => plan,
+            () = heartbeat => unreachable!("playback heartbeat loop must remain pending"),
+        };
+        let measured_context_elapsed = measured_context_started_at.elapsed();
+        let measured_context_binding = harness
+            .state
+            .hls_playback_contexts
+            .binding_for_update(&measured_update.context_id);
+        let measured_reader_snapshot = harness
+            .state
+            .current_hls_playback_context_for_reader(READER_ID);
 
-        assert_eq!(plan.outcome, HighPreparationPlanOutcome::Completed);
+        assert_eq!(
+            plan.outcome,
+            HighPreparationPlanOutcome::Completed,
+            "unexpected terminal plan for measured context {:?} after closing {:?}; defer_reason={:?}; context_age={measured_context_elapsed:?}; current_binding={measured_context_binding:?}; reader_snapshot={measured_reader_snapshot:?}; full bounded plan={plan:#?}",
+            measured_update.context_id,
+            opened.context_id,
+            plan.defer_reason,
+        );
         assert_eq!(plan.initial_window_readable, Some(false));
         assert!(plan.window_readable);
         assert_eq!(plan.window_start_seconds, Some(20.0));
