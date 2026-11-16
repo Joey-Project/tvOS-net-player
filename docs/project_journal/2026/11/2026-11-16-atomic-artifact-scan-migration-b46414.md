@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-16
 updated: 2026-11-16
 branch: codex/artifact-scan-atomic-publication
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/109
 supersedes: []
 superseded_by:
 ---
@@ -24,6 +24,15 @@ superseded_by:
 - Keep unreadable metadata/traversal distinct from an enumerated missing child.
   Reject actual symlinks and special files, retain the 512-entry and aggregate
   byte limits, and preserve the native report contract and playback assertions.
+- Isolate the buffered-continuity fixture's origin fault from LAN shaping:
+  keep LAN video at its healthy 4 Mbps baseline across all phases while retaining
+  the existing high-origin-only 503 injection. The long ABR and extended
+  diagnostic fixtures retain their 4/1/8 Mbps phase rates.
+- Keep every origin fault-exposure predicate. A downshift without a high-origin
+  request and actual 503 does not prove that fault path. Name each missing
+  predicate/count explicitly; buffered continuity does not require recovered
+  high requests, while the long ABR and extended diagnostic cases still do.
+  Isolating interventions is not a substitute for actual native exposure proof.
 
 ## Implementation And Validation
 - Collect no-follow metadata once for each observed entry. Skip a missing
@@ -35,6 +44,10 @@ superseded_by:
   replacement and unreadable access, plus the existing size and entry bounds.
 - The complete helper unittest module passed all 44 cases with no failures or
   skips on Python 3.14.5. Helper/test bytes were unchanged after execution.
+- Cover fixture pacing and individual trace-admission predicates with pure
+  deterministic tests, including the rejected zero-bad-high/zero-503 case and
+  the buffered-versus-long-case recovery distinction. Do not use timing sleeps,
+  manufactured origin requests, forced playback controls or relaxed budgets.
 - Formal artifact validation uses the independently accepted control release
   `1f6465c95570cff3c652401ad13f77e7ed9b4f65`.
   Declare exactly `scripts/media-network-e2e.py` as the migrating producer;
