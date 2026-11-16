@@ -260,10 +260,11 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS cache controls share one vertical `ScrollView` and one `LazyVStack`.
-  Cache, candidate and task-result rows are direct `ForEach` children of flat
-  lazy-stack sections rather than separate nested lazy containers. The stack
-  creates repeated content as needed while directional focus stays native.
+- tvOS cache controls share one vertical `ScrollView` with a stable eager
+  form and control hierarchy. Laziness is confined to repeated cache, candidate
+  and task-result collections, rather than virtualizing the mixed form itself.
+  Text fields and operation controls retain their view identity when native
+  keyboard dismissal or directional navigation scrolls them offscreen.
   Bounded form groups remain separate from repeated rows, without nested
   result scrollers, eager first-row exceptions or truncated accumulated data.
   The scroll owner uses its remaining allocated height, not a fixed-size result

@@ -224,7 +224,7 @@ struct ContentView: View {
             .fixedSize(horizontal: false, vertical: true)
 
             ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 20) {
                     Section {
                         Text(cacheModel.statusMessage)
                             .font(.callout)
@@ -331,34 +331,36 @@ struct ContentView: View {
                             }
                             .frame(maxWidth: .infinity, minHeight: 220)
                         } else {
-                            ForEach(cacheModel.items) { item in
-                                HStack(alignment: .center, spacing: 10) {
-                                    Button {
-                                        Task {
-                                            await playCachedItem(item)
+                            LazyVStack(alignment: .leading, spacing: 20) {
+                                ForEach(cacheModel.items) { item in
+                                    HStack(alignment: .center, spacing: 10) {
+                                        Button {
+                                            Task {
+                                                await playCachedItem(item)
+                                            }
+                                        } label: {
+                                            CacheLibraryRow(item: item)
                                         }
-                                    } label: {
-                                        CacheLibraryRow(item: item)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .accessibilityLabel(item.displayTitle)
-                                    .accessibilityIdentifier("cache-library-item")
-                                    .disabled(
-                                        cacheModel.isLoading
-                                            || cacheModel.deletingItemIDs.contains(item.id)
-                                            || !item.hasPlayableVariant
-                                    )
-
-                                    Button {
-                                        pendingDeleteItem = item
-                                    } label: {
-                                        Label(
-                                            cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
-                                            systemImage: "trash"
+                                        .buttonStyle(.bordered)
+                                        .accessibilityLabel(item.displayTitle)
+                                        .accessibilityIdentifier("cache-library-item")
+                                        .disabled(
+                                            cacheModel.isLoading
+                                                || cacheModel.deletingItemIDs.contains(item.id)
+                                                || !item.hasPlayableVariant
                                         )
+
+                                        Button {
+                                            pendingDeleteItem = item
+                                        } label: {
+                                            Label(
+                                                cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                                systemImage: "trash"
+                                            )
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .disabled(!cacheModel.canDelete(item))
                                     }
-                                    .buttonStyle(.bordered)
-                                    .disabled(!cacheModel.canDelete(item))
                                 }
                             }
                         }
@@ -478,37 +480,39 @@ struct ContentView: View {
                                 .disabled(!bilibiliModel.canClearCandidateSelection)
                             }
 
-                            ForEach(bilibiliModel.resolvedCandidates) { candidate in
-                                Button {
-                                    bilibiliModel.chooseCandidate(candidate)
-                                } label: {
-                                    HStack(spacing: 10) {
-                                        Image(
-                                            systemName: bilibiliModel.isCandidateSelected(candidate)
-                                                ? "checkmark.circle.fill"
-                                                : "circle"
-                                        )
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(candidate.title)
-                                                .lineLimit(1)
-                                            if !candidate.subtitle.isEmpty {
-                                                Text(candidate.subtitle)
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
+                            LazyVStack(alignment: .leading, spacing: 20) {
+                                ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                                    Button {
+                                        bilibiliModel.chooseCandidate(candidate)
+                                    } label: {
+                                        HStack(spacing: 10) {
+                                            Image(
+                                                systemName: bilibiliModel.isCandidateSelected(candidate)
+                                                    ? "checkmark.circle.fill"
+                                                    : "circle"
+                                            )
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(candidate.title)
                                                     .lineLimit(1)
+                                                if !candidate.subtitle.isEmpty {
+                                                    Text(candidate.subtitle)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                }
                                             }
                                         }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(bilibiliModel.candidateSelectionMode == .all)
-                                .accessibilityIdentifier("bilibili-candidate")
-                                .task(id: candidate.selectionID) {
-                                    await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
-                                        appearingCandidateID: candidate.selectionID,
-                                        serverAddressText: cacheModel.serverAddressText
-                                    )
+                                    .buttonStyle(.bordered)
+                                    .disabled(bilibiliModel.candidateSelectionMode == .all)
+                                    .accessibilityIdentifier("bilibili-candidate")
+                                    .task(id: candidate.selectionID) {
+                                        await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
+                                            appearingCandidateID: candidate.selectionID,
+                                            serverAddressText: cacheModel.serverAddressText
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -600,8 +604,10 @@ struct ContentView: View {
                                     .disabled(bilibiliModel.isLoadingMoreTaskResults)
                                     .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
                                 }
-                                ForEach(bilibiliModel.taskResults) { result in
-                                    taskResultRow(result)
+                                LazyVStack(alignment: .leading, spacing: 20) {
+                                    ForEach(bilibiliModel.taskResults) { result in
+                                        taskResultRow(result)
+                                    }
                                 }
                                 if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {
                                     Button {
