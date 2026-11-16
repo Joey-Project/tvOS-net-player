@@ -1,7 +1,7 @@
 use super::*;
 use std::{
     collections::{HashMap, VecDeque},
-    fs::{self, OpenOptions},
+    fs::{self, Metadata, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     pin::Pin,
@@ -1150,20 +1150,38 @@ fn publish_challenge(directory: &Path, value: &NativeChallenge<'_>) -> Result<()
         .map_err(|_| "native challenge could not be atomically published".to_owned())
 }
 
+fn native_sample_metadata_is_valid(metadata: &Metadata) -> bool {
+    metadata.is_file()
+        && metadata.len() > 0
+        && metadata.len() <= CONTROL_MESSAGE_LIMIT as u64
+        && metadata.permissions().mode() & 0o777 == 0o600
+        && metadata.uid() == unsafe { libc::geteuid() }
+}
+
+// Length and mtime detect in-place content changes without treating rename or unlink metadata as mutation.
+fn same_native_sample_content_state(before: &Metadata, after: &Metadata) -> bool {
+    before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+}
+
 fn read_native_sample(path: &Path) -> Result<Option<NativeSample>, String> {
+    read_native_sample_with_before_open(path, || {})
+}
+
+fn read_native_sample_with_before_open(
+    path: &Path,
+    before_open: impl FnOnce(),
+) -> Result<Option<NativeSample>, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("native sample metadata could not be inspected".to_owned()),
     };
-    if !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > CONTROL_MESSAGE_LIMIT as u64
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
+    if !native_sample_metadata_is_valid(&metadata) {
         return Err("native sample was not a bounded private regular file".to_owned());
     }
+    before_open();
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -1172,24 +1190,37 @@ fn read_native_sample(path: &Path) -> Result<Option<NativeSample>, String> {
     let opened = file
         .metadata()
         .map_err(|_| "opened native sample metadata could not be verified".to_owned())?;
-    if !opened.is_file()
-        || opened.dev() != metadata.dev()
-        || opened.ino() != metadata.ino()
-        || opened.len() != metadata.len()
-    {
+    if !native_sample_metadata_is_valid(&opened) {
+        return Err("native sample was not a bounded private regular file".to_owned());
+    }
+    let same_object = opened.dev() == metadata.dev() && opened.ino() == metadata.ino();
+    if same_object && !same_native_sample_content_state(&metadata, &opened) {
         return Err("native sample identity changed while it was opened".to_owned());
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
     Read::by_ref(&mut file)
         .take(CONTROL_MESSAGE_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "native sample could not be read within its bound".to_owned())?;
+    let after_read = file
+        .metadata()
+        .map_err(|_| "opened native sample metadata could not be verified".to_owned())?;
+    if !native_sample_metadata_is_valid(&after_read) {
+        return Err("native sample was not a bounded private regular file".to_owned());
+    }
+    if after_read.dev() != opened.dev()
+        || after_read.ino() != opened.ino()
+        || !same_native_sample_content_state(&opened, &after_read)
+        || u64::try_from(bytes.len()).ok() != Some(after_read.len())
+    {
+        return Err("native sample identity changed while it was opened".to_owned());
+    }
     if bytes.is_empty() || bytes.len() > CONTROL_MESSAGE_LIMIT {
         return Err("native sample exceeded its 4 KiB limit".to_owned());
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| "native sample did not match the continuous-control schema".to_owned())
+    let sample = serde_json::from_slice(&bytes)
+        .map_err(|_| "native sample did not match the continuous-control schema".to_owned())?;
+    Ok(same_object.then_some(sample))
 }
 
 async fn wait_for_native_sample(
@@ -2566,6 +2597,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         true,
     )
     .await?;
+    super::require_high_playback_sidx_maps(&state, &session, generation)?;
     if let Ok(mut report) = fixture_report.lock() {
         report.hls_playlist_preflight = Some(playlist_preflight);
         report.fault_timeline = FaultTimeline {
@@ -3612,6 +3644,51 @@ mod pure_helper_tests {
             10.0,
             11.5
         ));
+        sample.context_id = "other-context".to_owned();
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.context_id = "context".to_owned();
+        sample.challenge = "other-challenge".to_owned();
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.challenge = "challenge".to_owned();
+        sample.reader_id = "other-reader".to_owned();
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.reader_id = ticket.http_reader_id.clone();
+        sample.session_generation += 1;
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.session_generation = ticket.session_generation;
+        sample.sequence += 1;
+        assert!(!challenge_response_is_fresh(
+            &sample,
+            &sample.sample_request_id,
+            &ticket,
+            10.0,
+            11.5
+        ));
+        sample.sequence = ticket.next_sequence;
         assert!(!challenge_response_is_fresh(
             &sample,
             &sample.sample_request_id,
@@ -3651,6 +3728,201 @@ mod pure_helper_tests {
             10.0,
             20.0
         ));
+    }
+
+    fn native_sample_test_bytes(
+        ticket: &HlsPlaybackContextTicket,
+        request_id: &str,
+        sample_monotonic_seconds: f64,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "sample_request_id": request_id,
+            "context_id": ticket.context_id.as_str(),
+            "challenge": ticket.challenge.as_str(),
+            "reader_id": ticket.http_reader_id.as_str(),
+            "session_generation": ticket.session_generation,
+            "sequence": ticket.next_sequence,
+            "sample_monotonic_seconds": sample_monotonic_seconds,
+            "playhead_seconds": 4.0,
+            "continuous_buffered_end_seconds": 30.0,
+            "playback_rate": 1.0,
+            "time_control_status": "playing"
+        }))
+        .expect("native sample fixture serializes")
+    }
+
+    fn write_private_native_sample_test_file(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("private sample fixture is created");
+        file.write_all(bytes)
+            .expect("private sample fixture is written");
+        file.sync_all()
+            .expect("private sample fixture is persisted");
+    }
+
+    fn native_sample_test_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("native sample test directory is created");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("native sample test directory is private");
+        directory
+    }
+
+    #[test]
+    fn native_sample_atomic_replacement_next_read_accepts_same_ticket() {
+        let ticket = HlsPlaybackContextTicket {
+            context_id: "context".to_owned(),
+            challenge: "challenge".to_owned(),
+            session_id: "session".to_owned(),
+            session_generation: 7,
+            next_sequence: 3,
+            validity_millis: 5_000,
+            http_reader_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+        };
+        let request_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let old_request_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let requested_at = 10.0;
+        let fresh_sample_time = 10.25;
+        let now = 10.5;
+        let directory = native_sample_test_directory();
+        let sample_path = directory.path().join("sample.json");
+        let replacement_path = directory.path().join("sample.next");
+        write_private_native_sample_test_file(
+            &sample_path,
+            &native_sample_test_bytes(&ticket, old_request_id, fresh_sample_time),
+        );
+        write_private_native_sample_test_file(
+            &replacement_path,
+            &native_sample_test_bytes(&ticket, request_id, fresh_sample_time),
+        );
+        assert!(
+            read_native_sample_with_before_open(&sample_path, || {
+                fs::rename(&replacement_path, &sample_path)
+                    .expect("atomic sample replacement is published");
+            })
+            .expect("replacement during open is safely observed")
+            .is_none()
+        );
+
+        let accepted = read_native_sample(&sample_path)
+            .expect("replacement sample can be read")
+            .expect("replacement sample is present on the next read");
+        assert_eq!(accepted.sample_request_id, request_id);
+        assert_eq!(accepted.context_id, ticket.context_id);
+        assert_eq!(accepted.challenge, ticket.challenge);
+        assert_eq!(accepted.reader_id, ticket.http_reader_id);
+        assert_eq!(accepted.session_generation, ticket.session_generation);
+        assert_eq!(accepted.sequence, ticket.next_sequence);
+        assert_eq!(accepted.sample_monotonic_seconds, fresh_sample_time);
+        assert_eq!(accepted.playhead_seconds, Some(4.0));
+        assert_eq!(accepted.continuous_buffered_end_seconds, Some(30.0));
+        assert_eq!(accepted.playback_rate, Some(1.0));
+        assert_eq!(accepted.time_control_status, "playing");
+        assert!(challenge_response_is_fresh(
+            &accepted,
+            request_id,
+            &ticket,
+            requested_at,
+            now
+        ));
+    }
+
+    #[test]
+    fn native_sample_rejects_in_place_mutation_and_invalid_replacements() {
+        let ticket = HlsPlaybackContextTicket {
+            context_id: "context".to_owned(),
+            challenge: "challenge".to_owned(),
+            session_id: "session".to_owned(),
+            session_generation: 7,
+            next_sequence: 3,
+            validity_millis: 5_000,
+            http_reader_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+        };
+        let directory = native_sample_test_directory();
+        let sample_path = directory.path().join("sample.json");
+        let before = native_sample_test_bytes(&ticket, "request", 12.0);
+        let after = native_sample_test_bytes(&ticket, "request", 13.0);
+        assert_eq!(before.len(), after.len());
+        write_private_native_sample_test_file(&sample_path, &before);
+        let mutation_error = read_native_sample_with_before_open(&sample_path, || {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&sample_path)
+                .expect("published sample remains writable by its owner");
+            file.write_all(&after)
+                .expect("same-object sample is mutated in place");
+            file.sync_all().expect("in-place mutation is persisted");
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+                .expect("in-place mutation receives a distinct modification time");
+        })
+        .err()
+        .expect("same-object mutation must not be treated as replacement");
+        assert!(mutation_error.contains("native sample identity changed"));
+
+        fn replacement_error(
+            directory: &Path,
+            name: &str,
+            replacement_bytes: &[u8],
+            replacement_mode: u32,
+        ) -> String {
+            let path = directory.join(format!("{name}.json"));
+            let replacement = directory.join(format!("{name}.next"));
+            write_private_native_sample_test_file(&path, br#"{"sample_request_id":"old"}"#);
+            write_private_native_sample_test_file(&replacement, replacement_bytes);
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(replacement_mode))
+                .expect("replacement fixture mode is set");
+            let error = read_native_sample_with_before_open(&path, || {
+                fs::rename(&replacement, &path)
+                    .expect("invalid replacement is atomically published");
+            })
+            .err()
+            .expect("invalid replacement must not be skipped as benign");
+            let _ = fs::remove_file(path);
+            error
+        }
+
+        let valid_sample = native_sample_test_bytes(&ticket, "request", 14.0);
+        assert!(
+            replacement_error(directory.path(), "bad-mode", &valid_sample, 0o644)
+                .contains("not a bounded private regular file")
+        );
+        let unreadable_error =
+            replacement_error(directory.path(), "unreadable", &valid_sample, 0o000);
+        assert!(
+            unreadable_error.contains("could not be opened without following links")
+                || unreadable_error.contains("not a bounded private regular file")
+        );
+        assert!(
+            replacement_error(
+                directory.path(),
+                "oversized",
+                &vec![b'x'; CONTROL_MESSAGE_LIMIT + 1],
+                0o600
+            )
+            .contains("not a bounded private regular file")
+        );
+        assert!(
+            replacement_error(directory.path(), "invalid-json", b"{", 0o600)
+                .contains("continuous-control schema")
+        );
+
+        let symlink_path = directory.path().join("symlink-race.json");
+        let symlink_target = directory.path().join("symlink-target.json");
+        let symlink_source = directory.path().join("symlink.next");
+        write_private_native_sample_test_file(&symlink_path, &valid_sample);
+        write_private_native_sample_test_file(&symlink_target, &valid_sample);
+        std::os::unix::fs::symlink(&symlink_target, &symlink_source)
+            .expect("symlink fixture is created");
+        let symlink_error = read_native_sample_with_before_open(&symlink_path, || {
+            fs::rename(&symlink_source, &symlink_path)
+                .expect("symlink replacement is atomically published");
+        })
+        .err()
+        .expect("symlink replacement must not be skipped as benign");
+        assert!(symlink_error.contains("could not be opened without following links"));
     }
 
     #[test]

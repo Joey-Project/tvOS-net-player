@@ -201,6 +201,21 @@ superseded_by:
   canonical content, allowing only the exact expected reader association.
   Validation-only normalization never rewrites the served or player URL;
   missing, duplicated, mismatched or unrelated query fields remain failures.
+- Immutable synthetic origin resources publish a strong ETag derived from the
+  resource name and complete file contents. Successful full, range and HEAD
+  responses share that validator; production source-binding checks are unchanged.
+  Preparation preflight requires both target-video and required-audio SIDX maps
+  for the current session generation before starting the native control phase.
+  Deterministic loopback regressions exercise the actual playlist route with
+  strong, missing and weak validators in independent fresh states, before any
+  coordinator update; a missing or weak validator cannot register either map.
+- Sample publication may atomically replace the pathname between inspection
+  and open. Discard a valid replacement observation and retry within the same
+  existing challenge deadline. Recheck type, ownership, private mode and bounded
+  size on the opened descriptor; reject in-place length/mtime changes, unstable
+  reads and malformed content. Rename/unlink-only ctime or link-count changes
+  are not content-mutation evidence. Fixed-time regressions separate permitted
+  publication from invalid replacements without requiring wall-clock freshness.
 - Eligibility requires a completed recovery-phase preparation, matching
   reader/context/session generation and target window, actual missing-to-readable
   cache transitions, completed source-range overlap and known player-request
@@ -222,7 +237,7 @@ superseded_by:
   diagnostic object retain unknown diagnostics, not fabricated zero counts.
 - Integration-test terminal-observation timeouts report aggregate counters and
   at most eight sanitized plan summaries, without raw media addresses or
-  request headers. The existing six-second wait and completed-plan,
+  request headers. The approved 16-second positive observation and completed-plan,
   before-readability and aligned audio/video range assertions remain unchanged.
 - No matching exact before-state plan does not prove no coordinator admission
   or no media transfer. Associated transfer arrays can be empty because no

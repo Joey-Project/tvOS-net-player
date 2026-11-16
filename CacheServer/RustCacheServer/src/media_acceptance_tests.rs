@@ -31,6 +31,7 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
@@ -63,6 +64,9 @@ use crate::{
     transcoding::HlsTranscodingPlan,
 };
 
+#[cfg(test)]
+#[path = "media_high_preparation_fixture_tests.rs"]
+mod media_high_preparation_fixture_tests;
 #[path = "media_high_preparation_tests.rs"]
 mod media_high_preparation_tests;
 
@@ -553,6 +557,7 @@ struct CaptureTaskOutcome {
 
 struct OriginMedia {
     path: PathBuf,
+    strong_etag: String,
     representation_code: u8,
     initialization_length: u64,
     fragments: Vec<Mp4SegmentRange>,
@@ -1169,7 +1174,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         Arc::clone(&origin.phase),
         Arc::clone(&origin.epoch),
     ));
-    let media_router = crate::media_router(state).layer(from_fn_with_state(
+    let media_router = crate::media_router(state.clone()).layer(from_fn_with_state(
         Arc::clone(&telemetry),
         record_lan_ingress,
     ));
@@ -1192,6 +1197,14 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         case.uses_long_profile(),
     )
     .await?;
+    if case.uses_progressive_abr() {
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&session.id)
+            .map(|handle| handle.generation)
+            .ok_or_else(|| "high-preparation session generation is not registered".to_owned())?;
+        require_high_playback_sidx_maps(&state, &session, generation)?;
+    }
     if let Ok(mut data) = report.lock() {
         data.hls_playlist_preflight = Some(playlist_preflight);
     }
@@ -1415,6 +1428,40 @@ fn publish_playable_session(
         .map_err(|_| {
             "local playback task could not pass production publication checks".to_owned()
         })?;
+    Ok(())
+}
+
+pub(super) fn require_high_playback_sidx_maps(
+    state: &AppState,
+    session: &HlsPlaybackSession,
+    expected_generation: u64,
+) -> Result<(), String> {
+    let handle = state
+        .hls_sessions
+        .get_with_generation(&session.id)
+        .filter(|handle| {
+            handle.generation == expected_generation
+                && handle.session.variant.id == session.variant.id
+        })
+        .ok_or_else(|| "high-preparation session generation or variant changed".to_owned())?;
+    let generation = handle.generation;
+    let audio = session.variant.audio.as_ref().ok_or_else(|| {
+        "high-preparation target variant has no required audio resource".to_owned()
+    })?;
+    for (label, resource) in [
+        ("high video", &session.variant.video),
+        ("required audio", audio),
+    ] {
+        if state
+            .hls_cache
+            .playback_sidx_map(&session.id, generation, resource)
+            .is_none()
+        {
+            return Err(format!(
+                "high-preparation {label} playback SIDX map was not registered for the current session generation"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2317,6 +2364,7 @@ fn make_origin_state(
         "high.mp4".to_owned(),
         OriginMedia {
             path: fixture.high_video.path.clone(),
+            strong_etag: fixture_strong_etag("high.mp4", &fixture.high_video.path)?,
             representation_code: 1,
             initialization_length: fixture.high_video.record.initialization_bytes,
             fragments: fixture.high_video.fragments.clone(),
@@ -2328,6 +2376,7 @@ fn make_origin_state(
             "low.mp4".to_owned(),
             OriginMedia {
                 path: low.path.clone(),
+                strong_etag: fixture_strong_etag("low.mp4", &low.path)?,
                 representation_code: 2,
                 initialization_length: low.record.initialization_bytes,
                 fragments: low.fragments.clone(),
@@ -2339,6 +2388,7 @@ fn make_origin_state(
         "audio.mp4".to_owned(),
         OriginMedia {
             path: fixture.audio.path.clone(),
+            strong_etag: fixture_strong_etag("audio.mp4", &fixture.audio.path)?,
             representation_code: 3,
             initialization_length: fixture.audio.record.initialization_bytes,
             fragments: fixture.audio.fragments.clone(),
@@ -2441,6 +2491,7 @@ async fn origin_response(
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_TYPE, media.content_type)
         .header(CONTENT_LENGTH, range.length.to_string())
+        .header("etag", media.strong_etag.as_str())
         .header("cache-control", "no-store");
     if range.partial {
         let end = range.start.saturating_add(range.length).saturating_sub(1);
@@ -2487,6 +2538,29 @@ async fn origin_response(
     builder
         .body(body)
         .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn fixture_strong_etag(resource_name: &str, path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|_| "fixture media could not be opened".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(resource_name.as_bytes());
+    digest.update([0]);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "fixture media could not be hashed".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let value = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("\"{value}\""))
 }
 
 fn pacing_rate_bits_per_second(
@@ -4978,7 +5052,8 @@ mod origin_request_diagnostic_tests {
             media: HashMap::from([(
                 "high.mp4".to_owned(),
                 OriginMedia {
-                    path,
+                    path: path.clone(),
+                    strong_etag: fixture_strong_etag("high.mp4", &path).unwrap(),
                     representation_code: 1,
                     initialization_length: 100,
                     fragments: sample_fragments().to_vec(),
@@ -5070,6 +5145,109 @@ mod origin_request_diagnostic_tests {
             .unwrap();
         assert_eq!(first_media.range_start, 250);
         assert_eq!(first_media.media_window.unwrap().first_fragment_index, 1);
+    }
+
+    #[tokio::test]
+    async fn immutable_fixture_etag_is_shared_by_ranges_and_head_but_scoped_to_resource() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bytes = vec![0_u8; 500];
+        let high_path = temporary.path().join("high.mp4");
+        let audio_path = temporary.path().join("audio.mp4");
+        let changed_path = temporary.path().join("changed.mp4");
+        tokio::fs::write(&high_path, &bytes).await.unwrap();
+        tokio::fs::write(&audio_path, &bytes).await.unwrap();
+        tokio::fs::write(&changed_path, vec![1_u8; 500])
+            .await
+            .unwrap();
+        let high_etag = fixture_strong_etag("high.mp4", &high_path).unwrap();
+        let audio_etag = fixture_strong_etag("audio.mp4", &audio_path).unwrap();
+        let changed_etag = fixture_strong_etag("high.mp4", &changed_path).unwrap();
+        assert_ne!(high_etag, audio_etag);
+        assert_ne!(high_etag, changed_etag);
+
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = Arc::new(OriginState {
+            media: HashMap::from([
+                (
+                    "high.mp4".to_owned(),
+                    OriginMedia {
+                        path: high_path,
+                        strong_etag: high_etag.clone(),
+                        representation_code: 1,
+                        initialization_length: 100,
+                        fragments: sample_fragments().to_vec(),
+                        content_type: "video/mp4",
+                    },
+                ),
+                (
+                    "audio.mp4".to_owned(),
+                    OriginMedia {
+                        path: audio_path,
+                        strong_etag: audio_etag.clone(),
+                        representation_code: 3,
+                        initialization_length: 100,
+                        fragments: sample_fragments().to_vec(),
+                        content_type: "audio/mp4",
+                    },
+                ),
+            ]),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report,
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        });
+        let range_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, "bytes=150-199".parse().unwrap());
+            headers
+        };
+
+        let full = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers().get("etag").unwrap(), high_etag.as_str());
+
+        let range = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            range_headers(),
+            false,
+        )
+        .await;
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range.headers().get("etag").unwrap(), high_etag.as_str());
+
+        let head = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            range_headers(),
+            true,
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(head.headers().get("etag").unwrap(), high_etag.as_str());
+        assert!(
+            axum::body::to_bytes(head.into_body(), 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut weak = HeaderMap::new();
+        weak.insert("etag", "W/\"weak\"".parse().unwrap());
+        assert_eq!(None, crate::hls_cache::strong_etag(&weak));
+        assert_eq!(None, crate::hls_cache::strong_etag(&HeaderMap::new()));
+
+        let audio = origin_response(origin, "audio.mp4".to_owned(), range_headers(), false).await;
+        assert_eq!(audio.headers().get("etag").unwrap(), audio_etag.as_str());
     }
 
     #[test]
