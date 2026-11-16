@@ -223,469 +223,468 @@ struct ContentView: View {
             }
             .fixedSize(horizontal: false, vertical: true)
 
-            List {
-                Section {
-                    Text(cacheModel.statusMessage)
-                        .font(.callout)
-                        .foregroundStyle(
-                            focusedControl == .cacheLibraryStatus ? Color.white : Color.secondary
-                        )
-                        .accessibilityIdentifier("cache-library-status")
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(
-                                    focusedControl == .cacheLibraryStatus
-                                        ? Color.white.opacity(0.16)
-                                        : Color.clear
-                                )
-                        }
-                        .focusable()
-                        .focused($focusedControl, equals: .cacheLibraryStatus)
-
-                    if discoveryModel.isSearching || discoveryModel.errorMessage != nil
-                        || !discoveryModel.discoveredServers.isEmpty
-                    {
-                        Text(discoveryModel.statusMessage)
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    Section {
+                        Text(cacheModel.statusMessage)
                             .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-
-                        ForEach(discoveryModel.discoveredServers.prefix(4)) { server in
-                            Button {
-                                Task {
-                                    await selectDiscoveredServer(server)
-                                }
-                            } label: {
-                                Label {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(server.displayName)
-                                        Text(server.detailText)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                } icon: {
-                                    Image(systemName: "network")
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(cacheModel.isLoading)
-                        }
-                    }
-
-                    bilibiliLoginControls
-
-                    ForEach(cacheModel.cacheRoots) { root in
-                        CacheRootRow(root: root)
-                    }
-
-                    if let hlsCacheSummary = cacheModel.hlsCacheSummary {
-                        Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                    }
-
-                    ForEach(cacheModel.hlsCacheStatusBadges) { badge in
-                        CacheStatusBadgeRow(badge: badge)
-                    }
-                }
-
-                Section {
-                    HStack(spacing: 12) {
-                        TextField("Search cached videos", text: $cacheModel.searchText)
-                            .textContentType(.none)
-                            .submitLabel(.search)
-                            .accessibilityIdentifier("cache-library-search")
-                            .onSubmit {
-                                Task {
-                                    await cacheModel.refresh()
-                                }
-                            }
-                            .focused($focusedControl, equals: .cacheSearchField)
-
-                        Button {
-                            Task {
-                                await cacheModel.refresh()
-                            }
-                        } label: {
-                            Label(
-                                cacheModel.hasPendingSearch ? "Search" : "Reload",
-                                systemImage: "magnifyingglass"
+                            .foregroundStyle(
+                                focusedControl == .cacheLibraryStatus ? Color.white : Color.secondary
                             )
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!cacheModel.canRefresh)
-                        .focused($focusedControl, equals: .cacheSearchButton)
-                        .accessibilityIdentifier("cache-library-search-submit")
-                    }
-
-                    if cacheModel.items.isEmpty {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(.white.opacity(0.08))
-                            Text("No cached videos")
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 220)
-                    } else {
-                        ForEach(cacheModel.items) { item in
-                            HStack(alignment: .center, spacing: 10) {
-                                Button {
-                                    Task {
-                                        await playCachedItem(item)
-                                    }
-                                } label: {
-                                    CacheLibraryRow(item: item)
-                                }
-                                .buttonStyle(.bordered)
-                                .accessibilityLabel(item.displayTitle)
-                                .accessibilityIdentifier("cache-library-item")
-                                .disabled(
-                                    cacheModel.isLoading
-                                        || cacheModel.deletingItemIDs.contains(item.id)
-                                        || !item.hasPlayableVariant
-                                )
-
-                                Button {
-                                    pendingDeleteItem = item
-                                } label: {
-                                    Label(
-                                        cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
-                                        systemImage: "trash"
+                            .accessibilityIdentifier("cache-library-status")
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(
+                                        focusedControl == .cacheLibraryStatus
+                                            ? Color.white.opacity(0.16)
+                                            : Color.clear
                                     )
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(!cacheModel.canDelete(item))
                             }
-                        }
-                    }
+                            .focusable()
+                            .focused($focusedControl, equals: .cacheLibraryStatus)
 
-                    if !cacheModel.items.isEmpty {
-                        cacheLoadMoreButton
-                    }
-                }
-
-                Section {
-                    Text("Bilibili")
-                        .font(.title3.weight(.semibold))
-
-                    TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
-                        .keyboardType(.URL)
-                        .submitLabel(.go)
-                        .accessibilityIdentifier("bilibili-source")
-                        .onSubmit {
-                            Task {
-                                await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
-                            }
-                        }
-                        .focused($focusedControl, equals: .bilibiliField)
-
-                    Picker("Mode", selection: $bilibiliModel.submissionMode) {
-                        ForEach(BilibiliTaskSubmissionMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .accessibilityIdentifier("bilibili-mode")
-
-                    HStack(spacing: 10) {
-                        TextField("Quality", text: $bilibiliModel.qualityPreference)
-                            .textContentType(.none)
-
-                        if bilibiliModel.submissionMode == .playback {
-                            TextField("Codec", text: $bilibiliModel.encodingPreference)
-                                .textContentType(.none)
-                        }
-
-                        TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
-                            .textContentType(.none)
-                    }
-
-                    if bilibiliModel.submissionMode == .playback {
-                        bilibiliPlaybackPolicyControls
-                    }
-
-                    if bilibiliModel.submissionMode == .download {
-                        bilibiliDownloadOptions
-                    }
-
-                    if let errorMessage = bilibiliModel.errorMessage {
-                        Text(errorMessage)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                            .accessibilityIdentifier("bilibili-error")
-                    }
-
-                    if let notice = bilibiliModel.fetchNotice {
-                        BilibiliFetchNoticeRow(notice: notice)
-                    }
-
-                    bilibiliResumptionControls
-
-                    if shouldShowStandaloneBilibiliNoticeAction {
-                        bilibiliReResolveButton
-                    }
-
-                    if bilibiliModel.isWaitingForCandidateSelection {
-                        Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
-                            ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
-                                Text(
-                                    mode == .all && bilibiliModel.isResolvedCandidateWindowTruncated
-                                        ? "Window"
-                                        : mode.title
-                                ).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-
-                        if bilibiliModel.candidateSelectionMode == .range {
-                            HStack(spacing: 10) {
-                                Picker("From", selection: $bilibiliModel.rangeStartCandidateID) {
-                                    ForEach(bilibiliModel.resolvedCandidates) { candidate in
-                                        Text(candidate.title).tag(Optional(candidate.selectionID))
-                                    }
-                                }
-
-                                Picker("To", selection: $bilibiliModel.rangeEndCandidateID) {
-                                    ForEach(bilibiliModel.resolvedCandidates) { candidate in
-                                        Text(candidate.title).tag(Optional(candidate.selectionID))
-                                    }
-                                }
-                            }
-                        }
-
-                        if let selectionSummary = bilibiliModel.candidateSelectionSummary {
-                            Text(selectionSummary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-
-                        Text(candidatePaginationSummary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        HStack(spacing: 12) {
-                            bilibiliReResolveButton
-
-                            Button {
-                                bilibiliModel.clearResolvedCandidateSelection()
-                            } label: {
-                                Label("Clear Selection", systemImage: "xmark.circle")
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!bilibiliModel.canClearCandidateSelection)
-                        }
-
-                        ForEach(bilibiliModel.resolvedCandidates) { candidate in
-                            Button {
-                                bilibiliModel.chooseCandidate(candidate)
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(
-                                        systemName: bilibiliModel.isCandidateSelected(candidate)
-                                            ? "checkmark.circle.fill"
-                                            : "circle"
-                                    )
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(candidate.title)
-                                            .lineLimit(1)
-                                        if !candidate.subtitle.isEmpty {
-                                            Text(candidate.subtitle)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(bilibiliModel.candidateSelectionMode == .all)
-                            .accessibilityIdentifier("bilibili-candidate")
-                            .task(id: candidate.selectionID) {
-                                await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
-                                    appearingCandidateID: candidate.selectionID,
-                                    serverAddressText: cacheModel.serverAddressText
-                                )
-                            }
-                        }
-                    }
-
-                    if bilibiliModel.isWaitingForCandidateSelection
-                        && (bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates)
-                    {
-                        Button {
-                            Task {
-                                await bilibiliModel.loadMoreResolvedCandidates(
-                                    serverAddressText: cacheModel.serverAddressText
-                                )
-                            }
-                        } label: {
-                            Label(
-                                bilibiliModel.isLoadingMoreCandidates
-                                    ? "Loading Candidates"
-                                    : (bilibiliModel.canRetryResolvedCandidatePage
-                                        ? "Retry Loading Candidates"
-                                        : "Load More Candidates"),
-                                systemImage: bilibiliModel.isLoadingMoreCandidates
-                                    ? "hourglass"
-                                    : "chevron.down.circle"
-                            )
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(
-                            !bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates
-                        )
-                        .focused($focusedControl, equals: .bilibiliCandidateLoadMoreButton)
-                    }
-
-                    if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ProgressView(value: bilibiliModel.progress)
-                            Text(bilibiliModel.statusMessage)
+                        if discoveryModel.isSearching || discoveryModel.errorMessage != nil
+                            || !discoveryModel.discoveredServers.isEmpty
+                        {
+                            Text(discoveryModel.statusMessage)
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
-                                .accessibilityIdentifier("bilibili-task-status")
-                            if let summary = bilibiliModel.activePlaybackPolicySummary {
-                                Text(summary)
+
+                            ForEach(discoveryModel.discoveredServers.prefix(4)) { server in
+                                Button {
+                                    Task {
+                                        await selectDiscoveredServer(server)
+                                    }
+                                } label: {
+                                    Label {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(server.displayName)
+                                            Text(server.detailText)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    } icon: {
+                                        Image(systemName: "network")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(cacheModel.isLoading)
+                            }
+                        }
+
+                        bilibiliLoginControls
+
+                        ForEach(cacheModel.cacheRoots) { root in
+                            CacheRootRow(root: root)
+                        }
+
+                        if let hlsCacheSummary = cacheModel.hlsCacheSummary {
+                            Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(3)
+                        }
+
+                        ForEach(cacheModel.hlsCacheStatusBadges) { badge in
+                            CacheStatusBadgeRow(badge: badge)
+                        }
+                    }
+
+                    Section {
+                        HStack(spacing: 12) {
+                            TextField("Search cached videos", text: $cacheModel.searchText)
+                                .textContentType(.none)
+                                .submitLabel(.search)
+                                .accessibilityIdentifier("cache-library-search")
+                                .onSubmit {
+                                    Task {
+                                        await cacheModel.refresh()
+                                    }
+                                }
+                                .focused($focusedControl, equals: .cacheSearchField)
+
+                            Button {
+                                Task {
+                                    await cacheModel.refresh()
+                                }
+                            } label: {
+                                Label(
+                                    cacheModel.hasPendingSearch ? "Search" : "Reload",
+                                    systemImage: "magnifyingglass"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!cacheModel.canRefresh)
+                            .focused($focusedControl, equals: .cacheSearchButton)
+                            .accessibilityIdentifier("cache-library-search-submit")
+                        }
+
+                        if cacheModel.items.isEmpty {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(.white.opacity(0.08))
+                                Text("No cached videos")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 220)
+                        } else {
+                            ForEach(cacheModel.items) { item in
+                                HStack(alignment: .center, spacing: 10) {
+                                    Button {
+                                        Task {
+                                            await playCachedItem(item)
+                                        }
+                                    } label: {
+                                        CacheLibraryRow(item: item)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .accessibilityLabel(item.displayTitle)
+                                    .accessibilityIdentifier("cache-library-item")
+                                    .disabled(
+                                        cacheModel.isLoading
+                                            || cacheModel.deletingItemIDs.contains(item.id)
+                                            || !item.hasPlayableVariant
+                                    )
+
+                                    Button {
+                                        pendingDeleteItem = item
+                                    } label: {
+                                        Label(
+                                            cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                            systemImage: "trash"
+                                        )
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(!cacheModel.canDelete(item))
+                                }
+                            }
+                        }
+
+                        cacheLoadMoreButton
+                    }
+
+                    Section {
+                        Text("Bilibili")
+                            .font(.title3.weight(.semibold))
+
+                        TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
+                            .keyboardType(.URL)
+                            .submitLabel(.go)
+                            .accessibilityIdentifier("bilibili-source")
+                            .onSubmit {
+                                Task {
+                                    await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                                }
+                            }
+                            .focused($focusedControl, equals: .bilibiliField)
+
+                        Picker("Mode", selection: $bilibiliModel.submissionMode) {
+                            ForEach(BilibiliTaskSubmissionMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .accessibilityIdentifier("bilibili-mode")
+
+                        HStack(spacing: 10) {
+                            TextField("Quality", text: $bilibiliModel.qualityPreference)
+                                .textContentType(.none)
+
+                            if bilibiliModel.submissionMode == .playback {
+                                TextField("Codec", text: $bilibiliModel.encodingPreference)
+                                    .textContentType(.none)
+                            }
+
+                            TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
+                                .textContentType(.none)
+                        }
+
+                        if bilibiliModel.submissionMode == .playback {
+                            bilibiliPlaybackPolicyControls
+                        }
+
+                        if bilibiliModel.submissionMode == .download {
+                            bilibiliDownloadOptions
+                        }
+
+                        if let errorMessage = bilibiliModel.errorMessage {
+                            Text(errorMessage)
+                                .font(.callout)
+                                .foregroundStyle(.red)
+                                .accessibilityIdentifier("bilibili-error")
+                        }
+
+                        if let notice = bilibiliModel.fetchNotice {
+                            BilibiliFetchNoticeRow(notice: notice)
+                        }
+
+                        bilibiliResumptionControls
+
+                        if shouldShowStandaloneBilibiliNoticeAction {
+                            bilibiliReResolveButton
+                        }
+
+                        if bilibiliModel.isWaitingForCandidateSelection {
+                            Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
+                                ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
+                                    Text(
+                                        mode == .all && bilibiliModel.isResolvedCandidateWindowTruncated
+                                            ? "Window"
+                                            : mode.title
+                                    ).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            if bilibiliModel.candidateSelectionMode == .range {
+                                HStack(spacing: 10) {
+                                    Picker("From", selection: $bilibiliModel.rangeStartCandidateID) {
+                                        ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                                            Text(candidate.title).tag(Optional(candidate.selectionID))
+                                        }
+                                    }
+
+                                    Picker("To", selection: $bilibiliModel.rangeEndCandidateID) {
+                                        ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                                            Text(candidate.title).tag(Optional(candidate.selectionID))
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let selectionSummary = bilibiliModel.candidateSelectionSummary {
+                                Text(selectionSummary)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                             }
-                            if let badge = bilibiliModel.progressiveCacheStatusBadge {
-                                Label(badge.label, systemImage: badge.systemImage)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
-                                let fillProgress = fillStatus.progressFraction
-                            {
-                                ProgressView(value: fillProgress)
-                                Text(
-                                    "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
-                                )
+
+                            Text(candidatePaginationSummary)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            }
-                        }
 
-                        if !bilibiliModel.taskResults.isEmpty
-                            || bilibiliModel.taskResultsErrorMessage != nil
-                            || bilibiliModel.hasMoreTaskResults
-                        {
-                            if let summary = bilibiliModel.taskResultSummary {
-                                Text(taskResultsPaginationSummary(totalCount: summary.totalCount))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            if let errorMessage = bilibiliModel.taskResultsErrorMessage {
-                                Text(errorMessage)
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
-                            }
-                            if bilibiliModel.taskResultsErrorMessage != nil && !bilibiliModel.hasMoreTaskResults {
+                            HStack(spacing: 12) {
+                                bilibiliReResolveButton
+
                                 Button {
-                                    Task {
-                                        await bilibiliModel.retryTaskResults(
-                                            serverAddressText: cacheModel.serverAddressText
-                                        )
-                                    }
+                                    bilibiliModel.clearResolvedCandidateSelection()
                                 } label: {
-                                    Label("Retry Results", systemImage: "arrow.clockwise")
+                                    Label("Clear Selection", systemImage: "xmark.circle")
                                 }
                                 .buttonStyle(.bordered)
-                                .disabled(bilibiliModel.isLoadingMoreTaskResults)
-                                .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
+                                .disabled(!bilibiliModel.canClearCandidateSelection)
                             }
-                            ForEach(bilibiliModel.taskResults) { result in
-                                taskResultRow(result)
-                            }
-                            if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {
+
+                            ForEach(bilibiliModel.resolvedCandidates) { candidate in
                                 Button {
-                                    Task {
-                                        await bilibiliModel.loadMoreTaskResults(
-                                            serverAddressText: cacheModel.serverAddressText
-                                        )
-                                    }
+                                    bilibiliModel.chooseCandidate(candidate)
                                 } label: {
-                                    Label(
-                                        bilibiliModel.isLoadingMoreTaskResults
-                                            ? "Loading Results"
-                                            : "Load More Results",
-                                        systemImage: bilibiliModel.isLoadingMoreTaskResults
-                                            ? "hourglass"
-                                            : "chevron.down.circle"
+                                    HStack(spacing: 10) {
+                                        Image(
+                                            systemName: bilibiliModel.isCandidateSelected(candidate)
+                                                ? "checkmark.circle.fill"
+                                                : "circle"
+                                        )
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(candidate.title)
+                                                .lineLimit(1)
+                                            if !candidate.subtitle.isEmpty {
+                                                Text(candidate.subtitle)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(bilibiliModel.candidateSelectionMode == .all)
+                                .accessibilityIdentifier("bilibili-candidate")
+                                .task(id: candidate.selectionID) {
+                                    await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
+                                        appearingCandidateID: candidate.selectionID,
+                                        serverAddressText: cacheModel.serverAddressText
                                     )
                                 }
-                                .buttonStyle(.bordered)
-                                .disabled(
-                                    !bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults
+                            }
+                        }
+
+                        if bilibiliModel.isWaitingForCandidateSelection
+                            && (bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates)
+                        {
+                            Button {
+                                Task {
+                                    await bilibiliModel.loadMoreResolvedCandidates(
+                                        serverAddressText: cacheModel.serverAddressText
+                                    )
+                                }
+                            } label: {
+                                Label(
+                                    bilibiliModel.isLoadingMoreCandidates
+                                        ? "Loading Candidates"
+                                        : (bilibiliModel.canRetryResolvedCandidatePage
+                                            ? "Retry Loading Candidates"
+                                            : "Load More Candidates"),
+                                    systemImage: bilibiliModel.isLoadingMoreCandidates
+                                        ? "hourglass"
+                                        : "chevron.down.circle"
                                 )
-                                .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(
+                                !bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates
+                            )
+                            .focused($focusedControl, equals: .bilibiliCandidateLoadMoreButton)
+                        }
+
+                        if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ProgressView(value: bilibiliModel.progress)
+                                Text(bilibiliModel.statusMessage)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .accessibilityIdentifier("bilibili-task-status")
+                                if let summary = bilibiliModel.activePlaybackPolicySummary {
+                                    Text(summary)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                                if let badge = bilibiliModel.progressiveCacheStatusBadge {
+                                    Label(badge.label, systemImage: badge.systemImage)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
+                                    let fillProgress = fillStatus.progressFraction
+                                {
+                                    ProgressView(value: fillProgress)
+                                    Text(
+                                        "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+
+                            if !bilibiliModel.taskResults.isEmpty
+                                || bilibiliModel.taskResultsErrorMessage != nil
+                                || bilibiliModel.hasMoreTaskResults
+                            {
+                                if let summary = bilibiliModel.taskResultSummary {
+                                    Text(taskResultsPaginationSummary(totalCount: summary.totalCount))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let errorMessage = bilibiliModel.taskResultsErrorMessage {
+                                    Text(errorMessage)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+                                if bilibiliModel.taskResultsErrorMessage != nil && !bilibiliModel.hasMoreTaskResults {
+                                    Button {
+                                        Task {
+                                            await bilibiliModel.retryTaskResults(
+                                                serverAddressText: cacheModel.serverAddressText
+                                            )
+                                        }
+                                    } label: {
+                                        Label("Retry Results", systemImage: "arrow.clockwise")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(bilibiliModel.isLoadingMoreTaskResults)
+                                    .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
+                                }
+                                ForEach(bilibiliModel.taskResults) { result in
+                                    taskResultRow(result)
+                                }
+                                if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {
+                                    Button {
+                                        Task {
+                                            await bilibiliModel.loadMoreTaskResults(
+                                                serverAddressText: cacheModel.serverAddressText
+                                            )
+                                        }
+                                    } label: {
+                                        Label(
+                                            bilibiliModel.isLoadingMoreTaskResults
+                                                ? "Loading Results"
+                                                : "Load More Results",
+                                            systemImage: bilibiliModel.isLoadingMoreTaskResults
+                                                ? "hourglass"
+                                                : "chevron.down.circle"
+                                        )
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(
+                                        !bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults
+                                    )
+                                    .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
+                                }
                             }
                         }
-                    }
 
-                    HStack(spacing: 12) {
-                        Button {
-                            Task {
-                                await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                        HStack(spacing: 12) {
+                            Button {
+                                Task {
+                                    await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                                }
+                            } label: {
+                                Label(bilibiliModel.submitButtonTitle, systemImage: "plus.circle.fill")
                             }
-                        } label: {
-                            Label(bilibiliModel.submitButtonTitle, systemImage: "plus.circle.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!bilibiliModel.canSubmit)
-                        .focused($focusedControl, equals: .bilibiliSubmitButton)
-                        .accessibilityIdentifier("bilibili-submit")
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!bilibiliModel.canSubmit)
+                            .focused($focusedControl, equals: .bilibiliSubmitButton)
+                            .accessibilityIdentifier("bilibili-submit")
 
-                        Button {
-                            Task {
-                                await playBilibiliTask()
+                            Button {
+                                Task {
+                                    await playBilibiliTask()
+                                }
+                            } label: {
+                                Label("Play", systemImage: "play.fill")
                             }
-                        } label: {
-                            Label("Play", systemImage: "play.fill")
-                        }
-                        .disabled(!bilibiliModel.canPlay)
-                        .accessibilityIdentifier("bilibili-play")
+                            .disabled(!bilibiliModel.canPlay)
+                            .accessibilityIdentifier("bilibili-play")
 
-                        Button {
-                            Task {
-                                await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
+                            Button {
+                                Task {
+                                    await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
+                                }
+                            } label: {
+                                Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
                             }
-                        } label: {
-                            Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
+                            .disabled(!bilibiliModel.canCancel)
+                            .accessibilityIdentifier("bilibili-cancel")
                         }
-                        .disabled(!bilibiliModel.canCancel)
-                        .accessibilityIdentifier("bilibili-cancel")
-                    }
 
-                    HStack(spacing: 12) {
-                        Button {
-                            Task {
-                                await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
+                        HStack(spacing: 12) {
+                            Button {
+                                Task {
+                                    await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
+                                }
+                            } label: {
+                                Label("Retry", systemImage: "arrow.clockwise")
                             }
-                        } label: {
-                            Label("Retry", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(!bilibiliModel.canRetry)
-                        .accessibilityIdentifier("bilibili-retry")
+                            .disabled(!bilibiliModel.canRetry)
+                            .accessibilityIdentifier("bilibili-retry")
 
-                        Button {
-                            bilibiliModel.clearTask()
-                        } label: {
-                            Label("Clear", systemImage: "trash")
+                            Button {
+                                bilibiliModel.clearTask()
+                            } label: {
+                                Label("Clear", systemImage: "trash")
+                            }
+                            .disabled(!bilibiliModel.canClear)
+                            .accessibilityIdentifier("bilibili-clear")
                         }
-                        .disabled(!bilibiliModel.canClear)
-                        .accessibilityIdentifier("bilibili-clear")
                     }
                 }
             }
-            .listStyle(.plain)
             .accessibilityIdentifier("cache-controls-scroll")
             .frame(maxHeight: .infinity, alignment: .top)
         }
