@@ -2,7 +2,7 @@
 
 这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本提供手动播放和 LAN cache control-plane 第一片：
 
-- SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
+- SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放；缓存、候选视频和任务输出通过独立原生列表浏览，明确选中后才播放。
 - SwiftUI macOS app target：复用同一套 AppCore/cache client，用于桌面调试和轻量使用。
 - 手动 URL v0 工作流：保存上次播放地址，支持停止、清空和输入校验。
 - LAN cache client v0：输入 Mac mini cache server 地址，刷新 gRPC library 首屏预览，选择可播放 variant，并把 HTTP/HLS playback source 交给 `AVPlayer`。
@@ -110,7 +110,7 @@ Rust 测试 waiter 的超时诊断仅包含有限的任务/结果状态、观察
 
 `just test-ui-e2e-macos` 和 `just test-ui-e2e-tvos` 是独立的 XCUITest 界面测试入口，不是现有 AppCore/hosted-view XCTest 的别名。它们启动隔离的真实 Rust LAN cache server，生成不含音轨的短视频和跨越 50 条分页边界的本地目录，再通过实际客户端界面连接、选片和操作播放。tvOS 入口需要已安装且可用的 simulator runtime；仓库没有 iOS app target，安装 iOS runtime 不会增加 iOS 客户端覆盖。
 
-macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
+macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器打开原生缓存列表、加载第二页，经过第 50 条到达第 55 条，再明确选中并检查播放状态和时间推进；任务结果也通过原生列表验证精确选片、返回与无自动播放。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
 
 每个平台还执行自动恢复、手动重连、静默校准和退出后续接四项任务用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；实际客户端仍通过界面输入、提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。静默用例保持 watch 连接打开，跨越状态未变和发现完成的校准读取，检查没有错误重连且已有播放持续推进。续接用例暂停在非零位置，真正终止并重开应用，确认不会自动播放，再明确继续原结果并检查位置与时间推进。runner 独立核对每个场景只创建一个任务，续接不会重新解析或提交；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
 

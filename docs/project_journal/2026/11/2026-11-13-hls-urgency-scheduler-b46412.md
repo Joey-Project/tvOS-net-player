@@ -3,7 +3,7 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-15
+updated: 2026-11-16
 branch: codex/hls-high-preparation
 pr:
 supersedes: []
@@ -260,48 +260,38 @@ superseded_by:
   It does not depend on a play/pause round trip finishing inside a ten-second
   media tail at 2x speed. Natural completion, paused terminal clamping, Resume
   and speed assertions remain required; production player behavior is unchanged.
-- tvOS cache controls share one vertical `ScrollView` with a stable eager
-  form and control hierarchy. Laziness is confined to repeated cache, candidate
-  and task-result collections, rather than virtualizing the mixed form itself.
-  Text fields and operation controls retain their view identity when native
-  keyboard dismissal or directional navigation scrolls them offscreen.
-  Bounded form groups remain separate from repeated rows, without nested
-  result scrollers, eager first-row exceptions or truncated accumulated data.
-  The scroll owner uses its remaining allocated height, not a fixed-size result
-  viewport. Cache pagination remains available whenever more items exist,
-  including an empty loaded page; the load-more control owns its availability.
-  The first cache-status text is a readable native focus stop, allowing Up to
-  traverse long noninteractive metadata back to the fixed connection controls.
-  Its focus binding changes only foreground and background colors; padding and
-  bounds stay stable and native directional movement remains system-managed.
-  Each task-result row places its full-width primary Play action above the
-  separate status and metadata view. Accessible result and artifact identifiers,
-  existing availability rules and native directional movement are retained.
-  The existing 500-point cache-column width and paginated loading are
-  retained without truncating accumulated results or eagerly building every
-  loaded row. Relaunch validation checks the actual shared viewport's positive
-  width and height within its existing five-second geometry allowance and
-  overall recovery deadline. Catalog and task data readiness use the persistent
-  app-status summary before remote navigation materializes their controls.
-  Per-result readiness is checked while the corresponding row is materialized,
-  not by requiring offscreen lazy rows to exist simultaneously. Connection
-  controls and transient task-watch status, errors and reconnect actions remain
-  outside the scrolling body so their focus and accessibility do not
-  disappear when results arrive. Progress, detailed task status and accumulated
-  result rows remain in the body; rows stay outside its bounded status group.
-  Offscreen terminal data readiness uses the persistent app-status summary,
-  followed by real navigation to verify the actual cached result while playback
-  continues. Remote navigation recovers the persistent address
-  landmark rather than assuming Submit or Load More retains focus after those
-  updates. Second-page library navigation passes through the last first-page
-  fixture before focusing the final fixture, without activating the waypoint.
-  Real per-result focus and readiness, exact second-result selection and
-  Continue assertions remain intact, with the existing deadlines unchanged.
-  Task UI setup confirms the complete server address before and after keyboard
-  dismissal within one shared ten-second input window. Silent reconciliation
-  observes the actual playing state rather than mutable playback status text,
-  while still requiring the exact result to become Cached, healthy watch UI
-  and continued timeline advancement.
+- tvOS list navigation follows the native-list decision below. Task UI setup
+  still confirms the complete server address before and after keyboard dismissal
+  within one shared ten-second input window. Silent reconciliation observes the
+  actual playing state rather than mutable playback status text, while requiring
+  the exact result to become Cached, healthy watch UI and timeline advancement.
+
+## tvOS Native List Decision
+- Use explicit entry points to independent native lists for the cache library,
+  resolved candidates and task outputs. Do not embed accumulated result arrays
+  in the mixed connection/submission form or replace the player controls.
+- Present each list on an opaque full-screen dark surface. Keep an explicitly
+  legible title and standard Done button outside the native List so rows cannot
+  scroll through the header or overlap the underlying connection/player UI.
+- Retain the existing view models, complete accumulated pages, opaque page tokens,
+  near-end candidate loading, manual retry, selection modes and range selection.
+  Empty, loading, error and more-results states remain visible. The cache list's
+  loaded-count/status remains outside its virtualized rows while paging and
+  browsing. Native Back/Done
+  returns to a stable entry control; output arrival never opens a list or starts
+  playback automatically.
+- Rows expose their real title, readiness and exact identity. Selecting a playable
+  cache/output row uses the existing playback path and returns to the player;
+  candidate selection alone neither submits a task nor starts playback. Cache
+  deletion keeps capability checks and explicit confirmation in the active list.
+- Acceptance uses real remote navigation into and out of the lists. Preserve
+  catalog pagination through item 50 to item 55, decoy-first navigation followed
+  by explicit second-result playback, watch recovery during progressing playback,
+  relaunch without autoplay and explicit Continue near the saved position.
+  Adapt navigation to the real UI, not business assertions or existing deadlines.
+- Keep native `AVPlayer` controls, one player/item, default buffering, scheduler
+  eligibility and the separate native media comparison unchanged. UI navigation
+  validation does not establish ABR improvement or audible audio acceptance.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and
