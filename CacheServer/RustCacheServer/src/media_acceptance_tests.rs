@@ -2571,6 +2571,9 @@ fn pacing_rate_bits_per_second(
     if !case.uses_progressive_abr() || !matches!(representation_code, 1 | 2) {
         return None;
     }
+    if matches!(case, NativeCase::BufferedContinuity) {
+        return Some(ABR_BASELINE_RATE_BITS_PER_SECOND);
+    }
     Some(match phase_code.min(PHASE_RECOVERY) {
         PHASE_BASELINE => ABR_BASELINE_RATE_BITS_PER_SECOND,
         PHASE_BAD_HIGH => ABR_BAD_RATE_BITS_PER_SECOND,
@@ -3448,20 +3451,44 @@ fn validate_abr_request_trace(report: &ReportStore, case: NativeCase) -> Result<
         .lock()
         .map_err(|_| "acceptance report lock was poisoned".to_owned())?;
     let requests = &data.requests;
-    if requests.media_payload_by_phase_and_representation[0][0] == 0
-        || requests.count_by_phase_and_representation[1][0] == 0
-        || requests.high_fault_status_count == 0
-        || requests.count_by_phase_and_representation[1][1] == 0
-        || requests.successful_by_representation[1] == 0
-        || (matches!(
-            case,
-            NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic
-        ) && requests.media_payload_by_phase_and_representation[2][0] == 0)
+    let mut missing = Vec::new();
+    let healthy_high_payloads = requests.media_payload_by_phase_and_representation[0][0];
+    let bad_high_requests = requests.count_by_phase_and_representation[1][0];
+    let bad_high_statuses = requests.high_fault_status_count;
+    let bad_low_requests = requests.count_by_phase_and_representation[1][1];
+    let successful_low_requests = requests.successful_by_representation[1];
+    let recovered_high_payloads = requests.media_payload_by_phase_and_representation[2][0];
+    if healthy_high_payloads == 0 {
+        missing.push(format!(
+            "healthy high media payloads={healthy_high_payloads}"
+        ));
+    }
+    if bad_high_requests == 0 {
+        missing.push(format!("bad-high high requests={bad_high_requests}"));
+    }
+    if bad_high_statuses == 0 {
+        missing.push(format!("high-origin 503 responses={bad_high_statuses}"));
+    }
+    if bad_low_requests == 0 {
+        missing.push(format!("bad-high low requests={bad_low_requests}"));
+    }
+    if successful_low_requests == 0 {
+        missing.push(format!("successful low requests={successful_low_requests}"));
+    }
+    if matches!(
+        case,
+        NativeCase::ProgressiveAbr | NativeCase::ExtendedDiagnostic
+    ) && recovered_high_payloads == 0
     {
-        return Err(
-            "origin trace did not prove healthy high, bad-high with healthy low, and recovered high requests"
-                .to_owned(),
-        );
+        missing.push(format!(
+            "recovered high media payloads={recovered_high_payloads}"
+        ));
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "origin trace missing required counts: {}",
+            missing.join(", ")
+        ));
     }
     Ok(())
 }
@@ -5756,6 +5783,28 @@ mod origin_pacing_tests {
                 ),
                 Some(ABR_RECOVERY_RATE_BITS_PER_SECOND),
             );
+            for phase_code in [PHASE_BASELINE, PHASE_BAD_HIGH, PHASE_RECOVERY] {
+                assert_eq!(
+                    pacing_rate_bits_per_second(
+                        NativeCase::BufferedContinuity,
+                        phase_code,
+                        representation_code,
+                    ),
+                    Some(ABR_BASELINE_RATE_BITS_PER_SECOND),
+                );
+                assert_eq!(
+                    pacing_rate_bits_per_second(
+                        NativeCase::ExtendedDiagnostic,
+                        phase_code,
+                        representation_code,
+                    ),
+                    Some(match phase_code {
+                        PHASE_BASELINE => ABR_BASELINE_RATE_BITS_PER_SECOND,
+                        PHASE_BAD_HIGH => ABR_BAD_RATE_BITS_PER_SECOND,
+                        _ => ABR_RECOVERY_RATE_BITS_PER_SECOND,
+                    }),
+                );
+            }
         }
         assert_eq!(
             pacing_rate_bits_per_second(NativeCase::Transcoding, PHASE_BASELINE, 1),
@@ -5765,6 +5814,88 @@ mod origin_pacing_tests {
             pacing_rate_bits_per_second(NativeCase::ProgressiveAbr, PHASE_BASELINE, 3),
             None,
         );
+    }
+
+    fn trace_report(case: NativeCase) -> ReportStore {
+        let mut report = AcceptanceReport::new(case);
+        report.requests.media_payload_by_phase_and_representation[0][0] = 1;
+        report.requests.count_by_phase_and_representation[1][0] = 1;
+        report.requests.high_fault_status_count = 1;
+        report.requests.count_by_phase_and_representation[1][1] = 1;
+        report.requests.successful_by_representation[1] = 1;
+        report.requests.media_payload_by_phase_and_representation[2][0] = 1;
+        Arc::new(Mutex::new(report))
+    }
+
+    #[test]
+    fn buffered_trace_reports_each_missing_required_count() {
+        type RemoveCount = fn(&mut RequestSummary);
+        let cases: [(&str, RemoveCount); 5] = [
+            ("healthy high media payloads=0", |requests| {
+                requests.media_payload_by_phase_and_representation[0][0] = 0
+            }),
+            ("bad-high high requests=0", |requests| {
+                requests.count_by_phase_and_representation[1][0] = 0
+            }),
+            ("high-origin 503 responses=0", |requests| {
+                requests.high_fault_status_count = 0
+            }),
+            ("bad-high low requests=0", |requests| {
+                requests.count_by_phase_and_representation[1][1] = 0
+            }),
+            ("successful low requests=0", |requests| {
+                requests.successful_by_representation[1] = 0
+            }),
+        ];
+        for (expected, remove_count) in cases {
+            let report = trace_report(NativeCase::BufferedContinuity);
+            remove_count(&mut report.lock().unwrap().requests);
+            let error =
+                validate_abr_request_trace(&report, NativeCase::BufferedContinuity).unwrap_err();
+            assert!(error.contains(expected), "unexpected diagnostic: {error}");
+        }
+    }
+
+    #[test]
+    fn buffered_trace_rejects_reported_missing_bad_high_requests_and_503s() {
+        let report = trace_report(NativeCase::BufferedContinuity);
+        {
+            let mut data = report.lock().unwrap();
+            data.requests.media_payload_by_phase_and_representation[0][0] = 32;
+            data.requests.count_by_phase_and_representation[1][0] = 0;
+            data.requests.high_fault_status_count = 0;
+            data.requests.count_by_phase_and_representation[1][1] = 64;
+            data.requests.media_payload_by_phase_and_representation[2][0] = 184;
+        }
+        let error =
+            validate_abr_request_trace(&report, NativeCase::BufferedContinuity).unwrap_err();
+        assert!(error.contains("bad-high high requests=0"), "{error}");
+        assert!(error.contains("high-origin 503 responses=0"), "{error}");
+    }
+
+    #[test]
+    fn buffered_trace_does_not_require_recovered_high_payloads() {
+        let report = trace_report(NativeCase::BufferedContinuity);
+        report
+            .lock()
+            .unwrap()
+            .requests
+            .media_payload_by_phase_and_representation[2][0] = 0;
+        assert!(validate_abr_request_trace(&report, NativeCase::BufferedContinuity).is_ok());
+    }
+
+    #[test]
+    fn long_recovery_trace_requires_recovered_high_payloads() {
+        for case in [NativeCase::ProgressiveAbr, NativeCase::ExtendedDiagnostic] {
+            let report = trace_report(case);
+            report
+                .lock()
+                .unwrap()
+                .requests
+                .media_payload_by_phase_and_representation[2][0] = 0;
+            let error = validate_abr_request_trace(&report, case).unwrap_err();
+            assert!(error.contains("recovered high media payloads=0"), "{error}");
+        }
     }
 
     #[test]

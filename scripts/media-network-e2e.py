@@ -11,6 +11,7 @@ import os
 import re
 import selectors
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -148,20 +149,43 @@ def _fresh_artifact_dir(configured: str | None) -> Path:
 def _artifact_size(directory: Path, *, limit: int = ARTIFACT_BYTES) -> int:
     total = 0
     entries = 0
-    for current, dirs, files in os.walk(directory, followlinks=False):
+    enumerated_directories: set[Path] = set()
+
+    def on_walk_error(error: OSError) -> None:
+        error_path = Path(os.fsdecode(error.filename)) if error.filename is not None else None
+        if isinstance(error, FileNotFoundError) and error_path in enumerated_directories:
+            return
+        location = error.filename or directory
+        raise MediaNetworkError(f"Could not enumerate artifact directory {location}: {error}") from error
+
+    # Observe entry type and size without following links; this bounded walk is not an atomic snapshot.
+    for current, dirs, files in os.walk(directory, followlinks=False, onerror=on_walk_error):
         base = Path(current)
         entries += len(dirs) + len(files)
         if entries > 512:
             raise MediaNetworkError("Artifact tree exceeded its 512-entry bound.")
+        directory_names = set(dirs)
+        enumerated_directories.update(base / name for name in dirs)
         for name in dirs + files:
             item = base / name
-            if item.is_symlink():
+            try:
+                metadata = item.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise MediaNetworkError(f"Could not inspect artifact entry {item.name}: {error}") from error
+            if stat.S_ISLNK(metadata.st_mode):
                 raise MediaNetworkError(f"Artifact tree contains an unexpected symlink: {item.name}")
-        for name in files:
-            item = base / name
-            if not item.is_file():
+
+            if name in directory_names:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise MediaNetworkError(f"Artifact directory changed type before inspection: {item.name}")
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                raise MediaNetworkError(f"Artifact file changed to a directory before inspection: {item.name}")
+            if not stat.S_ISREG(metadata.st_mode):
                 raise MediaNetworkError(f"Artifact tree contains a non-regular file: {item.name}")
-            total += item.stat().st_size
+            total += metadata.st_size
             if total > limit:
                 raise MediaNetworkError(f"Artifact tree exceeded the {limit}-byte aggregate cap.")
     return total

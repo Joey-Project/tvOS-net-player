@@ -985,7 +985,7 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
             with self.assertRaisesRegex(media.MediaNetworkError, "unexpected ordered dimension"):
                 media.validate_report(path, media.EXPECTED_TESTS[1], media.EXPECTED_TRANSCODE_SIZES)
 
-    def test_artifact_tree_rejects_aggregate_overflow_and_symlinks(self) -> None:
+    def test_artifact_tree_rejects_aggregate_overflow_symlinks_and_special_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "payload.bin").write_bytes(b"123456")
@@ -995,6 +995,159 @@ class MediaNetworkAcceptanceTests(unittest.TestCase):
             (root / "link").symlink_to(root)
             with self.assertRaisesRegex(media.MediaNetworkError, "symlink"):
                 media._artifact_size(root)
+            (root / "link").unlink()
+            os.mkfifo(root / "pipe")
+            with self.assertRaisesRegex(media.MediaNetworkError, "non-regular file"):
+                media._artifact_size(root)
+
+    def test_artifact_tree_tolerates_atomic_report_publication_after_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            temporary = root / "abr.json.tmp"
+            final = root / "abr.json"
+            temporary.write_bytes(b"report")
+            original_walk = media.os.walk
+
+            def publish_after_enumeration(*args, **kwargs):
+                for current, dirs, files in original_walk(*args, **kwargs):
+                    if Path(current) == root:
+                        temporary.replace(final)
+                    yield current, dirs, files
+
+            with mock.patch.object(media.os, "walk", side_effect=publish_after_enumeration):
+                self.assertEqual(media._artifact_size(root), 0)
+            self.assertEqual(media._artifact_size(root), len(b"report"))
+
+    def test_artifact_tree_tolerates_disappearing_enumerated_file_and_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_path = root / "gone.bin"
+            directory_path = root / "gone-directory"
+            file_path.write_bytes(b"gone")
+            directory_path.mkdir()
+            original_walk = media.os.walk
+
+            def remove_after_enumeration(*args, **kwargs):
+                for current, dirs, files in original_walk(*args, **kwargs):
+                    if Path(current) == root:
+                        if "gone.bin" in files:
+                            file_path.unlink()
+                        if "gone-directory" in dirs:
+                            directory_path.rmdir()
+                    yield current, dirs, files
+
+            with mock.patch.object(media.os, "walk", side_effect=remove_after_enumeration):
+                self.assertEqual(media._artifact_size(root), 0)
+
+    def test_artifact_tree_rejects_unreadable_entries_and_walk_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked = root / "blocked.bin"
+            blocked.write_bytes(b"data")
+            original_lstat = Path.lstat
+
+            def deny_entry(path):
+                if path == blocked:
+                    raise PermissionError("permission denied")
+                return original_lstat(path)
+
+            with mock.patch.object(Path, "lstat", autospec=True, side_effect=deny_entry):
+                with self.assertRaisesRegex(media.MediaNetworkError, "Could not inspect artifact entry blocked.bin"):
+                    media._artifact_size(root)
+
+            original_scandir = media.os.scandir
+
+            def deny_walk(path):
+                if Path(path) == root:
+                    raise PermissionError("permission denied")
+                return original_scandir(path)
+
+            with mock.patch.object(media.os, "scandir", side_effect=deny_walk):
+                with self.assertRaisesRegex(media.MediaNetworkError, "Could not enumerate artifact directory"):
+                    media._artifact_size(root)
+
+    def test_artifact_tree_does_not_treat_root_enoent_as_child_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_scandir = media.os.scandir
+
+            def lose_root(path):
+                if Path(path) == root:
+                    raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+                return original_scandir(path)
+
+            with mock.patch.object(media.os, "scandir", side_effect=lose_root):
+                with self.assertRaisesRegex(media.MediaNetworkError, "Could not enumerate artifact directory"):
+                    media._artifact_size(root)
+
+    def test_artifact_tree_rejects_enumeration_kind_changes(self) -> None:
+        for transition in ("file-to-directory", "directory-to-file"):
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entry = root / "entry"
+                if transition == "file-to-directory":
+                    entry.write_bytes(b"before")
+                    expected_error = "file changed to a directory"
+                else:
+                    entry.mkdir()
+                    expected_error = "directory changed type"
+                original_walk = media.os.walk
+
+                def replace_after_enumeration(*args, **kwargs):
+                    for current, dirs, files in original_walk(*args, **kwargs):
+                        if Path(current) == root:
+                            if transition == "file-to-directory" and "entry" in files:
+                                entry.unlink()
+                                entry.mkdir()
+                                (entry / "child.bin").write_bytes(b"child")
+                            elif transition == "directory-to-file" and "entry" in dirs:
+                                entry.rmdir()
+                                entry.write_bytes(b"after")
+                        yield current, dirs, files
+
+                with mock.patch.object(media.os, "walk", side_effect=replace_after_enumeration):
+                    with self.assertRaisesRegex(media.MediaNetworkError, expected_error):
+                        media._artifact_size(root)
+
+    def test_artifact_tree_rejects_directory_replaced_by_symlink_or_fifo(self) -> None:
+        for replacement in ("symlink", "fifo"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entry = root / "entry"
+                entry.mkdir()
+                original_walk = media.os.walk
+
+                def replace_after_enumeration(*args, **kwargs):
+                    for current, dirs, files in original_walk(*args, **kwargs):
+                        if Path(current) == root and "entry" in dirs:
+                            entry.rmdir()
+                            if replacement == "symlink":
+                                entry.symlink_to(root.parent / "target", target_is_directory=True)
+                            else:
+                                os.mkfifo(entry)
+                        yield current, dirs, files
+
+                expected_error = "symlink" if replacement == "symlink" else "directory changed type"
+                with mock.patch.object(media.os, "walk", side_effect=replace_after_enumeration):
+                    with self.assertRaisesRegex(media.MediaNetworkError, expected_error):
+                        media._artifact_size(root)
+
+    def test_artifact_tree_counts_513_enumerated_entries_before_missing_child_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(513):
+                (root / f"{index}.bin").touch()
+            original_walk = media.os.walk
+
+            def remove_after_enumeration(*args, **kwargs):
+                for current, dirs, files in original_walk(*args, **kwargs):
+                    if Path(current) == root and files:
+                        (root / files[0]).unlink()
+                    yield current, dirs, files
+
+            with mock.patch.object(media.os, "walk", side_effect=remove_after_enumeration):
+                with self.assertRaisesRegex(media.MediaNetworkError, "512-entry bound"):
+                    media._artifact_size(root)
 
     def test_explicit_artifact_directory_accepts_empty_and_rejects_nonempty_or_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
