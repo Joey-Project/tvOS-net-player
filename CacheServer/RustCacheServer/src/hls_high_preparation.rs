@@ -2714,8 +2714,9 @@ mod integration_tests {
             resource: &video,
             requested: retry_range.clone(),
         }];
-        let retried = tokio::time::timeout(
-            Duration::from_secs(4),
+        // Allow the retry to traverse the playback preparation's 15-second limit on a loaded host.
+        let retry_result = tokio::time::timeout(
+            Duration::from_secs(16),
             harness.state.hls_cache.prepare_playback_batch(
                 &harness.state.hls_upstream_client,
                 PlaybackPreparationBatch {
@@ -2725,11 +2726,63 @@ mod integration_tests {
                 &control,
             ),
         )
-        .await
-        .expect("a canceled single-flight range should not block a batch retry")
-        .expect("retried batch should complete after its origin is released");
+        .await;
+        let retried = match retry_result {
+            Ok(result) => {
+                result.expect("retried batch should complete after its origin is released")
+            }
+            Err(_) => {
+                let recent_ranges = harness
+                    .origin
+                    .ranges()
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .map(|request| {
+                        format!(
+                            "{}:{}-{} body_bytes={}",
+                            request.resource,
+                            request.range.start,
+                            request.range.end,
+                            request.body_bytes
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                panic!(
+                    "retry observation timed out; gate_claimed={} gate_released={} range_activity={:?} overlapping_flight={} origin_request_count={} recent_origin_ranges=[{}]; trace is observational and does not identify a causal phase",
+                    gate.claimed.load(Ordering::Acquire),
+                    *gate.release.borrow(),
+                    harness.state.hls_cache.range_activity_counts(),
+                    harness
+                        .state
+                        .hls_cache
+                        .has_range_flight_overlapping_for_test(SESSION_ID, &video.id, &high_range,),
+                    harness.origin.ranges().len(),
+                    recent_ranges.join(", ")
+                );
+            }
+        };
         assert_eq!(1, retried.len());
         assert_eq!(retry_range, retried[0].requested);
+        let expected_bytes = harness.origin.resources["video"]
+            [retry_range.start as usize..retry_range.end as usize]
+            .to_vec();
+        let cached_bytes = tokio::time::timeout(
+            Duration::from_secs(15),
+            harness
+                .state
+                .hls_cache
+                .read_resource_range(SESSION_ID, &video, retry_range),
+        )
+        .await
+        .expect("retried cache range should remain readable")
+        .expect("retried cache range read should succeed")
+        .expect("retried cache range should contain bytes");
+        assert!(
+            expected_bytes == cached_bytes,
+            "retried cache bytes must match the origin"
+        );
     }
 }
 

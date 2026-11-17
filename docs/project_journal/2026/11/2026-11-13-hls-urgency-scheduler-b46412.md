@@ -3,9 +3,9 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-16
+updated: 2026-11-17
 branch: codex/hls-high-preparation
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/108
 supersedes: []
 superseded_by:
 ---
@@ -13,8 +13,8 @@ superseded_by:
 # HLS Playback Urgency Scheduler
 
 ## Summary
-- Continue from accepted master `cbcd297b5f6b9950d957e258901f3b4f147b0808`
-  after PR #107. Preserve one player/item, default buffering, full-fill intent,
+- Continue from accepted master `c30f67d65b6a1468b0c6b3cdcf3a3872b36c3a82`
+  after PR #109. Preserve one player/item, default buffering, full-fill intent,
   media identity validation and the existing strict acceptance budgets.
 - Approved ordering is missing near-term video/audio first, eligible high
   preparation before far-future low, and eventual complete fills. Insufficient
@@ -182,6 +182,18 @@ superseded_by:
   Fixed-signed native media regression acceptance, production high preparation
   and the separate OFF/ON measurement retain their distinct evidence boundaries.
 
+## Artifact Baseline
+- Use accepted release `c30f67d65b6a1468b0c6b3cdcf3a3872b36c3a82` after
+  PR #109 for the successor artifact controls. Its manifest SHA-256 is
+  `29bb6429c3f16286be99f77056058b4e66bcffd7031924ca81cbfef5fc8b68e0`.
+- Preserve the preceding controls and independent helper-migration proof.
+  The successor is selected from the normally merged, independently accepted
+  release, not from this candidate checkout or its own artifact declarations.
+- Ordinary acceptance keeps both UI/media producers outside the genuine
+  base-to-head diff. The complete native3, UI5-per-platform and fixture4 contracts,
+  source identities, deadlines and assertions remain unchanged. Packaging the
+  successor does not establish this feature's native comparison result.
+
 ## Native Comparison Contract
 - `just test-media-high-preparation` is an opt-in, credential-free comparison
   with fresh sequential OFF and ON fixture/cache/player instances. The existing
@@ -311,8 +323,21 @@ superseded_by:
 - Keep native `AVPlayer` controls, one player/item, default buffering, scheduler
   eligibility and the separate native media comparison unchanged. UI navigation
   validation does not establish ABR improvement or audible audio acceptance.
+- The post-relaunch empty-player landmark retains its 25-second assertion.
+  Failure diagnostics use bounded, non-secret accessibility/state observations
+  and the existing failure-message/teardown artifact route. Missing observations
+  and internal checkpoint-validation outcomes remain unknown; an absent landmark
+  alone does not prove autoplay or an attached player. Do not change the two
+  explicit playback-source requests, producer helpers or report contract to
+  make an early relaunch failure pass.
 
 ## Load-Tolerant Test Timing
+- The deadline/cancellation retry fixture keeps its gated origin, terminal
+  deadline outcome, released permit/reader/flight checks and successful retry
+  assertions. Its retry observation covers the existing 15-second batch limit
+  instead of imposing a shorter 4-second deadline. Bounded phase diagnostics
+  and exact cached-byte readback distinguish failure evidence from completion;
+  this does not change production limits or prove that host load caused a failure.
 - The successful-live-context fixture sends generated timing updates every two
   seconds instead of allowing its five-second context to expire during I/O.
   The heartbeat ends with the observation future; cancellation tests retain

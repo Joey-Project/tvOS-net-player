@@ -582,7 +582,10 @@ final class UIPlaybackTests: XCTestCase {
         recordLifecycleState("after-relaunch")
 
         let emptyPlayer = identifiedElement("player-empty-state")
-        XCTAssertTrue(emptyPlayer.waitForExistence(timeout: 25))
+        XCTAssertTrue(
+            emptyPlayer.waitForExistence(timeout: 25),
+            relaunchLandmarkFailureDescription(savedCheckpoint: savedCheckpoint)
+        )
         XCTAssertNotEqual(
             playbackState.value as? String,
             "playing",
@@ -990,6 +993,91 @@ final class UIPlaybackTests: XCTestCase {
 
     private func identifiedElement(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).element
+    }
+
+    private func relaunchLandmarkFailureDescription(savedCheckpoint: Double) -> String {
+        let emptyPlayer = identifiedElement("player-empty-state")
+        let playbackState = identifiedElement("playback-state")
+        let playbackStateExists = playbackState.exists
+        let playbackStateValue = playbackStateExists ? playbackState.value as? String : nil
+        let knownPlaybackStates = ["paused", "buffering", "playing", "finished"]
+        let hasKnownPlaybackState =
+            playbackStateExists && knownPlaybackStates.contains(playbackStateValue ?? "")
+        let playbackStateSummary: String
+        if hasKnownPlaybackState, let playbackStateValue {
+            playbackStateSummary = playbackStateValue
+        } else {
+            playbackStateSummary = "unknown"
+        }
+        let timeline = identifiedElement("playback-timeline")
+        let timelineSummary: String
+        if !timeline.exists {
+            timelineSummary = "absent"
+        } else if let value = playbackTimeline(),
+            value.current.isFinite, value.duration.isFinite,
+            abs(value.current) <= 1_000_000_000, abs(value.duration) <= 1_000_000_000
+        {
+            timelineSummary = String(format: "%.1f/%.1f", value.current, value.duration)
+        } else {
+            timelineSummary = "unknown"
+        }
+
+        let appStatus = identifiedElement("app-status")
+        let expectedSummary = status(appStatus, contains: "2 Bilibili results are cached for LAN playback.")
+        let resumptionMessage = identifiedElement("bilibili-resumption-message")
+        let resumptionMessageExists = resumptionMessage.exists
+        let messageText =
+            resumptionMessageExists
+            ? (resumptionMessage.label + " " + (resumptionMessage.value as? String ?? "")).lowercased()
+            : ""
+        let messageCategory: String
+        if !resumptionMessageExists {
+            messageCategory = "absent"
+        } else if messageText.contains("checking") {
+            messageCategory = "checking"
+        } else if messageText.contains("restored") {
+            messageCategory = "restored"
+        } else if messageText.contains("checkpoint") {
+            messageCategory = "checkpoint"
+        } else if messageText.contains("retry") {
+            messageCategory = "retry-needed"
+        } else {
+            messageCategory = "other"
+        }
+
+        let continueButton = app.buttons["bilibili-resumption-continue"]
+        let retryButton = app.buttons["bilibili-resumption-retry"]
+        let forgetButton = app.buttons["bilibili-resumption-forget"]
+        let appStateSummary: String
+        switch app.state {
+        case .notRunning:
+            appStateSummary = "not-running"
+        case .runningBackground:
+            appStateSummary = "background"
+        case .runningBackgroundSuspended:
+            appStateSummary = "background-suspended"
+        case .runningForeground:
+            appStateSummary = "foreground"
+        case .unknown:
+            appStateSummary = "unknown"
+        @unknown default:
+            appStateSummary = "unknown"
+        }
+
+        let checkpointIsSafe = savedCheckpoint.isFinite && abs(savedCheckpoint) <= 1_000_000_000
+        let checkpointSummary = checkpointIsSafe ? String(format: "%.1f", savedCheckpoint) : "unknown"
+        let details =
+            "Relaunch empty-player landmark missing: appState=\(appStateSummary), "
+            + "emptyPlayer=\(emptyPlayer.exists), playbackStateExists=\(playbackStateExists), "
+            + "playbackState=\(playbackStateSummary), timelineExists=\(timeline.exists), "
+            + "timelineSeconds=\(timelineSummary), appStatusExists=\(appStatus.exists), "
+            + "cachedSummaryExpected=\(expectedSummary), resumptionMessageExists=\(resumptionMessageExists), "
+            + "resumptionMessageCategory=\(messageCategory), "
+            + "continue=\(continueButton.exists)/\(continueButton.exists && continueButton.isEnabled), "
+            + "retry=\(retryButton.exists)/\(retryButton.exists && retryButton.isEnabled), "
+            + "forget=\(forgetButton.exists)/\(forgetButton.exists && forgetButton.isEnabled), "
+            + "savedCheckpointSeconds=\(checkpointSummary), checkpointValidation=unknown"
+        return String(decoding: details.utf8.prefix(4096), as: UTF8.self)
     }
 
     private func recordLifecycleState(_ milestone: String) {
