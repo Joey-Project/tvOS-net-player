@@ -2068,11 +2068,38 @@ async fn run_native_high_preparation_probe(
     master_url: String,
     reader_id: &str,
     ready_marker: &Path,
+    bad_high_marker: &Path,
+    recovery_marker: &Path,
     control_directory: &Path,
 ) -> Result<ProcessCapture, String> {
     ensure_loopback_url(&master_url)?;
     let mut command = Command::new(probe_path);
-    command.args([
+    command.args(high_preparation_probe_arguments(
+        master_url,
+        reader_id,
+        ready_marker,
+        bad_high_marker,
+        recovery_marker,
+        control_directory,
+    ));
+    run_process(
+        command,
+        "native-high-preparation-continuous-probe",
+        Duration::from_secs(720) + PROBE_EXIT_GRACE,
+        MAX_PROBE_JSON_BYTES,
+    )
+    .await
+}
+
+fn high_preparation_probe_arguments(
+    master_url: String,
+    reader_id: &str,
+    ready_marker: &Path,
+    bad_high_marker: &Path,
+    recovery_marker: &Path,
+    control_directory: &Path,
+) -> Vec<String> {
+    vec![
         "--url".to_owned(),
         master_url,
         "--duration".to_owned(),
@@ -2083,19 +2110,16 @@ async fn run_native_high_preparation_probe(
         "640x360,320x180,640x360".to_owned(),
         "--ready-marker".to_owned(),
         ready_marker.to_string_lossy().into_owned(),
+        "--bad-high-trigger".to_owned(),
+        bad_high_marker.to_string_lossy().into_owned(),
+        "--recovery-observation-trigger".to_owned(),
+        recovery_marker.to_string_lossy().into_owned(),
         "--reader-id".to_owned(),
         reader_id.to_owned(),
         "--control-directory".to_owned(),
         control_directory.to_string_lossy().into_owned(),
         "--high-preparation-continuous".to_owned(),
-    ]);
-    run_process(
-        command,
-        "native-high-preparation-continuous-probe",
-        Duration::from_secs(720) + PROBE_EXIT_GRACE,
-        MAX_PROBE_JSON_BYTES,
-    )
-    .await
+    ]
 }
 
 async fn validate_reader_bound_master_playlist(
@@ -2614,6 +2638,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
     fs::set_permissions(&control_directory, fs::Permissions::from_mode(0o700))
         .map_err(|_| "native control directory permissions could not be restricted".to_owned())?;
     let ready_marker = temporary_root.join("decoder-ready.json");
+    let bad_high_marker = temporary_root.join("bad-high.trigger");
     let recovery_marker = temporary_root.join("recovery-observation.trigger");
     let phase_result = run_arm_phase(
         &state,
@@ -2625,6 +2650,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         &probe_path,
         &control_directory,
         &ready_marker,
+        &bad_high_marker,
         &recovery_marker,
         &origin,
         &fixture_report,
@@ -2658,6 +2684,7 @@ async fn run_arm_phase(
     probe_path: &Path,
     control_directory: &Path,
     ready_marker: &Path,
+    bad_high_marker: &Path,
     recovery_marker: &Path,
     origin: &Arc<OriginState>,
     report: &ReportStore,
@@ -2676,6 +2703,8 @@ async fn run_arm_phase(
     let master_url = master_url.to_owned();
     let reader_for_probe = reader_id.to_owned();
     let ready_for_probe = ready_marker.to_path_buf();
+    let bad_high_for_probe = bad_high_marker.to_path_buf();
+    let recovery_for_probe = recovery_marker.to_path_buf();
     let control_for_probe = control_directory.to_path_buf();
     let mut probe = AbortTask(Some(tokio::spawn(async move {
         run_native_high_preparation_probe(
@@ -2683,13 +2712,22 @@ async fn run_arm_phase(
             master_url,
             &reader_for_probe,
             &ready_for_probe,
+            &bad_high_for_probe,
+            &recovery_for_probe,
             &control_for_probe,
         )
         .await
     })));
 
-    if let Err(error) =
-        run_abr_fault_timeline(origin, &mut probe, ready_marker, report, recovery_marker).await
+    if let Err(error) = run_abr_fault_timeline(
+        origin,
+        &mut probe,
+        ready_marker,
+        bad_high_marker,
+        report,
+        recovery_marker,
+    )
+    .await
     {
         probe.abort();
         return Err(format!("ProgressiveAbr fault timeline failed: {error}"));
@@ -2835,6 +2873,42 @@ fn write_arm_report(path: &Path, report: &ArmReport) -> Result<(), String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    #[test]
+    fn continuous_probe_arguments_include_both_phase_markers_with_fixed_limits() {
+        let arguments = high_preparation_probe_arguments(
+            "http://127.0.0.1/master.m3u8?playback_reader=reader".to_owned(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            Path::new("/tmp/ready.json"),
+            Path::new("/tmp/bad-high.trigger"),
+            Path::new("/tmp/recovery.trigger"),
+            Path::new("/tmp/control"),
+        );
+        assert_eq!(
+            arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8?playback_reader=reader",
+                "--duration",
+                "600",
+                "--deadline",
+                "720",
+                "--expect-video-sizes",
+                "640x360,320x180,640x360",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--bad-high-trigger",
+                "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+                "--reader-id",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "--control-directory",
+                "/tmp/control",
+                "--high-preparation-continuous",
+            ]
+        );
+    }
 
     const TEST_READER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 

@@ -354,6 +354,7 @@ private struct ProbeOptions {
     let controlDirectory: String?
     let expectedVideoSizes: [VideoSize]
     let readyMarkerPath: String?
+    let badHighTriggerPath: String?
     let recoveryObservationTriggerPath: String?
     let minimumSteadyPlaySeconds: TimeInterval?
     let controlsAfterVideoSizeExpectations: Bool
@@ -368,6 +369,7 @@ private struct ProbeOptions {
         var controlDirectory: String?
         var expectedVideoSizes: [VideoSize]?
         var readyMarkerPath: String?
+        var badHighTriggerPath: String?
         var recoveryObservationTriggerPath: String?
         var minimumSteadyPlaySeconds: TimeInterval?
         var controlsAfterVideoSizeExpectations = false
@@ -439,6 +441,11 @@ private struct ProbeOptions {
                     throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 9)
                 }
                 readyMarkerPath = value
+            case "--bad-high-trigger":
+                guard badHighTriggerPath == nil, value.hasPrefix("/"), !value.isEmpty else {
+                    throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 15)
+                }
+                badHighTriggerPath = value
             case "--recovery-observation-trigger":
                 guard recoveryObservationTriggerPath == nil, value.hasPrefix("/"), !value.isEmpty else {
                     throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 11)
@@ -475,7 +482,7 @@ private struct ProbeOptions {
                     VideoSize(width: 640, height: 360),
                 ],
                 !controlsAfterVideoSizeExpectations,
-                readyMarkerPath != nil, recoveryObservationTriggerPath == nil,
+                readyMarkerPath != nil,
                 minimumSteadyPlaySeconds == nil
             else {
                 throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 13)
@@ -501,6 +508,25 @@ private struct ProbeOptions {
         guard recoveryObservationTriggerPath == nil || expectedVideoSizes != nil else {
             throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 11)
         }
+        if highPreparationContinuous,
+            (badHighTriggerPath == nil) != (recoveryObservationTriggerPath == nil)
+        {
+            throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 15)
+        }
+        if badHighTriggerPath != nil {
+            guard readyMarkerPath != nil, recoveryObservationTriggerPath != nil,
+                expectedVideoSizes == [
+                    VideoSize(width: 640, height: 360), VideoSize(width: 320, height: 180),
+                ]
+                    || expectedVideoSizes == [
+                        VideoSize(width: 640, height: 360),
+                        VideoSize(width: 320, height: 180),
+                        VideoSize(width: 640, height: 360),
+                    ]
+            else {
+                throw ProbeFailure(phase: "cli", domain: "ProbeCLI", code: 15)
+            }
+        }
         guard
             !controlsAfterVideoSizeExpectations
                 || (expectedVideoSizes != nil && duration > 30)
@@ -509,6 +535,7 @@ private struct ProbeOptions {
         }
         guard
             (recoveryObservationTriggerPath == nil && minimumSteadyPlaySeconds == nil)
+                || (highPreparationContinuous && minimumSteadyPlaySeconds == nil)
                 || (controlsAfterVideoSizeExpectations
                     && (minimumSteadyPlaySeconds ?? 0) <= duration - VideoSizePhasePolicy.controlReserveSeconds)
         else {
@@ -525,6 +552,7 @@ private struct ProbeOptions {
             controlDirectory: controlDirectory,
             expectedVideoSizes: expectedVideoSizes ?? [],
             readyMarkerPath: readyMarkerPath,
+            badHighTriggerPath: badHighTriggerPath,
             recoveryObservationTriggerPath: recoveryObservationTriggerPath,
             minimumSteadyPlaySeconds: minimumSteadyPlaySeconds,
             controlsAfterVideoSizeExpectations: controlsAfterVideoSizeExpectations
@@ -629,8 +657,8 @@ private struct ProbeOptions {
         try accept("minimum_duration_deadline", url: "http://localhost/live.m3u8", duration: 30, deadline: 45)
         try accept("custom_duration_deadline", url: "https://localhost/live.m3u8", duration: 300, deadline: 360)
         let readerID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        let highPreparationOptions = try parse([
-            "--url", "http://127.0.0.1/hls/session/master.m3u8?playback_reader=\(readerID)",
+        let highPreparationArguments = [
+            "--url", "http://127.0.0.1/hls/session/master.m3u8?playback_reader=" + readerID,
             "--duration", "600",
             "--deadline", "720",
             "--expect-video-sizes", "640x360,320x180,640x360",
@@ -638,8 +666,8 @@ private struct ProbeOptions {
             "--reader-id", readerID,
             "--control-directory", "/tmp/high-preparation-control",
             "--high-preparation-continuous",
-            "--validate-only",
-        ])
+        ]
+        let highPreparationOptions = try parse(highPreparationArguments + ["--validate-only"])
         guard highPreparationOptions.highPreparationContinuous,
             highPreparationOptions.readerID == readerID,
             highPreparationOptions.controlDirectory == "/tmp/high-preparation-control",
@@ -649,6 +677,28 @@ private struct ProbeOptions {
             throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 8)
         }
         passed.append("high_preparation_mode_requires_bound_reader_and_fixed_phase_limits")
+        let phasedHighPreparationOptions = try parse(
+            highPreparationArguments + [
+                "--bad-high-trigger", "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger", "/tmp/recovery.trigger",
+                "--validate-only",
+            ])
+        guard phasedHighPreparationOptions.highPreparationContinuous,
+            phasedHighPreparationOptions.readerID == readerID,
+            phasedHighPreparationOptions.controlDirectory == "/tmp/high-preparation-control",
+            phasedHighPreparationOptions.readyMarkerPath == "/tmp/high-preparation-decoder-ready.json",
+            phasedHighPreparationOptions.badHighTriggerPath == "/tmp/bad-high.trigger",
+            phasedHighPreparationOptions.recoveryObservationTriggerPath == "/tmp/recovery.trigger",
+            phasedHighPreparationOptions.expectedVideoSizes == [
+                VideoSize(width: 640, height: 360),
+                VideoSize(width: 320, height: 180),
+                VideoSize(width: 640, height: 360),
+            ],
+            phasedHighPreparationOptions.duration == 600, phasedHighPreparationOptions.deadline == 720
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 18)
+        }
+        passed.append("high_preparation_continuous_accepts_paired_phase_triggers")
         try reject(
             "high_preparation_reader_query_must_match_argument",
             arguments: [
@@ -664,6 +714,22 @@ private struct ProbeOptions {
             ],
             expectedCode: 14
         )
+        for (name, triggerArguments) in [
+            (
+                "high_preparation_continuous_rejects_bad_high_only",
+                ["--bad-high-trigger", "/tmp/bad-high.trigger"]
+            ),
+            (
+                "high_preparation_continuous_rejects_recovery_only",
+                ["--recovery-observation-trigger", "/tmp/recovery.trigger"]
+            ),
+        ] {
+            try reject(
+                name,
+                arguments: highPreparationArguments + triggerArguments,
+                expectedCode: 15
+            )
+        }
         let sizeOptions = try parse([
             "--url", "http://192.168.1.8/live.m3u8",
             "--expect-video-sizes", "1920x1080,1280x720,1920x1080",
@@ -689,6 +755,7 @@ private struct ProbeOptions {
             "--controls-after-video-size-expectations",
         ])
         guard markerOptions.readyMarkerPath == "/tmp/ready.json",
+            markerOptions.badHighTriggerPath == nil,
             markerOptions.recoveryObservationTriggerPath == "/tmp/recovery.trigger",
             markerOptions.minimumSteadyPlaySeconds == 110,
             markerOptions.controlsAfterVideoSizeExpectations
@@ -696,6 +763,98 @@ private struct ProbeOptions {
             throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 5)
         }
         passed.append("marker_and_minimum_steady_play_options_parse")
+        let standardPhasedOptions = try parse([
+            "--url", "http://192.168.1.8/live.m3u8",
+            "--duration", "600",
+            "--deadline", "720",
+            "--expect-video-sizes", "640x360,320x180,640x360",
+            "--ready-marker", "/tmp/ready.json",
+            "--bad-high-trigger", "/tmp/bad-high.trigger",
+            "--recovery-observation-trigger", "/tmp/recovery.trigger",
+            "--controls-after-video-size-expectations",
+            "--validate-only",
+        ])
+        guard standardPhasedOptions.duration == 600, standardPhasedOptions.deadline == 720,
+            standardPhasedOptions.expectedVideoSizes == [
+                VideoSize(width: 640, height: 360),
+                VideoSize(width: 320, height: 180),
+                VideoSize(width: 640, height: 360),
+            ],
+            standardPhasedOptions.readyMarkerPath == "/tmp/ready.json",
+            standardPhasedOptions.badHighTriggerPath == "/tmp/bad-high.trigger",
+            standardPhasedOptions.recoveryObservationTriggerPath == "/tmp/recovery.trigger",
+            standardPhasedOptions.controlsAfterVideoSizeExpectations
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 19)
+        }
+        passed.append("standard_three_phase_triggers_accept_actual_profile")
+        let bufferedMarkerOptions = try parse([
+            "--url", "http://192.168.1.8/live.m3u8",
+            "--duration", "130",
+            "--deadline", "175",
+            "--expect-video-sizes", "640x360,320x180",
+            "--ready-marker", "/tmp/ready.json",
+            "--bad-high-trigger", "/tmp/bad-high.trigger",
+            "--recovery-observation-trigger", "/tmp/recovery.trigger",
+            "--minimum-steady-play-seconds", "110",
+            "--controls-after-video-size-expectations",
+        ])
+        guard bufferedMarkerOptions.expectedVideoSizes.count == 2,
+            bufferedMarkerOptions.minimumSteadyPlaySeconds == 110,
+            bufferedMarkerOptions.badHighTriggerPath == "/tmp/bad-high.trigger",
+            bufferedMarkerOptions.recoveryObservationTriggerPath == "/tmp/recovery.trigger"
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "ProbeSelfTest", code: 14)
+        }
+        passed.append("buffered_two_phase_markers_accept_actual_profile")
+        try reject(
+            "bad_high_and_recovery_markers_must_be_paired",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--expect-video-sizes", "640x360,320x180",
+                "--ready-marker", "/tmp/ready.json",
+                "--bad-high-trigger", "/tmp/bad-high.trigger",
+            ],
+            expectedCode: 15
+        )
+        try reject(
+            "bad_high_trigger_requires_path_value",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--bad-high-trigger",
+            ],
+            expectedCode: 1
+        )
+        try reject(
+            "bad_high_trigger_requires_absolute_path",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--expect-video-sizes", "640x360,320x180,640x360",
+                "--recovery-observation-trigger", "/tmp/recovery.trigger",
+                "--bad-high-trigger", "bad-high.trigger",
+            ],
+            expectedCode: 15
+        )
+        try reject(
+            "bad_high_trigger_duplicate_flag",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--expect-video-sizes", "640x360,320x180,640x360",
+                "--recovery-observation-trigger", "/tmp/recovery.trigger",
+                "--bad-high-trigger", "/tmp/bad-high.trigger",
+                "--bad-high-trigger", "/tmp/duplicate.trigger",
+            ],
+            expectedCode: 15
+        )
+        try reject(
+            "bad_high_trigger_requires_progressive_phase_markers",
+            arguments: [
+                "--url", "http://192.168.1.8/live.m3u8",
+                "--expect-video-sizes", "640x360",
+                "--bad-high-trigger", "/tmp/bad-high.trigger",
+            ],
+            expectedCode: 15
+        )
         try reject("public_ipv4", arguments: ["--url", "http://8.8.8.8/live.m3u8"], expectedCode: 6)
         try reject("public_ipv6", arguments: ["--url", "http://[2001:4860:4860::8888]/live.m3u8"], expectedCode: 6)
         try reject("userinfo", arguments: ["--url", "http://name:secret@192.168.1.8/live.m3u8"], expectedCode: 6)
@@ -1330,13 +1489,25 @@ private struct VideoSizeExpectationTracker {
     }
 
     private var entries: [Entry]
+    private let phaseAware: Bool
+    private var badHighStarted = false
+    private var recoveryStarted = false
     private(set) var currentIndex = 0
 
-    init(expectedSizes: [VideoSize]) {
+    init(expectedSizes: [VideoSize], phaseAware: Bool = false) {
         entries = expectedSizes.map { Entry(size: $0) }
+        self.phaseAware = phaseAware
     }
 
     var isComplete: Bool { currentIndex == entries.count }
+
+    mutating func markBadHighStarted() {
+        badHighStarted = true
+    }
+
+    mutating func markRecoveryStarted() {
+        recoveryStarted = true
+    }
 
     mutating func observe(
         width: Int,
@@ -1347,6 +1518,11 @@ private struct VideoSizeExpectationTracker {
         observedMonotonicSeconds: Double? = nil
     ) {
         guard currentIndex < entries.count else { return }
+        guard !phaseAware || (currentIndex != 1 || badHighStarted),
+            !phaseAware || (currentIndex != 2 || recoveryStarted)
+        else {
+            return
+        }
         let size = VideoSize(width: width, height: height)
         guard entries[currentIndex].size == size else { return }
         guard !entries[currentIndex].timestamps.contains(timestampNanoseconds),
@@ -1490,6 +1666,90 @@ private struct VideoSizeExpectationTracker {
         else {
             throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 10)
         }
+        var phaseAwareTracker = VideoSizeExpectationTracker(
+            expectedSizes: [high, low, high], phaseAware: true
+        )
+        for index in 1...3 {
+            phaseAwareTracker.observe(
+                width: high.width, height: high.height,
+                timestampNanoseconds: Int64(index), observedElapsedSeconds: Double(index),
+                observedMonotonicSeconds: 1_000 + Double(index)
+            )
+        }
+        for index in 1...3 {
+            phaseAwareTracker.observe(
+                width: low.width, height: low.height,
+                timestampNanoseconds: Int64(10 + index), observedElapsedSeconds: Double(10 + index),
+                observedMonotonicSeconds: 1_010 + Double(index)
+            )
+        }
+        guard phaseAwareTracker.currentIndex == 1,
+            phaseAwareTracker.progress[1]["distinct_frame_count"] as? Int == 0
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 11)
+        }
+        phaseAwareTracker.markBadHighStarted()
+        for index in 1...3 {
+            phaseAwareTracker.observe(
+                width: low.width, height: low.height,
+                timestampNanoseconds: Int64(20 + index), observedElapsedSeconds: Double(20 + index),
+                observedMonotonicSeconds: 1_020 + Double(index)
+            )
+        }
+        for index in 1...3 {
+            phaseAwareTracker.observe(
+                width: high.width, height: high.height,
+                timestampNanoseconds: Int64(30 + index), observedElapsedSeconds: Double(30 + index),
+                observedMonotonicSeconds: 1_030 + Double(index)
+            )
+        }
+        guard phaseAwareTracker.currentIndex == 2,
+            phaseAwareTracker.progress[2]["distinct_frame_count"] as? Int == 0
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 12)
+        }
+        phaseAwareTracker.markRecoveryStarted()
+        for index in 1...3 {
+            phaseAwareTracker.observe(
+                width: high.width, height: high.height,
+                timestampNanoseconds: Int64(40 + index), observedElapsedSeconds: Double(40 + index),
+                observedMonotonicSeconds: 1_040 + Double(index)
+            )
+        }
+        guard phaseAwareTracker.isComplete, phaseAwareTracker.hasValidNumericSamples else {
+            throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 13)
+        }
+        var bufferedPhaseTracker = VideoSizeExpectationTracker(
+            expectedSizes: [high, low], phaseAware: true
+        )
+        for index in 1...3 {
+            bufferedPhaseTracker.observe(
+                width: high.width, height: high.height,
+                timestampNanoseconds: Int64(100 + index), observedElapsedSeconds: Double(100 + index),
+                observedMonotonicSeconds: 1_100 + Double(index)
+            )
+        }
+        for index in 1...3 {
+            bufferedPhaseTracker.observe(
+                width: low.width, height: low.height,
+                timestampNanoseconds: Int64(110 + index), observedElapsedSeconds: Double(110 + index),
+                observedMonotonicSeconds: 1_110 + Double(index)
+            )
+        }
+        guard bufferedPhaseTracker.currentIndex == 1 else {
+            throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 15)
+        }
+        bufferedPhaseTracker.markBadHighStarted()
+        for index in 1...3 {
+            bufferedPhaseTracker.observe(
+                width: low.width, height: low.height,
+                timestampNanoseconds: Int64(120 + index), observedElapsedSeconds: Double(120 + index),
+                observedMonotonicSeconds: 1_120 + Double(index)
+            )
+        }
+        guard bufferedPhaseTracker.isComplete, bufferedPhaseTracker.hasValidNumericSamples else {
+            throw ProbeFailure(phase: "self_test", domain: "VideoSizeExpectationTracker", code: 16)
+        }
         return [
             "video_size_expectations_require_ordered_three_unique_timestamps",
             "duplicate_timestamps_and_out_of_order_sizes_do_not_advance",
@@ -1498,6 +1758,10 @@ private struct VideoSizeExpectationTracker {
             "video_size_expectations_require_numeric_elapsed_times_for_completion",
             "video_size_expectations_reject_nonmonotonic_elapsed_times",
             "video_size_expectations_retain_shared_monotonic_timestamps",
+            "phase_aware_video_size_expectations_ignore_low_frames_before_bad_high",
+            "phase_aware_video_size_expectations_ignore_recovered_high_before_recovery",
+            "phase_aware_video_size_expectations_accept_three_unique_samples_per_phase",
+            "phase_aware_video_size_expectations_accept_two_stage_buffered_profile",
         ]
     }
 }
@@ -1795,7 +2059,10 @@ private final class PlaybackProbe {
 
     init(options: ProbeOptions) {
         self.options = options
-        videoSizeExpectations = VideoSizeExpectationTracker(expectedSizes: options.expectedVideoSizes)
+        videoSizeExpectations = VideoSizeExpectationTracker(
+            expectedSizes: options.expectedVideoSizes,
+            phaseAware: options.badHighTriggerPath != nil
+        )
     }
 
     static func runSelfTest() throws -> [String] {
@@ -2354,6 +2621,16 @@ private final class PlaybackProbe {
             timestampNanoseconds > Double(Int64.min), timestampNanoseconds < Double(Int64.max)
         {
             sizeObservation["display_time_seconds"] = displaySeconds
+            if let path = options.badHighTriggerPath,
+                RecoveryObservationTrigger.isFreshEmptyRegularFile(at: path)
+            {
+                videoSizeExpectations.markBadHighStarted()
+            }
+            if let path = options.recoveryObservationTriggerPath,
+                RecoveryObservationTrigger.isFreshEmptyRegularFile(at: path)
+            {
+                videoSizeExpectations.markRecoveryStarted()
+            }
             videoSizeExpectations.observe(
                 width: width,
                 height: height,

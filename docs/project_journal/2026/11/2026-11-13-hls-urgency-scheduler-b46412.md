@@ -106,6 +106,10 @@ superseded_by:
    clocks and explicit synchronization. Keep functional correctness separate
    from measured performance; real I/O and native playback retain bounded
    observation windows and their independently approved acceptance budgets.
+6. Collect bounded simulator, application and testmanagerd diagnostics for
+   tvOS relaunch snapshot/helper-connection loss. Do not infer a missing view,
+   autoplay or an incorrect source request from an unavailable snapshot or an
+   incomplete fixture flow; preserve the full five-case acceptance contract.
 
 ## High Preparation Slice Design
 - Continue from PR #107's production reporting and bounded request urgency.
@@ -193,6 +197,25 @@ superseded_by:
   base-to-head diff. The complete native3, UI5-per-platform and fixture4 contracts,
   source identities, deadlines and assertions remain unchanged. Packaging the
   successor does not establish this feature's native comparison result.
+
+## Native Sample Phase Binding
+- Startup adaptation can produce low-resolution frames before the source fault
+  starts. First-seen samples alone must not stand in for evidence collected
+  inside the controlled fault and recovery windows.
+- Explicit fixture phase markers gate only expectation sampling: retain initial
+  high frames, collect new low frames after the bad-high transition, and collect
+  recovered high frames only after recovery. Each stage still requires three
+  distinct actual decoded pixel buffers and their original numeric timestamps.
+- Keep the existing 6-second baseline, 45-second fault, 600/130/30-second native
+  profiles, default buffering and one player. Markers never force quality,
+  seek or playback, fabricate frames, or replace the frame-level evidence with
+  periodic timeline dimensions. Missing or invalid phase evidence fails closed.
+- Calls without the new bad-high marker retain their original behavior,
+  including standard recovery-only invocations. The OFF and ON comparison
+  arms use the same paired phase markers and fixed fault timeline. Preserve
+  the existing output contract and independently released artifact producers.
+  Correct phase sampling is not proof of faster recovery or of a fault causing
+  an earlier startup downshift.
 
 ## Native Comparison Contract
 - `just test-media-high-preparation` is an opt-in, credential-free comparison

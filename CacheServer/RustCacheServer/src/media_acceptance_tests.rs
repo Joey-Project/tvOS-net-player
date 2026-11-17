@@ -456,6 +456,7 @@ struct PlaylistExpectations {
 
 struct ProbeMarkerPaths {
     ready: Option<PathBuf>,
+    bad_high: Option<PathBuf>,
     recovery_observation: Option<PathBuf>,
 }
 
@@ -1248,6 +1249,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     let recovery_marker_path = case
         .uses_progressive_abr()
         .then(|| temporary_root.join("recovery-observation.trigger"));
+    let bad_high_marker_path = case
+        .uses_progressive_abr()
+        .then(|| temporary_root.join("bad-high.trigger"));
     let minimum_steady_play_seconds =
         matches!(case, NativeCase::BufferedContinuity).then_some(MINIMUM_STEADY_PLAY_SECONDS);
     let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
@@ -1261,6 +1265,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         expected_sizes.to_owned(),
         ProbeMarkerPaths {
             ready: ready_marker_path.clone(),
+            bad_high: bad_high_marker_path.clone(),
             recovery_observation: recovery_marker_path.clone(),
         },
         minimum_steady_play_seconds,
@@ -1273,6 +1278,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
             ready_marker_path
                 .as_deref()
                 .expect("ABR marker path is present"),
+            bad_high_marker_path
+                .as_deref()
+                .expect("ABR bad-high marker path is present"),
             &report,
             recovery_marker_path
                 .as_deref()
@@ -2875,6 +2883,7 @@ async fn run_abr_fault_timeline(
     origin: &Arc<OriginState>,
     probe: &mut AbortTask<Result<ProcessCapture, String>>,
     marker_path: &Path,
+    bad_high_trigger_path: &Path,
     report: &ReportStore,
     recovery_observation_path: &Path,
 ) -> Result<(), String> {
@@ -2908,11 +2917,16 @@ async fn run_abr_fault_timeline(
         report_data.fault_timeline.baseline_start_elapsed_ms = Some(baseline_elapsed_ms);
     }
     wait_while_probe_runs(origin, probe, BASELINE_WINDOW).await?;
-    origin.set_phase(PHASE_BAD_HIGH)?;
+    begin_bad_high_phase(origin, bad_high_trigger_path)?;
     wait_while_probe_runs(origin, probe, BAD_HIGH_WINDOW).await?;
     origin.set_phase(PHASE_RECOVERY)?;
     create_empty_private_marker(recovery_observation_path)?;
     Ok(())
+}
+
+fn begin_bad_high_phase(origin: &OriginState, trigger_path: &Path) -> Result<(), String> {
+    origin.set_phase(PHASE_BAD_HIGH)?;
+    create_empty_private_marker(trigger_path)
 }
 
 fn create_empty_private_marker(path: &Path) -> Result<(), String> {
@@ -3039,8 +3053,55 @@ async fn run_native_probe(
     minimum_steady_play_seconds: Option<u64>,
 ) -> Result<ProcessCapture, String> {
     ensure_loopback_url(&master_url)?;
+    let command = build_native_probe_command(
+        probe_path,
+        master_url,
+        duration,
+        deadline,
+        expected_sizes,
+        marker_paths,
+        minimum_steady_play_seconds,
+    );
+    run_process(
+        command,
+        "native-probe",
+        Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
+        MAX_PROBE_JSON_BYTES,
+    )
+    .await
+}
+
+fn build_native_probe_command(
+    probe_path: PathBuf,
+    master_url: String,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: String,
+    marker_paths: ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
+) -> Command {
+    let arguments = native_probe_arguments(
+        master_url,
+        duration,
+        deadline,
+        expected_sizes,
+        marker_paths,
+        minimum_steady_play_seconds,
+    );
     let mut command = Command::new(probe_path);
-    command.args([
+    command.args(arguments);
+    command
+}
+
+fn native_probe_arguments(
+    master_url: String,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: String,
+    marker_paths: ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
+) -> Vec<String> {
+    let mut arguments = vec![
         "--url".to_owned(),
         master_url,
         "--duration".to_owned(),
@@ -3049,33 +3110,33 @@ async fn run_native_probe(
         deadline.to_string(),
         "--expect-video-sizes".to_owned(),
         expected_sizes,
-    ]);
+    ];
     if let Some(path) = marker_paths.ready {
-        command.args([
+        arguments.extend([
             "--ready-marker".to_owned(),
             path.to_string_lossy().into_owned(),
             "--controls-after-video-size-expectations".to_owned(),
         ]);
     }
+    if let Some(path) = marker_paths.bad_high {
+        arguments.extend([
+            "--bad-high-trigger".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
     if let Some(path) = marker_paths.recovery_observation {
-        command.args([
+        arguments.extend([
             "--recovery-observation-trigger".to_owned(),
             path.to_string_lossy().into_owned(),
         ]);
     }
     if let Some(seconds) = minimum_steady_play_seconds {
-        command.args([
+        arguments.extend([
             "--minimum-steady-play-seconds".to_owned(),
             seconds.to_string(),
         ]);
     }
-    run_process(
-        command,
-        "native-probe",
-        Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
-        MAX_PROBE_JSON_BYTES,
-    )
-    .await
+    arguments
 }
 
 fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
@@ -6879,6 +6940,130 @@ mod recovery_observation_tests {
         assert_eq!(metadata.len(), 0);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert!(create_empty_private_marker(&marker).is_err());
+    }
+
+    #[test]
+    fn bad_high_marker_is_created_only_after_the_fault_phase_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("bad-high.trigger");
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report,
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+
+        assert!(!marker.exists());
+        assert_eq!(origin.phase.load(Ordering::Acquire), PHASE_BASELINE);
+        begin_bad_high_phase(&origin, &marker).unwrap();
+        assert_eq!(origin.phase.load(Ordering::Acquire), PHASE_BAD_HIGH);
+        let metadata = std::fs::symlink_metadata(&marker).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(begin_bad_high_phase(&origin, &marker).is_err());
+    }
+
+    #[test]
+    fn native_probe_arguments_include_phase_markers_in_order_and_preserve_legacy_shape() {
+        let buffered_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            130,
+            175,
+            "640x360,320x180".to_owned(),
+            ProbeMarkerPaths {
+                ready: Some(PathBuf::from("/tmp/ready.json")),
+                bad_high: Some(PathBuf::from("/tmp/bad-high.trigger")),
+                recovery_observation: Some(PathBuf::from("/tmp/recovery.trigger")),
+            },
+            Some(110),
+        );
+        assert_eq!(
+            buffered_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "130",
+                "--deadline",
+                "175",
+                "--expect-video-sizes",
+                "640x360,320x180",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--controls-after-video-size-expectations",
+                "--bad-high-trigger",
+                "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+                "--minimum-steady-play-seconds",
+                "110",
+            ]
+        );
+
+        let abr_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            600,
+            720,
+            "640x360,320x180,640x360".to_owned(),
+            ProbeMarkerPaths {
+                ready: Some(PathBuf::from("/tmp/ready.json")),
+                bad_high: Some(PathBuf::from("/tmp/bad-high.trigger")),
+                recovery_observation: Some(PathBuf::from("/tmp/recovery.trigger")),
+            },
+            None,
+        );
+        assert_eq!(
+            abr_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "600",
+                "--deadline",
+                "720",
+                "--expect-video-sizes",
+                "640x360,320x180,640x360",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--controls-after-video-size-expectations",
+                "--bad-high-trigger",
+                "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+            ]
+        );
+
+        let legacy_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            30,
+            45,
+            "640x360".to_owned(),
+            ProbeMarkerPaths {
+                ready: None,
+                bad_high: None,
+                recovery_observation: None,
+            },
+            None,
+        );
+        assert_eq!(
+            legacy_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "30",
+                "--deadline",
+                "45",
+                "--expect-video-sizes",
+                "640x360",
+            ]
+        );
     }
 
     #[test]
