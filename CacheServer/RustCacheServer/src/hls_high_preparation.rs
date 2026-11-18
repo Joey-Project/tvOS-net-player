@@ -27,7 +27,7 @@ use crate::{
     hls_playback_context::{PlaybackContextSnapshot, PlaybackTimingSample, is_canonical_uuid_v4},
     hls_playback_progress::PlaybackProgressIntent,
     hls_range_cache::HlsRangeError,
-    hls_readiness::{CacheWindowReason, CacheWindowState, PlaybackWindow},
+    hls_readiness::{CacheWindowInspection, CacheWindowReason, CacheWindowState, PlaybackWindow},
     playback_policy::variant_is_avplayer_h264_aac_hls_compatible,
     playback_request_urgency::PlaybackSidxMap,
 };
@@ -113,6 +113,8 @@ pub(crate) struct HighPreparationPlanObservation {
     pub(crate) window_start_seconds: Option<f64>,
     pub(crate) window_end_seconds: Option<f64>,
     pub(crate) initial_window_readable: Option<bool>,
+    pub(crate) initial_inspection: Option<CacheWindowInspection>,
+    pub(crate) final_inspection: Option<CacheWindowInspection>,
     pub(crate) selected_spans: Vec<HighPreparationResourceSpanObservation>,
     pub(crate) outcome: HighPreparationPlanOutcome,
     pub(crate) defer_reason: Option<HighPreparationDeferReason>,
@@ -384,7 +386,12 @@ impl HighPreparationCoordinator {
         push_observation(&mut state.observation, observation);
     }
 
-    fn record_initial_window_readability(&self, plan_id: u64, readable: Option<bool>) {
+    fn record_initial_inspection(
+        &self,
+        plan_id: u64,
+        inspection: CacheWindowInspection,
+        readable: Option<bool>,
+    ) {
         let mut state = self
             .inner
             .state
@@ -392,6 +399,18 @@ impl HighPreparationCoordinator {
             .expect("HLS high-preparation coordinator lock poisoned");
         if let Some(observation) = find_observation_mut(&mut state.observation, plan_id) {
             observation.initial_window_readable = readable;
+            observation.initial_inspection = Some(inspection);
+        }
+    }
+
+    fn record_final_inspection(&self, plan_id: u64, inspection: CacheWindowInspection) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("HLS high-preparation coordinator lock poisoned");
+        if let Some(observation) = find_observation_mut(&mut state.observation, plan_id) {
+            observation.final_inspection = Some(inspection);
         }
     }
 
@@ -706,6 +725,8 @@ fn empty_plan_observation(reader_id: &str) -> HighPreparationPlanObservation {
         window_start_seconds: None,
         window_end_seconds: None,
         initial_window_readable: None,
+        initial_inspection: None,
+        final_inspection: None,
         selected_spans: Vec::new(),
         outcome: HighPreparationPlanOutcome::Deferred,
         defer_reason: None,
@@ -1149,7 +1170,11 @@ async fn run_high_preparation_inner(
         CacheWindowState::Missing => Some(false),
         CacheWindowState::Unknown => None,
     };
-    coordinator.record_initial_window_readability(plan.plan_id, initial_window_readable);
+    coordinator.record_initial_inspection(
+        plan.plan_id,
+        initial_inspection,
+        initial_window_readable,
+    );
     match initial_inspection.state {
         CacheWindowState::Readable => {
             coordinator.finish_plan(
@@ -1219,6 +1244,7 @@ async fn run_high_preparation_inner(
         .hls_cache
         .inspect_cached_playback_window(&plan.session_id, &plan.target, plan.window)
         .await;
+    coordinator.record_final_inspection(plan.plan_id, final_inspection);
     let window_readable = final_inspection.state == CacheWindowState::Readable;
     let current_reason = plan_control_reason(&state, &coordinator, &plan);
     let cancellation_reason = *cancel_reason
@@ -1928,6 +1954,47 @@ mod integration_tests {
         .expect("retired job should release reader and global slots");
     }
 
+    #[test]
+    fn initial_unknown_inspection_is_retained_before_early_defer() {
+        let coordinator = HighPreparationCoordinator::default();
+        let mut observation = empty_plan_observation("inspection-reader");
+        observation.plan_id = 1_010;
+        observation.outcome = HighPreparationPlanOutcome::Admitted;
+        observation.initial_window_readable = None;
+        coordinator.record_admitted(observation);
+
+        let inspection = CacheWindowInspection::unknown(CacheWindowReason::Busy, 0);
+        coordinator.record_initial_inspection(1_010, inspection, None);
+        coordinator.finish_plan(
+            1_010,
+            HighPreparationPlanOutcome::Deferred,
+            Some(HighPreparationDeferReason::CacheInspectionUnavailable),
+            0,
+            false,
+            &[false],
+        );
+
+        let aggregate = coordinator.observation_for_tests();
+        let plan = aggregate
+            .plan_history
+            .iter()
+            .find(|plan| plan.plan_id == 1_010)
+            .expect("early-deferred plan should remain in history");
+        assert_eq!(Some(inspection), plan.initial_inspection);
+        assert_eq!(None, plan.final_inspection);
+        assert_eq!(None, plan.initial_window_readable);
+        assert_eq!(HighPreparationPlanOutcome::Deferred, plan.outcome);
+        assert_eq!(
+            Some(HighPreparationDeferReason::CacheInspectionUnavailable),
+            plan.defer_reason
+        );
+        assert_eq!(0, plan.requested_resource_ranges);
+        assert_eq!(0, aggregate.requested_resource_ranges);
+        assert_eq!(1, aggregate.admitted_plans);
+        assert_eq!(1, aggregate.deferred_plans);
+        assert_eq!(0, aggregate.completed_plans);
+    }
+
     #[tokio::test]
     async fn disabled_coordinator_preserves_context_reporting_and_reader_requests() {
         let harness = Harness::new(false).await;
@@ -2345,6 +2412,18 @@ mod integration_tests {
             plan.defer_reason,
         );
         assert_eq!(plan.initial_window_readable, Some(false));
+        let initial_inspection = plan
+            .initial_inspection
+            .expect("initial cache inspection should be observed");
+        assert_eq!(CacheWindowState::Missing, initial_inspection.state);
+        assert_eq!(CacheWindowReason::NotCached, initial_inspection.reason);
+        assert!(initial_inspection.checked_bytes > 0);
+        let final_inspection = plan
+            .final_inspection
+            .expect("terminal cache inspection should be observed");
+        assert_eq!(CacheWindowState::Readable, final_inspection.state);
+        assert_eq!(CacheWindowReason::None, final_inspection.reason);
+        assert!(final_inspection.checked_bytes > 0);
         assert!(plan.window_readable);
         assert_eq!(plan.window_start_seconds, Some(20.0));
         assert_eq!(plan.window_end_seconds, Some(40.0));

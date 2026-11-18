@@ -161,6 +161,8 @@ fn plan_observation(
         window_start_seconds: Some(20.0),
         window_end_seconds: Some(40.0),
         initial_window_readable: Some(false),
+        initial_inspection: None,
+        final_inspection: None,
         selected_spans: Vec::new(),
         outcome,
         defer_reason: None,

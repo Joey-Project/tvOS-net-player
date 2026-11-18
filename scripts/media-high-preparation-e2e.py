@@ -45,6 +45,11 @@ COORDINATOR_DEFER_REASONS = {
     "JobDeadlineExceeded", "OwnershipChanged", "Seek", "PausedOrStopped", "Preempted",
     "RangeFailure", "WindowNotReadable",
 }
+CACHE_INSPECTION_STATES = {"Readable", "Missing", "Unknown"}
+CACHE_INSPECTION_REASONS = {
+    "None", "NotCached", "IndexUnavailable", "OutOfRange", "Busy",
+    "BudgetExceeded", "IdentityChanged", "IoFailure",
+}
 TEST_NAME = "media_high_preparation_native_tests::native_high_preparation_off_on_comparison"
 PROBE_SELF_TEST_CASE = "high_preparation_player_verification_survives_cleanup"
 PRIVATE_CONTROL_PUBLISH_CASE = "high_preparation_control_publishes_private_atomic_samples_under_umask_022_and_077"
@@ -55,6 +60,22 @@ NEWLY_READABLE_SEMANTICS = "one_byte_lower_bound_per_exact_range_none_to_full_so
 
 class HighPreparationError(RuntimeError):
     pass
+
+
+def _validate_cache_inspection_fields(plan: dict[str, Any]) -> None:
+    expected_keys = {"state", "reason", "checked_bytes"}
+    for key in ("initial_inspection", "final_inspection"):
+        if key not in plan:
+            continue
+        inspection = plan[key]
+        if not isinstance(inspection, dict) or set(inspection) != expected_keys:
+            raise HighPreparationError("Cache inspection diagnostic is malformed.")
+        if type(inspection["state"]) is not str or inspection["state"] not in CACHE_INSPECTION_STATES \
+            or type(inspection["reason"]) is not str or inspection["reason"] not in CACHE_INSPECTION_REASONS:
+            raise HighPreparationError("Cache inspection diagnostic state or reason is unknown.")
+        checked_bytes = inspection["checked_bytes"]
+        if type(checked_bytes) is not int or not 0 <= checked_bytes <= (2**64 - 1):
+            raise HighPreparationError("Cache inspection checked-byte count is outside its unsigned bound.")
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -459,6 +480,7 @@ def validate_arm_report(value: Any, *, expected_arm: str) -> None:
     for plan in plans:
         if not isinstance(plan, dict) or not isinstance(plan.get("selected_spans"), list) or len(plan["selected_spans"]) > MAX_SELECTED_SPANS:
             raise HighPreparationError("Plan evidence is malformed or exceeds its span bound.")
+        _validate_cache_inspection_fields(plan)
         if "downloaded_bytes" in plan or "origin_attempts" in plan:
             raise HighPreparationError("Logical plan observations were mislabeled as transfer evidence.")
     plan_retention = value.get("plan_history_retention")
@@ -547,14 +569,17 @@ def validate_arm_report(value: Any, *, expected_arm: str) -> None:
         recent = coordinator.get("recent_plans")
         if not isinstance(recent, list) or len(recent) > MAX_COORDINATOR_DIAGNOSTIC_PLANS:
             raise HighPreparationError("Coordinator plan summaries exceed their retention bound.")
-        expected_plan_keys = {
+        required_plan_keys = {
             "plan_id", "outcome", "defer_reason", "window_start_seconds", "window_end_seconds",
             "requested_resource_ranges", "readable_resource_ranges", "deferred_resource_ranges",
             "selected_span_count",
         }
+        optional_plan_keys = {"initial_inspection", "final_inspection"}
         for plan in recent:
-            if not isinstance(plan, dict) or set(plan) != expected_plan_keys:
+            if not isinstance(plan, dict) or not required_plan_keys.issubset(plan) \
+                or set(plan) - required_plan_keys - optional_plan_keys:
                 raise HighPreparationError("Coordinator plan summary is malformed or contains unexpected fields.")
+            _validate_cache_inspection_fields(plan)
             if type(plan.get("plan_id")) is not int or not 0 <= plan["plan_id"] <= (2**64 - 1):
                 raise HighPreparationError("Coordinator plan identifier is outside its unsigned bound.")
             if type(plan.get("outcome")) is not str or plan["outcome"] not in COORDINATOR_PLAN_OUTCOMES:

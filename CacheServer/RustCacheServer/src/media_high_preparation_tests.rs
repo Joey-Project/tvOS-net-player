@@ -39,6 +39,7 @@ use crate::{
         HighPreparationPlanOutcome, HighPreparationResourceKind,
     },
     hls_playback_context::PlaybackTimingSample,
+    hls_readiness::{CacheWindowInspection, CacheWindowReason, CacheWindowState},
     playback_request_urgency::PlaybackSidxMap,
 };
 
@@ -159,6 +160,48 @@ struct CoordinatorPlanSummaryReport {
     readable_resource_ranges: u32,
     deferred_resource_ranges: u32,
     selected_span_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_inspection: Option<CacheWindowInspectionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_inspection: Option<CacheWindowInspectionReport>,
+}
+
+#[derive(Clone, Serialize)]
+struct CacheWindowInspectionReport {
+    state: &'static str,
+    reason: &'static str,
+    checked_bytes: u64,
+}
+
+impl From<CacheWindowInspection> for CacheWindowInspectionReport {
+    fn from(inspection: CacheWindowInspection) -> Self {
+        Self {
+            state: cache_window_state_name(inspection.state),
+            reason: cache_window_reason_name(inspection.reason),
+            checked_bytes: inspection.checked_bytes,
+        }
+    }
+}
+
+fn cache_window_state_name(state: CacheWindowState) -> &'static str {
+    match state {
+        CacheWindowState::Readable => "Readable",
+        CacheWindowState::Missing => "Missing",
+        CacheWindowState::Unknown => "Unknown",
+    }
+}
+
+fn cache_window_reason_name(reason: CacheWindowReason) -> &'static str {
+    match reason {
+        CacheWindowReason::None => "None",
+        CacheWindowReason::NotCached => "NotCached",
+        CacheWindowReason::IndexUnavailable => "IndexUnavailable",
+        CacheWindowReason::OutOfRange => "OutOfRange",
+        CacheWindowReason::Busy => "Busy",
+        CacheWindowReason::BudgetExceeded => "BudgetExceeded",
+        CacheWindowReason::IdentityChanged => "IdentityChanged",
+        CacheWindowReason::IoFailure => "IoFailure",
+    }
 }
 
 #[derive(Serialize)]
@@ -219,6 +262,10 @@ struct PlanReport {
     window_start_seconds: f64,
     window_end_seconds: f64,
     initial_window_readable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_inspection: Option<CacheWindowInspectionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_inspection: Option<CacheWindowInspectionReport>,
     outcome: &'static str,
     window_readable: bool,
     admitted_sample_monotonic_seconds: f64,
@@ -1061,6 +1108,8 @@ fn coordinator_diagnostics(
                 readable_resource_ranges: plan.readable_resource_ranges,
                 deferred_resource_ranges: plan.deferred_resource_ranges,
                 selected_span_count: plan.selected_spans.len(),
+                initial_inspection: plan.initial_inspection.map(Into::into),
+                final_inspection: plan.final_inspection.map(Into::into),
             })
             .collect(),
         projected_history_truncated: observation.plan_history.len() > TRACKED_PLAN_LIMIT,
@@ -1781,6 +1830,8 @@ fn assess_plan(
         window_start_seconds: captured.before.start_seconds,
         window_end_seconds: captured.before.end_seconds,
         initial_window_readable: captured.observation.initial_window_readable,
+        initial_inspection: captured.observation.initial_inspection.map(Into::into),
+        final_inspection: captured.observation.final_inspection.map(Into::into),
         outcome: plan_outcome_name(captured.observation.outcome),
         window_readable: captured.observation.window_readable,
         admitted_sample_monotonic_seconds: captured.admitted_sample_monotonic_seconds,
@@ -3115,6 +3166,8 @@ mod pure_helper_tests {
             window_start_seconds: Some(before.start_seconds),
             window_end_seconds: Some(before.end_seconds),
             initial_window_readable: Some(false),
+            initial_inspection: None,
+            final_inspection: None,
             selected_spans: vec![
                 crate::hls_high_preparation::HighPreparationResourceSpanObservation {
                     kind: HighPreparationResourceKind::Video,
@@ -3453,6 +3506,12 @@ mod pure_helper_tests {
             window_start_seconds: 10.0,
             window_end_seconds: 30.0,
             initial_window_readable: Some(false),
+            initial_inspection: Some(CacheWindowInspectionReport::from(
+                CacheWindowInspection::missing(CacheWindowReason::NotCached, 17),
+            )),
+            final_inspection: Some(CacheWindowInspectionReport::from(
+                CacheWindowInspection::readable(29),
+            )),
             outcome: "Completed",
             window_readable: true,
             admitted_sample_monotonic_seconds: 100.0,
@@ -3555,6 +3614,12 @@ mod pure_helper_tests {
                         readable_resource_ranges: u32::MAX,
                         deferred_resource_ranges: u32::MAX,
                         selected_span_count: 1_024,
+                        initial_inspection: Some(CacheWindowInspectionReport::from(
+                            CacheWindowInspection::unknown(CacheWindowReason::Busy, 31),
+                        )),
+                        final_inspection: Some(CacheWindowInspectionReport::from(
+                            CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 47),
+                        )),
                     })
                     .collect(),
                 projected_history_truncated: false,
@@ -3617,6 +3682,55 @@ mod pure_helper_tests {
                 .map(Vec::len),
             Some(TRACKED_PLAN_LIMIT)
         );
+        assert_eq!(
+            value["plans"][0]["initial_inspection"],
+            serde_json::json!({"state": "Missing", "reason": "NotCached", "checked_bytes": 17})
+        );
+        assert_eq!(
+            value["plans"][0]["final_inspection"],
+            serde_json::json!({"state": "Readable", "reason": "None", "checked_bytes": 29})
+        );
+        assert_eq!(
+            value["coordinator_diagnostics"]["recent_plans"][0]["initial_inspection"],
+            serde_json::json!({"state": "Unknown", "reason": "Busy", "checked_bytes": 31})
+        );
+        assert_eq!(
+            value["coordinator_diagnostics"]["recent_plans"][0]["final_inspection"],
+            serde_json::json!({"state": "Unknown", "reason": "IdentityChanged", "checked_bytes": 47})
+        );
+        assert!(
+            value["recovery_preparation"]
+                .get("initial_inspection")
+                .is_none()
+        );
+        assert!(
+            value["recovery_preparation"]
+                .get("final_inspection")
+                .is_none()
+        );
+        for inspection in [
+            &value["plans"][0]["initial_inspection"],
+            &value["plans"][0]["final_inspection"],
+            &value["coordinator_diagnostics"]["recent_plans"][0]["initial_inspection"],
+            &value["coordinator_diagnostics"]["recent_plans"][0]["final_inspection"],
+        ] {
+            let keys = inspection
+                .as_object()
+                .expect("inspection is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                std::collections::BTreeSet::from(["checked_bytes", "reason", "state"])
+            );
+        }
+        let mut legacy_plan = report.plans[0].clone();
+        legacy_plan.initial_inspection = None;
+        legacy_plan.final_inspection = None;
+        let legacy_plan = serde_json::to_value(legacy_plan).expect("legacy plan serializes");
+        assert!(legacy_plan.get("initial_inspection").is_none());
+        assert!(legacy_plan.get("final_inspection").is_none());
         assert!(
             encoded.len() <= ARM_REPORT_LIMIT,
             "maximum bounded report serialized to {} bytes",
@@ -3651,6 +3765,16 @@ mod pure_helper_tests {
         assert_eq!(
             serialized["recent_plans"][0]["defer_reason"],
             "GlobalJobLimit"
+        );
+        assert!(
+            serialized["recent_plans"][0]
+                .get("initial_inspection")
+                .is_none()
+        );
+        assert!(
+            serialized["recent_plans"][0]
+                .get("final_inspection")
+                .is_none()
         );
     }
 

@@ -497,6 +497,11 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
                 lambda diagnostic: diagnostic["recent_plans"][0].update(window_start_seconds=10**1000),
                 "Coordinator plan window is not finite numeric data.",
             ),
+            (
+                "unexpected_plan_field",
+                lambda diagnostic: diagnostic["recent_plans"][0].update(private_identity="canary"),
+                "Coordinator plan summary is malformed or contains unexpected fields.",
+            ),
         )
         for case_name, mutate, expected_error in invalid_cases:
             invalid = arm("off")
@@ -507,6 +512,113 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
                 with self.assertRaises(runner.HighPreparationError) as error:
                     runner.validate_arm_report(invalid, expected_arm="off")
                 self.assertEqual(str(error.exception), expected_error)
+
+    def test_cache_inspection_diagnostics_are_optional_and_do_not_change_eligibility(self) -> None:
+        legacy = arm("on", eligible=True)
+        runner.validate_arm_report(legacy, expected_arm="on")
+        self.assertTrue(legacy["eligible"])
+        self.assertEqual(legacy["status"], "complete")
+
+        value = arm("on", eligible=True)
+        initial = {"state": "Missing", "reason": "NotCached", "checked_bytes": 0}
+        final = {"state": "Readable", "reason": "None", "checked_bytes": 2**64 - 1}
+        value["plans"][0].update(initial_inspection=initial, final_inspection=final)  # type: ignore[index]
+        value["coordinator_diagnostics"] = {
+            "admitted_plans": 1,
+            "completed_plans": 1,
+            "deferred_plans": 0,
+            "requested_resource_ranges": 2,
+            "readable_resource_ranges": 2,
+            "deferred_resource_ranges": 0,
+            "recent_plans": [{
+                "plan_id": 1,
+                "outcome": "Completed",
+                "defer_reason": None,
+                "window_start_seconds": 10.0,
+                "window_end_seconds": 30.0,
+                "requested_resource_ranges": 2,
+                "readable_resource_ranges": 2,
+                "deferred_resource_ranges": 0,
+                "selected_span_count": 2,
+                "initial_inspection": final,
+                "final_inspection": initial,
+            }],
+            "projected_history_truncated": False,
+            "source_history_completeness": "unknown",
+        }
+        runner.validate_arm_report(value, expected_arm="on")
+        self.assertTrue(value["eligible"])
+        self.assertEqual(value["status"], "complete")
+
+        for state in runner.CACHE_INSPECTION_STATES:
+            candidate = copy.deepcopy(value)
+            candidate["plans"][0]["initial_inspection"]["state"] = state  # type: ignore[index]
+            runner.validate_arm_report(candidate, expected_arm="on")
+        for reason in runner.CACHE_INSPECTION_REASONS:
+            candidate = copy.deepcopy(value)
+            candidate["plans"][0]["initial_inspection"]["reason"] = reason  # type: ignore[index]
+            runner.validate_arm_report(candidate, expected_arm="on")
+
+        inconclusive = arm("on")
+        inconclusive["coordinator_diagnostics"] = copy.deepcopy(value["coordinator_diagnostics"])
+        runner.validate_arm_report(inconclusive, expected_arm="on")
+        self.assertFalse(inconclusive["eligible"])
+        self.assertEqual(inconclusive["status"], "inconclusive")
+
+    def test_cache_inspection_diagnostics_reject_malformed_values_without_echo(self) -> None:
+        invalid_cases = (
+            ("null", None, "Cache inspection diagnostic is malformed."),
+            ("list", [], "Cache inspection diagnostic is malformed."),
+            ("missing_keys", {}, "Cache inspection diagnostic is malformed."),
+            ("extra_key", {"state": "Missing", "reason": "NotCached", "checked_bytes": 0, "private": "canary"},
+             "Cache inspection diagnostic is malformed."),
+            ("unknown_state", {"state": "private-canary", "reason": "NotCached", "checked_bytes": 0},
+             "Cache inspection diagnostic state or reason is unknown."),
+            ("unknown_reason", {"state": "Missing", "reason": "private-canary", "checked_bytes": 0},
+             "Cache inspection diagnostic state or reason is unknown."),
+            ("bool", {"state": "Missing", "reason": "NotCached", "checked_bytes": True},
+             "Cache inspection checked-byte count is outside its unsigned bound."),
+            ("float", {"state": "Missing", "reason": "NotCached", "checked_bytes": 1.0},
+             "Cache inspection checked-byte count is outside its unsigned bound."),
+            ("negative", {"state": "Missing", "reason": "NotCached", "checked_bytes": -1},
+             "Cache inspection checked-byte count is outside its unsigned bound."),
+            ("overflow", {"state": "Missing", "reason": "NotCached", "checked_bytes": 2**64},
+             "Cache inspection checked-byte count is outside its unsigned bound."),
+        )
+        for surface in ("selected", "recent"):
+            for diagnostic in ("initial_inspection", "final_inspection"):
+                for case_name, malformed, expected_error in invalid_cases:
+                    with self.subTest(surface=surface, diagnostic=diagnostic, case=case_name):
+                        value = arm("on", eligible=True)
+                        if surface == "selected":
+                            value["plans"][0][diagnostic] = malformed  # type: ignore[index]
+                        else:
+                            value["coordinator_diagnostics"] = {
+                                "admitted_plans": 1,
+                                "completed_plans": 0,
+                                "deferred_plans": 1,
+                                "requested_resource_ranges": 0,
+                                "readable_resource_ranges": 0,
+                                "deferred_resource_ranges": 0,
+                                "recent_plans": [{
+                                    "plan_id": 1,
+                                    "outcome": "Deferred",
+                                    "defer_reason": "GlobalJobLimit",
+                                    "window_start_seconds": None,
+                                    "window_end_seconds": None,
+                                    "requested_resource_ranges": 0,
+                                    "readable_resource_ranges": 0,
+                                    "deferred_resource_ranges": 0,
+                                    "selected_span_count": 0,
+                                    diagnostic: malformed,
+                                }],
+                                "projected_history_truncated": False,
+                                "source_history_completeness": "unknown",
+                            }
+                        with self.assertRaises(runner.HighPreparationError) as error:
+                            runner.validate_arm_report(value, expected_arm="on")
+                        self.assertEqual(str(error.exception), expected_error)
+                        self.assertNotIn("private-canary", str(error.exception))
 
     def test_arm_contract_requires_the_approved_fixture_generation_timeout(self) -> None:
         self.assertEqual(runner.FIXTURE_GENERATION_TIMEOUT_SECONDS, 240)

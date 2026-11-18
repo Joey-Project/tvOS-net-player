@@ -234,6 +234,30 @@ superseded_by:
   not establish the cause of an earlier probe exit or enable an automatic
   replay. Playback, fixture-generation and total budgets remain unchanged.
 
+## Bounded Cache Inspection Diagnostics
+- Preserve the existing typed initial and final cache-window inspection
+  results before reducing them to readability booleans or a generic defer
+  reason. Retain only state, the existing closed reason enum and checked bytes
+  from the inspection already performed; do not add cache I/O or alter any
+  readiness, scheduling, identity, cancellation or completion decision.
+- An absent observation means the inspection did not run. Keep that distinct
+  from an observed Unknown result, and preserve the existing readability
+  booleans and logical range counters. Final inspection evidence can be absent
+  when an early defer or cancellation prevents reaching that stage.
+- Private comparison reports may add optional initial_inspection and
+  final_inspection objects to bounded recent-plan summaries and the selected
+  plan. Each object has exactly state, reason and unsigned checked_bytes;
+  enum values use static names. Never include raw errors, paths, URLs, headers
+  or private identity fields in these objects. Legacy reports without the
+  extension remain readable; malformed extensions fail closed.
+- Diagnostic metadata cannot grant preparation eligibility, clear history
+  truncation or substitute for complete-window readability and causal transfer
+  witnesses. Preserve the 16-record history, one selected plan, byte/range
+  limits, native playback assertions and every production/test deadline.
+- Exercise inspector reasons and recorder/serialization boundaries with
+  deterministic fixtures and explicit synchronization. A classified defer is
+  diagnostic evidence, not a demonstrated fix or a faster-decoding result.
+
 ## Native Comparison Contract
 - `just test-media-high-preparation` is an opt-in, credential-free comparison
   with fresh sequential OFF and ON fixture/cache/player instances. The existing

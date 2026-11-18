@@ -19586,6 +19586,77 @@ done
     }
 
     #[tokio::test]
+    async fn cache_readiness_malformed_metadata_reports_exact_typed_failure() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "readiness-malformed-metadata",
+            "https://example.test/video.m4s",
+        );
+        let resource = &session.variant.video;
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("resource metadata path should be valid");
+        store
+            .ensure_cache_directory(
+                metadata_path
+                    .parent()
+                    .expect("metadata parent should exist"),
+            )
+            .expect("metadata directory should be created");
+        fs::write(&metadata_path, b"{").expect("malformed metadata should be written");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, result.reason);
+        assert_eq!(1, result.checked_bytes);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_oversized_metadata_is_rejected_before_reading() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "readiness-oversized-metadata",
+            "https://example.test/video.m4s",
+        );
+        let resource = &session.variant.video;
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("resource metadata path should be valid");
+        store
+            .ensure_cache_directory(
+                metadata_path
+                    .parent()
+                    .expect("metadata parent should exist"),
+            )
+            .expect("metadata directory should be created");
+        fs::File::create(&metadata_path)
+            .expect("metadata file should be created")
+            .set_len(RANGE_MAX_MANIFEST_BYTES + 1)
+            .expect("oversized metadata length should be set sparsely");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, result.reason);
+        assert_eq!(0, result.checked_bytes);
+    }
+
+    #[tokio::test]
     async fn cache_readiness_complete_video_and_audio_include_init_ranges() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
@@ -19851,6 +19922,16 @@ done
 
         assert_eq!(CacheWindowState::Unknown, result.state);
         assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+        assert_eq!(
+            fs::metadata(
+                store
+                    .resource_metadata_path(&session.id, &session.variant.video.id)
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            result.checked_bytes
+        );
     }
 
     #[tokio::test]
@@ -20013,6 +20094,7 @@ done
 
         assert_eq!(CacheWindowState::Unknown, result.state);
         assert_eq!(CacheWindowReason::Busy, result.reason);
+        assert_eq!(0, result.checked_bytes);
         assert_eq!((0, 0), store.range_activity_counts());
     }
 
@@ -20121,6 +20203,7 @@ done
         assert!(both_entered, "both inspection jobs should enter the hook");
         assert_eq!(CacheWindowState::Unknown, third_result.state);
         assert_eq!(CacheWindowReason::Busy, third_result.reason);
+        assert_eq!(0, third_result.checked_bytes);
         assert_eq!((2, 0), active_while_blocked);
         assert_eq!((0, 0), store.range_activity_counts());
     }
