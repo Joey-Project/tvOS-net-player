@@ -579,15 +579,24 @@ final class UIPlaybackTests: XCTestCase {
                 + "; resumption message: "
                 + accessibilityDescription(identifiedElement("bilibili-resumption-message"))
         )
+        XCTAssertFalse(identifiedElement("playback-resume-observation").exists)
         clickVisible(continueButton, scrollingIn: controls)
         XCTAssertTrue(
             waitUntil(timeout: 30) {
                 playbackState.value as? String == "playing"
-                    && timelineSeconds().map { abs($0 - savedCheckpoint) <= 2 } == true
+                    && playbackResumeObservationMatches(checkpoint: savedCheckpoint, resultID: selectedResultID)
             },
-            "Explicit Continue did not restore the saved position near \(savedCheckpoint). "
-                + accessibilityDescription(timeline)
+            "Explicit Continue did not both restore the observed saved checkpoint near \(savedCheckpoint) "
+                + "and start playback. State: \(accessibilityDescription(playbackState)); observation: "
+                + accessibilityDescription(identifiedElement("playback-resume-observation"))
         )
+        XCTAssertEqual(playbackState.value as? String, "playing")
+        let resumeObservation = try XCTUnwrap(playbackResumeObservationValues())
+        XCTAssertEqual(resumeObservation["source"], "validated-resume-seek")
+        XCTAssertNotNil(UUID(uuidString: resumeObservation["requestID"] ?? ""))
+        XCTAssertEqual(resumeObservation["resultID"], selectedResultID)
+        XCTAssertLessThanOrEqual(abs(try XCTUnwrap(Double(resumeObservation["requested"] ?? "")) - savedCheckpoint), 2)
+        XCTAssertLessThanOrEqual(abs(try XCTUnwrap(Double(resumeObservation["observed"] ?? "")) - savedCheckpoint), 2)
         let restoredAt = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
         XCTAssertNotNil(
             waitForTimeline(timeout: 15) { $0 >= restoredAt + 1.5 },
@@ -809,6 +818,25 @@ final class UIPlaybackTests: XCTestCase {
 
     private func timelineSeconds() -> Double? {
         playbackTimeline()?.current
+    }
+
+    private func playbackResumeObservationValues() -> [String: String]? {
+        let value = identifiedElement("playback-resume-observation").value as? String
+        guard let value else { return nil }
+        guard let data = value.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+    }
+
+    private func playbackResumeObservationMatches(checkpoint: Double, resultID: String) -> Bool {
+        guard let observation = playbackResumeObservationValues(),
+            let requested = Double(observation["requested"] ?? ""),
+            let observed = Double(observation["observed"] ?? "")
+        else { return false }
+        return observation["source"] == "validated-resume-seek"
+            && UUID(uuidString: observation["requestID"] ?? "") != nil
+            && observation["resultID"] == resultID
+            && abs(requested - checkpoint) <= 2
+            && abs(observed - checkpoint) <= 2
     }
 
     private func waitForTimeline(timeout: TimeInterval, matching predicate: (Double) -> Bool) -> Double? {

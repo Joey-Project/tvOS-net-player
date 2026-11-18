@@ -176,6 +176,32 @@ public struct PlayerPlaybackProgressContext: Equatable, Sendable {
     }
 }
 
+public struct PlaybackResumePositionObservation: Equatable, Sendable {
+    public enum Source: String, Equatable, Sendable {
+        case validatedResumeSeek = "validated-resume-seek"
+    }
+
+    public let identity: ClientPlaybackIdentity
+    public let requestID: UUID
+    public let source: Source
+    public let requestedPositionSeconds: Double
+    public let observedPositionSeconds: Double
+
+    public init(
+        identity: ClientPlaybackIdentity,
+        requestID: UUID,
+        source: Source,
+        requestedPositionSeconds: Double,
+        observedPositionSeconds: Double
+    ) {
+        self.identity = identity
+        self.requestID = requestID
+        self.source = source
+        self.requestedPositionSeconds = requestedPositionSeconds
+        self.observedPositionSeconds = observedPositionSeconds
+    }
+}
+
 @MainActor
 public final class PlayerViewModel: ObservableObject {
     public static let lastStreamURLDefaultsKey = "LastStreamURLText"
@@ -195,6 +221,7 @@ public final class PlayerViewModel: ObservableObject {
     @Published public private(set) var playbackSpeed: PlayerPlaybackSpeed = .normal
     @Published public private(set) var playbackProgressReportingMessage: String?
     @Published public private(set) var playbackProgressStatusRefreshRequestID = 0
+    @Published public private(set) var playbackResumePositionObservation: PlaybackResumePositionObservation?
     public private(set) var manualInteractionSequence = 0
 
     private let defaults: UserDefaults
@@ -754,6 +781,7 @@ public final class PlayerViewModel: ObservableObject {
         suppressCurrentPosition: Bool = false,
         resumptionOperation: PlaybackResumptionOperation? = nil
     ) {
+        playbackResumePositionObservation = nil
         invalidateHLSUpshiftAssessment()
         invalidateHLSPlaybackContext()
         let queuedStoppedReport =
@@ -1321,6 +1349,7 @@ public final class PlayerViewModel: ObservableObject {
         checkpoint: ClientPlaybackCheckpoint,
         requestID: UUID
     ) {
+        playbackResumePositionObservation = nil
         let request = PendingPlaybackResume(
             id: requestID,
             player: player,
@@ -1430,7 +1459,18 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        cancelPendingPlaybackResume(cancelSavedSeek: false, preservingResumptionResult: true)
+        playbackResumePositionObservation = PlaybackResumePositionObservation(
+            identity: request.identity,
+            requestID: request.id,
+            source: .validatedResumeSeek,
+            requestedPositionSeconds: targetSeconds,
+            observedPositionSeconds: position
+        )
+        cancelPendingPlaybackResume(
+            cancelSavedSeek: false,
+            preservingResumptionResult: true,
+            preservingPositionObservation: true
+        )
         resumePositionUnrestoredItem = nil
         request.controller.defaultRate = playbackSpeed.rate
         statusMessage =
@@ -1484,6 +1524,7 @@ public final class PlayerViewModel: ObservableObject {
             cancelPendingPlaybackResume()
             return
         }
+        playbackResumePositionObservation = nil
         tearDownFailedPlaybackResume(player: request.player, controller: request.controller)
     }
 
@@ -1507,12 +1548,16 @@ public final class PlayerViewModel: ObservableObject {
 
     private func cancelPendingPlaybackResume(
         cancelSavedSeek: Bool = true,
-        preservingResumptionResult: Bool = false
+        preservingResumptionResult: Bool = false,
+        preservingPositionObservation: Bool = false
     ) {
         let request = pendingPlaybackResume
         let operation = playbackResumptionOperation
         let preservesResult = preservingResumptionResult && operation != nil
         pendingPlaybackResume = nil
+        if !preservingPositionObservation {
+            playbackResumePositionObservation = nil
+        }
         pendingPlaybackResumeObserver?.cancel()
         pendingPlaybackResumeObserver = nil
         if !preservesResult {

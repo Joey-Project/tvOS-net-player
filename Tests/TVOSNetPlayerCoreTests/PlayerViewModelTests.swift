@@ -194,6 +194,7 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertFalse(model.canUsePlaybackControls, file: file, line: line)
         XCTAssertEqual(model.playbackState, .paused, file: file, line: line)
         XCTAssertFalse(model.isPlaybackPositionUnrestored, file: file, line: line)
+        XCTAssertNil(model.playbackResumePositionObservation, file: file, line: line)
         XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 0, file: file, line: line)
         XCTAssertEqual(controller.playCallCount, 0, file: file, line: line)
         XCTAssertEqual(controller.timeControlStatus, .paused, file: file, line: line)
@@ -1716,6 +1717,57 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testResumeObservationReportsMeasuredPositionBeforeAutoplay() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42)
+        let (model, controller, _, _) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint,
+            autoplay: true
+        )
+        var observationAtPlay: PlaybackResumePositionObservation?
+        controller.onPlay = { [weak model] in observationAtPlay = model?.playbackResumePositionObservation }
+
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42.5, preferredTimescale: 600))
+        await model.flushPlaybackProgressReports()
+
+        let observation = try XCTUnwrap(model.playbackResumePositionObservation)
+        XCTAssertEqual(observation.identity, identity)
+        XCTAssertEqual(observation.requestID, try XCTUnwrap(observationAtPlay).requestID)
+        XCTAssertEqual(observation.source, .validatedResumeSeek)
+        XCTAssertEqual(observation.requestedPositionSeconds, 42)
+        XCTAssertEqual(observation.observedPositionSeconds, 42.5)
+        XCTAssertNotEqual(observation.requestedPositionSeconds, observation.observedPositionSeconds)
+        XCTAssertEqual(observationAtPlay, observation)
+        XCTAssertEqual(controller.playCallCount, 1)
+    }
+
+    @MainActor
+    func testNewResumeRequestInvalidatesPreviousPositionObservation() async throws {
+        let identity = makePlaybackIdentity()
+        let checkpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 42)
+        let (model, controller, _, _) = try makeResumableFixture(
+            identity: identity,
+            checkpoint: checkpoint
+        )
+        controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
+        XCTAssertNotNil(model.playbackResumePositionObservation)
+
+        let replacementCheckpoint = ClientPlaybackCheckpoint(identity: identity, positionSeconds: 65)
+        let attempt = startAsyncResumption(model, checkpoint: replacementCheckpoint)
+        defer { attempt.task?.cancel() }
+        await waitForResumptionEvent {
+            model.isPlaybackPositionUnrestored && model.playbackResumePositionObservation == nil
+        }
+
+        XCTAssertNil(model.playbackResumePositionObservation)
+        attempt.task?.cancel()
+        await waitForResumptionEvent { attempt.result != nil }
+        XCTAssertEqual(attempt.result, false)
+        XCTAssertNil(model.playbackResumePositionObservation)
+    }
+
+    @MainActor
     func testAsyncCompletedResumptionVerifiesZeroBeforeClearingCompletion() async throws {
         let checkpoint = ClientPlaybackCheckpoint(
             identity: makePlaybackIdentity(), positionSeconds: 100, durationSeconds: 100, completed: true)
@@ -1899,6 +1951,7 @@ final class PlayerViewModelTests: XCTestCase {
             XCTAssertEqual(oldAttempt.result, false)
             XCTAssertNil(newAttempt.result)
             XCTAssertTrue(model.player === newPlayer)
+            XCTAssertNil(model.playbackResumePositionObservation)
             XCTAssertTrue(newController.cancelledSeekItems.isEmpty)
             XCTAssertEqual(store.record?.playback, replacementCheckpoint)
             newController.setReadiness(.readyToPlay)
@@ -1907,6 +1960,9 @@ final class PlayerViewModelTests: XCTestCase {
 
             XCTAssertEqual(newAttempt.result, true)
             XCTAssertTrue(model.player === newPlayer)
+            XCTAssertEqual(model.playbackResumePositionObservation?.identity, identity)
+            XCTAssertEqual(model.playbackResumePositionObservation?.requestedPositionSeconds, 65)
+            XCTAssertEqual(model.playbackResumePositionObservation?.observedPositionSeconds, 65)
             XCTAssertEqual(store.record?.playback?.positionSeconds, 65)
             model.stop()
             await model.flushPlaybackProgressReports()
@@ -1936,6 +1992,7 @@ final class PlayerViewModelTests: XCTestCase {
 
             XCTAssertEqual(attempt.result, false)
             XCTAssertTrue(model.isPlaybackPositionUnrestored)
+            XCTAssertNil(model.playbackResumePositionObservation)
             XCTAssertEqual(controller.playCallCount, 0)
             XCTAssertEqual(store.record?.playback, checkpoint)
             let reports = await client.reportsSnapshot()
@@ -2269,6 +2326,7 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.loadedURL)
         XCTAssertFalse(model.canUsePlaybackControls)
         XCTAssertEqual(controller.playCallCount, 0)
+        XCTAssertNil(model.playbackResumePositionObservation)
         XCTAssertEqual(store.record?.playback, checkpoint)
     }
 
@@ -2297,6 +2355,7 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.loadedURL)
         XCTAssertFalse(model.canUsePlaybackControls)
         XCTAssertEqual(controller.playCallCount, 0)
+        XCTAssertNil(model.playbackResumePositionObservation)
         XCTAssertEqual(store.record?.playback, checkpoint)
     }
 
@@ -2646,6 +2705,7 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertTrue(model.isPlaybackPositionUnrestored)
         model.seek(by: 5, using: controller)
         XCTAssertFalse(model.isPlaybackPositionUnrestored)
+        XCTAssertNil(model.playbackResumePositionObservation)
         XCTAssertEqual(controller.cancelledSeekItems.count, 1)
         XCTAssertEqual(store.record?.playback?.positionSeconds, 5)
         controller.completeNextSeek(finished: true, position: CMTime(seconds: 42, preferredTimescale: 600))
@@ -3693,6 +3753,7 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
         set { playbackTime = CMTime(seconds: newValue, preferredTimescale: 600) }
     }
     private(set) var playCallCount = 0
+    var onPlay: (() -> Void)?
     private(set) var pauseCallCount = 0
     private(set) var seekTargets: [CMTime] = []
     private(set) var cancelledSeekItems: [AVPlayerItem] = []
@@ -3711,6 +3772,7 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     }
 
     func play() {
+        onPlay?()
         playCallCount += 1
         timeControlStatus = .waitingToPlayAtSpecifiedRate
     }
