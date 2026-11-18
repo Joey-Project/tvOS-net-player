@@ -345,6 +345,255 @@ class ProcessSupervisorTests(unittest.TestCase):
             selector.close.assert_called_once()
 
 
+class ProcessProgressTests(unittest.TestCase):
+    def test_fixed_phase_records_use_fake_clock_and_preserve_terminal_space(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui-progress.jsonl"
+            for phase in ("fixture_build", "xcode_test"):
+                with mock.patch.object(
+                    ui_e2e.time, "monotonic", side_effect=(100.0, 100.0, 102.5, 105.0)
+                ):
+                    progress = ui_e2e._ProcessProgress(path, phase, 900)
+                    progress.write(
+                        "started", retained_bytes=0, last_output_age=None,
+                        output_activity=None,
+                    )
+                    progress.write(
+                        "periodic", retained_bytes=11, last_output_age=2.0,
+                        output_activity=True,
+                    )
+                    progress.write(
+                        "completed", retained_bytes=11, last_output_age=2.5,
+                        output_activity=False, returncode=0, terminal=True,
+                    )
+                    progress.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["phase"] for record in records], [
+                "fixture_build", "fixture_build", "fixture_build",
+                "xcode_test", "xcode_test", "xcode_test",
+            ])
+            self.assertEqual([record["event"] for record in records], [
+                "started", "periodic", "completed",
+                "started", "periodic", "completed",
+            ])
+            self.assertEqual(records[1]["elapsed_seconds"], 2.5)
+            self.assertEqual(records[1]["last_output_age_seconds"], 2.0)
+            self.assertTrue(records[1]["output_activity"])
+            self.assertEqual(records[2]["retained_output_bytes"], 11)
+            self.assertEqual(records[2]["child_returncode"], 0)
+            self.assertLessEqual(path.stat().st_size, ui_e2e.MAX_PROGRESS_DIAGNOSTIC_BYTES)
+            self.assertTrue(all("argv" not in record and "path" not in record for record in records))
+
+    def test_progress_record_and_byte_caps_keep_both_terminal_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui-progress.jsonl"
+            with mock.patch.object(ui_e2e.time, "monotonic", return_value=1.0):
+                for phase in ("fixture_build", "xcode_test"):
+                    progress = ui_e2e._ProcessProgress(path, phase, 1800)
+                    progress.write(
+                        "started", retained_bytes=0, last_output_age=None,
+                        output_activity=None,
+                    )
+                    for _ in range(100):
+                        progress.write(
+                            "periodic", retained_bytes=8192, last_output_age=None,
+                            output_activity=False,
+                        )
+                    progress.write(
+                        "completed", retained_bytes=8192, last_output_age=None,
+                        output_activity=False, returncode=0, terminal=True,
+                    )
+                    progress.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertLessEqual(len(records), ui_e2e.MAX_PROGRESS_DIAGNOSTIC_RECORDS)
+            self.assertLessEqual(path.stat().st_size, ui_e2e.MAX_PROGRESS_DIAGNOSTIC_BYTES)
+            self.assertEqual(
+                [record["event"] for record in records if record["event"] == "completed"],
+                ["completed", "completed"],
+            )
+
+    def test_full_effective_budgets_sample_early_and_late_in_both_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui-progress.jsonl"
+            clock = [0.0]
+            with mock.patch.object(ui_e2e.time, "monotonic", side_effect=lambda: clock[0]):
+                for phase, budget in (("fixture_build", 900), ("xcode_test", 1800)):
+                    phase_start = clock[0]
+                    progress = ui_e2e._ProcessProgress(path, phase, budget)
+                    self.assertEqual(progress.periodic_interval_seconds, budget / 31)
+                    progress.write(
+                        "started", retained_bytes=0, last_output_age=None,
+                        output_activity=None,
+                    )
+                    for sample in range(1, 31):
+                        clock[0] = phase_start + sample * progress.periodic_interval_seconds
+                        progress.write(
+                            "periodic", retained_bytes=0, last_output_age=None,
+                            output_activity=False,
+                        )
+                    clock[0] = phase_start + float(budget)
+                    progress.write(
+                        "deadline", retained_bytes=0, last_output_age=None,
+                        output_activity=False, returncode=-15, terminal=True,
+                    )
+                    progress.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            for phase, budget in (("fixture_build", 900), ("xcode_test", 1800)):
+                phase_records = [record for record in records if record["phase"] == phase]
+                periodic = [record for record in phase_records if record["event"] == "periodic"]
+                self.assertEqual(len(periodic), 30)
+                self.assertAlmostEqual(periodic[0]["elapsed_seconds"], budget / 31, places=3)
+                self.assertAlmostEqual(periodic[-1]["elapsed_seconds"], budget * 30 / 31, places=3)
+                self.assertEqual(phase_records[0]["event"], "started")
+                self.assertEqual(phase_records[-1]["event"], "deadline")
+                self.assertEqual(phase_records[-1]["effective_budget_seconds"], budget)
+                self.assertEqual(phase_records[-1]["child_returncode"], -15)
+            self.assertEqual(len(records), 64)
+            self.assertLessEqual(path.stat().st_size, ui_e2e.MAX_PROGRESS_DIAGNOSTIC_BYTES)
+
+    def test_unexpected_event_labels_are_omitted_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui-progress.jsonl"
+            with mock.patch.object(ui_e2e.time, "monotonic", return_value=1.0):
+                progress = ui_e2e._ProcessProgress(path, "fixture_build", 900)
+                progress.write(
+                    "private raw error", retained_bytes=1, last_output_age=None,
+                    output_activity=False,
+                )
+                progress.write(
+                    "completed", retained_bytes=1, last_output_age=None,
+                    output_activity=False, returncode=0, terminal=True,
+                )
+                progress.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["event"] for record in records], ["completed"])
+            self.assertNotIn("private", path.read_text())
+
+    def test_hardlinked_progress_file_is_rejected_before_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "original"
+            progress_path = root / "ui-progress.jsonl"
+            original.write_text("existing", encoding="utf-8")
+            original.chmod(0o644)
+            os.link(original, progress_path)
+            original_mode = original.stat().st_mode
+            with mock.patch.object(ui_e2e.time, "monotonic", return_value=1.0):
+                progress = ui_e2e._ProcessProgress(progress_path, "xcode_test", 1800)
+                progress.write(
+                    "completed", retained_bytes=0, last_output_age=None,
+                    output_activity=None, returncode=0, terminal=True,
+                )
+                progress.close()
+            self.assertTrue(progress.disabled)
+            self.assertEqual(original.stat().st_mode, original_mode)
+            self.assertEqual(original.read_text(encoding="utf-8"), "existing")
+
+    def test_descriptor_is_closed_when_permission_setup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui-progress.jsonl"
+            with (
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=1.0),
+                mock.patch.object(ui_e2e.os, "fchmod", side_effect=PermissionError("private")),
+                mock.patch.object(ui_e2e.os, "close", wraps=os.close) as close,
+            ):
+                progress = ui_e2e._ProcessProgress(path, "fixture_build", 900)
+            self.assertTrue(progress.disabled)
+            self.assertIsNone(progress.file)
+            close.assert_called_once()
+
+    def test_process_outcomes_and_unknown_states_are_recorded_without_raw_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("success", "print('ok')", 0, "completed", False),
+                ("nonzero", "raise SystemExit(7)", 7, "completed", False),
+                ("deadline", "import time; time.sleep(5)", None, "deadline", True),
+                ("output", "print('x' * 4096)", None, "output_limited", True),
+            )
+            for name, code, expected_status, expected_event, limited in cases:
+                with self.subTest(name=name):
+                    progress_path = root / f"{name}.jsonl"
+                    result = ui_e2e.run_process(
+                        [sys.executable, "-c", code],
+                        log_path=root / f"{name}.log",
+                        timeout_seconds=0.1 if name == "deadline" else 5,
+                        max_output_bytes=16 if name == "output" else 1024,
+                        progress_path=progress_path,
+                        progress_phase="xcode_test",
+                    )
+                    self.assertEqual(result.timed_out, name == "deadline")
+                    self.assertEqual(result.output_limited, limited and name == "output")
+                    terminal = json.loads(progress_path.read_text().splitlines()[-1])
+                    self.assertEqual(terminal["event"], expected_event)
+                    self.assertEqual(
+                        terminal["child_returncode"],
+                        result.returncode if expected_status is None else expected_status,
+                    )
+                    self.assertEqual(terminal["retained_output_bytes"], result.bytes_written)
+                    self.assertEqual(terminal["last_output_age_seconds"] is None, result.bytes_written == 0)
+                    self.assertNotIn("ok", progress_path.read_text())
+                    self.assertLessEqual(progress_path.stat().st_size, ui_e2e.MAX_PROGRESS_DIAGNOSTIC_BYTES)
+
+    def test_spawn_and_cleanup_errors_remain_errors_and_keep_unknown_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spawn_path = root / "spawn.jsonl"
+            with (
+                mock.patch.object(ui_e2e.subprocess, "Popen", side_effect=OSError("private spawn detail")),
+                self.assertRaises(OSError),
+            ):
+                ui_e2e.run_process(
+                    ["private-command"], log_path=root / "spawn.log",
+                    timeout_seconds=2, max_output_bytes=128,
+                    progress_path=spawn_path, progress_phase="fixture_build",
+                )
+            spawned = [json.loads(line) for line in spawn_path.read_text().splitlines()]
+            self.assertEqual(spawned[-1]["event"], "error")
+            self.assertIsNone(spawned[-1]["child_returncode"])
+            self.assertNotIn("private", spawn_path.read_text())
+
+            cleanup_path = root / "cleanup.jsonl"
+            owned: list[subprocess.Popen[bytes]] = []
+            popen = ui_e2e.subprocess.Popen
+
+            def spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                process = popen(*args, **kwargs)
+                owned.append(process)
+                return process
+
+            try:
+                with (
+                    mock.patch.object(ui_e2e.subprocess, "Popen", side_effect=spawn),
+                    mock.patch.object(ui_e2e, "stop_process_group", side_effect=PermissionError("private cleanup detail")),
+                    self.assertRaisesRegex(ui_e2e.UIE2EError, "cleanup unverified"),
+                ):
+                    ui_e2e.run_process(
+                        [sys.executable, "-c", "print('x')"], log_path=root / "cleanup.log",
+                        timeout_seconds=2, max_output_bytes=128,
+                        progress_path=cleanup_path, progress_phase="fixture_build",
+                    )
+            finally:
+                for process in owned:
+                    if process.returncode is None:
+                        process.wait(timeout=2)
+            terminal = json.loads(cleanup_path.read_text().splitlines()[-1])
+            self.assertEqual(terminal["event"], "error")
+            self.assertTrue(terminal["cleanup_failed"])
+            self.assertNotIn("private", cleanup_path.read_text())
+
+    def test_default_process_callers_do_not_create_progress_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = ui_e2e.run_process(
+                [sys.executable, "-c", "print('ordinary')"],
+                log_path=root / "ordinary.log", timeout_seconds=2,
+                max_output_bytes=128,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse((root / "ui-progress.jsonl").exists())
+
+
 class DarwinPIDStateAssertionTests(unittest.TestCase):
     def test_explicit_zombie_state_is_terminal(self) -> None:
         for output in (
@@ -925,7 +1174,7 @@ class RunnerContractTests(unittest.TestCase):
             result_bundle_path=Path("/tmp/UIE2E.xcresult"),
             destination="platform=macOS",
         )
-        self.assertIn("-quiet", command)
+        self.assertNotIn("-quiet", command)
         self.assertIn(f"APP_BUNDLE_IDENTIFIER={bundle_id}", command)
         self.assertIn("UI_E2E_SERVER_ADDRESS=http://127.0.0.1:43210", command)
         self.assertEqual(
@@ -1293,6 +1542,8 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
             self.assertEqual(args.args[0], ui_e2e.build_task_fixture_swift_command())
             self.assertEqual(args.kwargs["timeout_seconds"], 60)
             self.assertEqual(args.kwargs["cwd"], ui_e2e.ROOT)
+            self.assertEqual(args.kwargs["progress_path"], Path(directory) / "ui-progress.jsonl")
+            self.assertEqual(args.kwargs["progress_phase"], "fixture_build")
 
             for incomplete in (
                 ui_e2e.CommandResult(0, 10, timed_out=True),
@@ -1895,6 +2146,29 @@ class FailureAttachmentExportTests(unittest.TestCase):
                 [item["status"] for item in receipt["attachments"]],
                 ["exported", "unavailable"],
             )
+
+    def test_progress_diagnostics_stage_with_absent_or_partial_result_bundle(self) -> None:
+        for partial_bundle in (False, True):
+            with self.subTest(partial_bundle=partial_bundle), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                work = root / "work"
+                logs = work / "logs"
+                logs.mkdir(parents=True)
+                progress = logs / "ui-progress.jsonl"
+                progress.write_text('{"phase":"xcode_test","event":"started"}\n', encoding="utf-8")
+                bundle = work / "result.xcresult"
+                if partial_bundle:
+                    bundle.mkdir()
+                    (bundle / "partial-data").write_bytes(b"partial")
+                stager = ui_e2e.ArtifactStager(root / "artifacts")
+                ui_e2e._stage_artifacts(stager, work_dir=work, result_bundle=bundle)
+                staged = stager.destination / "ui-progress.jsonl"
+                self.assertEqual(staged.read_bytes(), progress.read_bytes())
+                self.assertLessEqual(staged.stat().st_size, ui_e2e.MAX_PROGRESS_DIAGNOSTIC_BYTES)
+                self.assertEqual((stager.destination / "result.xcresult").is_dir(), partial_bundle)
+                if not partial_bundle:
+                    report = (stager.destination / "artifact-staging.log").read_text()
+                    self.assertIn("result.xcresult omitted", report)
 
     def test_staging_selected_payloads_keeps_allowlist_and_aggregate_caps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
