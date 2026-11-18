@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import importlib.util
+import io
+import json
 import tempfile
 import sys
 import time
@@ -354,6 +357,76 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
     def test_runner_refuses_to_start_without_explicit_opt_in(self) -> None:
         with self.assertRaises(runner.HighPreparationError):
             runner.run(enabled=False)
+
+    def test_native_command_failure_is_safely_summarized_and_restores_patched_state(self) -> None:
+        network = runner._load_network_runner()
+        original_artifact_size = network._artifact_size
+        original_artifact_limit = network.ARTIFACT_BYTES
+        oversized_private_detail = (
+            "private-canary.example.invalid/path header-canary=x-value " + "z" * 65_536
+        )
+
+        class BuildError(Exception):
+            pass
+
+        original_build_run = object()
+        local_build = type("LocalBuild", (), {})()
+        local_build.BuildError = BuildError
+        local_build.RUN = original_build_run
+        local_build.load_config = lambda _config_file: {}
+        local_build.prepared_targets = lambda _targets, **_kwargs: contextlib.nullcontext({})
+
+        modules = {
+            "media_high_preparation_local_build": local_build,
+            "media_high_preparation_network_runner": network,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact_root = Path(temporary).resolve() / "artifacts"
+            with (
+                patch.object(runner, "_load_module", side_effect=lambda name, _path: modules[name]),
+                patch.object(runner, "_products_from_receipt", return_value=(
+                    Path("/mock/probe"), Path("/mock/tests"), {"probe": "mock"},
+                )),
+                patch.object(runner, "_verify_legacy_native_test_filter"),
+                patch.object(runner, "_verify_test_filter"),
+                patch.object(runner, "_verify_probe_self_test"),
+                patch.object(runner, "mute_and_verify_system_audio"),
+                patch.object(runner, "_verify_native_tools"),
+                patch.object(network, "_artifact_size", lambda _directory: 0),
+                patch.object(network, "ARTIFACT_BYTES", 123_456),
+                patch.object(
+                    network, "_run_command",
+                    side_effect=network.MediaNetworkError(oversized_private_detail),
+                ) as run_command,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                patched_artifact_size = network._artifact_size
+                result = runner.run(enabled=True, artifact_root=artifact_root)
+
+                self.assertEqual(result, 1)
+                self.assertEqual(run_command.call_count, 1)
+                self.assertIs(network._artifact_size, patched_artifact_size)
+                self.assertEqual(network.ARTIFACT_BYTES, 123_456)
+                self.assertIs(local_build.RUN, original_build_run)
+
+            summaries = list(artifact_root.glob("runs/*/summary.json"))
+            self.assertEqual(len(summaries), 1)
+            encoded_summary = summaries[0].read_bytes()
+            summary = json.loads(encoded_summary)
+            expected_message = (
+                "Opt-in native comparison command failed; see bounded native-comparison.log."
+            )
+            self.assertLessEqual(len(encoded_summary), runner.SUMMARY_BYTES)
+            self.assertEqual(summary["schema_version"], 1)
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["message"], expected_message)
+            self.assertLessEqual(len(summary["message"].encode("utf-8")), 512)
+            self.assertNotIn("private-canary.example.invalid", encoded_summary.decode("utf-8"))
+            self.assertNotIn("header-canary", encoded_summary.decode("utf-8"))
+
+        self.assertIs(network._artifact_size, original_artifact_size)
+        self.assertEqual(network.ARTIFACT_BYTES, original_artifact_limit)
 
     def test_arm_contract_accepts_only_bound_continuous_muted_report(self) -> None:
         runner.validate_arm_report(arm("off"), expected_arm="off")

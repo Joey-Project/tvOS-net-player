@@ -3,7 +3,7 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-17
+updated: 2026-11-18
 branch: codex/hls-high-preparation
 pr: https://github.com/Joey-Project/tvOS-net-player/pull/108
 supersedes: []
@@ -216,6 +216,23 @@ superseded_by:
   the existing output contract and independently released artifact producers.
   Correct phase sampling is not proof of faster recovery or of a fault causing
   an earlier startup downshift.
+
+## Bounded Probe Failure Diagnostics
+- A nonzero native probe exit remains a failure. Preserve its process status
+  and bounded process diagnostics, and project only known status, error phase,
+  error domain and an integer error code from the already-redacted JSON.
+  Unknown or malformed values remain explicitly unknown; they do not become
+  successful playback, fabricated zero codes or complete arm reports.
+- Never copy raw probe JSON, localized messages, addresses, paths, headers or
+  unrelated private fields into the failure line. Keep the existing 64 KiB
+  input limit, truncation rejection and successful-result behavior unchanged.
+- Normalize the imported native-command error at the comparison runner's call
+  boundary so the existing failed-summary handler retains a bounded diagnostic
+  pointing to the retained native log. Do not expose arbitrary exception text
+  or alter complete/inconclusive results, cleanup or artifact limits.
+- These changes preserve evidence for a later authorized diagnosis; they do
+  not establish the cause of an earlier probe exit or enable an automatic
+  replay. Playback, fixture-generation and total budgets remain unchanged.
 
 ## Native Comparison Contract
 - `just test-media-high-preparation` is an opt-in, credential-free comparison

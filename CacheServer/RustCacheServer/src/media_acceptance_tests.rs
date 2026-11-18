@@ -3158,15 +3158,105 @@ fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<V
     }
     if !process.success {
         return Err(format!(
-            "native probe exited with status {}; {}",
+            "native probe exited with status {}; {}; {}",
             process
                 .status_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned()),
+            probe_failure_diagnostics(&value),
             process.diagnostics()
         ));
     }
     Ok(value)
+}
+
+fn probe_failure_diagnostics(value: &Value) -> String {
+    fn classified_string(value: Option<&Value>, known: &'static [&'static str]) -> &'static str {
+        match value {
+            Some(Value::String(value)) => known
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == value)
+                .unwrap_or("other"),
+            _ => "unknown",
+        }
+    }
+
+    const STATUSES: &[&str] = &[
+        "complete",
+        "completed",
+        "drift",
+        "ended_early",
+        "failed",
+        "inconclusive",
+        "unsupported",
+        "unsupported_duration",
+        "validated",
+    ];
+    const PHASES: &[&str] = &[
+        "audible_media_group",
+        "cli",
+        "continuous_high_preparation",
+        "continuous_play",
+        "decode",
+        "duration_remainder",
+        "mute",
+        "native_control",
+        "pause",
+        "play",
+        "rate_1_25",
+        "rate_reset",
+        "ready",
+        "ready_marker",
+        "resume",
+        "runtime",
+        "seek_back_play",
+        "seek_forward_play",
+        "self_test",
+        "video_size_expectations",
+    ];
+    const DOMAINS: &[&str] = &[
+        "AVFoundationErrorDomain",
+        "AVPlayer",
+        "AVPlayerItem",
+        "AVPlayerItemVideoOutput",
+        "AVPlayerMute",
+        "BoundedObservations",
+        "CoreMediaErrorDomain",
+        "DecodedVideoSizeTracker",
+        "HighPreparationControl",
+        "LoadedTimeRangeDiagnostics",
+        "NSCocoaErrorDomain",
+        "NSOSStatusErrorDomain",
+        "NSPOSIXErrorDomain",
+        "NSURLErrorDomain",
+        "NativeMonotonicClock",
+        "PlaybackPolicy",
+        "PlaybackTimelineDiagnostics",
+        "PlayerErrorLogDiagnostics",
+        "PlayerSetup",
+        "Probe",
+        "ProbeCLI",
+        "ProbeDeadline",
+        "ProbePlayback",
+        "ProbeSelfTest",
+        "ReadyMarker",
+        "RecoveryObservationTrigger",
+        "VideoSizeExpectationTracker",
+        "VideoSizePhasePolicy",
+    ];
+
+    let error = value.get("error");
+    let status = classified_string(value.get("status"), STATUSES);
+    let phase = classified_string(error.and_then(|error| error.get("phase")), PHASES);
+    let domain = classified_string(error.and_then(|error| error.get("domain")), DOMAINS);
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    format!("probe_status={status} probe_phase={phase} probe_domain={domain} probe_code={code}")
 }
 
 fn validate_probe_result(
@@ -7079,5 +7169,218 @@ mod recovery_observation_tests {
 
         let evidence = validate_player_observation(&gapped, 160.0).unwrap();
         assert_eq!(evidence.range_end, 10.0);
+    }
+}
+
+#[cfg(test)]
+mod probe_result_diagnostic_tests {
+    use super::*;
+
+    fn report() -> ReportStore {
+        Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )))
+    }
+
+    fn process(stdout: Vec<u8>, success: bool) -> ProcessCapture {
+        ProcessCapture {
+            status_code: Some(if success { 0 } else { 2 }),
+            status_signal: None,
+            success,
+            stdout,
+            stdout_truncated: false,
+            stderr_tail: Vec::new(),
+            stderr_truncated: false,
+            context: ChildProcessContext {
+                phase: "native-control".to_owned(),
+                executable: "probe".to_owned(),
+                deadline: Duration::from_secs(20),
+            },
+            elapsed: Duration::from_millis(123),
+        }
+    }
+
+    #[test]
+    fn failed_probe_exposes_only_allowlisted_structured_diagnostics() {
+        let report = report();
+        let payload = serde_json::json!({
+            "status": "failed",
+            "error": {
+                "phase": "continuous_play",
+                "domain": "AVFoundationErrorDomain",
+                "code": -11828,
+                "message": "private error detail",
+                "url": "https://example.invalid/private?detail=private-url-canary"
+            },
+            "reader_id": "private-reader-canary",
+            "headers": {"x-private-canary": "private-header-canary"}
+        });
+        let error = parse_probe_result(
+            process(serde_json::to_vec(&payload).unwrap(), false),
+            &report,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("native probe exited with status 2"));
+        assert!(error.contains(
+            "probe_status=failed probe_phase=continuous_play probe_domain=AVFoundationErrorDomain probe_code=-11828"
+        ));
+        assert!(error.contains("phase=native-control"));
+        assert!(error.contains("executable=probe"));
+        assert!(error.len() < 2048);
+        for private_value in [
+            "private error detail",
+            "example.invalid",
+            "private-url-canary",
+            "private-reader-canary",
+            "private-header-canary",
+            "x-private-canary",
+        ] {
+            assert!(!error.contains(private_value));
+        }
+
+        let stored = report.lock().unwrap().probe.clone().unwrap();
+        assert_eq!(stored["error"]["url"], "[redacted]");
+        assert_eq!(stored["reader_id"], "private-reader-canary");
+    }
+
+    #[test]
+    fn malformed_or_unrecognized_diagnostic_fields_use_fixed_fallbacks() {
+        let cases = [
+            (
+                serde_json::json!({"status": "failed"}),
+                "probe_status=failed probe_phase=unknown probe_domain=unknown probe_code=unknown",
+            ),
+            (
+                serde_json::json!({"status": 2, "error": "wrong-type"}),
+                "probe_status=unknown probe_phase=unknown probe_domain=unknown probe_code=unknown",
+            ),
+            (
+                serde_json::json!({
+                    "status": "future-status\nprivate",
+                    "error": {
+                        "phase": "future-phase\nprivate",
+                        "domain": "private.domain\nprivate",
+                        "code": "-11828"
+                    }
+                }),
+                "probe_status=other probe_phase=other probe_domain=other probe_code=unknown",
+            ),
+            (
+                serde_json::json!({
+                    "status": "x".repeat(2048),
+                    "error": {
+                        "phase": "y".repeat(2048),
+                        "domain": "z".repeat(2048),
+                        "code": 1.5
+                    }
+                }),
+                "probe_status=other probe_phase=other probe_domain=other probe_code=unknown",
+            ),
+        ];
+
+        for (payload, expected_diagnostics) in cases {
+            let report = report();
+            let error = parse_probe_result(
+                process(serde_json::to_vec(&payload).unwrap(), false),
+                &report,
+            )
+            .unwrap_err();
+            assert!(error.contains("native probe exited with status 2"));
+            assert!(error.contains(expected_diagnostics));
+            assert!(error.len() < 2048);
+            assert!(!error.contains("future"));
+            assert!(!error.contains("private"));
+        }
+
+        for (value, expected_code) in [
+            (serde_json::json!(true), "unknown".to_owned()),
+            (serde_json::json!(1.5), "unknown".to_owned()),
+            (serde_json::json!(u64::MAX), "unknown".to_owned()),
+            (serde_json::json!(i64::MIN), i64::MIN.to_string()),
+            (serde_json::json!(i64::MAX), i64::MAX.to_string()),
+        ] {
+            let diagnostic = probe_failure_diagnostics(&serde_json::json!({
+                "status": "failed",
+                "error": {
+                    "phase": "seek_forward_play",
+                    "domain": "ProbePlayback",
+                    "code": value
+                }
+            }));
+            assert!(diagnostic.contains(&format!(
+                "probe_status=failed probe_phase=seek_forward_play probe_domain=ProbePlayback probe_code={expected_code}"
+            )));
+            assert!(diagnostic.len() < 512);
+        }
+
+        let diagnostic = probe_failure_diagnostics(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "phase": "future-phase",
+                "domain": "private.domain",
+                "code": 1
+            }
+        }));
+        assert!(diagnostic.contains("probe_status=failed"));
+        assert!(diagnostic.contains("probe_phase=other"));
+        assert!(diagnostic.contains("probe_domain=other"));
+        assert!(diagnostic.len() < 512);
+    }
+
+    #[test]
+    fn nonzero_exit_never_passes_even_when_payload_claims_success() {
+        let report = report();
+        let error = parse_probe_result(
+            process(
+                br#"{"status":"validated","error":{"phase":"ready","domain":"Probe","code":0}}"#
+                    .to_vec(),
+                false,
+            ),
+            &report,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("native probe exited with status 2"));
+        assert!(error.contains("probe_status=validated"));
+    }
+
+    #[test]
+    fn successful_probe_keeps_existing_redaction_and_report_behavior() {
+        let report = report();
+        let payload = br#"{"status":"validated","url":"https://example.invalid/private","detail":"not rendered"}"#.to_vec();
+        let result = parse_probe_result(process(payload, true), &report).unwrap();
+
+        assert_eq!(result["url"], "[redacted]");
+        assert_eq!(
+            report.lock().unwrap().probe.as_ref().unwrap()["url"],
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn truncated_oversized_and_malformed_probe_json_still_fails() {
+        let report = report();
+        let mut truncated = process(br#"{"status":"failed"}"#.to_vec(), false);
+        truncated.stdout_truncated = true;
+        assert!(
+            parse_probe_result(truncated, &report)
+                .unwrap_err()
+                .contains("exceeded its 64 KiB bound")
+        );
+
+        let oversized = process(vec![b' '; MAX_PROBE_JSON_BYTES + 1], false);
+        assert!(
+            parse_probe_result(oversized, &report)
+                .unwrap_err()
+                .contains("exceeded its 64 KiB bound")
+        );
+
+        let malformed = process(b"not-json".to_vec(), false);
+        assert!(
+            parse_probe_result(malformed, &report)
+                .unwrap_err()
+                .contains("did not return bounded JSON")
+        );
     }
 }

@@ -327,11 +327,16 @@ def _build_and_run_locked(
             network._artifact_size = bounded_artifact_size
             network.ARTIFACT_BYTES = min(previous_artifact_limit, ARTIFACT_BYTES - OUTPUT_RESERVE_BYTES)
             try:
-                code = network._run_command(
-                    argv, log_path=log_path, env=test_env,
-                    timeout=runtime_deadline - time.monotonic(), artifact_dir=artifact_dir,
-                    cargo_artifact_monitor=True,
-                ).returncode
+                try:
+                    code = network._run_command(
+                        argv, log_path=log_path, env=test_env,
+                        timeout=runtime_deadline - time.monotonic(), artifact_dir=artifact_dir,
+                        cargo_artifact_monitor=True,
+                    ).returncode
+                except network.MediaNetworkError as error:
+                    raise HighPreparationError(
+                        "Opt-in native comparison command failed; see bounded native-comparison.log."
+                    ) from error
             finally:
                 network.ARTIFACT_BYTES = previous_artifact_limit
                 network._artifact_size = previous_artifact_size
