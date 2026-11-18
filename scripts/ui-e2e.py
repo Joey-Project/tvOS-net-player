@@ -14,6 +14,7 @@ import selectors
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,14 @@ FIXTURE_DURATION_SECONDS = 92
 MAX_FIXTURE_BYTES = 64 * 1024 * 1024
 MAX_RESULT_SUMMARY_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_LOG_BYTES = 8 * 1024 * 1024
+MAX_PROGRESS_DIAGNOSTIC_BYTES = 32 * 1024
+MAX_PROGRESS_DIAGNOSTIC_RECORDS = 64
+PROGRESS_TERMINAL_RESERVE_BYTES = 2048
+PROGRESS_PERIODIC_RECORDS_PER_PHASE = 30
+PROGRESS_NONTERMINAL_RECORDS_PER_PHASE = PROGRESS_PERIODIC_RECORDS_PER_PHASE + 1
+PROGRESS_NONTERMINAL_BYTES_PER_PHASE = (
+    MAX_PROGRESS_DIAGNOSTIC_BYTES - PROGRESS_TERMINAL_RESERVE_BYTES
+) // 2
 MAX_SERVER_LOG_BYTES = 256 * 1024
 MAX_TASK_FIXTURE_LOG_BYTES = 256 * 1024
 MAX_FIXTURE_JSON_BYTES = 64 * 1024
@@ -90,6 +99,165 @@ class CommandResult:
     bytes_written: int
     timed_out: bool = False
     output_limited: bool = False
+
+
+class _ProcessProgress:
+    """Write bounded, privacy-safe process progress records when enabled."""
+
+    PHASES = {"fixture_build", "xcode_test"}
+    EVENTS = {"started", "periodic", "deadline", "output_limited", "completed", "error"}
+    TERMINAL_EVENTS = {"deadline", "output_limited", "completed", "error"}
+
+    def __init__(self, path: Path, phase: str, budget_seconds: float) -> None:
+        if not isinstance(phase, str) or phase not in self.PHASES:
+            raise ValueError("Progress phase must be a fixed UI process label.")
+        self.path = path
+        self.phase = phase
+        self.budget_seconds = budget_seconds
+        self.periodic_interval_seconds = budget_seconds / (PROGRESS_PERIODIC_RECORDS_PER_PHASE + 1)
+        self.started = time.monotonic()
+        self.records = 0
+        self.bytes_written = 0
+        self._nonterminal_records = {label: 0 for label in self.PHASES}
+        self._nonterminal_bytes = {label: 0 for label in self.PHASES}
+        self._terminal_phases: set[str] = set()
+        self.file = None
+        self.disabled = False
+        descriptor: int | None = None
+        try:
+            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(path, flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(descriptor)
+                descriptor = None
+                self.disabled = True
+                return
+            os.fchmod(descriptor, 0o600)
+            self.file = os.fdopen(descriptor, "a+b")
+            descriptor = None
+            self.file.seek(0)
+            existing = self.file.read(MAX_PROGRESS_DIAGNOSTIC_BYTES + 1)
+            self.file.seek(0, os.SEEK_END)
+            self.bytes_written = len(existing)
+            if self.bytes_written > MAX_PROGRESS_DIAGNOSTIC_BYTES:
+                self.disabled = True
+                return
+            try:
+                for line in existing.splitlines():
+                    record = json.loads(line)
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("phase") not in self.PHASES
+                        or record.get("event") not in self.EVENTS
+                    ):
+                        raise ValueError("invalid progress record")
+                    self.records += 1
+                    retained_phase = record["phase"]
+                    if record["event"] in self.TERMINAL_EVENTS:
+                        self._terminal_phases.add(retained_phase)
+                    else:
+                        self._nonterminal_records[retained_phase] += 1
+                        self._nonterminal_bytes[retained_phase] += len(line) + 1
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                self.disabled = True
+        except Exception:
+            if self.file is not None:
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
+            elif descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except Exception:
+                    pass
+            self.disabled = True
+
+    def elapsed(self) -> float:
+        return round(max(0.0, time.monotonic() - self.started), 3)
+
+    def write(
+        self,
+        event: str,
+        *,
+        retained_bytes: int,
+        last_output_age: float | None,
+        output_activity: bool | None,
+        returncode: int | None = None,
+        terminal: bool = False,
+        cleanup_failed: bool = False,
+    ) -> None:
+        if self.disabled or self.file is None:
+            return
+        if (
+            not isinstance(event, str)
+            or event not in self.EVENTS
+            or terminal != (event in self.TERMINAL_EVENTS)
+        ):
+            return
+        if terminal:
+            if self.phase in self._terminal_phases:
+                return
+        elif (
+            self._nonterminal_records[self.phase] >= PROGRESS_NONTERMINAL_RECORDS_PER_PHASE
+            or self.records >= MAX_PROGRESS_DIAGNOSTIC_RECORDS
+            - len(self.PHASES - self._terminal_phases)
+        ):
+            return
+        record = {
+            "phase": self.phase,
+            "event": event,
+            "elapsed_seconds": self.elapsed(),
+            "effective_budget_seconds": round(self.budget_seconds, 3),
+            "retained_output_bytes": retained_bytes,
+            "last_output_age_seconds": (
+                None if last_output_age is None else round(last_output_age, 3)
+            ),
+            "output_activity": output_activity,
+            "child_returncode": returncode,
+            "cleanup_failed": cleanup_failed,
+        }
+        try:
+            data = json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+            remaining_terminals = len(self.PHASES - self._terminal_phases)
+            record_limit = MAX_PROGRESS_DIAGNOSTIC_RECORDS - (
+                0 if terminal else remaining_terminals
+            )
+            if len(data) > 512 or self.records >= record_limit:
+                return
+            ceiling = MAX_PROGRESS_DIAGNOSTIC_BYTES
+            if not terminal:
+                ceiling -= PROGRESS_TERMINAL_RESERVE_BYTES
+                if (
+                    self._nonterminal_bytes[self.phase] + len(data)
+                    > PROGRESS_NONTERMINAL_BYTES_PER_PHASE
+                ):
+                    return
+            if self.bytes_written + len(data) > ceiling:
+                return
+            self.file.write(data)
+            self.file.flush()
+            self.bytes_written += len(data)
+            self.records += 1
+            if terminal:
+                self._terminal_phases.add(self.phase)
+            else:
+                self._nonterminal_records[self.phase] += 1
+                self._nonterminal_bytes[self.phase] += len(data)
+        except Exception:
+            self.disabled = True
+
+    def close(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
 
 
 @dataclass(frozen=True)
@@ -282,17 +450,32 @@ def run_process(
     max_output_bytes: int,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    progress_path: Path | None = None,
+    progress_phase: str | None = None,
 ) -> CommandResult:
     """Run one owned process group with a hard deadline and retained-byte limit."""
     if timeout_seconds <= 0 or max_output_bytes <= 0:
         raise ValueError("Process deadline and output limit must be positive.")
+    if (progress_path is None) != (progress_phase is None):
+        raise ValueError("Progress path and fixed phase must be supplied together.")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     selector = selectors.DefaultSelector()
     process: subprocess.Popen[bytes] | None = None
     bytes_written = 0
     timed_out = False
     output_limited = False
+    last_output_at: float | None = None
+    bytes_since_progress = 0
     deadline = time.monotonic() + timeout_seconds
+    progress = (
+        _ProcessProgress(progress_path, progress_phase, timeout_seconds)
+        if progress_path is not None and progress_phase is not None
+        else None
+    )
+    next_progress_at = (
+        progress.started + progress.periodic_interval_seconds
+        if progress is not None else 0.0
+    )
 
     try:
         with log_path.open("xb") as log_file:
@@ -306,6 +489,11 @@ def run_process(
                 start_new_session=True,
                 close_fds=True,
             )
+            if progress is not None:
+                progress.write(
+                    "started", retained_bytes=0, last_output_age=None,
+                    output_activity=None,
+                )
             assert process.stdout is not None
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -322,6 +510,9 @@ def run_process(
                     if not chunk:
                         selector.unregister(key.fileobj)
                         continue
+                    if progress is not None:
+                        last_output_at = time.monotonic()
+                        bytes_since_progress += len(chunk)
                     available = max_output_bytes - bytes_written
                     if len(chunk) > available:
                         if available:
@@ -334,6 +525,24 @@ def run_process(
 
                 if output_limited:
                     break
+                now = time.monotonic() if progress is not None else 0.0
+                if (
+                    progress is not None
+                    and now >= next_progress_at
+                ):
+                    progress.write(
+                        "periodic",
+                        retained_bytes=bytes_written,
+                        last_output_age=(None if last_output_at is None else now - last_output_at),
+                        output_activity=bytes_since_progress > 0,
+                    )
+                    missed_intervals = math.floor(
+                        (now - next_progress_at) / progress.periodic_interval_seconds
+                    ) + 1
+                    next_progress_at += (
+                        missed_intervals * progress.periodic_interval_seconds
+                    )
+                    bytes_since_progress = 0
                 if _child_has_exited(process) and not selector.get_map():
                     break
 
@@ -355,6 +564,24 @@ def run_process(
                     process.stdout.close()
                 except Exception as error:
                     cleanup_errors.append(error)
+        if progress is not None:
+            event = (
+                "deadline" if timed_out else
+                "output_limited" if output_limited else
+                "error" if primary_error is not None or cleanup_errors else
+                "completed"
+            )
+            now = time.monotonic()
+            progress.write(
+                event,
+                retained_bytes=bytes_written,
+                last_output_age=(None if last_output_at is None else now - last_output_at),
+                output_activity=(bytes_since_progress > 0),
+                returncode=(process.returncode if process is not None else None),
+                terminal=True,
+                cleanup_failed=bool(cleanup_errors),
+            )
+            progress.close()
         if cleanup_errors:
             context = []
             if timed_out:
@@ -632,7 +859,6 @@ def build_xcodebuild_command(
     )
     return [
         "xcodebuild",
-        "-quiet",
         "-onlyUsePackageVersionsFromResolvedFile",
         "-skipPackagePluginValidation",
         "-project",
@@ -775,6 +1001,8 @@ def build_task_fixture(logs_dir: Path, *, timeout_seconds: float) -> Path:
         timeout_seconds=timeout_seconds,
         max_output_bytes=MAX_COMMAND_LOG_BYTES,
         cwd=ROOT,
+        progress_path=logs_dir / "ui-progress.jsonl",
+        progress_phase="fixture_build",
     )
     _require_result(result, "TaskWatchUIFixture SwiftPM debug build", logs_dir / "task-fixture-build.log")
     binary = resolve_swift_bin_path(logs_dir) / TASK_FIXTURE_PRODUCT
@@ -1790,6 +2018,7 @@ class ArtifactStager:
         "runner.log",
         "server.log",
         "task-fixture-build.log",
+        "ui-progress.jsonl",
         "task-fixture-bin-path.log",
         "task-fixture.log",
         "task-fixture-ready.json",
@@ -1839,6 +2068,8 @@ class ArtifactStager:
             file_limit = MAX_FIXTURE_JSON_BYTES
         elif source.name == "task-fixture.log":
             file_limit = MAX_TASK_FIXTURE_LOG_BYTES
+        elif source.name == "ui-progress.jsonl":
+            file_limit = MAX_PROGRESS_DIAGNOSTIC_BYTES
         if source.name.endswith(".export.log"):
             file_limit = MAX_ATTACHMENT_EXPORT_LOG_BYTES
         elif source.name == "xcresult-attachment-export.json":
@@ -1952,6 +2183,7 @@ def _stage_artifacts(
             "result-validation.json",
             "server.log",
             "task-fixture-build.log",
+            "ui-progress.jsonl",
             "task-fixture-bin-path.log",
             "task-fixture.log",
             "task-fixture-ready.json",
@@ -2175,6 +2407,8 @@ def run_ui_e2e(platform: str) -> int:
                 max_output_bytes=MAX_COMMAND_LOG_BYTES,
                 env=child_env,
                 cwd=ROOT,
+                progress_path=logs_dir / "ui-progress.jsonl",
+                progress_phase="xcode_test",
             )
             counts = finish_xcode_run(
                 xcode_result,
