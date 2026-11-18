@@ -1079,6 +1079,9 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             playerSurface
             PlaybackTimelineStatus(model: model)
+            if isUITesting {
+                PlaybackResumePositionObservationStatus(model: model)
+            }
             playbackControls
         }
     }
@@ -1445,6 +1448,40 @@ private struct PlaybackTimelineStatus: View {
     private static func safeSeconds(_ seconds: Double) -> Double {
         guard seconds.isFinite else { return 0 }
         return min(max(0, seconds), Double(Int32.max))
+    }
+}
+
+private struct PlaybackResumePositionObservationStatus: View {
+    @ObservedObject var model: PlayerViewModel
+
+    var body: some View {
+        if let observation = model.playbackResumePositionObservation {
+            Text("Restored playback position")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Playback resume observation")
+                .accessibilityValue(Self.value(for: observation))
+                .accessibilityIdentifier("playback-resume-observation")
+        }
+    }
+
+    private static func value(for observation: PlaybackResumePositionObservation) -> String {
+        let identity = observation.identity
+        let values: [String: String] = [
+            "source": observation.source.rawValue,
+            "requestID": observation.requestID.uuidString,
+            "serverID": identity.task.serverID,
+            "taskID": identity.task.taskID,
+            "resultID": identity.resultID ?? "",
+            "libraryItemID": identity.libraryItemID,
+            "variantID": identity.variantID,
+            "requested": String(observation.requestedPositionSeconds),
+            "observed": String(observation.observedPositionSeconds),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]) else {
+            return "{}"
+        }
+        return String(data: data, encoding: .utf8) ?? "{}"
     }
 }
 

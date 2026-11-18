@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-18
 updated: 2026-11-18
 branch: codex/ui-progress-diagnostics
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/110
 supersedes: []
 superseded_by:
 ---
@@ -36,6 +36,9 @@ superseded_by:
   The unchanged report contract is native3-ui5-fixture4; only ui-e2e.py migrates.
 - Preserve the immutable C manifest pin
   29bb6429c3f16286be99f77056058b4e66bcffd7031924ca81cbfef5fc8b68e0.
+- Integrate the separately accepted native-list and precise-resumption
+  observation baseline from [PR111](https://github.com/Joey-Project/tvOS-net-player/pull/111).
+  This diagnostic slice does not change those UI behaviors or their assertions.
 
 ## Evidence
 - [PR108 UI run44312746210](https://github.com/Joey-Project/tvOS-net-player/actions/runs/44312746210)
@@ -50,6 +53,11 @@ superseded_by:
   cleanup failures, hardlink rejection, descriptor cleanup and result staging.
   Actual process microtests preserve nonzero, deadline and log-limit outcomes;
   none is a claim of UI playback or a repaired historical timeout.
+- [The original PR110 UI run](https://github.com/Joey-Project/tvOS-net-player/actions/runs/44332592866)
+  used these diagnostics to distinguish completed Xcode assertion failures
+  from timeouts: both platforms ran five cases, with the resumption case
+  failing. The independent PR111 repair passed all five cases per platform
+  without changing helper limits or playback precision.
 - [Independent artifact verification](../../../architecture/artifact-verification.md)
   defines the unchanged-helper and explicit helper-migration routes. Complete
   delivery/test/review evidence is retained by the associated prerequisite PR.

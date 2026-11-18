@@ -108,27 +108,57 @@ final class UIPlaybackTests: XCTestCase {
         )
         remote.press(.select)
 
+        let firstCachePageDeadline = Date().addingTimeInterval(60)
         XCTAssertTrue(
-            waitUntil(timeout: 60) { status(libraryStatus, contains: "Loaded 50 cached item(s)") },
+            waitUntil(timeout: max(0, firstCachePageDeadline.timeIntervalSinceNow)) {
+                status(libraryStatus, contains: "Loaded 50 cached item(s)")
+            },
             "The app did not load the first real catalog page. Status: \(accessibilityDescription(libraryStatus))"
         )
 
-        let loadMore = app.buttons["cache-library-load-more"]
+        let cacheOpener = app.buttons["cache-library-open"]
+        XCTAssertTrue(
+            moveFocus(until: cacheOpener, direction: .down, limit: 40, deadline: firstCachePageDeadline)
+        )
+        remote.press(.select)
+        let cacheList = identifiedElement("cache-library-list")
+        let nativeLibraryStatus = identifiedElement("cache-library-list-status")
+        XCTAssertTrue(
+            waitUntil(timeout: min(10, max(0, firstCachePageDeadline.timeIntervalSinceNow))) { cacheList.exists },
+            "The cache library did not open as a native list."
+        )
+
+        let loadMore = cacheList.buttons["cache-library-load-more"]
         XCTAssertTrue(
             focusDown(until: loadMore, limit: 80),
             "Remote focus could not reach the next-page control in the real library."
         )
         remote.press(.select)
         XCTAssertTrue(
-            waitUntil(timeout: 30) { status(libraryStatus, contains: "Loaded 55 cached item(s)") },
-            "The app did not load the second catalog page. Status: \(accessibilityDescription(libraryStatus))"
+            waitUntil(timeout: 30) { status(nativeLibraryStatus, contains: "Loaded 55 cached item(s)") },
+            "The app did not load the second catalog page. Status: \(accessibilityDescription(nativeLibraryStatus))"
         )
 
-        let fixture = libraryItem(named: "Fixture 055")
+        let fixture = cacheList.buttons
+            .matching(identifier: "cache-library-item")
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Fixture 055"))
+            .firstMatch
         XCTAssertTrue(
             focusDown(until: fixture, limit: 20),
             "Remote navigation did not materialize and focus Fixture 055 after paging. "
                 + "Target: \(accessibilityDescription(fixture)); \(libraryFocusDescription())"
+        )
+        let deleteFixture = cacheList.buttons
+            .matching(identifier: "cache-library-delete-item")
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Fixture 055"))
+            .firstMatch
+        XCTAssertTrue(
+            deleteFixture.exists,
+            "The read-only Fixture 055 row should expose its disabled delete control."
+        )
+        XCTAssertFalse(
+            deleteFixture.isEnabled,
+            "The UI E2E cache server does not grant library-item deletion."
         )
         remote.press(.select)
 
@@ -167,14 +197,23 @@ final class UIPlaybackTests: XCTestCase {
         )
         XCTAssertTrue(status(reconnecting, contains: "Reconnecting task updates"))
         let taskStatus = identifiedElement("bilibili-task-status")
+        let terminalDeadline = Date().addingTimeInterval(60)
         XCTAssertTrue(
-            waitUntil(timeout: 60) {
+            waitUntil(timeout: max(0, terminalDeadline.timeIntervalSinceNow)) {
                 status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
-                    && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
                 + accessibilityDescription(taskStatus)
         )
+        let resultsList = openResultsList(deadline: terminalDeadline)
+        let resultStatus = resultsList.descendants(matching: .any)
+            .matching(identifier: "bilibili-result-status-ui-e2e-automatic-result").element
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, terminalDeadline.timeIntervalSinceNow)) {
+                status(resultStatus, contains: "Cached")
+            }
+        )
+        closeResultsList(resultsList, deadline: terminalDeadline)
         XCTAssertFalse(reconnecting.exists, "The terminal task must stop showing a reconnecting state.")
         XCTAssertFalse(
             identifiedElement("bilibili.watch.error").exists, "A recovered task must not retain a watch error.")
@@ -197,15 +236,13 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
         XCTAssertFalse(reconnecting.exists)
 
-        let addressField = app.textFields["cache-server-address"]
+        let resultReadyDeadline = Date().addingTimeInterval(20)
+        let resultsList = openResultsList(deadline: resultReadyDeadline)
+        let play = resultsList.buttons["bilibili-result-play-ui-e2e-manual-result"]
         XCTAssertTrue(
-            moveFocus(until: addressField, direction: .up, limit: 40),
-            "Remote focus could not recover the cache server address landmark. "
-                + taskWatchFocusDescription(target: addressField)
-        )
-        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
+            waitUntil(timeout: max(0, resultReadyDeadline.timeIntervalSinceNow)) { play.exists && play.isEnabled })
         XCTAssertTrue(
-            focusDown(until: play, limit: 80),
+            moveFocus(until: play, direction: .down, limit: 80, deadline: resultReadyDeadline),
             "Remote focus could not reach the visible result Play control. " + taskWatchFocusDescription(target: play)
         )
         XCTAssertTrue(play.isEnabled, "The fixture's task media must be playable while updates are unavailable.")
@@ -225,19 +262,30 @@ final class UIPlaybackTests: XCTestCase {
 
         let beforeReconnect = try XCTUnwrap(timelineSeconds())
         XCTAssertTrue(
-            moveFocus(until: reconnect, direction: .up, limit: 20),
-            "Remote focus could not return to Reconnect Updates from the result Play control. "
+            moveFocus(until: reconnect, direction: .down, limit: 80),
+            "Remote focus could not return to Reconnect Updates after leaving the native results list. "
                 + taskWatchFocusDescription(target: reconnect)
         )
         XCUIRemote.shared.press(.select)
         let taskStatus = identifiedElement("bilibili-task-status")
+        let reconnectDeadline = Date().addingTimeInterval(60)
         XCTAssertTrue(
-            waitUntil(timeout: 60) {
+            waitUntil(timeout: max(0, reconnectDeadline.timeIntervalSinceNow)) {
                 status(taskStatus, contains: "Playing Manual recovery fixture.")
-                    && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
             },
             "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
         )
+        let recoveredResults = openResultsList(deadline: reconnectDeadline)
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, reconnectDeadline.timeIntervalSinceNow)) {
+                status(
+                    recoveredResults.descendants(matching: .any)
+                        .matching(identifier: "bilibili-result-status-ui-e2e-manual-result").element,
+                    contains: "Cached"
+                )
+            }
+        )
+        closeResultsList(recoveredResults, deadline: reconnectDeadline)
         XCTAssertFalse(watchError.exists, "Successful manual reconnection must clear the stale watch warning.")
         XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists)
         XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 10))
@@ -257,15 +305,14 @@ final class UIPlaybackTests: XCTestCase {
         let reconnecting = identifiedElement("bilibili.watch.status")
         let watchError = identifiedElement("bilibili.watch.error")
         let retry = identifiedElement("bilibili.watch.retry")
-        let play = app.buttons["bilibili-result-play-ui-e2e-silent-result"]
         var observedFalseWatchState = false
-        let playable = waitUntil(timeout: 20) {
+        let initialReadyDeadline = Date().addingTimeInterval(20)
+        let playable = waitUntil(timeout: max(0, initialReadyDeadline.timeIntervalSinceNow)) {
             if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
                 observedFalseWatchState = true
                 return true
             }
-            return play.exists && play.isEnabled
-                && status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
+            return status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
         XCTAssertTrue(
@@ -276,13 +323,12 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.exists)
         XCTAssertFalse(retry.exists)
 
-        let addressField = app.textFields["cache-server-address"]
+        let resultsList = openResultsList(deadline: initialReadyDeadline)
+        let play = resultsList.buttons["bilibili-result-play-ui-e2e-silent-result"]
         XCTAssertTrue(
-            moveFocus(until: addressField, direction: .up, limit: 40),
-            "Remote focus could not return to the server address. " + taskWatchFocusDescription(target: addressField)
-        )
+            waitUntil(timeout: max(0, initialReadyDeadline.timeIntervalSinceNow)) { play.exists && play.isEnabled })
         XCTAssertTrue(
-            focusDown(until: play, limit: 80),
+            moveFocus(until: play, direction: .down, limit: 80, deadline: initialReadyDeadline),
             "Remote focus could not reach the silent task Play control. " + taskWatchFocusDescription(target: play)
         )
         XCTAssertTrue(play.isEnabled, "The silent task media must remain playable while its watch is open.")
@@ -304,13 +350,13 @@ final class UIPlaybackTests: XCTestCase {
         let duration = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline)).duration
         XCTAssertGreaterThanOrEqual(duration, 90, "The task media must cover the bounded reconciliation window.")
 
-        let reconciled = waitUntil(timeout: 75) {
+        let reconciliationDeadline = Date().addingTimeInterval(75)
+        let reconciled = waitUntil(timeout: max(0, reconciliationDeadline.timeIntervalSinceNow)) {
             if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
                 observedFalseWatchState = true
                 return true
             }
             return status(taskStatus, contains: "Playing Silent task reconciliation fixture.")
-                && status(identifiedElement("bilibili-result-status-ui-e2e-silent-result"), contains: "Cached")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
         XCTAssertTrue(
@@ -322,6 +368,17 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.exists)
         XCTAssertFalse(retry.exists)
         XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 10))
+        let reconciledResults = openResultsList(deadline: reconciliationDeadline)
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, reconciliationDeadline.timeIntervalSinceNow)) {
+                status(
+                    reconciledResults.descendants(matching: .any)
+                        .matching(identifier: "bilibili-result-status-ui-e2e-silent-result").element,
+                    contains: "Cached"
+                )
+            }
+        )
+        closeResultsList(reconciledResults, deadline: reconciliationDeadline)
         let afterReconciliation = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
         XCTAssertNotNil(
             waitForTimeline(timeout: 10) { $0 >= afterReconciliation + 1.5 },
@@ -338,27 +395,44 @@ final class UIPlaybackTests: XCTestCase {
         let selectedResultID = "ui-e2e-resumption-result"
         let decoyResultID = "ui-e2e-resumption-decoy-result"
         let taskStatus = identifiedElement("bilibili-task-status")
-        let selectedStatus = identifiedElement("bilibili-result-status-\(selectedResultID)")
-        let decoyStatus = identifiedElement("bilibili-result-status-\(decoyResultID)")
-        let selectedPlay = app.buttons["bilibili-result-play-\(selectedResultID)"]
-        let decoyPlay = app.buttons["bilibili-result-play-\(decoyResultID)"]
+        let initialResultsDeadline = Date().addingTimeInterval(75)
         XCTAssertTrue(
-            waitUntil(timeout: 75) {
+            waitUntil(timeout: max(0, initialResultsDeadline.timeIntervalSinceNow)) {
                 status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
-                    && status(selectedStatus, contains: "Cached")
-                    && status(decoyStatus, contains: "Cached")
-                    && selectedPlay.exists && selectedPlay.isEnabled
-                    && decoyPlay.exists && decoyPlay.isEnabled
             },
             "The fixture did not restore both the decoy and exact selected task results. "
                 + accessibilityDescription(taskStatus)
         )
 
-        remote.press(.up)
+        let initialResults = openResultsList(deadline: initialResultsDeadline)
+        let initialSelectedStatus = initialResults.descendants(matching: .any)
+            .matching(identifier: "bilibili-result-status-\(selectedResultID)").element
+        let initialDecoyStatus = initialResults.descendants(matching: .any)
+            .matching(identifier: "bilibili-result-status-\(decoyResultID)").element
+        let initialSelectedPlay = initialResults.buttons["bilibili-result-play-\(selectedResultID)"]
+        let initialDecoyPlay = initialResults.buttons["bilibili-result-play-\(decoyResultID)"]
+        let initialPlaybackState = initialResults.descendants(matching: .any)
+            .matching(identifier: "bilibili-results-playback-state").element
         XCTAssertTrue(
-            waitUntil(timeout: 5) { selectedPlay.exists && selectedPlay.hasFocus && selectedPlay.isHittable },
-            "Remote focus could not reach the exact second result. " + taskWatchFocusDescription(target: selectedPlay)
+            waitUntil(timeout: max(0, initialResultsDeadline.timeIntervalSinceNow)) {
+                status(initialSelectedStatus, contains: "Cached") && status(initialDecoyStatus, contains: "Cached")
+                    && initialSelectedPlay.exists && initialSelectedPlay.isEnabled
+                    && initialDecoyPlay.exists && initialDecoyPlay.isEnabled
+                    && initialPlaybackState.value as? String == "empty"
+            },
+            "The native list did not expose both the exact selected result and decoy."
         )
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
+        XCTAssertTrue(
+            moveFocus(until: initialDecoyPlay, direction: .down, limit: 50, deadline: initialResultsDeadline)
+        )
+        XCTAssertEqual(initialDecoyPlay.identifier, "bilibili-result-play-\(decoyResultID)")
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
+        XCTAssertTrue(
+            moveFocus(until: initialSelectedPlay, direction: .down, limit: 50, deadline: initialResultsDeadline)
+        )
+        XCTAssertEqual(initialSelectedPlay.identifier, "bilibili-result-play-\(selectedResultID)")
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
         remote.press(.select)
         let timeline = identifiedElement("playback-timeline")
         let playbackState = identifiedElement("playback-state")
@@ -408,7 +482,7 @@ final class UIPlaybackTests: XCTestCase {
         let restoredResultsDeadline = Date().addingTimeInterval(75)
         guard
             waitUntil(
-                timeout: 75,
+                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
                 condition: {
                     status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
                 })
@@ -418,6 +492,72 @@ final class UIPlaybackTests: XCTestCase {
         }
 
         let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(moveFocus(until: addressField, direction: .up, limit: 40, deadline: restoredResultsDeadline))
+        let resultsOpener = app.buttons["bilibili-results-open"]
+        XCTAssertTrue(
+            moveFocus(until: resultsOpener, direction: .down, limit: 80, deadline: restoredResultsDeadline),
+            "Remote focus could not reach the explicit task-results navigation control. "
+                + taskWatchFocusDescription(target: resultsOpener)
+        )
+        remote.press(.select)
+        let resultsList = identifiedElement("bilibili-results-list")
+        let resultsClose = app.buttons["bilibili-results-close"]
+        let nativeSelectedStatus = resultsList.descendants(matching: .any)
+            .matching(identifier: "bilibili-result-status-\(selectedResultID)").element
+        let nativeDecoyStatus = resultsList.descendants(matching: .any)
+            .matching(identifier: "bilibili-result-status-\(decoyResultID)").element
+        let nativeSelectedPlay = resultsList.buttons["bilibili-result-play-\(selectedResultID)"]
+        let nativeDecoyPlay = resultsList.buttons["bilibili-result-play-\(decoyResultID)"]
+        let nativePlaybackState = resultsList.descendants(matching: .any)
+            .matching(identifier: "bilibili-results-playback-state").element
+        XCTAssertTrue(
+            waitUntil(timeout: min(10, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
+                resultsList.exists && resultsClose.exists && resultsClose.isHittable
+                    && (resultsClose.hasFocus
+                        || resultsList.buttons.allElementsBoundByIndex.contains {
+                            $0.isHittable && $0.hasFocus
+                        })
+            },
+            "The task-results list did not open with a usable focus target."
+        )
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
+                status(nativeSelectedStatus, contains: "Cached") && status(nativeDecoyStatus, contains: "Cached")
+                    && nativeSelectedPlay.exists && nativeSelectedPlay.isEnabled
+                    && nativeDecoyPlay.exists && nativeDecoyPlay.isEnabled
+            },
+            "The native list did not restore both the exact selected result and its decoy."
+        )
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
+        XCTAssertTrue(moveFocus(until: nativeDecoyPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline))
+        XCTAssertEqual(nativeDecoyPlay.identifier, "bilibili-result-play-\(decoyResultID)")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
+                nativeDecoyPlay.exists && nativeDecoyPlay.hasFocus && nativeDecoyPlay.isHittable
+                    && nativeDecoyPlay.isEnabled
+            }
+        )
+        XCTAssertTrue(
+            moveFocus(until: nativeSelectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline))
+        XCTAssertEqual(nativeSelectedPlay.identifier, "bilibili-result-play-\(selectedResultID)")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
+        XCTAssertTrue(
+            waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
+                nativeSelectedPlay.exists && nativeSelectedPlay.hasFocus && nativeSelectedPlay.isHittable
+                    && nativeSelectedPlay.isEnabled
+            }
+        )
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
+        remote.press(.menu)
+        XCTAssertTrue(
+            waitUntil(timeout: min(10, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
+                !resultsList.exists && resultsOpener.exists && resultsOpener.hasFocus
+            },
+            "Closing the native results list must restore focus to its opener."
+        )
+
         guard moveFocus(until: addressField, direction: .up, limit: 50, deadline: restoredResultsDeadline) else {
             XCTFail(
                 "Remote focus could not recover the cache-server address landmark before restoring the result view. "
@@ -458,62 +598,6 @@ final class UIPlaybackTests: XCTestCase {
             )
             return
         }
-        guard
-            moveFocus(until: decoyPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline),
-            waitUntil(
-                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
-                condition: {
-                    decoyPlay.exists && decoyPlay.hasFocus && decoyPlay.isHittable && decoyPlay.isEnabled
-                }
-            )
-        else {
-            XCTFail(
-                "Remote focus could not enter the visible result Play column at the decoy without activating it. "
-                    + taskWatchFocusDescription(target: decoyPlay)
-                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
-                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
-            )
-            return
-        }
-        guard
-            moveFocus(until: selectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline),
-            waitUntil(
-                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
-                condition: {
-                    selectedPlay.exists && selectedPlay.hasFocus && selectedPlay.isHittable && selectedPlay.isEnabled
-                }
-            )
-        else {
-            XCTFail(
-                "Remote navigation could not focus the exact selected result after the decoy without activating it. "
-                    + taskWatchFocusDescription(target: selectedPlay)
-                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
-                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
-                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
-            )
-            return
-        }
-        guard
-            waitUntil(
-                timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow),
-                condition: {
-                    status(taskStatus, contains: "2 Bilibili results are cached for LAN playback.")
-                        && status(selectedStatus, contains: "Cached")
-                        && status(decoyStatus, contains: "Cached")
-                        && selectedPlay.exists && selectedPlay.isEnabled
-                        && decoyPlay.exists && decoyPlay.isEnabled
-                })
-        else {
-            XCTFail(
-                "The original task/result identity was not restored after relaunch. "
-                    + accessibilityDescription(taskStatus)
-                    + "; selectedStatus: \(accessibilityDescription(selectedStatus))"
-                    + "; selectedPlay: \(taskWatchFocusDescription(target: selectedPlay))"
-                    + "; decoyStatus: \(accessibilityDescription(decoyStatus))"
-                    + "; decoyPlay: \(accessibilityDescription(decoyPlay))"
-            )
-            return
-        }
         RunLoop.current.run(until: Date().addingTimeInterval(2.2))
         XCTAssertTrue(emptyPlayer.exists, "Relaunch loaded a player before explicit Continue.")
         XCTAssertNotEqual(playbackState.value as? String, "playing")
@@ -541,11 +625,25 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(
             waitUntil(timeout: 30) {
                 playbackState.value as? String == "playing"
-                    && timelineSeconds().map { abs($0 - savedCheckpoint) <= 2 } == true
+                    && playbackResumePositionObservationMatches(
+                        checkpoint: savedCheckpoint,
+                        resultID: selectedResultID
+                    )
             },
-            "Explicit Continue did not restore the saved position near \(savedCheckpoint). "
-                + accessibilityDescription(timeline)
+            "Explicit Continue did not start playback at the observed saved position for the exact result near "
+                + "\(savedCheckpoint). State: \(accessibilityDescription(playbackState)); timeline: "
+                + "\(accessibilityDescription(timeline)); observation: "
+                + accessibilityDescription(identifiedElement("playback-resume-observation"))
         )
+        let resumeObservation = try XCTUnwrap(playbackResumeObservationValues())
+        XCTAssertEqual(resumeObservation["source"], "validated-resume-seek")
+        XCTAssertNotNil(UUID(uuidString: resumeObservation["requestID"] ?? ""))
+        XCTAssertEqual(resumeObservation["resultID"], selectedResultID)
+        let requestedPosition = try XCTUnwrap(Double(resumeObservation["requested"] ?? ""))
+        let observedPosition = try XCTUnwrap(Double(resumeObservation["observed"] ?? ""))
+        XCTAssertLessThanOrEqual(abs(requestedPosition - savedCheckpoint), 2)
+        XCTAssertLessThanOrEqual(abs(observedPosition - savedCheckpoint), 2)
+        XCTAssertLessThanOrEqual(abs(observedPosition - requestedPosition), 1)
         let restoredAt = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
         XCTAssertNotNil(
             waitForTimeline(timeout: 15) { $0 >= restoredAt + 1.5 },
@@ -779,13 +877,6 @@ final class UIPlaybackTests: XCTestCase {
             + "status: \(accessibilityDescription(app.staticTexts["cache-library-status"]))"
     }
 
-    private func libraryItem(named title: String) -> XCUIElement {
-        app.buttons
-            .matching(identifier: "cache-library-item")
-            .matching(NSPredicate(format: "label CONTAINS[c] %@", title))
-            .firstMatch
-    }
-
     private func libraryFocusDescription() -> String {
         let items = app.buttons.matching(identifier: "cache-library-item").allElementsBoundByIndex
         let focused = items.first(where: { $0.hasFocus }).map { accessibilityDescription($0) } ?? "none"
@@ -794,6 +885,46 @@ final class UIPlaybackTests: XCTestCase {
 
     private func focusDown(until element: XCUIElement, limit: Int) -> Bool {
         moveFocus(until: element, direction: .down, limit: limit)
+    }
+
+    private func openResultsList(deadline: Date? = nil) -> XCUIElement {
+        let address = app.textFields["cache-server-address"]
+        let opener = app.buttons["bilibili-results-open"]
+        XCTAssertTrue(
+            moveFocus(until: address, direction: .up, limit: 50, deadline: deadline),
+            "Remote focus could not recover the cache-server address before opening task results. "
+                + taskWatchFocusDescription(target: address)
+        )
+        XCTAssertTrue(
+            moveFocus(until: opener, direction: .down, limit: 100, deadline: deadline),
+            "Remote focus could not reach the explicit task-results opener. "
+                + taskWatchFocusDescription(target: opener)
+        )
+        XCUIRemote.shared.press(.select)
+        let list = identifiedElement("bilibili-results-list")
+        let close = app.buttons["bilibili-results-close"]
+        let openTimeout = min(10, max(0, deadline?.timeIntervalSinceNow ?? 10))
+        XCTAssertTrue(
+            waitUntil(timeout: openTimeout) {
+                list.exists && close.exists && close.isHittable
+                    && (close.hasFocus
+                        || list.buttons.allElementsBoundByIndex.contains { $0.isHittable && $0.hasFocus })
+            },
+            "The native task-results list did not open with a focused, hittable control."
+        )
+        return list
+    }
+
+    private func closeResultsList(_ list: XCUIElement, deadline: Date? = nil) {
+        let opener = app.buttons["bilibili-results-open"]
+        let close = app.buttons["bilibili-results-close"]
+        XCTAssertTrue(list.exists && close.exists && close.isHittable)
+        XCUIRemote.shared.press(.menu)
+        let closeTimeout = min(10, max(0, deadline?.timeIntervalSinceNow ?? 10))
+        XCTAssertTrue(
+            waitUntil(timeout: closeTimeout) { !list.exists && opener.exists && opener.hasFocus },
+            "Closing task results must restore focus to its opener."
+        )
     }
 
     private func focusContinueFromResumptionRow(
@@ -858,6 +989,27 @@ final class UIPlaybackTests: XCTestCase {
 
     private func timelineSeconds() -> Double? {
         playbackTimeline()?.current
+    }
+
+    private func playbackResumeObservationValues() -> [String: String]? {
+        let value = identifiedElement("playback-resume-observation").value as? String
+        guard let value, let data = value.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+    }
+
+    private func playbackResumePositionObservationMatches(checkpoint: Double, resultID: String) -> Bool {
+        guard let observation = playbackResumeObservationValues(),
+            let requested = Double(observation["requested"] ?? ""),
+            let observed = Double(observation["observed"] ?? ""),
+            requested.isFinite,
+            observed.isFinite
+        else { return false }
+        return observation["source"] == "validated-resume-seek"
+            && UUID(uuidString: observation["requestID"] ?? "") != nil
+            && observation["resultID"] == resultID
+            && abs(requested - checkpoint) <= 2
+            && abs(observed - checkpoint) <= 2
+            && abs(observed - requested) <= 1
     }
 
     private func waitForTimeline(timeout: TimeInterval, matching predicate: (Double) -> Bool) -> Double? {
