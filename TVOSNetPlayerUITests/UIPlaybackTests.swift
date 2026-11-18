@@ -152,29 +152,14 @@ final class UIPlaybackTests: XCTestCase {
             .matching(identifier: "cache-library-delete-item")
             .matching(NSPredicate(format: "label CONTAINS[c] %@", "Fixture 055"))
             .firstMatch
-        XCTAssertTrue(moveFocus(until: deleteFixture, direction: .right, limit: 8))
-        XCTAssertTrue(deleteFixture.isHittable && deleteFixture.isEnabled)
-        remote.press(.select)
-
-        let deleteConfirmationTitle = app.staticTexts["Delete Cached Video?"]
-        let confirmDelete = app.buttons["Delete"]
-        let cancelDelete = app.buttons["Cancel"]
         XCTAssertTrue(
-            waitUntil(timeout: 10) {
-                deleteConfirmationTitle.exists
-                    && confirmDelete.exists && confirmDelete.isHittable
-                    && cancelDelete.exists && cancelDelete.isHittable
-            },
-            "The cache-list delete confirmation did not appear with its native actions."
+            deleteFixture.exists,
+            "The read-only Fixture 055 row should expose its disabled delete control."
         )
-        remote.press(.menu)
-        XCTAssertTrue(
-            waitUntil(timeout: 10) { !deleteConfirmationTitle.exists && cacheList.exists },
-            "Cancel did not dismiss the cache-list delete confirmation."
+        XCTAssertFalse(
+            deleteFixture.isEnabled,
+            "The UI E2E cache server does not grant library-item deletion."
         )
-        XCTAssertTrue(fixture.exists, "Cancel must leave Fixture 055 in the cache list.")
-        XCTAssertTrue(status(nativeLibraryStatus, contains: "Loaded 55 cached item(s)"))
-        XCTAssertTrue(moveFocus(until: fixture, direction: .left, limit: 8))
         remote.press(.select)
 
         let timeline = identifiedElement("playback-timeline")

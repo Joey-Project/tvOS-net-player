@@ -24,7 +24,8 @@ superseded_by:
 - The visible cache-library cover owns its deletion confirmation, including
   cancellation. The results cover displays the actual current Core playback
   state, so no-autoplay checks do not query a hidden underlying player. The
-  existing cache UI case also opens and cancels deletion without removing data.
+  existing read-only cache fixture verifies deletion remains disabled; positive
+  confirmation/cancellation runtime coverage needs a separate opt-in fixture.
 - Preserve the existing zero-tolerance resume seek and its one-second actual
   position verification. Publish a read-only, operation/identity-bound sample
   of that actual position before autoplay; a requested target is not an applied
@@ -32,6 +33,10 @@ superseded_by:
   only in isolated UI-test mode, without changing production capture or
   playback. Tests verify precision plus playing inside the original 30-second
   window, then separately verify real progress.
+- Isolated UI diagnostics use a native text leaf, like the working playback
+  timeline, rather than a transparent one-pixel accessibility carrier. Native
+  focus sections preserve access to available actions when adjacent actions
+  are disabled; tests do not force focus or change playback behavior.
 - Keep no-autoplay, selected-vs-decoy, failure/cancellation and stale-operation
   protections. Do not widen position tolerance, budgets or required case sets.
 - Both producer helpers remain outside this candidate's diff. Independent old

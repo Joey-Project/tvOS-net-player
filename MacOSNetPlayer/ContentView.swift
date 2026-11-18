@@ -1456,9 +1456,9 @@ private struct PlaybackResumePositionObservationStatus: View {
 
     var body: some View {
         if let observation = model.playbackResumePositionObservation {
-            Color.clear
-                .frame(width: 1, height: 1)
-                .accessibilityElement(children: .ignore)
+            Text("Restored playback position")
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .accessibilityLabel("Playback resume observation")
                 .accessibilityValue(Self.value(for: observation))
                 .accessibilityIdentifier("playback-resume-observation")
