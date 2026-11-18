@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-18
 updated: 2026-11-18
 branch: codex/ui-resumption-fix
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/111
 supersedes: []
 superseded_by:
 ---
@@ -21,6 +21,10 @@ superseded_by:
 - Extract relevant native tvOS results/cache/task lists and focus navigation
   from the existing high-preparation branch without importing unrelated media,
   Rust, EOF-test or helper changes.
+- The visible cache-library cover owns its deletion confirmation, including
+  cancellation. The results cover displays the actual current Core playback
+  state, so no-autoplay checks do not query a hidden underlying player. The
+  existing cache UI case also opens and cancels deletion without removing data.
 - Preserve the existing zero-tolerance resume seek and its one-second actual
   position verification. Publish a read-only, operation/identity-bound sample
   of that actual position before autoplay; a requested target is not an applied

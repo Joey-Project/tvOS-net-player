@@ -148,6 +148,33 @@ final class UIPlaybackTests: XCTestCase {
             "Remote navigation did not materialize and focus Fixture 055 after paging. "
                 + "Target: \(accessibilityDescription(fixture)); \(libraryFocusDescription())"
         )
+        let deleteFixture = cacheList.buttons
+            .matching(identifier: "cache-library-delete-item")
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Fixture 055"))
+            .firstMatch
+        XCTAssertTrue(moveFocus(until: deleteFixture, direction: .right, limit: 8))
+        XCTAssertTrue(deleteFixture.isHittable && deleteFixture.isEnabled)
+        remote.press(.select)
+
+        let deleteConfirmationTitle = app.staticTexts["Delete Cached Video?"]
+        let confirmDelete = app.buttons["Delete"]
+        let cancelDelete = app.buttons["Cancel"]
+        XCTAssertTrue(
+            waitUntil(timeout: 10) {
+                deleteConfirmationTitle.exists
+                    && confirmDelete.exists && confirmDelete.isHittable
+                    && cancelDelete.exists && cancelDelete.isHittable
+            },
+            "The cache-list delete confirmation did not appear with its native actions."
+        )
+        remote.press(.menu)
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { !deleteConfirmationTitle.exists && cacheList.exists },
+            "Cancel did not dismiss the cache-list delete confirmation."
+        )
+        XCTAssertTrue(fixture.exists, "Cancel must leave Fixture 055 in the cache list.")
+        XCTAssertTrue(status(nativeLibraryStatus, contains: "Loaded 55 cached item(s)"))
+        XCTAssertTrue(moveFocus(until: fixture, direction: .left, limit: 8))
         remote.press(.select)
 
         let timeline = identifiedElement("playback-timeline")
@@ -399,25 +426,28 @@ final class UIPlaybackTests: XCTestCase {
             .matching(identifier: "bilibili-result-status-\(decoyResultID)").element
         let initialSelectedPlay = initialResults.buttons["bilibili-result-play-\(selectedResultID)"]
         let initialDecoyPlay = initialResults.buttons["bilibili-result-play-\(decoyResultID)"]
+        let initialPlaybackState = initialResults.descendants(matching: .any)
+            .matching(identifier: "bilibili-results-playback-state").element
         XCTAssertTrue(
             waitUntil(timeout: max(0, initialResultsDeadline.timeIntervalSinceNow)) {
                 status(initialSelectedStatus, contains: "Cached") && status(initialDecoyStatus, contains: "Cached")
                     && initialSelectedPlay.exists && initialSelectedPlay.isEnabled
                     && initialDecoyPlay.exists && initialDecoyPlay.isEnabled
+                    && initialPlaybackState.value as? String == "empty"
             },
             "The native list did not expose both the exact selected result and decoy."
         )
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
         XCTAssertTrue(
             moveFocus(until: initialDecoyPlay, direction: .down, limit: 50, deadline: initialResultsDeadline)
         )
         XCTAssertEqual(initialDecoyPlay.identifier, "bilibili-result-play-\(decoyResultID)")
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
         XCTAssertTrue(
             moveFocus(until: initialSelectedPlay, direction: .down, limit: 50, deadline: initialResultsDeadline)
         )
         XCTAssertEqual(initialSelectedPlay.identifier, "bilibili-result-play-\(selectedResultID)")
-        let initialEmptyPlayer = identifiedElement("player-empty-state")
-        XCTAssertTrue(initialEmptyPlayer.exists, "Result arrival and browsing must not start playback.")
-        XCTAssertNotEqual(identifiedElement("playback-state").value as? String, "playing")
+        XCTAssertEqual(initialPlaybackState.value as? String, "empty")
         remote.press(.select)
         let timeline = identifiedElement("playback-timeline")
         let playbackState = identifiedElement("playback-state")
@@ -493,6 +523,8 @@ final class UIPlaybackTests: XCTestCase {
             .matching(identifier: "bilibili-result-status-\(decoyResultID)").element
         let nativeSelectedPlay = resultsList.buttons["bilibili-result-play-\(selectedResultID)"]
         let nativeDecoyPlay = resultsList.buttons["bilibili-result-play-\(decoyResultID)"]
+        let nativePlaybackState = resultsList.descendants(matching: .any)
+            .matching(identifier: "bilibili-results-playback-state").element
         XCTAssertTrue(
             waitUntil(timeout: min(10, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {
                 resultsList.exists && resultsClose.exists && resultsClose.isHittable
@@ -503,8 +535,7 @@ final class UIPlaybackTests: XCTestCase {
             },
             "The task-results list did not open with a usable focus target."
         )
-        XCTAssertTrue(emptyPlayer.exists, "Browsing task results must not start playback.")
-        XCTAssertNotEqual(playbackState.value as? String, "playing")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
         XCTAssertTrue(
             waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
                 status(nativeSelectedStatus, contains: "Cached") && status(nativeDecoyStatus, contains: "Cached")
@@ -513,8 +544,10 @@ final class UIPlaybackTests: XCTestCase {
             },
             "The native list did not restore both the exact selected result and its decoy."
         )
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
         XCTAssertTrue(moveFocus(until: nativeDecoyPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline))
         XCTAssertEqual(nativeDecoyPlay.identifier, "bilibili-result-play-\(decoyResultID)")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
         XCTAssertTrue(
             waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
                 nativeDecoyPlay.exists && nativeDecoyPlay.hasFocus && nativeDecoyPlay.isHittable
@@ -524,14 +557,14 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(
             moveFocus(until: nativeSelectedPlay, direction: .down, limit: 50, deadline: restoredResultsDeadline))
         XCTAssertEqual(nativeSelectedPlay.identifier, "bilibili-result-play-\(selectedResultID)")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
         XCTAssertTrue(
             waitUntil(timeout: max(0, restoredResultsDeadline.timeIntervalSinceNow)) {
                 nativeSelectedPlay.exists && nativeSelectedPlay.hasFocus && nativeSelectedPlay.isHittable
                     && nativeSelectedPlay.isEnabled
             }
         )
-        XCTAssertTrue(emptyPlayer.exists, "Focusing the decoy and selected result must not activate either one.")
-        XCTAssertNotEqual(playbackState.value as? String, "playing")
+        XCTAssertEqual(nativePlaybackState.value as? String, "empty")
         remote.press(.menu)
         XCTAssertTrue(
             waitUntil(timeout: min(10, max(0, restoredResultsDeadline.timeIntervalSinceNow))) {

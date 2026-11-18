@@ -160,28 +160,6 @@ struct ContentView: View {
         ) {
             bilibiliResultsListScreen
         }
-        .confirmationDialog(
-            "Delete Cached Video?",
-            isPresented: Binding(
-                get: { pendingDeleteItem != nil },
-                set: { isPresented in
-                    if !isPresented {
-                        pendingDeleteItem = nil
-                    }
-                }
-            ),
-            titleVisibility: .visible,
-            presenting: pendingDeleteItem
-        ) { item in
-            Button("Delete", role: .destructive) {
-                confirmDeleteCachedItem(item)
-            }
-            Button("Cancel", role: .cancel) {
-                pendingDeleteItem = nil
-            }
-        } message: { item in
-            Text("Delete \(item.displayTitle) from the cache server.")
-        }
         .sheet(isPresented: $isLoginQRPresented) {
             bilibiliLoginQRSheet
         }
@@ -406,6 +384,7 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .accessibilityLabel("Delete \(item.displayTitle)")
+                            .accessibilityIdentifier("cache-library-delete-item")
                             .disabled(!cacheModel.canDelete(item))
                         }
                     }
@@ -413,6 +392,28 @@ struct ContentView: View {
                 }
             }
             .accessibilityIdentifier("cache-library-list")
+        }
+        .confirmationDialog(
+            "Delete Cached Video?",
+            isPresented: Binding(
+                get: { pendingDeleteItem != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteItem = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteItem
+        ) { item in
+            Button("Delete", role: .destructive) {
+                confirmDeleteCachedItem(item)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItem = nil
+            }
+        } message: { item in
+            Text("Delete \(item.displayTitle) from the cache server.")
         }
         .onExitCommand { isCacheLibraryPresented = false }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -543,6 +544,12 @@ struct ContentView: View {
                 Section("Task") {
                     Text(bilibiliModel.statusMessage).font(.callout).foregroundStyle(.secondary)
                         .accessibilityIdentifier("bilibili-results-task-status")
+                    TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                        let hasPlayer = model.player != nil
+                        Text(hasPlayer ? model.playbackState.displayTitle : "No active playback")
+                            .accessibilityValue(hasPlayer ? model.playbackState.rawValue : "empty")
+                            .accessibilityIdentifier("bilibili-results-playback-state")
+                    }
                     if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
                         ProgressView(value: bilibiliModel.progress)
                         if let summary = bilibiliModel.activePlaybackPolicySummary {
