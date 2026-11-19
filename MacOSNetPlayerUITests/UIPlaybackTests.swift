@@ -295,17 +295,34 @@ final class UIPlaybackTests: XCTestCase {
             "Twelve Forward actions did not reach the final ten seconds. \(accessibilityDescription(timeline))"
         )
         if nearEnd.duration - nearEnd.current >= 10 {
-            let exactStepStart = nearEnd
-            clickVisible(toggle)
-            XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 10))
+            guard state.value as? String == "paused" else {
+                XCTFail("The native timeline seek requires the paused state. \(accessibilityDescription(state))")
+                return
+            }
+            let timelineSliders = app.sliders.matching(NSPredicate(format: "label == %@", "timeline"))
+            guard timelineSliders.count == 1 else {
+                XCTFail("Expected one native timeline slider; found \(timelineSliders.count).")
+                return
+            }
+            let timelineSlider = timelineSliders.firstMatch
+            guard isVisible(timelineSlider) else {
+                XCTFail(
+                    "The native timeline slider must be visible and hittable without clicking it. "
+                        + accessibilityDescription(timelineSlider)
+                )
+                return
+            }
+            XCTAssertTrue(timelineSlider.isEnabled, "The native timeline slider must be enabled.")
+            timelineSlider.adjust(toNormalizedSliderPosition: (nearEnd.duration - 5) / nearEnd.duration)
             XCTAssertNotNil(
-                waitForTimeline(timeout: 10) {
-                    $0 >= exactStepStart.current + 1 && $0 < exactStepStart.duration - 1
-                },
-                "Playback did not advance into the final ten seconds. \(accessibilityDescription(timeline))"
+                waitForTimeline(timeout: 10) { (3...7).contains(nearEnd.duration - $0) },
+                "The paused native timeline seek did not land 3-7 seconds from EOF. "
+                    + "Timeline: \(accessibilityDescription(timeline)); slider: \(accessibilityDescription(timelineSlider))"
             )
-            clickVisible(toggle)
-            XCTAssertTrue(waitUntilTimelineState(state, equals: "paused", timeout: 10))
+            XCTAssertTrue(
+                waitUntilTimelineState(state, equals: "paused", timeout: 10),
+                "Seeking near EOF must remain paused. \(accessibilityDescription(state))"
+            )
             nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
         }
         XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The video must be paused before EOF.")
