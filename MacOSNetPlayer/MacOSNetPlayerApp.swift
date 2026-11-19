@@ -2,6 +2,29 @@ import Foundation
 import SwiftUI
 import TVOSNetPlayerCore
 
+struct InitialFormInputConfiguration: Equatable {
+    let serverAddressText: String?
+    let bilibiliSourceText: String?
+
+    static func resolve(
+        arguments: [String],
+        environment: [String: String],
+        isDebugBuild: Bool
+    ) -> Self {
+        let argumentSet = Set(arguments)
+        guard isDebugBuild,
+            argumentSet.contains("--ui-testing"),
+            !argumentSet.contains("--ui-testing-preserve-preferences")
+        else {
+            return Self(serverAddressText: nil, bilibiliSourceText: nil)
+        }
+        return Self(
+            serverAddressText: environment["UI_E2E_INITIAL_SERVER_ADDRESS"],
+            bilibiliSourceText: environment["UI_E2E_INITIAL_BILIBILI_SOURCE"]
+        )
+    }
+}
+
 @main
 struct MacOSNetPlayerApp: App {
     @StateObject private var model: PlayerViewModel
@@ -15,6 +38,11 @@ struct MacOSNetPlayerApp: App {
     init() {
         let isUITesting = Self.isUITesting
         let preserveUITestingPreferences = Self.preserveUITestingPreferences
+        let initialFormInputs = InitialFormInputConfiguration.resolve(
+            arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment,
+            isDebugBuild: Self.isDebugBuild
+        )
         let defaults = Self.makeDefaults(
             isUITesting: isUITesting,
             preservePreferences: preserveUITestingPreferences
@@ -22,7 +50,7 @@ struct MacOSNetPlayerApp: App {
         let resumptionStore = ClientResumptionStore(defaults: defaults)
         let defaultServerAddressText: String?
         if isUITesting && !preserveUITestingPreferences {
-            defaultServerAddressText = ""
+            defaultServerAddressText = initialFormInputs.serverAddressText ?? ""
         } else if defaults.object(forKey: CacheLibraryViewModel.serverAddressDefaultsKey) == nil {
             defaultServerAddressText = resumptionStore.record?.task.endpoint.displayAddress
         } else {
@@ -45,7 +73,11 @@ struct MacOSNetPlayerApp: App {
         )
         _discoveryModel = StateObject(wrappedValue: CacheServerDiscoveryViewModel())
         _bilibiliModel = StateObject(
-            wrappedValue: BilibiliTaskViewModel(defaults: defaults, resumptionStore: resumptionStore)
+            wrappedValue: BilibiliTaskViewModel(
+                sourceText: initialFormInputs.bilibiliSourceText ?? "",
+                defaults: defaults,
+                resumptionStore: resumptionStore
+            )
         )
         _bilibiliLoginModel = StateObject(wrappedValue: BilibiliLoginViewModel())
         _diagnosticsModel = StateObject(wrappedValue: CacheServerDiagnosticsViewModel())
@@ -71,6 +103,14 @@ struct MacOSNetPlayerApp: App {
     private static var isUITesting: Bool {
         #if DEBUG
             ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        #else
+            false
+        #endif
+    }
+
+    private static var isDebugBuild: Bool {
+        #if DEBUG
+            true
         #else
             false
         #endif

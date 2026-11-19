@@ -8,6 +8,11 @@ final class UIPlaybackTests: XCTestCase {
         case missingServerAddress(String)
     }
 
+    private enum InitialInput {
+        static let serverAddress = "UI_E2E_INITIAL_SERVER_ADDRESS"
+        static let bilibiliSource = "UI_E2E_INITIAL_BILIBILI_SOURCE"
+    }
+
     private struct SourceInputError: Error, CustomStringConvertible {
         let description: String
     }
@@ -36,8 +41,6 @@ final class UIPlaybackTests: XCTestCase {
             serverAddress = address
             app = XCUIApplication()
             app.launchArguments = ["--ui-testing"]
-            app.launch()
-            didLaunchApp = true
         }
     }
 
@@ -65,6 +68,7 @@ final class UIPlaybackTests: XCTestCase {
 
     func testConnectBrowseAndControlRealPlayback() throws {
         executionTimeAllowance = 600
+        launchApp()
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
         let initialStatus = app.staticTexts["app-status"]
@@ -84,6 +88,7 @@ final class UIPlaybackTests: XCTestCase {
 
         clickVisible(addressField)
         addressField.typeText(serverAddress)
+        try requireServerAddressValue(serverAddress, in: addressField, phase: "after text entry, before Connect")
         clickVisible(refresh)
 
         let libraryStatus = app.staticTexts["cache-library-status"]
@@ -560,6 +565,10 @@ final class UIPlaybackTests: XCTestCase {
         )
         app.terminate()
         app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
+        var relaunchEnvironment = app.launchEnvironment
+        relaunchEnvironment.removeValue(forKey: InitialInput.serverAddress)
+        relaunchEnvironment.removeValue(forKey: InitialInput.bilibiliSource)
+        app.launchEnvironment = relaunchEnvironment
         app.launch()
         app.activate()
         XCTAssertTrue(
@@ -622,11 +631,10 @@ final class UIPlaybackTests: XCTestCase {
     }
 
     private func prepareResumptionScenario() throws {
+        launchApp(initialServerAddress: serverAddress, initialSource: "BV1xK4y1P7mN")
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
-        XCTAssertTrue(serverAddressIsEmpty(addressField))
-        clickVisible(addressField)
-        addressField.typeText(serverAddress)
+        try requireServerAddressValue(serverAddress, in: addressField, phase: "after seeded launch")
 
         let refresh = app.buttons["cache-server-refresh"]
         XCTAssertTrue(refresh.waitForExistence(timeout: 10))
@@ -641,25 +649,47 @@ final class UIPlaybackTests: XCTestCase {
         let controls = app.scrollViews["player-control-scroll"]
         let sourceField = app.textFields["bilibili-source"]
         clickVisible(sourceField, scrollingIn: controls)
-        sourceField.typeText("BV1xK4y1P7mN")
-        try requireSourceValue("BV1xK4y1P7mN", in: sourceField, phase: "before enabling Submit")
+        try requireSourceValue("BV1xK4y1P7mN", in: sourceField, phase: "after seeded launch, before enabling Submit")
     }
 
     private func prepareTaskWatchScenario(source: String) throws {
+        launchApp(initialServerAddress: serverAddress, initialSource: source)
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
-        XCTAssertTrue(
-            serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))")
-        clickVisible(addressField)
-        addressField.typeText(serverAddress)
+        try requireServerAddressValue(serverAddress, in: addressField, phase: "after seeded launch")
 
         let controls = app.scrollViews["player-control-scroll"]
         let sourceField = app.textFields["bilibili-source"]
         clickVisible(sourceField, scrollingIn: controls)
-        XCTAssertTrue(
-            serverAddressIsEmpty(sourceField), "Unexpected initial source: \(accessibilityDescription(sourceField))")
-        sourceField.typeText(source)
-        try requireSourceValue(source, in: sourceField, phase: "after text entry, before Submit")
+        try requireSourceValue(source, in: sourceField, phase: "after seeded launch, before Submit")
+    }
+
+    private func launchApp(initialServerAddress: String? = nil, initialSource: String? = nil) {
+        var environment = app.launchEnvironment
+        environment.removeValue(forKey: InitialInput.serverAddress)
+        environment.removeValue(forKey: InitialInput.bilibiliSource)
+        if let initialServerAddress {
+            environment[InitialInput.serverAddress] = initialServerAddress
+        }
+        if let initialSource {
+            environment[InitialInput.bilibiliSource] = initialSource
+        }
+        app.launchEnvironment = environment
+        defer {
+            app.launchEnvironment.removeValue(forKey: InitialInput.serverAddress)
+            app.launchEnvironment.removeValue(forKey: InitialInput.bilibiliSource)
+        }
+        app.launch()
+        didLaunchApp = true
+    }
+
+    private func requireServerAddressValue(_ expected: String, in field: XCUIElement, phase: String) throws {
+        guard field.value as? String == expected else {
+            throw SourceInputError(
+                description: "Cache server address mismatch \(phase). "
+                    + "expected=\(String(reflecting: expected)), actual=\(accessibilityDescription(field))"
+            )
+        }
     }
 
     private func requireSourceValue(_ expected: String, in field: XCUIElement, phase: String) throws {

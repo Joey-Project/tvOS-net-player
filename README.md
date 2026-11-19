@@ -116,6 +116,8 @@ The fixed test identity does not replace production signing, provisioning, notar
 
 Local-signed tests only reuse and verify the stable server already recorded by the local build system; they do not rebuild it or rewrite its operator receipt. Prepare it separately with `just local-build server` when needed. The signing key remains in the macOS keychain, and no signing profile or private key is copied into test artifacts.
 
+macOS UI input coverage is layered. The catalog/playback case starts with an empty address field, uses simulated keyboard input, and verifies the exact text before connecting. The four downstream task-watch/resumption cases provide only initial form strings through `UI_E2E_INITIAL_SERVER_ADDRESS` and `UI_E2E_INITIAL_BILIBILI_SOURCE` on a fresh DEBUG `--ui-testing` launch. Connect, Submit, fixture requests and playback remain real; there is no automatic submission or injected task, result or checkpoint. The test removes both inputs after launch and before relaunch; the app independently ignores them on normal, non-DEBUG and preserve-preferences launches. No clipboard or host input-method changes are involved.
+
 #### macOS 签名模式
 
 在 CI 之外，`just test-ui-e2e-macos` 使用固定的本机 Apple Development 身份和 `dev.joey.tvos-net-player.uie2e.local` 前缀下的 UI 测试 bundle identifier，从 `~/Library/Application Support/TVOSNetPlayer/LocalBuild/signing.json` 读取配置。配置与私钥留在本机；UI 测试 App 和 runner 使用区别于生产 App 的专用标识，持久 DerivedData 位于 `<durable_root>/UIE2E/DerivedData`。签名配置缺失或无效时会失败，不回退到 ad-hoc 签名。需要原有 ad-hoc/随机 UUID 隔离测试模式时运行 `just test-ui-e2e-macos-isolated`。CI 默认保持隔离模式，本机也可通过 `LOCAL_BUILD_MODE=isolated` 显式选择；tvOS 始终隔离，不接受 local-signed 模式。
@@ -124,11 +126,13 @@ Local-signed tests only reuse and verify the stable server already recorded by t
 
 本机固定签名测试只复用并核验本机构建系统已有记录的固定 server，不自动重建，也不改写日常构建记录；需要时先单独运行 `just local-build server`。签名私钥留在 macOS 钥匙串中，测试产物不复制签名配置或私钥。
 
+macOS 的输入测试按层分开：目录/播放用例从空地址栏开始，使用模拟键盘输入，并在连接前精确核对文字；其余四项任务观察/续接用例只在全新的 DEBUG `--ui-testing` 启动中，通过 `UI_E2E_INITIAL_SERVER_ADDRESS` 和 `UI_E2E_INITIAL_BILIBILI_SOURCE` 提供表单初始文字。连接、提交、夹具请求和播放仍走真实路径，不自动提交，也不注入任务、结果或检查点。测试在启动后及重新启动前移除这两个值；App 对普通启动、非 DEBUG 构建和保留偏好的续接启动也会独立忽略它们。不使用剪贴板，不修改系统输入法。
+
 `just test-ui-e2e-macos` 和 `just test-ui-e2e-tvos` 是独立的 XCUITest 界面测试入口，不是现有 AppCore/hosted-view XCTest 的别名。它们启动隔离的真实 Rust LAN cache server，生成不含音轨的短视频和跨越 50 条分页边界的本地目录，再通过实际客户端界面连接、选片和操作播放。tvOS 入口需要已安装且可用的 simulator runtime；仓库没有 iOS app target，安装 iOS runtime 不会增加 iOS 客户端覆盖。
 
 macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
 
-每个平台还执行自动恢复、手动重连、静默校准和退出后续接四项任务用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；实际客户端仍通过界面输入、提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。静默用例保持 watch 连接打开，跨越状态未变和发现完成的校准读取，检查没有错误重连且已有播放持续推进。续接用例暂停在非零位置，真正终止并重开应用，确认不会自动播放，再明确继续原结果并检查位置与时间推进。runner 独立核对每个场景只创建一个任务，续接不会重新解析或提交；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
+每个平台还执行自动恢复、手动重连、静默校准和退出后续接四项任务用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；macOS 仅使用上述初始表单文字，tvOS 仍通过界面输入，两端都通过实际控件提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。静默用例保持 watch 连接打开，跨越状态未变和发现完成的校准读取，检查没有错误重连且已有播放持续推进。续接用例暂停在非零位置，真正终止并重开应用，确认不会自动播放，再明确继续原结果并检查位置与时间推进。runner 独立核对每个场景只创建一个任务，续接不会重新解析或提交；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
 
 续接精度使用本次 seek 成功校验后、开始播放前实际读取的位置验证，不把请求目标当作已恢复的位置，也不要求持续前进的时间线停留在旧检查点附近。播放状态和后续真实进度分别验证；失败、取消或被替换的续接不能沿用旧成功观测。
 
