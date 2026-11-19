@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-19
 updated: 2026-11-19
 branch: codex/long-recovery-fixture-budget
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/113
 supersedes: []
 superseded_by:
 ---
@@ -22,12 +22,13 @@ superseded_by:
 - The required and diagnostic long-recovery cases retain their 840-second outer deadline; child process execution remains deadline-bounded.
 - Long-source generation remains 3600 seconds. Playback and probe durations, FFprobe and normal FFmpeg timeouts, global budgets, fixture limits, and existing identity, fault, byte, and cleanup assertions are unchanged.
 - The profile unit test asserts the exact long-recovery FFmpeg timeout and existing profile budgets.
+- The macOS EOF UI test prepares its paused near-terminal position through the existing AVPlayer timeline slider rather than a brief timed playback interval. Terminal Forward, finished-state, replay, and selected-speed assertions remain unchanged.
 
 ## Follow-On Plan
 1. After this prerequisite is accepted and integrated into `master`, update from `master` and finish the assigned PR #112 layered UI input work.
 2. Keep clipboard input unimplemented and make no host input-method changes.
 
 ## Evidence
-- Scoped implementation changed only the long-recovery FFmpeg timeout and its existing profile assertion.
+- The fixture-budget change is limited to the long-recovery FFmpeg timeout and its existing profile assertion; the UI gate fix changes only preparation of a paused near-EOF position.
 - Focused unit checks do not establish native media or audible-audio acceptance.
 - Full CI, exact-head GitHub Codex review, and independently validated hosted media/UI artifacts remain separate delivery gates; execution evidence is retained with the PR.
