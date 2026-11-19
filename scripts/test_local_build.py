@@ -347,11 +347,38 @@ class LocalBuildTests(unittest.TestCase):
             local_build.DIAGNOSTIC_IDENTIFIERS[target], "TESTTEAM01", "A" * 40,
             'identifier "native-navigation"', SYNTHETIC_CDHASH,
         )
+        deadline = 1234.5
         with mock.patch.object(local_build, "_codesign_details", return_value=signature) as signed_details:
-            details = local_build.verify_product(target, app, self.config)
+            details = local_build.verify_product(target, app, self.config, deadline=deadline)
         self.assertEqual(signed_details.call_count, 2)
+        self.assertEqual(signed_details.call_args_list, [
+            mock.call(app, deadline=deadline),
+            mock.call(executable, deadline=deadline),
+        ])
         self.assertEqual(details["cdhash"], SYNTHETIC_CDHASH)
         self.assertEqual(details["executable_cdhash"], SYNTHETIC_CDHASH)
+
+    def test_native_navigation_product_keeps_optional_deadline_default(self) -> None:
+        target = local_build.NATIVE_NAVIGATION_TARGET
+        app = self.root / "NativeNavigationProbe.app"
+        executable = app / "Contents/MacOS/native-navigation-probe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"synthetic executable")
+        with (app / "Contents/Info.plist").open("wb") as stream:
+            local_build.plistlib.dump({
+                "CFBundleIdentifier": local_build.DIAGNOSTIC_IDENTIFIERS[target],
+                "CFBundleExecutable": "native-navigation-probe",
+                "CFBundlePackageType": "APPL",
+                "CFBundleName": "Native Navigation Probe",
+                "CFBundleDisplayName": "Native Navigation Probe",
+            }, stream)
+        signature = (
+            local_build.DIAGNOSTIC_IDENTIFIERS[target], "TESTTEAM01", "A" * 40,
+            'identifier "native-navigation"', SYNTHETIC_CDHASH,
+        )
+        with mock.patch.object(local_build, "_codesign_details", return_value=signature) as signed_details:
+            local_build.verify_product(target, app, self.config)
+        self.assertEqual(signed_details.call_args_list, [mock.call(app, deadline=None), mock.call(executable, deadline=None)])
 
     def test_native_navigation_print_path_is_the_app_bundle(self) -> None:
         target = local_build.NATIVE_NAVIGATION_TARGET
@@ -497,6 +524,129 @@ class LocalBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(local_build.BuildError, "designated requirement changed"):
                 local_build.verify_product("probe", self.root / "probe", self.config, previous)
 
+    def test_ui_e2e_bundle_verifies_fixed_identifier_team_certificate_and_requirement(self) -> None:
+        bundle = self.root / "MacOSNetPlayer.app"
+        contents = bundle / "Contents"
+        contents.mkdir(parents=True)
+        identifier = "dev.joey.tvos-net-player.uie2e.local.macos"
+        with (contents / "Info.plist").open("wb") as stream:
+            local_build.plistlib.dump({"CFBundleIdentifier": identifier}, stream)
+        requirement = 'identifier "dev.joey.tvos-net-player.uie2e.local.macos" and anchor apple'
+        signature = (identifier, "TESTTEAM01", "A" * 40, requirement, SYNTHETIC_CDHASH)
+        with mock.patch.object(local_build, "_codesign_details", return_value=signature):
+            details = local_build.verify_ui_e2e_bundle(
+                bundle, expected_identifier=identifier, config=self.config
+            )
+        self.assertEqual(details["identifier"], identifier)
+        self.assertEqual(details["certificate_sha1"], "A" * 40)
+        self.assertEqual(details["designated_requirement"], requirement)
+        for mismatched, expected_message in (
+            ((identifier, "OTHERTEAM1", "A" * 40, requirement, SYNTHETIC_CDHASH), "identifier/team mismatch"),
+            ((identifier, "TESTTEAM01", "B" * 40, requirement, SYNTHETIC_CDHASH), "fingerprint mismatch"),
+            (("unexpected.identifier", "TESTTEAM01", "A" * 40, requirement, SYNTHETIC_CDHASH), "identifier/team mismatch"),
+        ):
+            with self.subTest(signature=mismatched), mock.patch.object(
+                local_build, "_codesign_details", return_value=mismatched
+            ):
+                with self.assertRaisesRegex(local_build.BuildError, expected_message):
+                    local_build.verify_ui_e2e_bundle(
+                        bundle, expected_identifier=identifier, config=self.config
+                    )
+        with mock.patch.object(local_build, "_codesign_details", return_value=signature):
+            with self.assertRaisesRegex(local_build.BuildError, "designated requirement changed"):
+                local_build.verify_ui_e2e_bundle(
+                    bundle,
+                    expected_identifier=identifier,
+                    config=self.config,
+                    previous={"designated_requirement": 'identifier "old"'},
+                )
+
+    def test_verify_existing_product_reuses_only_current_receipted_server(self) -> None:
+        root = self.root / "LocalBuild"
+        server_path = root / local_build.PRODUCTS["server"]
+        server_path.parent.mkdir(parents=True)
+        server_path.write_bytes(b"signed server")
+        source = {"repository": str(local_build.ROOT), "head": "abc", "dirty": True}
+        item = {"path": str(server_path), "source": source, "cdhash": SYNTHETIC_CDHASH}
+        local_build._write_receipt(root, {
+            "schema_version": 1,
+            "team_id": self.config["team_id"],
+            "identity_sha1": self.config["identity_sha1"],
+            "certificate_sha1": self.config["certificate_sha1"],
+            "products": {"server": item},
+        })
+        details = {"path": str(server_path), "cdhash": SYNTHETIC_CDHASH}
+        with mock.patch.object(local_build, "verify_identity") as identity, \
+                mock.patch.object(local_build, "_source_binding", return_value=source), \
+                mock.patch.object(local_build, "verify_product", return_value=details) as verify, \
+                mock.patch.object(local_build, "_build") as build:
+            result = local_build.verify_existing_product(
+                "server", config_file=self.config_path, deadline=100
+            )
+        self.assertEqual(result, details)
+        identity.assert_called_once()
+        verify.assert_called_once_with("server", server_path, mock.ANY, item, deadline=100)
+        build.assert_not_called()
+        self.assertFalse((root / ".build-session.lock").exists())
+
+    def test_verify_existing_product_accepts_valid_historical_source_without_reading_it(self) -> None:
+        root = self.root / "LocalBuild"
+        server_path = root / local_build.PRODUCTS["server"]
+        server_path.parent.mkdir(parents=True)
+        server_path.write_bytes(b"signed server")
+        source = {
+            "repository": str(self.root / "removed-linked-worktree"),
+            "head": "a" * 40,
+            "dirty": False,
+        }
+        item = {"path": str(server_path), "source": source, "cdhash": SYNTHETIC_CDHASH}
+        local_build._write_receipt(root, {
+            "schema_version": 1,
+            "team_id": self.config["team_id"],
+            "identity_sha1": self.config["identity_sha1"],
+            "certificate_sha1": self.config["certificate_sha1"],
+            "products": {"server": item},
+        })
+        with mock.patch.object(local_build, "verify_identity"), \
+                mock.patch.object(local_build, "_source_binding", side_effect=AssertionError("historical path must not be read")), \
+                mock.patch.object(local_build, "verify_product", return_value={"cdhash": SYNTHETIC_CDHASH}):
+            local_build.verify_existing_product(
+                "server", config_file=self.config_path, allow_historical_source=True
+            )
+        self.assertFalse(Path(source["repository"]).exists())
+
+    def test_verify_existing_product_rejects_malformed_historical_source(self) -> None:
+        root = self.root / "LocalBuild"
+        server_path = root / local_build.PRODUCTS["server"]
+        server_path.parent.mkdir(parents=True)
+        server_path.write_bytes(b"signed server")
+        valid_source = {
+            "repository": str(self.root / "removed-linked-worktree"),
+            "head": "a" * 40,
+            "dirty": False,
+        }
+        for source in (
+            dict(valid_source, repository="relative/path"),
+            dict(valid_source, head="unknown"),
+            dict(valid_source, dirty="false"),
+        ):
+            with self.subTest(source=source):
+                item = {"path": str(server_path), "source": source, "cdhash": SYNTHETIC_CDHASH}
+                local_build._write_receipt(root, {
+                    "schema_version": 1,
+                    "team_id": self.config["team_id"],
+                    "identity_sha1": self.config["identity_sha1"],
+                    "certificate_sha1": self.config["certificate_sha1"],
+                    "products": {"server": item},
+                })
+                with mock.patch.object(local_build, "verify_identity"), \
+                        mock.patch.object(local_build, "verify_product") as verify:
+                    with self.assertRaisesRegex(local_build.BuildError, "source binding is invalid"):
+                        local_build.verify_existing_product(
+                            "server", config_file=self.config_path, allow_historical_source=True
+                        )
+                    verify.assert_not_called()
+
     def test_codesign_verbose_four_metadata_supplies_hash_and_designated_requirement(self) -> None:
         path = self.root / "probe"
         fingerprint = ":".join(["AA"] * 20)
@@ -525,8 +675,9 @@ class LocalBuildTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "subject=CN=Test,OU=TESTTEAM01,O=Example\n", "")
             self.fail(f"unexpected command: {args}")
 
-        with mock.patch.object(local_build, "RUN", side_effect=run) as run_mock:
-            details = local_build.verify_product("probe", path, self.config)
+        with mock.patch.object(local_build.time, "monotonic", return_value=10), \
+                mock.patch.object(local_build, "RUN", side_effect=run) as run_mock:
+            details = local_build.verify_product("probe", path, self.config, deadline=20)
 
         self.assertEqual(details, {
             "path": str(path), "identifier": local_build.IDENTIFIERS["probe"],
@@ -538,6 +689,14 @@ class LocalBuildTests(unittest.TestCase):
         self.assertIn(["codesign", "-dv", "--verbose=4", str(path)], commands)
         self.assertNotIn(["codesign", "-d", "--verbose=2", str(path)], commands)
         self.assertEqual(verbose_two_calls, [])
+        self.assertTrue(all(call.kwargs.get("timeout") == 10 for call in run_mock.call_args_list))
+
+    def test_keychain_identity_query_uses_remaining_deadline(self) -> None:
+        output = f'  1) {"A" * 40} "Apple Development: Synthetic (TESTTEAM01)"\n'
+        with mock.patch.object(local_build.time, "monotonic", return_value=10), \
+                mock.patch.object(local_build, "RUN", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
+            local_build.verify_identity(self.config, deadline=20)
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     def test_codesign_metadata_nonzero_exit_is_rejected(self) -> None:
         path = self.root / "probe"

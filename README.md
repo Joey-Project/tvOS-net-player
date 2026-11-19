@@ -108,6 +108,22 @@ Rust 测试 waiter 的超时诊断仅包含有限的任务/结果状态、观察
 
 ### Native UI E2E
 
+#### macOS signing modes
+
+Outside CI, `just test-ui-e2e-macos` uses the pinned local Apple Development identity and fixed UI-test bundle identifiers under `dev.joey.tvos-net-player.uie2e.local`. It reads `~/Library/Application Support/TVOSNetPlayer/LocalBuild/signing.json`; the configuration stays local. The UI-test app and runner have dedicated identifiers distinct from production app identities, and durable DerivedData is stored at `<durable_root>/UIE2E/DerivedData`. A missing or invalid local signing setup fails; there is no ad-hoc fallback. Use `just test-ui-e2e-macos-isolated` for the existing ad-hoc/random-UUID isolated test mode. CI remains isolated by default, and `LOCAL_BUILD_MODE=isolated` explicitly selects that mode locally. tvOS remains isolated and does not accept local-signed mode.
+
+The fixed test identity does not replace production signing, provisioning, notarization or app permissions. Host UI automation may still require user-configured macOS/Xcode permissions; this test does not change host security settings or prove that prompts or lock-state behavior are resolved. See [Apple code requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+Local-signed tests only reuse and verify the stable server already recorded by the local build system; they do not rebuild it or rewrite its operator receipt. Prepare it separately with `just local-build server` when needed. The signing key remains in the macOS keychain, and no signing profile or private key is copied into test artifacts.
+
+#### macOS 签名模式
+
+在 CI 之外，`just test-ui-e2e-macos` 使用固定的本机 Apple Development 身份和 `dev.joey.tvos-net-player.uie2e.local` 前缀下的 UI 测试 bundle identifier，从 `~/Library/Application Support/TVOSNetPlayer/LocalBuild/signing.json` 读取配置。配置与私钥留在本机；UI 测试 App 和 runner 使用区别于生产 App 的专用标识，持久 DerivedData 位于 `<durable_root>/UIE2E/DerivedData`。签名配置缺失或无效时会失败，不回退到 ad-hoc 签名。需要原有 ad-hoc/随机 UUID 隔离测试模式时运行 `just test-ui-e2e-macos-isolated`。CI 默认保持隔离模式，本机也可通过 `LOCAL_BUILD_MODE=isolated` 显式选择；tvOS 始终隔离，不接受 local-signed 模式。
+
+固定测试身份不替代生产签名、provisioning、公证或 App 权限配置。主机 UI 自动化仍可能需要用户配置 macOS/Xcode 权限；该测试不会更改主机安全设置，也不证明权限提示或锁屏状态问题已解决。参见 [Apple code requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
+
+本机固定签名测试只复用并核验本机构建系统已有记录的固定 server，不自动重建，也不改写日常构建记录；需要时先单独运行 `just local-build server`。签名私钥留在 macOS 钥匙串中，测试产物不复制签名配置或私钥。
+
 `just test-ui-e2e-macos` 和 `just test-ui-e2e-tvos` 是独立的 XCUITest 界面测试入口，不是现有 AppCore/hosted-view XCTest 的别名。它们启动隔离的真实 Rust LAN cache server，生成不含音轨的短视频和跨越 50 条分页边界的本地目录，再通过实际客户端界面连接、选片和操作播放。tvOS 入口需要已安装且可用的 simulator runtime；仓库没有 iOS app target，安装 iOS runtime 不会增加 iOS 客户端覆盖。
 
 macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
@@ -118,7 +134,7 @@ macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的�
 
 自然播放的 90 秒等待窗口从实际重播点击开始计算，滚动和查找按钮的准备时间单独记录；按钮已经可见时立即停止滚动检查。播放结束后用原生播放器控件往回拖动，再点自定义 Resume，会从所选位置续播并保留倍速，而不是无条件回到开头；这项共享 AppCore 行为另有专项回归测试。
 
-这两个 Just 命令会先构建 Rust server；设置 `CACHE_SERVER_BINARY` 可复用已构建的可执行文件。`DERIVED_DATA_PATH` 可复用已有 Xcode 编译缓存，该目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
+隔离模式会先构建 Rust server，或通过 `CACHE_SERVER_BINARY` 复用已有可执行文件；本机固定签名模式只接受记录在固定签名配置中的 server 路径。隔离模式可用 `DERIVED_DATA_PATH` 复用 Xcode 编译缓存；本机固定签名模式使用上述专用固定目录，拒绝不一致的覆盖值。编译目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
 
 本地 helper 的工作预算上限为 35 分钟，fixture 编译最多 15 分钟。GHA 在 checkout 前记录整个 job 的单调时钟工作期限，最晚在首步后的 45 分钟结束主要构建/测试工作，包含安装工具和 Rust 构建已花费的时间；60 分钟 job 的余量留给有界诊断、清理和产物上传。诊断与清理使用独立期限，不复用已耗尽的工作预算。
 
@@ -126,7 +142,7 @@ Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据�
 
 测试会先设置并确认系统静音，结束后保持静音。调试测试实例使用隔离偏好并禁用 Bonjour 自动连接；夹具 server 关闭 Bilibili worker、登录会话和 Bonjour，不读取已有账号凭据，也不修改日常 cache server。普通 CI 不依赖 Bilibili、账号 Cookie 或公共反代。真实 Bilibili 和长播放验证仍使用下方显式 opt-in live suite。
 
-macOS UI 测试使用本地 ad-hoc 签名，不需要开发者证书或 team；tvOS simulator 构建不启用签名。这不替代实机 provisioning、分发签名或公证。本机 UI 执行仍需可用的桌面会话及 Xcode 所需权限，成功构建和签名校验不代表 UI 测试通过。
+CI 中的 macOS UI 测试继续使用隔离的 ad-hoc/random-UUID 身份；tvOS simulator 构建保持隔离。成功构建和签名校验不代表 UI 测试通过。
 
 GHA 的 UI 测试与现有构建/单元测试分开记录。每个平台预期的五项用例都必须实际执行并通过，且失败、跳过数量均为零；只执行其中一项、成功编译或列出 simulator runtime 都不能代替完整 UI e2e。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md)、[任务观察恢复 UI journal](docs/project_journal/2026/10/2026-10-23-task-watch-ui-e2e-b46387.md)、[静默校准 journal](docs/project_journal/2026/10/2026-10-23-silent-task-reconciliation-b46390.md) 和 [客户端续接 journal](docs/project_journal/2026/10/2026-10-23-client-task-playback-resumption-b46391.md)。
 
