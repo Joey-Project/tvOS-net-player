@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import importlib
 import json
 import math
 import os
@@ -29,9 +30,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-
 ROOT = Path(__file__).resolve().parent.parent
 SERVER_NAME = "tvos-net-player-cache-server"
+LOCAL_SIGNED_MODE = "local-signed"
+LOCAL_SIGNED_BUNDLE_ID = "dev.joey.tvos-net-player.uie2e.local"
+LOCAL_SIGNED_PRODUCT_PATHS = {
+    "app": Path("Build/Products/Debug/MacOSNetPlayer.app"),
+    "uitests": Path(
+        "Build/Products/Debug/MacOSNetPlayerUITests-Runner.app/Contents/PlugIns/"
+        "MacOSNetPlayerUITests.xctest"
+    ),
+    "runner": Path("Build/Products/Debug/MacOSNetPlayerUITests-Runner.app"),
+}
+LOCAL_SIGNED_RECEIPT = "local-signed-receipt.json"
+LOCAL_SIGNED_LOCK = ".local-signed-session.lock"
 FIXTURE_COUNT = 55
 FIXTURE_DURATION_SECONDS = 92
 MAX_FIXTURE_BYTES = 64 * 1024 * 1024
@@ -91,6 +103,16 @@ EXPECTED_PLAYBACK_SOURCES = {
 
 class UIE2EError(RuntimeError):
     pass
+
+
+def _local_build_module():
+    return importlib.import_module("local_build")
+
+
+def __getattr__(name: str):
+    if name == "local_build":
+        return _local_build_module()
+    raise AttributeError(name)
 
 
 @dataclass(frozen=True)
@@ -829,6 +851,68 @@ def verify_scheme_contract(scheme_path: Path, expected_target: str) -> None:
         )
 
 
+def local_signed_bundle_identifiers() -> dict[str, str]:
+    return {
+        "app": f"{LOCAL_SIGNED_BUNDLE_ID}.macos",
+        "uitests": f"{LOCAL_SIGNED_BUNDLE_ID}.macos.uitests",
+        "runner": f"{LOCAL_SIGNED_BUNDLE_ID}.macos.uitests.xctrunner",
+    }
+
+
+def local_signed_product_paths(derived_data_path: Path) -> dict[str, Path]:
+    return {name: derived_data_path / path for name, path in LOCAL_SIGNED_PRODUCT_PATHS.items()}
+
+
+def validate_run_mode(platform: str, mode: str) -> None:
+    if mode not in ("isolated", LOCAL_SIGNED_MODE):
+        raise UIE2EError(f"Unsupported UI E2E mode: {mode}")
+    if mode != LOCAL_SIGNED_MODE:
+        return
+    if os.environ.get("CI", "").lower() == "true":
+        raise UIE2EError("local-signed UI E2E mode is not allowed in CI.")
+    if platform != "macos":
+        raise UIE2EError("local-signed UI E2E mode is available only for macOS.")
+    if sys.platform != "darwin":
+        raise UIE2EError("local-signed UI E2E mode requires macOS.")
+
+
+def local_signed_session_root(config: dict) -> Path:
+    return Path(config["durable_root"]) / "UIE2E"
+
+
+def local_signed_derived_data_path(config: dict) -> Path:
+    expected = local_signed_session_root(config) / "DerivedData"
+    override = os.environ.get("DERIVED_DATA_PATH")
+    if override and Path(override).expanduser().resolve() != expected.resolve():
+        raise UIE2EError(
+            "DERIVED_DATA_PATH conflicts with the fixed local-signed UI E2E product root."
+        )
+    return expected
+
+
+def acquire_local_signed_lock(session_root: Path) -> Path:
+    if session_root.is_symlink():
+        raise UIE2EError("Local-signed UI E2E product root must not be a symlink.")
+    session_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not session_root.is_dir():
+        raise UIE2EError("Local-signed UI E2E product root is not a directory.")
+    lock = session_root / LOCAL_SIGNED_LOCK
+    try:
+        lock.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise UIE2EError(
+            f"Another local-signed UI E2E session holds {lock}; stale locks are not removed automatically."
+        ) from error
+    return lock
+
+
+def release_local_signed_lock(lock: Path) -> None:
+    try:
+        lock.rmdir()
+    except OSError as error:
+        raise UIE2EError(f"Could not release local-signed UI E2E session lock: {lock}") from error
+
+
 def build_xcodebuild_command(
     *,
     platform: str,
@@ -838,25 +922,49 @@ def build_xcodebuild_command(
     derived_data_path: Path,
     result_bundle_path: Path,
     destination: str,
+    mode: str = "isolated",
+    signing_config: dict | None = None,
+    action: str = "test",
 ) -> list[str]:
     endpoint = validate_server_address(server_address)
     task_endpoint = validate_server_address(task_server_address) if task_server_address else None
-    if not re.fullmatch(
-        r"dev\.joey\.tvos-net-player\.uie2e\.[0-9a-f]{32}",
-        app_bundle_identifier,
-    ):
-        raise UIE2EError("APP_BUNDLE_IDENTIFIER must be unique to this UI E2E run.")
+    if mode == LOCAL_SIGNED_MODE:
+        if platform != "macos" or app_bundle_identifier != LOCAL_SIGNED_BUNDLE_ID:
+            raise UIE2EError("Local-signed UI E2E requires its fixed macOS test bundle identifier.")
+        if signing_config is None:
+            raise UIE2EError("Local-signed UI E2E requires the pinned signing profile.")
+        if action not in ("build-for-testing", "test-without-building"):
+            raise UIE2EError("Local-signed UI E2E requires a split build/test action.")
+    else:
+        if mode != "isolated" or action != "test" or signing_config is not None:
+            raise UIE2EError("Isolated UI E2E accepts only the credential-free test action.")
+        if not re.fullmatch(
+            r"dev\.joey\.tvos-net-player\.uie2e\.[0-9a-f]{32}",
+            app_bundle_identifier,
+        ):
+            raise UIE2EError("APP_BUNDLE_IDENTIFIER must be unique to this UI E2E run.")
     config = PLATFORMS[platform]
-    signing_settings = (
-        [
-            "CODE_SIGN_IDENTITY=-",
+    if mode == LOCAL_SIGNED_MODE:
+        assert signing_config is not None
+        signing_settings = [
+            f"CODE_SIGN_IDENTITY={signing_config['identity_sha1']}",
             "CODE_SIGNING_ALLOWED=YES",
+            "CODE_SIGNING_REQUIRED=YES",
             "CODE_SIGN_STYLE=Manual",
-            "DEVELOPMENT_TEAM=",
+            f"DEVELOPMENT_TEAM={signing_config['team_id']}",
         ]
-        if platform == "macos"
-        else ["CODE_SIGNING_ALLOWED=NO"]
-    )
+    else:
+        signing_settings = (
+            [
+                "CODE_SIGN_IDENTITY=-",
+                "CODE_SIGNING_ALLOWED=YES",
+                "CODE_SIGN_STYLE=Manual",
+                "DEVELOPMENT_TEAM=",
+            ]
+            if platform == "macos"
+            else ["CODE_SIGNING_ALLOWED=NO"]
+        )
+    include_result_path = mode != LOCAL_SIGNED_MODE or action != "build-for-testing"
     return [
         "xcodebuild",
         "-onlyUsePackageVersionsFromResolvedFile",
@@ -871,15 +979,14 @@ def build_xcodebuild_command(
         destination,
         "-derivedDataPath",
         str(derived_data_path),
-        "-resultBundlePath",
-        str(result_bundle_path),
+        *(["-resultBundlePath", str(result_bundle_path)] if include_result_path else []),
         "-parallel-testing-enabled",
         "NO",
         *signing_settings,
         f"APP_BUNDLE_IDENTIFIER={app_bundle_identifier}",
         f"UI_E2E_SERVER_ADDRESS={endpoint}",
         *([f"UI_E2E_TASK_SERVER_ADDRESS={task_endpoint}"] if task_endpoint else []),
-        "test",
+        action,
     ]
 
 
@@ -1022,6 +1129,293 @@ def _read_bounded_json(path: Path, *, description: str) -> object:
         return json.loads(payload)
     except (OSError, json.JSONDecodeError) as error:
         raise UIE2EError(f"Could not read {description} JSON.") from error
+
+
+def read_local_signed_receipt(
+    session_root: Path,
+    *,
+    signing_config: dict,
+    derived_data_path: Path,
+) -> dict | None:
+    expected_root = local_signed_session_root(signing_config)
+    if session_root != expected_root or derived_data_path != expected_root / "DerivedData":
+        raise UIE2EError("Local-signed UI E2E receipt paths must use the fixed durable product root.")
+    receipt_path = session_root / LOCAL_SIGNED_RECEIPT
+    product_paths = local_signed_product_paths(derived_data_path)
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        if any(path.exists() or path.is_symlink() for path in product_paths.values()):
+            raise UIE2EError("Local-signed UI E2E receipt is missing for existing build products.")
+        return None
+
+    payload = _read_bounded_json(receipt_path, description="Local-signed UI E2E receipt")
+    expected_ids = local_signed_bundle_identifiers()
+    expected_keys = {
+        "schema_version", "source", "team_id", "identity_sha1",
+        "certificate_sha1", "bundle_ids", "products",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or payload.get("team_id") != signing_config["team_id"]
+        or payload.get("identity_sha1") != signing_config["identity_sha1"]
+        or payload.get("certificate_sha1") != signing_config["certificate_sha1"]
+        or payload.get("bundle_ids") != expected_ids
+    ):
+        raise UIE2EError("Local-signed UI E2E receipt is invalid or does not match the pinned profile.")
+    source = payload.get("source")
+    source_repository = source.get("repository") if isinstance(source, dict) else None
+    source_head = source.get("head") if isinstance(source, dict) else None
+    # A prior worktree path is descriptive receipt data, never an input path.
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"repository", "head", "dirty"}
+        or not isinstance(source_repository, str)
+        or not source_repository
+        or len(source_repository) > 4096
+        or "\x00" in source_repository
+        or not Path(source_repository).is_absolute()
+        or not isinstance(source_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source_head) is None
+        or type(source.get("dirty")) is not bool
+    ):
+        raise UIE2EError("Local-signed UI E2E receipt has invalid source binding.")
+    products = payload.get("products")
+    if not isinstance(products, dict) or set(products) != set(product_paths):
+        raise UIE2EError("Local-signed UI E2E receipt has an invalid product set.")
+    product_keys = {
+        "path", "identifier", "team_id", "certificate_sha1",
+        "designated_requirement", "cdhash",
+    }
+    for name, path in product_paths.items():
+        item = products.get(name)
+        if (
+            not isinstance(item, dict)
+            or set(item) != product_keys
+            or item.get("path") != str(path)
+            or item.get("identifier") != expected_ids[name]
+            or item.get("team_id") != signing_config["team_id"]
+            or item.get("certificate_sha1") != signing_config["certificate_sha1"]
+            or not isinstance(item.get("designated_requirement"), str)
+            or not item["designated_requirement"]
+            or not isinstance(item.get("cdhash"), str)
+            or not item["cdhash"]
+        ):
+            raise UIE2EError(f"Local-signed UI E2E receipt entry is invalid for {name}.")
+    return payload
+
+
+def verify_local_signed_products(
+    product_paths: dict[str, Path],
+    *,
+    signing_config: dict,
+    previous_receipt: dict | None,
+    deadline: float,
+    compare_codehash: bool = True,
+    allow_unbuilt: bool = False,
+) -> dict[str, dict]:
+    local_build = _local_build_module()
+    if previous_receipt is None and allow_unbuilt:
+        return {}
+    previous_products = previous_receipt["products"] if previous_receipt else {}
+    verified: dict[str, dict] = {}
+    for name, path in product_paths.items():
+        require_work_remaining(deadline)
+        previous = previous_products.get(name)
+        try:
+            actual = local_build.verify_ui_e2e_bundle(
+                path,
+                expected_identifier=local_signed_bundle_identifiers()[name],
+                config=signing_config,
+                previous=previous,
+                deadline=deadline,
+            )
+        except local_build.BuildError as error:
+            raise UIE2EError(f"Local-signed UI E2E product verification failed for {name}: {error}") from error
+        if previous is not None and (
+            actual.get("designated_requirement") != previous.get("designated_requirement")
+            or (compare_codehash and actual != previous)
+        ):
+            raise UIE2EError(f"Local-signed UI E2E product identity or CDHash drifted for {name}.")
+        verified[name] = actual
+    return verified
+
+
+def write_local_signed_receipt(
+    session_root: Path,
+    *,
+    derived_data_path: Path,
+    signing_config: dict,
+    products: dict[str, dict],
+    deadline: float,
+) -> None:
+    local_build = _local_build_module()
+    require_work_remaining(deadline)
+    expected_root = local_signed_session_root(signing_config)
+    if session_root != expected_root or derived_data_path != expected_root / "DerivedData":
+        raise UIE2EError("Local-signed UI E2E receipt paths must use the fixed durable product root.")
+    expected_paths = local_signed_product_paths(derived_data_path)
+    expected_ids = local_signed_bundle_identifiers()
+    if set(products) != set(expected_paths):
+        raise UIE2EError("Cannot write local-signed UI E2E receipt with an incomplete product set.")
+    for name, path in expected_paths.items():
+        item = products[name]
+        if (
+            not isinstance(item, dict)
+            or item.get("path") != str(path)
+            or item.get("identifier") != expected_ids[name]
+            or item.get("team_id") != signing_config["team_id"]
+            or item.get("certificate_sha1") != signing_config["certificate_sha1"]
+            or not item.get("designated_requirement")
+            or not item.get("cdhash")
+        ):
+            raise UIE2EError(f"Cannot write an invalid local-signed UI E2E receipt entry for {name}.")
+    try:
+        source = local_build._source_binding(deadline=deadline)
+    except local_build.BuildError as error:
+        raise UIE2EError(f"Could not bind local-signed UI E2E receipt to source: {error}") from error
+    if (
+        source.get("repository") != str(ROOT)
+        or not isinstance(source.get("head"), str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source["head"]) is None
+        or type(source.get("dirty")) is not bool
+    ):
+        raise UIE2EError("Could not bind local-signed UI E2E receipt to this checkout.")
+    payload = {
+        "schema_version": 1,
+        "source": source,
+        "team_id": signing_config["team_id"],
+        "identity_sha1": signing_config["identity_sha1"],
+        "certificate_sha1": signing_config["certificate_sha1"],
+        "bundle_ids": local_signed_bundle_identifiers(),
+        "products": products,
+    }
+    destination = session_root / LOCAL_SIGNED_RECEIPT
+    temporary = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _write_json(temporary, payload)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def prepare_local_signed_server(
+    signing_config: dict,
+    *,
+    deadline: float,
+) -> Path:
+    local_build = _local_build_module()
+    expected = Path(signing_config["durable_root"]) / local_build.PRODUCTS["server"]
+    configured = os.environ.get("CACHE_SERVER_BINARY")
+    if configured:
+        try:
+            candidate = Path(configured).expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise UIE2EError("CACHE_SERVER_BINARY is not a valid pinned local-build server path.") from error
+        if candidate != expected.resolve():
+            raise UIE2EError("CACHE_SERVER_BINARY must be the pinned stable local-build server path in local-signed mode.")
+    try:
+        verified = local_build.verify_existing_product(
+            "server", deadline=deadline, allow_historical_source=True
+        )
+    except local_build.BuildError as error:
+        raise UIE2EError(f"Pinned local cache-server verification failed: {error}") from error
+    if Path(verified["path"]) != expected:
+        raise UIE2EError("Pinned local cache-server receipt resolved to an unexpected path.")
+    if not expected.is_file() or not os.access(expected, os.X_OK):
+        raise UIE2EError("Pinned local cache-server product is missing or not executable.")
+    return expected
+
+
+def run_local_signed_xcode(
+    *,
+    endpoint: str,
+    task_endpoint: str,
+    derived_data_path: Path,
+    result_bundle: Path,
+    destination: str,
+    logs_dir: Path,
+    child_env: dict[str, str],
+    signing_config: dict,
+    session_root: Path,
+    deadline: float,
+    log: Callable[[str], None],
+) -> CommandResult:
+    product_paths = local_signed_product_paths(derived_data_path)
+    previous_receipt = read_local_signed_receipt(
+        session_root,
+        signing_config=signing_config,
+        derived_data_path=derived_data_path,
+    )
+    verify_local_signed_products(
+        product_paths,
+        signing_config=signing_config,
+        previous_receipt=previous_receipt,
+        deadline=deadline,
+        allow_unbuilt=True,
+    )
+    build_command = build_xcodebuild_command(
+        platform="macos",
+        server_address=endpoint,
+        task_server_address=task_endpoint,
+        app_bundle_identifier=LOCAL_SIGNED_BUNDLE_ID,
+        derived_data_path=derived_data_path,
+        result_bundle_path=result_bundle,
+        destination=destination,
+        mode=LOCAL_SIGNED_MODE,
+        signing_config=signing_config,
+        action="build-for-testing",
+    )
+    build_log = logs_dir / "xcodebuild-build-for-testing.log"
+    log("starting local-signed xcodebuild build-for-testing.")
+    build_result = run_process(
+        build_command,
+        log_path=build_log,
+        timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(deadline)),
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        env=child_env,
+        cwd=ROOT,
+    )
+    _require_result(build_result, "xcodebuild build-for-testing", build_log)
+    products = verify_local_signed_products(
+        product_paths,
+        signing_config=signing_config,
+        previous_receipt=previous_receipt,
+        deadline=deadline,
+        compare_codehash=False,
+    )
+    write_local_signed_receipt(
+        session_root,
+        derived_data_path=derived_data_path,
+        signing_config=signing_config,
+        products=products,
+        deadline=deadline,
+    )
+    test_command = build_xcodebuild_command(
+        platform="macos",
+        server_address=endpoint,
+        task_server_address=task_endpoint,
+        app_bundle_identifier=LOCAL_SIGNED_BUNDLE_ID,
+        derived_data_path=derived_data_path,
+        result_bundle_path=result_bundle,
+        destination=destination,
+        mode=LOCAL_SIGNED_MODE,
+        signing_config=signing_config,
+        action="test-without-building",
+    )
+    log("starting actual xcodebuild test execution.")
+    return run_process(
+        test_command,
+        log_path=logs_dir / "xcodebuild.log",
+        timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(deadline)),
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        env=child_env,
+        cwd=ROOT,
+        progress_path=logs_dir / "ui-progress.jsonl",
+        progress_phase="xcode_test",
+    )
 
 
 def wait_for_task_fixture(
@@ -2024,6 +2418,7 @@ class ArtifactStager:
         "task-fixture-ready.json",
         "task-fixture-metrics.json",
         "task-fixture-validation.json",
+        "xcodebuild-build-for-testing.log",
         "xcodebuild.log",
         "xcresult-summary.json",
         "xcresult-tests.json",
@@ -2189,6 +2584,7 @@ def _stage_artifacts(
             "task-fixture-ready.json",
             "task-fixture-metrics.json",
             "task-fixture-validation.json",
+            "xcodebuild-build-for-testing.log",
             "xcodebuild.log",
         ):
             source = work_dir / "logs" / source_name
@@ -2252,12 +2648,76 @@ def require_work_remaining(deadline: float) -> float:
     return remaining
 
 
-def run_ui_e2e(platform: str) -> int:
+def stage_preflight_failure(platform: str, error: UIE2EError) -> None:
+    artifact_dir = _artifact_dir(platform)
+    stager = ArtifactStager(artifact_dir)
+    work_dir = _private_work_dir()
+    logs_dir = work_dir / "logs"
+    logs_dir.mkdir(mode=0o700)
+    runner_log = logs_dir / "runner.log"
+
+    def record_failure(failure: BaseException) -> None:
+        with runner_log.open("a", encoding="utf-8") as output:
+            output.write(f"[ui-e2e:{platform}] failed: {type(failure).__name__}: {failure}\n")
+
+    cleanup = CleanupStack(on_failure=record_failure)
+    defer_workspace_cleanup(
+        cleanup,
+        stager,
+        work_dir=work_dir,
+        result_bundle=work_dir / "UIE2E.xcresult",
+    )
+    with cleanup:
+        raise error
+
+
+def run_ui_e2e(platform: str, mode: str = "isolated") -> int:
     if platform not in PLATFORMS:
         raise UIE2EError(f"Unsupported UI E2E platform: {platform}")
+    validate_run_mode(platform, mode)
     if sys.platform != "darwin":
         raise UIE2EError("UI E2E runner requires macOS.")
 
+    try:
+        run_deadline = resolve_work_deadline(
+            os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+        )
+    except UIE2EError as error:
+        stage_preflight_failure(platform, error)
+        raise
+    signing_config = None
+    session_root = None
+    session_lock = None
+    if mode == LOCAL_SIGNED_MODE:
+        local_build = _local_build_module()
+        try:
+            signing_config = local_build.load_config()
+        except local_build.BuildError as error:
+            raise UIE2EError(f"Pinned local signing profile is unavailable: {error}") from error
+        derived_data_path = local_signed_derived_data_path(signing_config)
+        session_root = local_signed_session_root(signing_config)
+        session_lock = acquire_local_signed_lock(session_root)
+    try:
+        return _run_ui_e2e(
+            platform,
+            mode=mode,
+            run_deadline=run_deadline,
+            signing_config=signing_config,
+            session_root=session_root,
+        )
+    finally:
+        if session_lock is not None:
+            release_local_signed_lock(session_lock)
+
+
+def _run_ui_e2e(
+    platform: str,
+    *,
+    mode: str,
+    run_deadline: float,
+    signing_config: dict | None,
+    session_root: Path | None,
+) -> int:
     config = PLATFORMS[platform]
     artifact_dir = _artifact_dir(platform)
     stager = ArtifactStager(artifact_dir)
@@ -2283,9 +2743,6 @@ def run_ui_e2e(platform: str) -> int:
     )
 
     with cleanup:
-            run_deadline = resolve_work_deadline(
-                os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
-            )
             mute_system_audio(logs_dir)
             log("macOS system output mute is set and verified.")
             require_work_remaining(run_deadline)
@@ -2309,8 +2766,15 @@ def run_ui_e2e(platform: str) -> int:
             log(f"built SwiftPM debug product {TASK_FIXTURE_PRODUCT}.")
 
             require_work_remaining(run_deadline)
-            server_binary = resolve_server_binary()
-            log(f"using existing cache server binary: {server_binary.name}")
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None
+                server_binary = prepare_local_signed_server(
+                    signing_config, deadline=run_deadline
+                )
+                log("using pinned local-build cache server.")
+            else:
+                server_binary = resolve_server_binary()
+                log(f"using existing cache server binary: {server_binary.name}")
             cache_dir = create_fixture_media(work_dir, logs_dir)
             state_dir = work_dir / "server-state"
             state_dir.mkdir(mode=0o700)
@@ -2376,40 +2840,59 @@ def run_ui_e2e(platform: str) -> int:
             else:
                 destination = "platform=macOS"
 
-            derived_override = os.environ.get("DERIVED_DATA_PATH")
-            derived_data_path = (
-                Path(derived_override).expanduser().resolve()
-                if derived_override
-                else work_dir / "DerivedData"
-            )
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None and session_root is not None
+                derived_data_path = local_signed_derived_data_path(signing_config)
+            else:
+                derived_override = os.environ.get("DERIVED_DATA_PATH")
+                derived_data_path = (
+                    Path(derived_override).expanduser().resolve()
+                    if derived_override
+                    else work_dir / "DerivedData"
+                )
             derived_data_path.mkdir(parents=True, exist_ok=True)
-            command = build_xcodebuild_command(
-                platform=platform,
-                server_address=endpoint,
-                task_server_address=task_endpoint,
-                app_bundle_identifier=(
-                    f"dev.joey.tvos-net-player.uie2e.{uuid.uuid4().hex}"
-                ),
-                derived_data_path=derived_data_path,
-                result_bundle_path=result_bundle,
-                destination=destination,
-            )
             child_env = os.environ.copy()
             child_env["UI_E2E_SERVER_ADDRESS"] = endpoint
             child_env["UI_E2E_TASK_SERVER_ADDRESS"] = task_endpoint
-            xcode_log = logs_dir / "xcodebuild.log"
-            log("starting actual xcodebuild test execution.")
-            test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
-            xcode_result = run_process(
-                command,
-                log_path=xcode_log,
-                timeout_seconds=test_timeout,
-                max_output_bytes=MAX_COMMAND_LOG_BYTES,
-                env=child_env,
-                cwd=ROOT,
-                progress_path=logs_dir / "ui-progress.jsonl",
-                progress_phase="xcode_test",
-            )
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None and session_root is not None
+                xcode_result = run_local_signed_xcode(
+                    endpoint=endpoint,
+                    task_endpoint=task_endpoint,
+                    derived_data_path=derived_data_path,
+                    result_bundle=result_bundle,
+                    destination=destination,
+                    logs_dir=logs_dir,
+                    child_env=child_env,
+                    signing_config=signing_config,
+                    session_root=session_root,
+                    deadline=run_deadline,
+                    log=log,
+                )
+            else:
+                app_bundle_identifier = f"dev.joey.tvos-net-player.uie2e.{uuid.uuid4().hex}"
+                command = build_xcodebuild_command(
+                    platform=platform,
+                    server_address=endpoint,
+                    task_server_address=task_endpoint,
+                    app_bundle_identifier=app_bundle_identifier,
+                    derived_data_path=derived_data_path,
+                    result_bundle_path=result_bundle,
+                    destination=destination,
+                )
+                xcode_log = logs_dir / "xcodebuild.log"
+                log("starting actual xcodebuild test execution.")
+                test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
+                xcode_result = run_process(
+                    command,
+                    log_path=xcode_log,
+                    timeout_seconds=test_timeout,
+                    max_output_bytes=MAX_COMMAND_LOG_BYTES,
+                    env=child_env,
+                    cwd=ROOT,
+                    progress_path=logs_dir / "ui-progress.jsonl",
+                    progress_phase="xcode_test",
+                )
             counts = finish_xcode_run(
                 xcode_result,
                 result_bundle=result_bundle,
@@ -2440,6 +2923,7 @@ def run_ui_e2e(platform: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
+    parser.add_argument("--mode", choices=("isolated", LOCAL_SIGNED_MODE), default="isolated")
     args = parser.parse_args(argv)
     if os.name != "posix":
         parser.error("UI E2E runner requires POSIX process-group support.")
@@ -2450,7 +2934,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, interrupt_handler)
     signal.signal(signal.SIGINT, interrupt_handler)
     try:
-        return run_ui_e2e(args.platform)
+        return run_ui_e2e(args.platform, mode=args.mode)
     except KeyboardInterrupt as error:
         print(f"[ui-e2e] interrupted: {error}", file=sys.stderr)
         return 130

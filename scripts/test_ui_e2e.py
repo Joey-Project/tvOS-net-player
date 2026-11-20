@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1158,6 +1159,540 @@ class WorkBudgetTests(unittest.TestCase):
             self.assertLessEqual(float(value), ui_e2e.time.monotonic() + 45 * 60)
 
 
+class ShellModeTests(unittest.TestCase):
+    def run_wrapper(self, arguments: list[str], extra_env: dict[str, str] | None = None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            bin_dir = root / "bin"
+            scripts.mkdir()
+            bin_dir.mkdir()
+            shutil.copyfile(Path(__file__).with_name("test-ui-e2e.sh"), scripts / "test-ui-e2e.sh")
+            build_capture = root / "build-env"
+            call_capture = root / "python-args"
+            (scripts / "build-cache-server.sh").write_text(
+                '#!/bin/sh\nprintf "%s|%s\\n" "${LOCAL_BUILD_MODE-unset}" "${CI-unset}" > "$BUILD_CAPTURE"\n',
+                encoding="utf-8",
+            )
+            (bin_dir / "python3").write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@" > "$UI_E2E_CAPTURE"\n',
+                encoding="utf-8",
+            )
+            (scripts / "build-cache-server.sh").chmod(0o755)
+            (bin_dir / "python3").chmod(0o755)
+            env = os.environ.copy()
+            for key in ("CI", "LOCAL_BUILD_MODE", "CACHE_SERVER_BINARY"):
+                env.pop(key, None)
+            env.update(extra_env or {})
+            env.update({
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "BUILD_CAPTURE": str(build_capture),
+                "UI_E2E_CAPTURE": str(call_capture),
+            })
+            result = subprocess.run(
+                ["bash", str(scripts / "test-ui-e2e.sh"), *arguments],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            calls = call_capture.read_text().splitlines() if call_capture.exists() else []
+            builder = build_capture.read_text().strip() if build_capture.exists() else None
+            return result, calls, builder
+
+    def test_default_macos_selects_local_signed_outside_isolated_environment(self) -> None:
+        result, calls, builder = self.run_wrapper(["macos"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls[-4:], ["--platform", "macos", "--mode", "local-signed"])
+        self.assertIsNone(builder)
+
+    def test_explicit_local_signed_overrides_isolated_default_environment(self) -> None:
+        result, calls, builder = self.run_wrapper(
+            ["macos", "local-signed"], {"LOCAL_BUILD_MODE": "isolated"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls[-4:], ["--platform", "macos", "--mode", "local-signed"])
+        self.assertIsNone(builder)
+
+    def test_isolated_modes_propagate_mode_into_cache_server_builder(self) -> None:
+        for arguments in (["macos", "isolated"], ["tvos"]):
+            with self.subTest(arguments=arguments):
+                result, calls, builder = self.run_wrapper(list(arguments))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(builder, "isolated|unset")
+                self.assertEqual(calls[-4:], ["--platform", arguments[0], "--mode", "isolated"])
+
+    def test_ci_and_environment_defaults_remain_isolated(self) -> None:
+        for env in (
+            {"CI": "true"},
+            {"LOCAL_BUILD_MODE": "isolated"},
+            {"CI": "true", "LOCAL_BUILD_MODE": "isolated"},
+        ):
+            with self.subTest(env=env):
+                result, calls, builder = self.run_wrapper(["macos"], dict(env))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls[-4:], ["--platform", "macos", "--mode", "isolated"])
+                self.assertTrue(builder.startswith("isolated|"))
+
+    def test_local_signed_ci_or_tvos_rejection_precedes_build_and_python(self) -> None:
+        for arguments, env in ((["macos", "local-signed"], {"CI": "true"}),
+                               (["macos", "local-signed"], {"CI": "true", "LOCAL_BUILD_MODE": "isolated"}),
+                               (["tvos", "local-signed"], {})):
+            with self.subTest(arguments=arguments, env=env):
+                result, calls, builder = self.run_wrapper(arguments, env)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(calls, [])
+                self.assertIsNone(builder)
+
+
+class ImportClosureTests(unittest.TestCase):
+    def test_cold_import_and_validation_work_without_local_build_companion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            isolated = temporary / "neutral"
+            isolated.mkdir()
+            helper = isolated / "ui-e2e.py"
+            shutil.copyfile(SCRIPT, helper)
+            probe = (
+                "import importlib.util, pathlib, sys; "
+                "path = pathlib.Path(sys.argv[1]); "
+                "spec = importlib.util.spec_from_file_location('isolated_ui_e2e', path); "
+                "module = importlib.util.module_from_spec(spec); "
+                "sys.modules[spec.name] = module; spec.loader.exec_module(module); "
+                "assert str(path.parent) not in sys.path; "
+                "assert 'local_build' not in sys.modules; "
+                "assert module.validate_server_address('http://127.0.0.1:8080') == 'http://127.0.0.1:8080'"
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", probe, str(helper)],
+                cwd=isolated,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+
+class LocalSignedContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.signing_config = {
+            "durable_root": self.root / "LocalBuild",
+            "team_id": "TESTTEAM01",
+            "identity_sha1": "A" * 40,
+            "certificate_sha1": "A" * 40,
+        }
+        self.session_root = ui_e2e.local_signed_session_root(self.signing_config)
+        self.session_root.mkdir(parents=True)
+        self.derived = self.session_root / "DerivedData"
+        self.paths = ui_e2e.local_signed_product_paths(self.derived)
+
+    def product_receipt(self) -> dict[str, dict]:
+        return {
+            name: {
+                "path": str(path),
+                "identifier": ui_e2e.local_signed_bundle_identifiers()[name],
+                "team_id": self.signing_config["team_id"],
+                "certificate_sha1": self.signing_config["certificate_sha1"],
+                "designated_requirement": f'identifier "{name}" and anchor apple',
+                "cdhash": f"{name}-cdhash",
+            }
+            for name, path in self.paths.items()
+        }
+
+    def make_product_bundles(self, paths: dict[str, Path]) -> None:
+        for name, path in paths.items():
+            contents = path / "Contents"
+            contents.mkdir(parents=True, exist_ok=True)
+            with (contents / "Info.plist").open("wb") as stream:
+                ui_e2e.local_build.plistlib.dump({
+                    "CFBundleIdentifier": ui_e2e.local_signed_bundle_identifiers()[name],
+                }, stream)
+
+    def test_python_cli_defaults_to_isolated_mode(self) -> None:
+        with mock.patch.object(ui_e2e, "run_ui_e2e", return_value=0) as run:
+            self.assertEqual(ui_e2e.main(["--platform", "macos"]), 0)
+        run.assert_called_once_with("macos", mode="isolated")
+
+    def test_local_signed_rejections_happen_before_profile_or_build_access(self) -> None:
+        cases = (("macos", "true", "darwin"), ("tvos", "", "darwin"), ("macos", "", "linux"))
+        for platform, ci, system in cases:
+            with self.subTest(platform=platform, ci=ci, system=system), \
+                    mock.patch.object(ui_e2e.sys, "platform", system), \
+                    mock.patch.dict(os.environ, {"CI": ci}, clear=True), \
+                    mock.patch.object(ui_e2e.local_build, "load_config") as load_config, \
+                    mock.patch.object(ui_e2e, "run_process") as run_process:
+                with self.assertRaises(ui_e2e.UIE2EError):
+                    ui_e2e.run_ui_e2e(platform, mode="local-signed")
+                load_config.assert_not_called()
+                run_process.assert_not_called()
+
+    def test_bad_local_profile_and_unverified_server_never_fall_back(self) -> None:
+        with mock.patch.object(ui_e2e.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ui_e2e.local_build, "load_config", side_effect=ui_e2e.local_build.BuildError("invalid profile")), \
+                mock.patch.object(ui_e2e, "run_process") as run_process:
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "Pinned local signing profile"):
+                ui_e2e.run_ui_e2e("macos", mode="local-signed")
+            run_process.assert_not_called()
+
+        expected = self.signing_config["durable_root"] / ui_e2e.local_build.PRODUCTS["server"]
+        with mock.patch.dict(os.environ, {"CACHE_SERVER_BINARY": str(self.root / "arbitrary-server")}, clear=True), \
+                mock.patch.object(ui_e2e.local_build, "verify_existing_product") as verify, \
+                mock.patch.object(ui_e2e, "run_process") as run_process:
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "pinned stable local-build server path"):
+                ui_e2e.prepare_local_signed_server(
+                    self.signing_config,
+                    deadline=ui_e2e.time.monotonic() + 60,
+                )
+            verify.assert_not_called()
+            run_process.assert_not_called()
+        self.assertTrue(str(expected).startswith(str(self.root)))
+
+    def test_local_server_reuses_only_receipted_fixed_product_without_building(self) -> None:
+        expected = self.signing_config["durable_root"] / ui_e2e.local_build.PRODUCTS["server"]
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"signed server fixture")
+        expected.chmod(0o755)
+        deadline = ui_e2e.time.monotonic() + 60
+        for override in (None, str(expected)):
+            env = {} if override is None else {"CACHE_SERVER_BINARY": override}
+            with self.subTest(override=override), \
+                    mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(ui_e2e.local_build, "verify_existing_product", return_value={"path": str(expected)}) as verify, \
+                    mock.patch.object(ui_e2e, "run_process") as run_process:
+                self.assertEqual(
+                    ui_e2e.prepare_local_signed_server(self.signing_config, deadline=deadline),
+                    expected,
+                )
+                verify.assert_called_once_with(
+                    "server", deadline=deadline, allow_historical_source=True
+                )
+                run_process.assert_not_called()
+
+    def test_missing_or_invalid_server_receipt_fails_without_build_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(
+                    ui_e2e.local_build,
+                    "verify_existing_product",
+                    side_effect=ui_e2e.local_build.BuildError("local build receipt is missing"),
+                ), \
+                mock.patch.object(ui_e2e, "run_process") as run_process:
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "Pinned local cache-server verification failed"):
+                ui_e2e.prepare_local_signed_server(
+                    self.signing_config,
+                    deadline=ui_e2e.time.monotonic() + 60,
+                )
+            run_process.assert_not_called()
+
+    def test_local_signed_bundle_ids_and_product_paths_are_fixed(self) -> None:
+        self.assertEqual(ui_e2e.local_signed_bundle_identifiers(), {
+            "app": "dev.joey.tvos-net-player.uie2e.local.macos",
+            "uitests": "dev.joey.tvos-net-player.uie2e.local.macos.uitests",
+            "runner": "dev.joey.tvos-net-player.uie2e.local.macos.uitests.xctrunner",
+        })
+        self.assertEqual(self.paths["app"].name, "MacOSNetPlayer.app")
+        self.assertEqual(self.paths["uitests"].name, "MacOSNetPlayerUITests.xctest")
+        self.assertEqual(
+            self.paths["uitests"].relative_to(self.derived).as_posix(),
+            "Build/Products/Debug/MacOSNetPlayerUITests-Runner.app/Contents/PlugIns/MacOSNetPlayerUITests.xctest",
+        )
+        self.assertEqual(self.paths["runner"].name, "MacOSNetPlayerUITests-Runner.app")
+        self.assertTrue(all(path.is_relative_to(self.derived) for path in self.paths.values()))
+
+    def test_derived_data_conflict_is_rejected_and_fixed_path_is_accepted(self) -> None:
+        with mock.patch.dict(os.environ, {"DERIVED_DATA_PATH": str(self.root / "other")}, clear=True):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "conflicts"):
+                ui_e2e.local_signed_derived_data_path(self.signing_config)
+        with mock.patch.dict(os.environ, {"DERIVED_DATA_PATH": str(self.derived)}, clear=True):
+            self.assertEqual(ui_e2e.local_signed_derived_data_path(self.signing_config), self.derived)
+
+    def test_session_lock_rejects_contention_and_releases_without_stale_cleanup(self) -> None:
+        lock = ui_e2e.acquire_local_signed_lock(self.session_root)
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "Another local-signed"):
+            ui_e2e.acquire_local_signed_lock(self.session_root)
+        self.assertTrue(lock.is_dir())
+        ui_e2e.release_local_signed_lock(lock)
+        self.assertFalse(lock.exists())
+
+    def test_session_lock_is_released_when_the_run_fails(self) -> None:
+        lock = self.session_root / ui_e2e.LOCAL_SIGNED_LOCK
+        with mock.patch.object(ui_e2e.sys, "platform", "darwin"), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ui_e2e.local_build, "load_config", return_value=self.signing_config), \
+                mock.patch.object(ui_e2e, "_run_ui_e2e", side_effect=ui_e2e.UIE2EError("fixture failure")):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "fixture failure"):
+                ui_e2e.run_ui_e2e("macos", mode="local-signed")
+        self.assertFalse(lock.exists())
+
+    def test_receipt_first_write_reuse_and_fail_closed_identity_drift(self) -> None:
+        self.assertIsNone(ui_e2e.read_local_signed_receipt(
+            self.session_root,
+            signing_config=self.signing_config,
+            derived_data_path=self.derived,
+        ))
+        products = self.product_receipt()
+        source = {"repository": str(ui_e2e.ROOT), "head": "a" * 40, "dirty": True}
+        with mock.patch.object(ui_e2e.local_build, "_source_binding", return_value=source):
+            ui_e2e.write_local_signed_receipt(
+                self.session_root,
+                derived_data_path=self.derived,
+                signing_config=self.signing_config,
+                products=products,
+                deadline=ui_e2e.time.monotonic() + 10,
+            )
+        receipt = ui_e2e.read_local_signed_receipt(
+            self.session_root,
+            signing_config=self.signing_config,
+            derived_data_path=self.derived,
+        )
+        self.assertEqual(receipt["products"], products)
+        self.assertEqual(receipt["source"], source)
+        receipt_path = self.session_root / ui_e2e.LOCAL_SIGNED_RECEIPT
+        invalid = dict(receipt, team_id="OTHERTEAM1")
+        receipt_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "does not match the pinned profile"):
+            ui_e2e.read_local_signed_receipt(
+                self.session_root,
+                signing_config=self.signing_config,
+                derived_data_path=self.derived,
+            )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        historical_root = self.root / "previous-linked-worktree"
+        self.assertFalse(historical_root.exists())
+        historical = dict(receipt)
+        historical["source"] = {
+            "repository": str(historical_root),
+            "head": "b" * 40,
+            "dirty": False,
+        }
+        receipt_path.write_text(json.dumps(historical), encoding="utf-8")
+        reused = ui_e2e.read_local_signed_receipt(
+            self.session_root,
+            signing_config=self.signing_config,
+            derived_data_path=self.derived,
+        )
+        self.assertEqual(reused["source"], historical["source"])
+        for invalid_source in (
+            {"repository": "relative/checkout", "head": "b" * 40, "dirty": False},
+            {"repository": str(historical_root), "head": "not-a-commit", "dirty": False},
+            {"repository": str(historical_root), "head": "b" * 40, "dirty": "false"},
+        ):
+            with self.subTest(invalid_source=invalid_source):
+                invalid = dict(receipt, source=invalid_source)
+                receipt_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "invalid source binding"):
+                    ui_e2e.read_local_signed_receipt(
+                        self.session_root,
+                        signing_config=self.signing_config,
+                        derived_data_path=self.derived,
+                    )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        updated = {name: dict(item) for name, item in products.items()}
+        updated["app"]["cdhash"] = "new-cdhash"
+        def changed_hash(path: Path, **_kwargs: object) -> dict:
+            name = next(name for name, product_path in self.paths.items() if product_path == path)
+            return updated[name]
+
+        with mock.patch.object(ui_e2e.local_build, "verify_ui_e2e_bundle", side_effect=changed_hash):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "CDHash drifted"):
+                ui_e2e.verify_local_signed_products(
+                    self.paths,
+                    signing_config=self.signing_config,
+                    previous_receipt=receipt,
+                    deadline=ui_e2e.time.monotonic() + 10,
+                )
+        changed_requirement = {name: dict(item) for name, item in products.items()}
+        changed_requirement["app"]["designated_requirement"] = 'identifier "unexpected"'
+        def changed_requirement_for(path: Path, **_kwargs: object) -> dict:
+            name = next(name for name, product_path in self.paths.items() if product_path == path)
+            return changed_requirement[name]
+
+        with mock.patch.object(ui_e2e.local_build, "verify_ui_e2e_bundle", side_effect=changed_requirement_for):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "identity or CDHash drifted"):
+                ui_e2e.verify_local_signed_products(
+                    self.paths,
+                    signing_config=self.signing_config,
+                    previous_receipt=receipt,
+                    deadline=ui_e2e.time.monotonic() + 10,
+                    compare_codehash=False,
+                )
+
+    def test_missing_receipt_with_existing_product_fails_closed(self) -> None:
+        self.paths["app"].mkdir(parents=True)
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "receipt is missing"):
+            ui_e2e.read_local_signed_receipt(
+                self.session_root,
+                signing_config=self.signing_config,
+                derived_data_path=self.derived,
+            )
+
+    def test_local_signed_split_verifies_all_products_before_tests(self) -> None:
+        events: list[str] = []
+
+        def run(command: list[str], **_kwargs: object) -> ui_e2e.CommandResult:
+            action = command[-1]
+            events.append(action)
+            if action == "build-for-testing":
+                self.make_product_bundles(self.paths)
+            return ui_e2e.CommandResult(0, 0)
+
+        def details(path: Path, **_kwargs: object) -> tuple[str, str, str, str, str]:
+            name = next(name for name, product_path in self.paths.items() if product_path == path)
+            events.append(f"verified:{name}")
+            identifier = ui_e2e.local_signed_bundle_identifiers()[name]
+            return (
+                identifier,
+                self.signing_config["team_id"],
+                self.signing_config["certificate_sha1"],
+                f'identifier "{identifier}" and anchor apple',
+                f"{name}-cdhash",
+            )
+
+        source = {"repository": str(ui_e2e.ROOT), "head": "a" * 40, "dirty": True}
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=1000), \
+                mock.patch.object(ui_e2e, "run_process", side_effect=run) as run_mock, \
+                mock.patch.object(ui_e2e.local_build, "_codesign_details", side_effect=details), \
+                mock.patch.object(ui_e2e.local_build, "_source_binding", return_value=source):
+            result = ui_e2e.run_local_signed_xcode(
+                endpoint="http://127.0.0.1:43210",
+                task_endpoint="http://127.0.0.1:43211",
+                derived_data_path=self.derived,
+                result_bundle=self.root / "result.xcresult",
+                destination="platform=macOS",
+                logs_dir=self.root,
+                child_env={},
+                signing_config=self.signing_config,
+                session_root=self.session_root,
+                deadline=1300,
+                log=lambda _message: None,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(events, [
+            "build-for-testing",
+            "verified:app",
+            "verified:uitests",
+            "verified:runner",
+            "test-without-building",
+        ])
+        self.assertEqual([call.kwargs["timeout_seconds"] for call in run_mock.call_args_list], [300, 300])
+        self.assertTrue((self.session_root / ui_e2e.LOCAL_SIGNED_RECEIPT).is_file())
+
+    def test_existing_total_and_artifact_budgets_remain_fixed(self) -> None:
+        self.assertEqual(ui_e2e.TOTAL_RUN_BUDGET_SECONDS, 35 * 60)
+        self.assertEqual(ui_e2e.COMMAND_TIMEOUT_SECONDS, 30 * 60)
+        self.assertEqual(ui_e2e.MAX_COMMAND_LOG_BYTES, 8 * 1024 * 1024)
+        self.assertEqual(ui_e2e.MAX_ARTIFACT_BYTES, 32 * 1024 * 1024)
+        self.assertEqual(ui_e2e.MAX_RESULT_BUNDLE_BYTES, 20 * 1024 * 1024)
+
+    def test_build_or_signature_drift_prevents_test_execution(self) -> None:
+        scenarios = ("build-failure", "team", "certificate", "identifier", "requirement")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = dict(self.signing_config, durable_root=root / "LocalBuild")
+                session_root = ui_e2e.local_signed_session_root(config)
+                session_root.mkdir(parents=True)
+                derived = session_root / "DerivedData"
+                paths = ui_e2e.local_signed_product_paths(derived)
+                identifiers = ui_e2e.local_signed_bundle_identifiers()
+                events: list[str] = []
+                built = False
+                previous = None
+                if scenario == "requirement":
+                    self.make_product_bundles(paths)
+                    previous = {
+                        "products": {
+                            name: {
+                                "path": str(path),
+                                "identifier": identifiers[name],
+                                "team_id": config["team_id"],
+                                "certificate_sha1": config["certificate_sha1"],
+                                "designated_requirement": f'identifier "{identifiers[name]}" and anchor apple',
+                                "cdhash": f"{name}-cdhash",
+                            }
+                            for name, path in paths.items()
+                        }
+                    }
+
+                def run(command: list[str], **_kwargs: object) -> ui_e2e.CommandResult:
+                    nonlocal built
+                    action = command[-1]
+                    events.append(action)
+                    if action == "build-for-testing":
+                        if scenario == "build-failure":
+                            return ui_e2e.CommandResult(65, 0)
+                        if previous is None:
+                            self.make_product_bundles(paths)
+                        built = True
+                    return ui_e2e.CommandResult(0, 0)
+
+                def details(path: Path, **_kwargs: object) -> tuple[str, str, str, str, str]:
+                    name = next(name for name, product_path in paths.items() if product_path == path)
+                    identifier = identifiers[name]
+                    team = config["team_id"]
+                    certificate = config["certificate_sha1"]
+                    requirement = f'identifier "{identifier}" and anchor apple'
+                    cdhash = f"{name}-cdhash"
+                    if scenario == "requirement" and built:
+                        requirement = 'identifier "changed" and anchor apple'
+                        cdhash = "changed-cdhash"
+                    elif scenario == "team" and name == "app":
+                        team = "OTHERTEAM1"
+                    elif scenario == "certificate" and name == "app":
+                        certificate = "B" * 40
+                    elif scenario == "identifier" and name == "app":
+                        identifier = "unexpected.bundle.id"
+                    return identifier, team, certificate, requirement, cdhash
+
+                failure = scenario != "build-failure"
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(ui_e2e, "run_process", side_effect=run), \
+                        mock.patch.object(ui_e2e, "read_local_signed_receipt", return_value=previous), \
+                        mock.patch.object(ui_e2e.local_build, "_codesign_details", side_effect=details), \
+                        mock.patch.object(ui_e2e.local_build, "_source_binding", return_value={
+                            "repository": str(ui_e2e.ROOT), "head": "a" * 40, "dirty": True,
+                        }):
+                    if failure:
+                        with self.assertRaises(ui_e2e.UIE2EError):
+                            ui_e2e.run_local_signed_xcode(
+                                endpoint="http://127.0.0.1:43210",
+                                task_endpoint="http://127.0.0.1:43211",
+                                derived_data_path=derived,
+                                result_bundle=root / "result.xcresult",
+                                destination="platform=macOS",
+                                logs_dir=root,
+                                child_env={},
+                                signing_config=config,
+                                session_root=session_root,
+                                deadline=ui_e2e.time.monotonic() + 300,
+                                log=lambda _message: None,
+                            )
+                    else:
+                        with self.assertRaisesRegex(ui_e2e.UIE2EError, "exited 65"):
+                            ui_e2e.run_local_signed_xcode(
+                                endpoint="http://127.0.0.1:43210",
+                                task_endpoint="http://127.0.0.1:43211",
+                                derived_data_path=derived,
+                                result_bundle=root / "result.xcresult",
+                                destination="platform=macOS",
+                                logs_dir=root,
+                                child_env={},
+                                signing_config=config,
+                                session_root=session_root,
+                                deadline=ui_e2e.time.monotonic() + 300,
+                                log=lambda _message: None,
+                            )
+                self.assertNotIn("test-without-building", events)
+                self.assertEqual(events[0], "build-for-testing")
+
+
 class RunnerContractTests(unittest.TestCase):
     def test_missing_or_non_loopback_endpoint_fails_closed(self) -> None:
         for address in (None, "", "http://localhost:5000", "http://127.0.0.1:70000"):
@@ -1223,6 +1758,41 @@ class RunnerContractTests(unittest.TestCase):
                     )
                 else:
                     self.assertEqual(settings, {"CODE_SIGNING_ALLOWED": "NO"})
+
+    def test_local_signed_xcodebuild_uses_fixed_ids_and_split_actions(self) -> None:
+        signing = {"identity_sha1": "A" * 40, "team_id": "TESTTEAM01"}
+        derived = Path("/stable/LocalBuild/UIE2E/DerivedData")
+        result_bundle = Path("/private/tmp/UIE2E.xcresult")
+        common = {
+            "platform": "macos",
+            "server_address": "http://127.0.0.1:43210",
+            "task_server_address": "http://127.0.0.1:43211",
+            "app_bundle_identifier": ui_e2e.LOCAL_SIGNED_BUNDLE_ID,
+            "derived_data_path": derived,
+            "result_bundle_path": result_bundle,
+            "destination": "platform=macOS",
+            "mode": "local-signed",
+            "signing_config": signing,
+        }
+        build = ui_e2e.build_xcodebuild_command(**common, action="build-for-testing")
+        self.assertEqual(build[-1], "build-for-testing")
+        self.assertNotIn("-resultBundlePath", build)
+        self.assertIn(f"-derivedDataPath", build)
+        self.assertIn(str(derived), build)
+        settings = dict(argument.split("=", 1) for argument in build if "=" in argument and not argument.startswith("-"))
+        self.assertEqual(settings["CODE_SIGN_IDENTITY"], signing["identity_sha1"])
+        self.assertEqual(settings["DEVELOPMENT_TEAM"], signing["team_id"])
+        self.assertEqual(settings["CODE_SIGNING_REQUIRED"], "YES")
+        self.assertEqual(settings["APP_BUNDLE_IDENTIFIER"], ui_e2e.LOCAL_SIGNED_BUNDLE_ID)
+
+        test = ui_e2e.build_xcodebuild_command(**common, action="test-without-building")
+        self.assertEqual(test[-1], "test-without-building")
+        result_index = test.index("-resultBundlePath")
+        self.assertEqual(test[result_index + 1], str(result_bundle))
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "fixed macOS"):
+            ui_e2e.build_xcodebuild_command(
+                **dict(common, platform="tvos"), action="build-for-testing"
+            )
 
     def test_scheme_requires_test_action_endpoint_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

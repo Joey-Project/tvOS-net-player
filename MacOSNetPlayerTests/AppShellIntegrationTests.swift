@@ -7,6 +7,91 @@ import XCTest
 
 @MainActor
 final class AppShellIntegrationTests: XCTestCase {
+    func testInitialFormInputsRequireFreshDebugUITestingLaunch() {
+        let environment = [
+            "UI_E2E_INITIAL_SERVER_ADDRESS": "https://cache.example.test:50051/path?x=1&y=%2F#frag.",
+            "UI_E2E_INITIAL_BILIBILI_SOURCE": "https://www.bilibili.com/video/BV1xx411c7mD?p=2&x=%2F.",
+        ]
+
+        XCTAssertEqual(
+            InitialFormInputConfiguration.resolve(
+                arguments: ["app", "--ui-testing"],
+                environment: environment,
+                isDebugBuild: true
+            ),
+            InitialFormInputConfiguration(
+                serverAddressText: environment["UI_E2E_INITIAL_SERVER_ADDRESS"],
+                bilibiliSourceText: environment["UI_E2E_INITIAL_BILIBILI_SOURCE"]
+            )
+        )
+        XCTAssertEqual(
+            InitialFormInputConfiguration.resolve(
+                arguments: ["app"],
+                environment: environment,
+                isDebugBuild: true
+            ),
+            InitialFormInputConfiguration(serverAddressText: nil, bilibiliSourceText: nil)
+        )
+        XCTAssertEqual(
+            InitialFormInputConfiguration.resolve(
+                arguments: ["app", "--ui-testing", "--ui-testing-preserve-preferences"],
+                environment: environment,
+                isDebugBuild: true
+            ),
+            InitialFormInputConfiguration(serverAddressText: nil, bilibiliSourceText: nil)
+        )
+        XCTAssertEqual(
+            InitialFormInputConfiguration.resolve(
+                arguments: ["app", "--ui-testing"],
+                environment: environment,
+                isDebugBuild: false
+            ),
+            InitialFormInputConfiguration(serverAddressText: nil, bilibiliSourceText: nil)
+        )
+    }
+
+    func testInitialFormInputsOnlyInitializeModelsWithoutPersistenceOrSubmission() throws {
+        let defaultsSuiteName = "MacOSNetPlayerTests-InitialInputs-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsSuiteName))
+        defaults.removePersistentDomain(forName: defaultsSuiteName)
+        defer { defaults.removePersistentDomain(forName: defaultsSuiteName) }
+
+        let serverAddress = "https://cache.example.test:50051/path?x=1&y=%2F#frag."
+        let source = "https://www.bilibili.com/video/BV1xx411c7mD?p=2&x=%2F."
+        let cacheModel = CacheLibraryViewModel(
+            defaultServerAddressText: serverAddress,
+            defaults: defaults
+        )
+        let bilibiliModel = BilibiliTaskViewModel(sourceText: source, defaults: defaults)
+
+        XCTAssertEqual(cacheModel.serverAddressText, serverAddress)
+        XCTAssertEqual(bilibiliModel.sourceText, source)
+        XCTAssertEqual(cacheModel.statusMessage, "Cache server not connected.")
+        XCTAssertFalse(cacheModel.isLoading)
+        XCTAssertNil(bilibiliModel.currentTask)
+        XCTAssertFalse(bilibiliModel.isSubmitting)
+        XCTAssertFalse(bilibiliModel.isResolving)
+        XCTAssertFalse(bilibiliModel.isWatching)
+        XCTAssertNil(defaults.object(forKey: CacheLibraryViewModel.serverAddressDefaultsKey))
+    }
+
+    func testModelWithoutInitialServerAddressPreservesSavedEndpoint() throws {
+        let defaultsSuiteName = "MacOSNetPlayerTests-SavedEndpoint-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsSuiteName))
+        defaults.removePersistentDomain(forName: defaultsSuiteName)
+        defer { defaults.removePersistentDomain(forName: defaultsSuiteName) }
+        defaults.set("saved-cache.example.test:50051", forKey: CacheLibraryViewModel.serverAddressDefaultsKey)
+
+        let model = CacheLibraryViewModel(defaults: defaults)
+
+        XCTAssertEqual(model.serverAddressText, "saved-cache.example.test:50051")
+        XCTAssertEqual(
+            defaults.string(forKey: CacheLibraryViewModel.serverAddressDefaultsKey),
+            "saved-cache.example.test:50051"
+        )
+        XCTAssertEqual(model.statusMessage, "Cache server not connected.")
+    }
+
     func testContentViewCanRenderWithSharedAppCoreModels() throws {
         let defaultsSuiteName = "MacOSNetPlayerTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsSuiteName))
