@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import importlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import selectors
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,14 +30,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-
 ROOT = Path(__file__).resolve().parent.parent
 SERVER_NAME = "tvos-net-player-cache-server"
+LOCAL_SIGNED_MODE = "local-signed"
+LOCAL_SIGNED_BUNDLE_ID = "dev.joey.tvos-net-player.uie2e.local"
+LOCAL_SIGNED_PRODUCT_PATHS = {
+    "app": Path("Build/Products/Debug/MacOSNetPlayer.app"),
+    "uitests": Path(
+        "Build/Products/Debug/MacOSNetPlayerUITests-Runner.app/Contents/PlugIns/"
+        "MacOSNetPlayerUITests.xctest"
+    ),
+    "runner": Path("Build/Products/Debug/MacOSNetPlayerUITests-Runner.app"),
+}
+LOCAL_SIGNED_RECEIPT = "local-signed-receipt.json"
+LOCAL_SIGNED_LOCK = ".local-signed-session.lock"
 FIXTURE_COUNT = 55
 FIXTURE_DURATION_SECONDS = 92
 MAX_FIXTURE_BYTES = 64 * 1024 * 1024
 MAX_RESULT_SUMMARY_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_LOG_BYTES = 8 * 1024 * 1024
+MAX_PROGRESS_DIAGNOSTIC_BYTES = 32 * 1024
+MAX_PROGRESS_DIAGNOSTIC_RECORDS = 64
+PROGRESS_TERMINAL_RESERVE_BYTES = 2048
+PROGRESS_PERIODIC_RECORDS_PER_PHASE = 30
+PROGRESS_NONTERMINAL_RECORDS_PER_PHASE = PROGRESS_PERIODIC_RECORDS_PER_PHASE + 1
+PROGRESS_NONTERMINAL_BYTES_PER_PHASE = (
+    MAX_PROGRESS_DIAGNOSTIC_BYTES - PROGRESS_TERMINAL_RESERVE_BYTES
+) // 2
 MAX_SERVER_LOG_BYTES = 256 * 1024
 MAX_TASK_FIXTURE_LOG_BYTES = 256 * 1024
 MAX_FIXTURE_JSON_BYTES = 64 * 1024
@@ -84,12 +105,181 @@ class UIE2EError(RuntimeError):
     pass
 
 
+def _local_build_module():
+    return importlib.import_module("local_build")
+
+
+def __getattr__(name: str):
+    if name == "local_build":
+        return _local_build_module()
+    raise AttributeError(name)
+
+
 @dataclass(frozen=True)
 class CommandResult:
     returncode: int
     bytes_written: int
     timed_out: bool = False
     output_limited: bool = False
+
+
+class _ProcessProgress:
+    """Write bounded, privacy-safe process progress records when enabled."""
+
+    PHASES = {"fixture_build", "xcode_test"}
+    EVENTS = {"started", "periodic", "deadline", "output_limited", "completed", "error"}
+    TERMINAL_EVENTS = {"deadline", "output_limited", "completed", "error"}
+
+    def __init__(self, path: Path, phase: str, budget_seconds: float) -> None:
+        if not isinstance(phase, str) or phase not in self.PHASES:
+            raise ValueError("Progress phase must be a fixed UI process label.")
+        self.path = path
+        self.phase = phase
+        self.budget_seconds = budget_seconds
+        self.periodic_interval_seconds = budget_seconds / (PROGRESS_PERIODIC_RECORDS_PER_PHASE + 1)
+        self.started = time.monotonic()
+        self.records = 0
+        self.bytes_written = 0
+        self._nonterminal_records = {label: 0 for label in self.PHASES}
+        self._nonterminal_bytes = {label: 0 for label in self.PHASES}
+        self._terminal_phases: set[str] = set()
+        self.file = None
+        self.disabled = False
+        descriptor: int | None = None
+        try:
+            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(path, flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(descriptor)
+                descriptor = None
+                self.disabled = True
+                return
+            os.fchmod(descriptor, 0o600)
+            self.file = os.fdopen(descriptor, "a+b")
+            descriptor = None
+            self.file.seek(0)
+            existing = self.file.read(MAX_PROGRESS_DIAGNOSTIC_BYTES + 1)
+            self.file.seek(0, os.SEEK_END)
+            self.bytes_written = len(existing)
+            if self.bytes_written > MAX_PROGRESS_DIAGNOSTIC_BYTES:
+                self.disabled = True
+                return
+            try:
+                for line in existing.splitlines():
+                    record = json.loads(line)
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("phase") not in self.PHASES
+                        or record.get("event") not in self.EVENTS
+                    ):
+                        raise ValueError("invalid progress record")
+                    self.records += 1
+                    retained_phase = record["phase"]
+                    if record["event"] in self.TERMINAL_EVENTS:
+                        self._terminal_phases.add(retained_phase)
+                    else:
+                        self._nonterminal_records[retained_phase] += 1
+                        self._nonterminal_bytes[retained_phase] += len(line) + 1
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                self.disabled = True
+        except Exception:
+            if self.file is not None:
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
+            elif descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except Exception:
+                    pass
+            self.disabled = True
+
+    def elapsed(self) -> float:
+        return round(max(0.0, time.monotonic() - self.started), 3)
+
+    def write(
+        self,
+        event: str,
+        *,
+        retained_bytes: int,
+        last_output_age: float | None,
+        output_activity: bool | None,
+        returncode: int | None = None,
+        terminal: bool = False,
+        cleanup_failed: bool = False,
+    ) -> None:
+        if self.disabled or self.file is None:
+            return
+        if (
+            not isinstance(event, str)
+            or event not in self.EVENTS
+            or terminal != (event in self.TERMINAL_EVENTS)
+        ):
+            return
+        if terminal:
+            if self.phase in self._terminal_phases:
+                return
+        elif (
+            self._nonterminal_records[self.phase] >= PROGRESS_NONTERMINAL_RECORDS_PER_PHASE
+            or self.records >= MAX_PROGRESS_DIAGNOSTIC_RECORDS
+            - len(self.PHASES - self._terminal_phases)
+        ):
+            return
+        record = {
+            "phase": self.phase,
+            "event": event,
+            "elapsed_seconds": self.elapsed(),
+            "effective_budget_seconds": round(self.budget_seconds, 3),
+            "retained_output_bytes": retained_bytes,
+            "last_output_age_seconds": (
+                None if last_output_age is None else round(last_output_age, 3)
+            ),
+            "output_activity": output_activity,
+            "child_returncode": returncode,
+            "cleanup_failed": cleanup_failed,
+        }
+        try:
+            data = json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+            remaining_terminals = len(self.PHASES - self._terminal_phases)
+            record_limit = MAX_PROGRESS_DIAGNOSTIC_RECORDS - (
+                0 if terminal else remaining_terminals
+            )
+            if len(data) > 512 or self.records >= record_limit:
+                return
+            ceiling = MAX_PROGRESS_DIAGNOSTIC_BYTES
+            if not terminal:
+                ceiling -= PROGRESS_TERMINAL_RESERVE_BYTES
+                if (
+                    self._nonterminal_bytes[self.phase] + len(data)
+                    > PROGRESS_NONTERMINAL_BYTES_PER_PHASE
+                ):
+                    return
+            if self.bytes_written + len(data) > ceiling:
+                return
+            self.file.write(data)
+            self.file.flush()
+            self.bytes_written += len(data)
+            self.records += 1
+            if terminal:
+                self._terminal_phases.add(self.phase)
+            else:
+                self._nonterminal_records[self.phase] += 1
+                self._nonterminal_bytes[self.phase] += len(data)
+        except Exception:
+            self.disabled = True
+
+    def close(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
 
 
 @dataclass(frozen=True)
@@ -282,17 +472,32 @@ def run_process(
     max_output_bytes: int,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    progress_path: Path | None = None,
+    progress_phase: str | None = None,
 ) -> CommandResult:
     """Run one owned process group with a hard deadline and retained-byte limit."""
     if timeout_seconds <= 0 or max_output_bytes <= 0:
         raise ValueError("Process deadline and output limit must be positive.")
+    if (progress_path is None) != (progress_phase is None):
+        raise ValueError("Progress path and fixed phase must be supplied together.")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     selector = selectors.DefaultSelector()
     process: subprocess.Popen[bytes] | None = None
     bytes_written = 0
     timed_out = False
     output_limited = False
+    last_output_at: float | None = None
+    bytes_since_progress = 0
     deadline = time.monotonic() + timeout_seconds
+    progress = (
+        _ProcessProgress(progress_path, progress_phase, timeout_seconds)
+        if progress_path is not None and progress_phase is not None
+        else None
+    )
+    next_progress_at = (
+        progress.started + progress.periodic_interval_seconds
+        if progress is not None else 0.0
+    )
 
     try:
         with log_path.open("xb") as log_file:
@@ -306,6 +511,11 @@ def run_process(
                 start_new_session=True,
                 close_fds=True,
             )
+            if progress is not None:
+                progress.write(
+                    "started", retained_bytes=0, last_output_age=None,
+                    output_activity=None,
+                )
             assert process.stdout is not None
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -322,6 +532,9 @@ def run_process(
                     if not chunk:
                         selector.unregister(key.fileobj)
                         continue
+                    if progress is not None:
+                        last_output_at = time.monotonic()
+                        bytes_since_progress += len(chunk)
                     available = max_output_bytes - bytes_written
                     if len(chunk) > available:
                         if available:
@@ -334,6 +547,24 @@ def run_process(
 
                 if output_limited:
                     break
+                now = time.monotonic() if progress is not None else 0.0
+                if (
+                    progress is not None
+                    and now >= next_progress_at
+                ):
+                    progress.write(
+                        "periodic",
+                        retained_bytes=bytes_written,
+                        last_output_age=(None if last_output_at is None else now - last_output_at),
+                        output_activity=bytes_since_progress > 0,
+                    )
+                    missed_intervals = math.floor(
+                        (now - next_progress_at) / progress.periodic_interval_seconds
+                    ) + 1
+                    next_progress_at += (
+                        missed_intervals * progress.periodic_interval_seconds
+                    )
+                    bytes_since_progress = 0
                 if _child_has_exited(process) and not selector.get_map():
                     break
 
@@ -355,6 +586,24 @@ def run_process(
                     process.stdout.close()
                 except Exception as error:
                     cleanup_errors.append(error)
+        if progress is not None:
+            event = (
+                "deadline" if timed_out else
+                "output_limited" if output_limited else
+                "error" if primary_error is not None or cleanup_errors else
+                "completed"
+            )
+            now = time.monotonic()
+            progress.write(
+                event,
+                retained_bytes=bytes_written,
+                last_output_age=(None if last_output_at is None else now - last_output_at),
+                output_activity=(bytes_since_progress > 0),
+                returncode=(process.returncode if process is not None else None),
+                terminal=True,
+                cleanup_failed=bool(cleanup_errors),
+            )
+            progress.close()
         if cleanup_errors:
             context = []
             if timed_out:
@@ -602,6 +851,68 @@ def verify_scheme_contract(scheme_path: Path, expected_target: str) -> None:
         )
 
 
+def local_signed_bundle_identifiers() -> dict[str, str]:
+    return {
+        "app": f"{LOCAL_SIGNED_BUNDLE_ID}.macos",
+        "uitests": f"{LOCAL_SIGNED_BUNDLE_ID}.macos.uitests",
+        "runner": f"{LOCAL_SIGNED_BUNDLE_ID}.macos.uitests.xctrunner",
+    }
+
+
+def local_signed_product_paths(derived_data_path: Path) -> dict[str, Path]:
+    return {name: derived_data_path / path for name, path in LOCAL_SIGNED_PRODUCT_PATHS.items()}
+
+
+def validate_run_mode(platform: str, mode: str) -> None:
+    if mode not in ("isolated", LOCAL_SIGNED_MODE):
+        raise UIE2EError(f"Unsupported UI E2E mode: {mode}")
+    if mode != LOCAL_SIGNED_MODE:
+        return
+    if os.environ.get("CI", "").lower() == "true":
+        raise UIE2EError("local-signed UI E2E mode is not allowed in CI.")
+    if platform != "macos":
+        raise UIE2EError("local-signed UI E2E mode is available only for macOS.")
+    if sys.platform != "darwin":
+        raise UIE2EError("local-signed UI E2E mode requires macOS.")
+
+
+def local_signed_session_root(config: dict) -> Path:
+    return Path(config["durable_root"]) / "UIE2E"
+
+
+def local_signed_derived_data_path(config: dict) -> Path:
+    expected = local_signed_session_root(config) / "DerivedData"
+    override = os.environ.get("DERIVED_DATA_PATH")
+    if override and Path(override).expanduser().resolve() != expected.resolve():
+        raise UIE2EError(
+            "DERIVED_DATA_PATH conflicts with the fixed local-signed UI E2E product root."
+        )
+    return expected
+
+
+def acquire_local_signed_lock(session_root: Path) -> Path:
+    if session_root.is_symlink():
+        raise UIE2EError("Local-signed UI E2E product root must not be a symlink.")
+    session_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not session_root.is_dir():
+        raise UIE2EError("Local-signed UI E2E product root is not a directory.")
+    lock = session_root / LOCAL_SIGNED_LOCK
+    try:
+        lock.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise UIE2EError(
+            f"Another local-signed UI E2E session holds {lock}; stale locks are not removed automatically."
+        ) from error
+    return lock
+
+
+def release_local_signed_lock(lock: Path) -> None:
+    try:
+        lock.rmdir()
+    except OSError as error:
+        raise UIE2EError(f"Could not release local-signed UI E2E session lock: {lock}") from error
+
+
 def build_xcodebuild_command(
     *,
     platform: str,
@@ -611,28 +922,51 @@ def build_xcodebuild_command(
     derived_data_path: Path,
     result_bundle_path: Path,
     destination: str,
+    mode: str = "isolated",
+    signing_config: dict | None = None,
+    action: str = "test",
 ) -> list[str]:
     endpoint = validate_server_address(server_address)
     task_endpoint = validate_server_address(task_server_address) if task_server_address else None
-    if not re.fullmatch(
-        r"dev\.joey\.tvos-net-player\.uie2e\.[0-9a-f]{32}",
-        app_bundle_identifier,
-    ):
-        raise UIE2EError("APP_BUNDLE_IDENTIFIER must be unique to this UI E2E run.")
+    if mode == LOCAL_SIGNED_MODE:
+        if platform != "macos" or app_bundle_identifier != LOCAL_SIGNED_BUNDLE_ID:
+            raise UIE2EError("Local-signed UI E2E requires its fixed macOS test bundle identifier.")
+        if signing_config is None:
+            raise UIE2EError("Local-signed UI E2E requires the pinned signing profile.")
+        if action not in ("build-for-testing", "test-without-building"):
+            raise UIE2EError("Local-signed UI E2E requires a split build/test action.")
+    else:
+        if mode != "isolated" or action != "test" or signing_config is not None:
+            raise UIE2EError("Isolated UI E2E accepts only the credential-free test action.")
+        if not re.fullmatch(
+            r"dev\.joey\.tvos-net-player\.uie2e\.[0-9a-f]{32}",
+            app_bundle_identifier,
+        ):
+            raise UIE2EError("APP_BUNDLE_IDENTIFIER must be unique to this UI E2E run.")
     config = PLATFORMS[platform]
-    signing_settings = (
-        [
-            "CODE_SIGN_IDENTITY=-",
+    if mode == LOCAL_SIGNED_MODE:
+        assert signing_config is not None
+        signing_settings = [
+            f"CODE_SIGN_IDENTITY={signing_config['identity_sha1']}",
             "CODE_SIGNING_ALLOWED=YES",
+            "CODE_SIGNING_REQUIRED=YES",
             "CODE_SIGN_STYLE=Manual",
-            "DEVELOPMENT_TEAM=",
+            f"DEVELOPMENT_TEAM={signing_config['team_id']}",
         ]
-        if platform == "macos"
-        else ["CODE_SIGNING_ALLOWED=NO"]
-    )
+    else:
+        signing_settings = (
+            [
+                "CODE_SIGN_IDENTITY=-",
+                "CODE_SIGNING_ALLOWED=YES",
+                "CODE_SIGN_STYLE=Manual",
+                "DEVELOPMENT_TEAM=",
+            ]
+            if platform == "macos"
+            else ["CODE_SIGNING_ALLOWED=NO"]
+        )
+    include_result_path = mode != LOCAL_SIGNED_MODE or action != "build-for-testing"
     return [
         "xcodebuild",
-        "-quiet",
         "-onlyUsePackageVersionsFromResolvedFile",
         "-skipPackagePluginValidation",
         "-project",
@@ -645,15 +979,14 @@ def build_xcodebuild_command(
         destination,
         "-derivedDataPath",
         str(derived_data_path),
-        "-resultBundlePath",
-        str(result_bundle_path),
+        *(["-resultBundlePath", str(result_bundle_path)] if include_result_path else []),
         "-parallel-testing-enabled",
         "NO",
         *signing_settings,
         f"APP_BUNDLE_IDENTIFIER={app_bundle_identifier}",
         f"UI_E2E_SERVER_ADDRESS={endpoint}",
         *([f"UI_E2E_TASK_SERVER_ADDRESS={task_endpoint}"] if task_endpoint else []),
-        "test",
+        action,
     ]
 
 
@@ -775,6 +1108,8 @@ def build_task_fixture(logs_dir: Path, *, timeout_seconds: float) -> Path:
         timeout_seconds=timeout_seconds,
         max_output_bytes=MAX_COMMAND_LOG_BYTES,
         cwd=ROOT,
+        progress_path=logs_dir / "ui-progress.jsonl",
+        progress_phase="fixture_build",
     )
     _require_result(result, "TaskWatchUIFixture SwiftPM debug build", logs_dir / "task-fixture-build.log")
     binary = resolve_swift_bin_path(logs_dir) / TASK_FIXTURE_PRODUCT
@@ -794,6 +1129,293 @@ def _read_bounded_json(path: Path, *, description: str) -> object:
         return json.loads(payload)
     except (OSError, json.JSONDecodeError) as error:
         raise UIE2EError(f"Could not read {description} JSON.") from error
+
+
+def read_local_signed_receipt(
+    session_root: Path,
+    *,
+    signing_config: dict,
+    derived_data_path: Path,
+) -> dict | None:
+    expected_root = local_signed_session_root(signing_config)
+    if session_root != expected_root or derived_data_path != expected_root / "DerivedData":
+        raise UIE2EError("Local-signed UI E2E receipt paths must use the fixed durable product root.")
+    receipt_path = session_root / LOCAL_SIGNED_RECEIPT
+    product_paths = local_signed_product_paths(derived_data_path)
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        if any(path.exists() or path.is_symlink() for path in product_paths.values()):
+            raise UIE2EError("Local-signed UI E2E receipt is missing for existing build products.")
+        return None
+
+    payload = _read_bounded_json(receipt_path, description="Local-signed UI E2E receipt")
+    expected_ids = local_signed_bundle_identifiers()
+    expected_keys = {
+        "schema_version", "source", "team_id", "identity_sha1",
+        "certificate_sha1", "bundle_ids", "products",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or payload.get("team_id") != signing_config["team_id"]
+        or payload.get("identity_sha1") != signing_config["identity_sha1"]
+        or payload.get("certificate_sha1") != signing_config["certificate_sha1"]
+        or payload.get("bundle_ids") != expected_ids
+    ):
+        raise UIE2EError("Local-signed UI E2E receipt is invalid or does not match the pinned profile.")
+    source = payload.get("source")
+    source_repository = source.get("repository") if isinstance(source, dict) else None
+    source_head = source.get("head") if isinstance(source, dict) else None
+    # A prior worktree path is descriptive receipt data, never an input path.
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"repository", "head", "dirty"}
+        or not isinstance(source_repository, str)
+        or not source_repository
+        or len(source_repository) > 4096
+        or "\x00" in source_repository
+        or not Path(source_repository).is_absolute()
+        or not isinstance(source_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source_head) is None
+        or type(source.get("dirty")) is not bool
+    ):
+        raise UIE2EError("Local-signed UI E2E receipt has invalid source binding.")
+    products = payload.get("products")
+    if not isinstance(products, dict) or set(products) != set(product_paths):
+        raise UIE2EError("Local-signed UI E2E receipt has an invalid product set.")
+    product_keys = {
+        "path", "identifier", "team_id", "certificate_sha1",
+        "designated_requirement", "cdhash",
+    }
+    for name, path in product_paths.items():
+        item = products.get(name)
+        if (
+            not isinstance(item, dict)
+            or set(item) != product_keys
+            or item.get("path") != str(path)
+            or item.get("identifier") != expected_ids[name]
+            or item.get("team_id") != signing_config["team_id"]
+            or item.get("certificate_sha1") != signing_config["certificate_sha1"]
+            or not isinstance(item.get("designated_requirement"), str)
+            or not item["designated_requirement"]
+            or not isinstance(item.get("cdhash"), str)
+            or not item["cdhash"]
+        ):
+            raise UIE2EError(f"Local-signed UI E2E receipt entry is invalid for {name}.")
+    return payload
+
+
+def verify_local_signed_products(
+    product_paths: dict[str, Path],
+    *,
+    signing_config: dict,
+    previous_receipt: dict | None,
+    deadline: float,
+    compare_codehash: bool = True,
+    allow_unbuilt: bool = False,
+) -> dict[str, dict]:
+    local_build = _local_build_module()
+    if previous_receipt is None and allow_unbuilt:
+        return {}
+    previous_products = previous_receipt["products"] if previous_receipt else {}
+    verified: dict[str, dict] = {}
+    for name, path in product_paths.items():
+        require_work_remaining(deadline)
+        previous = previous_products.get(name)
+        try:
+            actual = local_build.verify_ui_e2e_bundle(
+                path,
+                expected_identifier=local_signed_bundle_identifiers()[name],
+                config=signing_config,
+                previous=previous,
+                deadline=deadline,
+            )
+        except local_build.BuildError as error:
+            raise UIE2EError(f"Local-signed UI E2E product verification failed for {name}: {error}") from error
+        if previous is not None and (
+            actual.get("designated_requirement") != previous.get("designated_requirement")
+            or (compare_codehash and actual != previous)
+        ):
+            raise UIE2EError(f"Local-signed UI E2E product identity or CDHash drifted for {name}.")
+        verified[name] = actual
+    return verified
+
+
+def write_local_signed_receipt(
+    session_root: Path,
+    *,
+    derived_data_path: Path,
+    signing_config: dict,
+    products: dict[str, dict],
+    deadline: float,
+) -> None:
+    local_build = _local_build_module()
+    require_work_remaining(deadline)
+    expected_root = local_signed_session_root(signing_config)
+    if session_root != expected_root or derived_data_path != expected_root / "DerivedData":
+        raise UIE2EError("Local-signed UI E2E receipt paths must use the fixed durable product root.")
+    expected_paths = local_signed_product_paths(derived_data_path)
+    expected_ids = local_signed_bundle_identifiers()
+    if set(products) != set(expected_paths):
+        raise UIE2EError("Cannot write local-signed UI E2E receipt with an incomplete product set.")
+    for name, path in expected_paths.items():
+        item = products[name]
+        if (
+            not isinstance(item, dict)
+            or item.get("path") != str(path)
+            or item.get("identifier") != expected_ids[name]
+            or item.get("team_id") != signing_config["team_id"]
+            or item.get("certificate_sha1") != signing_config["certificate_sha1"]
+            or not item.get("designated_requirement")
+            or not item.get("cdhash")
+        ):
+            raise UIE2EError(f"Cannot write an invalid local-signed UI E2E receipt entry for {name}.")
+    try:
+        source = local_build._source_binding(deadline=deadline)
+    except local_build.BuildError as error:
+        raise UIE2EError(f"Could not bind local-signed UI E2E receipt to source: {error}") from error
+    if (
+        source.get("repository") != str(ROOT)
+        or not isinstance(source.get("head"), str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source["head"]) is None
+        or type(source.get("dirty")) is not bool
+    ):
+        raise UIE2EError("Could not bind local-signed UI E2E receipt to this checkout.")
+    payload = {
+        "schema_version": 1,
+        "source": source,
+        "team_id": signing_config["team_id"],
+        "identity_sha1": signing_config["identity_sha1"],
+        "certificate_sha1": signing_config["certificate_sha1"],
+        "bundle_ids": local_signed_bundle_identifiers(),
+        "products": products,
+    }
+    destination = session_root / LOCAL_SIGNED_RECEIPT
+    temporary = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _write_json(temporary, payload)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def prepare_local_signed_server(
+    signing_config: dict,
+    *,
+    deadline: float,
+) -> Path:
+    local_build = _local_build_module()
+    expected = Path(signing_config["durable_root"]) / local_build.PRODUCTS["server"]
+    configured = os.environ.get("CACHE_SERVER_BINARY")
+    if configured:
+        try:
+            candidate = Path(configured).expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise UIE2EError("CACHE_SERVER_BINARY is not a valid pinned local-build server path.") from error
+        if candidate != expected.resolve():
+            raise UIE2EError("CACHE_SERVER_BINARY must be the pinned stable local-build server path in local-signed mode.")
+    try:
+        verified = local_build.verify_existing_product(
+            "server", deadline=deadline, allow_historical_source=True
+        )
+    except local_build.BuildError as error:
+        raise UIE2EError(f"Pinned local cache-server verification failed: {error}") from error
+    if Path(verified["path"]) != expected:
+        raise UIE2EError("Pinned local cache-server receipt resolved to an unexpected path.")
+    if not expected.is_file() or not os.access(expected, os.X_OK):
+        raise UIE2EError("Pinned local cache-server product is missing or not executable.")
+    return expected
+
+
+def run_local_signed_xcode(
+    *,
+    endpoint: str,
+    task_endpoint: str,
+    derived_data_path: Path,
+    result_bundle: Path,
+    destination: str,
+    logs_dir: Path,
+    child_env: dict[str, str],
+    signing_config: dict,
+    session_root: Path,
+    deadline: float,
+    log: Callable[[str], None],
+) -> CommandResult:
+    product_paths = local_signed_product_paths(derived_data_path)
+    previous_receipt = read_local_signed_receipt(
+        session_root,
+        signing_config=signing_config,
+        derived_data_path=derived_data_path,
+    )
+    verify_local_signed_products(
+        product_paths,
+        signing_config=signing_config,
+        previous_receipt=previous_receipt,
+        deadline=deadline,
+        allow_unbuilt=True,
+    )
+    build_command = build_xcodebuild_command(
+        platform="macos",
+        server_address=endpoint,
+        task_server_address=task_endpoint,
+        app_bundle_identifier=LOCAL_SIGNED_BUNDLE_ID,
+        derived_data_path=derived_data_path,
+        result_bundle_path=result_bundle,
+        destination=destination,
+        mode=LOCAL_SIGNED_MODE,
+        signing_config=signing_config,
+        action="build-for-testing",
+    )
+    build_log = logs_dir / "xcodebuild-build-for-testing.log"
+    log("starting local-signed xcodebuild build-for-testing.")
+    build_result = run_process(
+        build_command,
+        log_path=build_log,
+        timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(deadline)),
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        env=child_env,
+        cwd=ROOT,
+    )
+    _require_result(build_result, "xcodebuild build-for-testing", build_log)
+    products = verify_local_signed_products(
+        product_paths,
+        signing_config=signing_config,
+        previous_receipt=previous_receipt,
+        deadline=deadline,
+        compare_codehash=False,
+    )
+    write_local_signed_receipt(
+        session_root,
+        derived_data_path=derived_data_path,
+        signing_config=signing_config,
+        products=products,
+        deadline=deadline,
+    )
+    test_command = build_xcodebuild_command(
+        platform="macos",
+        server_address=endpoint,
+        task_server_address=task_endpoint,
+        app_bundle_identifier=LOCAL_SIGNED_BUNDLE_ID,
+        derived_data_path=derived_data_path,
+        result_bundle_path=result_bundle,
+        destination=destination,
+        mode=LOCAL_SIGNED_MODE,
+        signing_config=signing_config,
+        action="test-without-building",
+    )
+    log("starting actual xcodebuild test execution.")
+    return run_process(
+        test_command,
+        log_path=logs_dir / "xcodebuild.log",
+        timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(deadline)),
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        env=child_env,
+        cwd=ROOT,
+        progress_path=logs_dir / "ui-progress.jsonl",
+        progress_phase="xcode_test",
+    )
 
 
 def wait_for_task_fixture(
@@ -1790,11 +2412,13 @@ class ArtifactStager:
         "runner.log",
         "server.log",
         "task-fixture-build.log",
+        "ui-progress.jsonl",
         "task-fixture-bin-path.log",
         "task-fixture.log",
         "task-fixture-ready.json",
         "task-fixture-metrics.json",
         "task-fixture-validation.json",
+        "xcodebuild-build-for-testing.log",
         "xcodebuild.log",
         "xcresult-summary.json",
         "xcresult-tests.json",
@@ -1839,6 +2463,8 @@ class ArtifactStager:
             file_limit = MAX_FIXTURE_JSON_BYTES
         elif source.name == "task-fixture.log":
             file_limit = MAX_TASK_FIXTURE_LOG_BYTES
+        elif source.name == "ui-progress.jsonl":
+            file_limit = MAX_PROGRESS_DIAGNOSTIC_BYTES
         if source.name.endswith(".export.log"):
             file_limit = MAX_ATTACHMENT_EXPORT_LOG_BYTES
         elif source.name == "xcresult-attachment-export.json":
@@ -1952,11 +2578,13 @@ def _stage_artifacts(
             "result-validation.json",
             "server.log",
             "task-fixture-build.log",
+            "ui-progress.jsonl",
             "task-fixture-bin-path.log",
             "task-fixture.log",
             "task-fixture-ready.json",
             "task-fixture-metrics.json",
             "task-fixture-validation.json",
+            "xcodebuild-build-for-testing.log",
             "xcodebuild.log",
         ):
             source = work_dir / "logs" / source_name
@@ -2020,12 +2648,76 @@ def require_work_remaining(deadline: float) -> float:
     return remaining
 
 
-def run_ui_e2e(platform: str) -> int:
+def stage_preflight_failure(platform: str, error: UIE2EError) -> None:
+    artifact_dir = _artifact_dir(platform)
+    stager = ArtifactStager(artifact_dir)
+    work_dir = _private_work_dir()
+    logs_dir = work_dir / "logs"
+    logs_dir.mkdir(mode=0o700)
+    runner_log = logs_dir / "runner.log"
+
+    def record_failure(failure: BaseException) -> None:
+        with runner_log.open("a", encoding="utf-8") as output:
+            output.write(f"[ui-e2e:{platform}] failed: {type(failure).__name__}: {failure}\n")
+
+    cleanup = CleanupStack(on_failure=record_failure)
+    defer_workspace_cleanup(
+        cleanup,
+        stager,
+        work_dir=work_dir,
+        result_bundle=work_dir / "UIE2E.xcresult",
+    )
+    with cleanup:
+        raise error
+
+
+def run_ui_e2e(platform: str, mode: str = "isolated") -> int:
     if platform not in PLATFORMS:
         raise UIE2EError(f"Unsupported UI E2E platform: {platform}")
+    validate_run_mode(platform, mode)
     if sys.platform != "darwin":
         raise UIE2EError("UI E2E runner requires macOS.")
 
+    try:
+        run_deadline = resolve_work_deadline(
+            os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+        )
+    except UIE2EError as error:
+        stage_preflight_failure(platform, error)
+        raise
+    signing_config = None
+    session_root = None
+    session_lock = None
+    if mode == LOCAL_SIGNED_MODE:
+        local_build = _local_build_module()
+        try:
+            signing_config = local_build.load_config()
+        except local_build.BuildError as error:
+            raise UIE2EError(f"Pinned local signing profile is unavailable: {error}") from error
+        derived_data_path = local_signed_derived_data_path(signing_config)
+        session_root = local_signed_session_root(signing_config)
+        session_lock = acquire_local_signed_lock(session_root)
+    try:
+        return _run_ui_e2e(
+            platform,
+            mode=mode,
+            run_deadline=run_deadline,
+            signing_config=signing_config,
+            session_root=session_root,
+        )
+    finally:
+        if session_lock is not None:
+            release_local_signed_lock(session_lock)
+
+
+def _run_ui_e2e(
+    platform: str,
+    *,
+    mode: str,
+    run_deadline: float,
+    signing_config: dict | None,
+    session_root: Path | None,
+) -> int:
     config = PLATFORMS[platform]
     artifact_dir = _artifact_dir(platform)
     stager = ArtifactStager(artifact_dir)
@@ -2051,9 +2743,6 @@ def run_ui_e2e(platform: str) -> int:
     )
 
     with cleanup:
-            run_deadline = resolve_work_deadline(
-                os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
-            )
             mute_system_audio(logs_dir)
             log("macOS system output mute is set and verified.")
             require_work_remaining(run_deadline)
@@ -2077,8 +2766,15 @@ def run_ui_e2e(platform: str) -> int:
             log(f"built SwiftPM debug product {TASK_FIXTURE_PRODUCT}.")
 
             require_work_remaining(run_deadline)
-            server_binary = resolve_server_binary()
-            log(f"using existing cache server binary: {server_binary.name}")
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None
+                server_binary = prepare_local_signed_server(
+                    signing_config, deadline=run_deadline
+                )
+                log("using pinned local-build cache server.")
+            else:
+                server_binary = resolve_server_binary()
+                log(f"using existing cache server binary: {server_binary.name}")
             cache_dir = create_fixture_media(work_dir, logs_dir)
             state_dir = work_dir / "server-state"
             state_dir.mkdir(mode=0o700)
@@ -2144,38 +2840,59 @@ def run_ui_e2e(platform: str) -> int:
             else:
                 destination = "platform=macOS"
 
-            derived_override = os.environ.get("DERIVED_DATA_PATH")
-            derived_data_path = (
-                Path(derived_override).expanduser().resolve()
-                if derived_override
-                else work_dir / "DerivedData"
-            )
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None and session_root is not None
+                derived_data_path = local_signed_derived_data_path(signing_config)
+            else:
+                derived_override = os.environ.get("DERIVED_DATA_PATH")
+                derived_data_path = (
+                    Path(derived_override).expanduser().resolve()
+                    if derived_override
+                    else work_dir / "DerivedData"
+                )
             derived_data_path.mkdir(parents=True, exist_ok=True)
-            command = build_xcodebuild_command(
-                platform=platform,
-                server_address=endpoint,
-                task_server_address=task_endpoint,
-                app_bundle_identifier=(
-                    f"dev.joey.tvos-net-player.uie2e.{uuid.uuid4().hex}"
-                ),
-                derived_data_path=derived_data_path,
-                result_bundle_path=result_bundle,
-                destination=destination,
-            )
             child_env = os.environ.copy()
             child_env["UI_E2E_SERVER_ADDRESS"] = endpoint
             child_env["UI_E2E_TASK_SERVER_ADDRESS"] = task_endpoint
-            xcode_log = logs_dir / "xcodebuild.log"
-            log("starting actual xcodebuild test execution.")
-            test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
-            xcode_result = run_process(
-                command,
-                log_path=xcode_log,
-                timeout_seconds=test_timeout,
-                max_output_bytes=MAX_COMMAND_LOG_BYTES,
-                env=child_env,
-                cwd=ROOT,
-            )
+            if mode == LOCAL_SIGNED_MODE:
+                assert signing_config is not None and session_root is not None
+                xcode_result = run_local_signed_xcode(
+                    endpoint=endpoint,
+                    task_endpoint=task_endpoint,
+                    derived_data_path=derived_data_path,
+                    result_bundle=result_bundle,
+                    destination=destination,
+                    logs_dir=logs_dir,
+                    child_env=child_env,
+                    signing_config=signing_config,
+                    session_root=session_root,
+                    deadline=run_deadline,
+                    log=log,
+                )
+            else:
+                app_bundle_identifier = f"dev.joey.tvos-net-player.uie2e.{uuid.uuid4().hex}"
+                command = build_xcodebuild_command(
+                    platform=platform,
+                    server_address=endpoint,
+                    task_server_address=task_endpoint,
+                    app_bundle_identifier=app_bundle_identifier,
+                    derived_data_path=derived_data_path,
+                    result_bundle_path=result_bundle,
+                    destination=destination,
+                )
+                xcode_log = logs_dir / "xcodebuild.log"
+                log("starting actual xcodebuild test execution.")
+                test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
+                xcode_result = run_process(
+                    command,
+                    log_path=xcode_log,
+                    timeout_seconds=test_timeout,
+                    max_output_bytes=MAX_COMMAND_LOG_BYTES,
+                    env=child_env,
+                    cwd=ROOT,
+                    progress_path=logs_dir / "ui-progress.jsonl",
+                    progress_phase="xcode_test",
+                )
             counts = finish_xcode_run(
                 xcode_result,
                 result_bundle=result_bundle,
@@ -2206,6 +2923,7 @@ def run_ui_e2e(platform: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
+    parser.add_argument("--mode", choices=("isolated", LOCAL_SIGNED_MODE), default="isolated")
     args = parser.parse_args(argv)
     if os.name != "posix":
         parser.error("UI E2E runner requires POSIX process-group support.")
@@ -2216,7 +2934,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, interrupt_handler)
     signal.signal(signal.SIGINT, interrupt_handler)
     try:
-        return run_ui_e2e(args.platform)
+        return run_ui_e2e(args.platform, mode=args.mode)
     except KeyboardInterrupt as error:
         print(f"[ui-e2e] interrupted: {error}", file=sys.stderr)
         return 130

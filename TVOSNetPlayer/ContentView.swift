@@ -23,13 +23,11 @@ struct ContentView: View {
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
     @State private var needsSavedPlaybackRevalidation = false
     @FocusState private var focusedControl: FocusedControl?
-    private let cacheControlsColumnWidth: CGFloat = 500
     private let autoDiscoveryRetryDelay: Duration = .seconds(30)
 
     private enum FocusedControl: Hashable {
         case cacheServerField
         case refreshButton
-        case cacheLibraryStatus
         case cacheLibraryOpen
         case cacheSearchField
         case cacheSearchButton
@@ -66,7 +64,7 @@ struct ContentView: View {
 
                 HStack(alignment: .top, spacing: 34) {
                     cacheControls
-                        .frame(width: cacheControlsColumnWidth)
+                        .frame(width: 500)
 
                     VStack(alignment: .leading, spacing: 22) {
                         manualStreamControls
@@ -173,11 +171,14 @@ struct ContentView: View {
     }
 
     private var cacheControls: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 16) {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 20) {
                 Text(cacheModel.serverName)
                     .font(.title2.weight(.semibold))
-                    .lineLimit(1)
+                Text(cacheModel.statusMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("cache-library-status")
 
                 VStack(alignment: .leading, spacing: 10) {
                     TextField(
@@ -198,7 +199,6 @@ struct ContentView: View {
                         Text(errorMessage)
                             .font(.callout)
                             .foregroundStyle(.red)
-                            .lineLimit(2)
                     }
                 }
 
@@ -227,241 +227,41 @@ struct ContentView: View {
                     }
                 }
 
-                if !areBilibiliResultsPresented {
-                    taskWatchControls
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
+                nativeListOpeners
 
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 20) {
-                    nativeListOpeners
+                discoveryControls
 
-                    Section {
-                        Text(cacheModel.statusMessage)
-                            .font(.callout)
-                            .foregroundStyle(
-                                focusedControl == .cacheLibraryStatus ? Color.white : Color.secondary
-                            )
-                            .accessibilityIdentifier("cache-library-status")
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background {
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(
-                                        focusedControl == .cacheLibraryStatus
-                                            ? Color.white.opacity(0.16)
-                                            : Color.clear
-                                    )
-                            }
-                            .focusable()
-                            .focused($focusedControl, equals: .cacheLibraryStatus)
+                bilibiliLoginControls
 
-                        if discoveryModel.isSearching || discoveryModel.errorMessage != nil
-                            || !discoveryModel.discoveredServers.isEmpty
-                        {
-                            Text(discoveryModel.statusMessage)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-
-                            ForEach(discoveryModel.discoveredServers.prefix(4)) { server in
-                                Button {
-                                    Task {
-                                        await selectDiscoveredServer(server)
-                                    }
-                                } label: {
-                                    Label {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(server.displayName)
-                                            Text(server.detailText)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    } icon: {
-                                        Image(systemName: "network")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(cacheModel.isLoading)
-                            }
-                        }
-
-                        bilibiliLoginControls
-
+                if !cacheModel.cacheRoots.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
                         ForEach(cacheModel.cacheRoots) { root in
                             CacheRootRow(root: root)
                         }
+                    }
+                }
 
-                        if let hlsCacheSummary = cacheModel.hlsCacheSummary {
-                            Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(3)
-                        }
+                if let hlsCacheSummary = cacheModel.hlsCacheSummary {
+                    Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
 
+                if !cacheModel.hlsCacheStatusBadges.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
                         ForEach(cacheModel.hlsCacheStatusBadges) { badge in
                             CacheStatusBadgeRow(badge: badge)
                         }
                     }
-
-                    Section {
-                        Text("Bilibili")
-                            .font(.title3.weight(.semibold))
-
-                        TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
-                            .keyboardType(.URL)
-                            .submitLabel(.go)
-                            .accessibilityIdentifier("bilibili-source")
-                            .onSubmit {
-                                Task {
-                                    await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
-                                }
-                            }
-                            .focused($focusedControl, equals: .bilibiliField)
-
-                        Picker("Mode", selection: $bilibiliModel.submissionMode) {
-                            ForEach(BilibiliTaskSubmissionMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .accessibilityIdentifier("bilibili-mode")
-
-                        HStack(spacing: 10) {
-                            TextField("Quality", text: $bilibiliModel.qualityPreference)
-                                .textContentType(.none)
-
-                            if bilibiliModel.submissionMode == .playback {
-                                TextField("Codec", text: $bilibiliModel.encodingPreference)
-                                    .textContentType(.none)
-                            }
-
-                            TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
-                                .textContentType(.none)
-                        }
-
-                        if bilibiliModel.submissionMode == .playback {
-                            bilibiliPlaybackPolicyControls
-                        }
-
-                        if bilibiliModel.submissionMode == .download {
-                            bilibiliDownloadOptions
-                        }
-
-                        if let errorMessage = bilibiliModel.errorMessage {
-                            Text(errorMessage)
-                                .font(.callout)
-                                .foregroundStyle(.red)
-                                .accessibilityIdentifier("bilibili-error")
-                        }
-
-                        if let notice = bilibiliModel.fetchNotice {
-                            BilibiliFetchNoticeRow(notice: notice)
-                        }
-
-                        bilibiliResumptionControls
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            Button {
-                                Task {
-                                    await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
-                                }
-                            } label: {
-                                Label(bilibiliModel.submitButtonTitle, systemImage: "plus.circle.fill")
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(!bilibiliModel.canSubmit)
-                            .focused($focusedControl, equals: .bilibiliSubmitButton)
-                            .accessibilityIdentifier("bilibili-submit")
-
-                            Button {
-                                Task {
-                                    await playBilibiliTask()
-                                }
-                            } label: {
-                                Label("Play", systemImage: "play.fill")
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!bilibiliModel.canPlay)
-                            .accessibilityIdentifier("bilibili-play")
-
-                            Button {
-                                Task {
-                                    await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
-                                }
-                            } label: {
-                                Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!bilibiliModel.canCancel)
-                            .accessibilityIdentifier("bilibili-cancel")
-                        }
-
-                        if !areBilibiliResultsPresented,
-                            bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting
-                                || bilibiliModel.isResolving
-                        {
-                            VStack(alignment: .leading, spacing: 8) {
-                                ProgressView(value: bilibiliModel.progress)
-                                Text(bilibiliModel.statusMessage)
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                    .accessibilityIdentifier("bilibili-task-status")
-                                if let summary = bilibiliModel.activePlaybackPolicySummary {
-                                    Text(summary)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
-                                if let badge = bilibiliModel.progressiveCacheStatusBadge {
-                                    Label(badge.label, systemImage: badge.systemImage)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
-                                    let fillProgress = fillStatus.progressFraction
-                                {
-                                    ProgressView(value: fillProgress)
-                                    Text(
-                                        "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
-                                    )
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-
-                        }
-
-                        HStack(spacing: 12) {
-                            Button {
-                                Task {
-                                    await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
-                                }
-                            } label: {
-                                Label("Retry", systemImage: "arrow.clockwise")
-                            }
-                            .disabled(!bilibiliModel.canRetry)
-                            .accessibilityIdentifier("bilibili-retry")
-
-                            Button {
-                                bilibiliModel.clearTask()
-                            } label: {
-                                Label("Clear", systemImage: "trash")
-                            }
-                            .disabled(!bilibiliModel.canClear)
-                            .accessibilityIdentifier("bilibili-clear")
-                        }
-                    }
                 }
+
+                Divider()
+                bilibiliControls
             }
-            .accessibilityIdentifier("cache-controls-scroll")
-            .frame(maxHeight: .infinity, alignment: .top)
+            .padding(.vertical, 4)
         }
+        .accessibilityIdentifier("cache-controls-scroll")
     }
 
     private var nativeListOpeners: some View {
@@ -498,15 +298,11 @@ struct ContentView: View {
         }
     }
 
-    private func nativeListHeader(
-        title: String,
-        closeAccessibilityIdentifier: String,
-        dismiss: @escaping () -> Void
-    ) -> some View {
+    private func nativeListHeader(title: String, closeID: String, dismiss: @escaping () -> Void) -> some View {
         HStack(spacing: 24) {
             Button("Done", action: dismiss)
                 .buttonStyle(.bordered)
-                .accessibilityIdentifier(closeAccessibilityIdentifier)
+                .accessibilityIdentifier(closeID)
             Text(title)
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.white)
@@ -520,104 +316,82 @@ struct ContentView: View {
 
     private var cacheLibraryListScreen: some View {
         VStack(spacing: 0) {
-            nativeListHeader(
-                title: "Cache Library",
-                closeAccessibilityIdentifier: "cache-library-close",
-                dismiss: { isCacheLibraryPresented = false }
-            )
-            VStack(spacing: 0) {
-                Text(cacheModel.statusMessage)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .accessibilityIdentifier("cache-library-list-status")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 80)
-                    .padding(.vertical, 12)
+            nativeListHeader(title: "Cache Library", closeID: "cache-library-close") {
+                isCacheLibraryPresented = false
+            }
+            Text(cacheModel.statusMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .accessibilityIdentifier("cache-library-list-status")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 80)
+                .padding(.vertical, 12)
 
-                List {
-                    Section("Search") {
-                        HStack(spacing: 12) {
-                            TextField("Search cached videos", text: $cacheModel.searchText)
-                                .textContentType(.none)
-                                .submitLabel(.search)
-                                .accessibilityIdentifier("cache-library-search")
-                                .onSubmit {
-                                    Task { await cacheModel.refresh() }
-                                }
-                                .focused($focusedControl, equals: .cacheSearchField)
-
-                            Button {
-                                Task { await cacheModel.refresh() }
-                            } label: {
-                                Label(
-                                    cacheModel.hasPendingSearch ? "Search" : "Reload",
-                                    systemImage: "magnifyingglass"
-                                )
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!cacheModel.canRefresh)
-                            .focused($focusedControl, equals: .cacheSearchButton)
-                            .accessibilityIdentifier("cache-library-search-submit")
+            List {
+                Section("Search") {
+                    HStack(spacing: 12) {
+                        TextField("Search cached videos", text: $cacheModel.searchText)
+                            .textContentType(.none)
+                            .submitLabel(.search)
+                            .accessibilityIdentifier("cache-library-search")
+                            .onSubmit { Task { await cacheModel.refresh() } }
+                            .focused($focusedControl, equals: .cacheSearchField)
+                        Button {
+                            Task { await cacheModel.refresh() }
+                        } label: {
+                            Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
                         }
-
-                        if cacheModel.isLoading {
-                            ProgressView("Loading cache library")
-                        }
-                        if let errorMessage = cacheModel.errorMessage {
-                            Text(errorMessage)
-                                .font(.callout)
-                                .foregroundStyle(.red)
-                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!cacheModel.canRefresh)
+                        .focused($focusedControl, equals: .cacheSearchButton)
+                        .accessibilityIdentifier("cache-library-search-submit")
                     }
-
-                    Section("Videos") {
-                        if cacheModel.items.isEmpty {
-                            Text(cacheModel.isLoading ? "Loading cached videos" : "No cached videos")
-                                .foregroundStyle(.secondary)
-                        }
-
-                        ForEach(cacheModel.items) { item in
-                            HStack(alignment: .center, spacing: 16) {
-                                Button {
-                                    Task {
-                                        await playCachedItem(item)
-                                        isCacheLibraryPresented = false
-                                    }
-                                } label: {
-                                    CacheLibraryRow(item: item)
-                                }
-                                .buttonStyle(.bordered)
-                                .accessibilityLabel(item.displayTitle)
-                                .accessibilityIdentifier("cache-library-item")
-                                .disabled(
-                                    cacheModel.isLoading
-                                        || cacheModel.deletingItemIDs.contains(item.id)
-                                        || !item.hasPlayableVariant
-                                )
-
-                                Button {
-                                    pendingDeleteItem = item
-                                } label: {
-                                    Label(
-                                        cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
-                                        systemImage: "trash"
-                                    )
-                                }
-                                .buttonStyle(.bordered)
-                                .accessibilityLabel("Delete \(item.displayTitle)")
-                                .disabled(!cacheModel.canDelete(item))
-                            }
-                        }
-
-                        cacheLoadMoreButton
+                    if cacheModel.isLoading { ProgressView("Loading cache library") }
+                    if let errorMessage = cacheModel.errorMessage {
+                        Text(errorMessage).font(.callout).foregroundStyle(.red)
                     }
                 }
-                .accessibilityIdentifier("cache-library-list")
+
+                Section("Videos") {
+                    if cacheModel.items.isEmpty {
+                        Text(cacheModel.isLoading ? "Loading cached videos" : "No cached videos")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(cacheModel.items) { item in
+                        HStack(spacing: 16) {
+                            Button {
+                                Task {
+                                    await playCachedItem(item)
+                                    isCacheLibraryPresented = false
+                                }
+                            } label: {
+                                CacheLibraryRow(item: item)
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityLabel(item.displayTitle)
+                            .accessibilityIdentifier("cache-library-item")
+                            .disabled(
+                                cacheModel.isLoading || cacheModel.deletingItemIDs.contains(item.id)
+                                    || !item.hasPlayableVariant)
+
+                            Button {
+                                pendingDeleteItem = item
+                            } label: {
+                                Label(
+                                    cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                    systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityLabel("Delete \(item.displayTitle)")
+                            .accessibilityIdentifier("cache-library-delete-item")
+                            .disabled(!cacheModel.canDelete(item))
+                        }
+                    }
+                    cacheLoadMoreButton
+                }
             }
-        }
-        .onExitCommand {
-            isCacheLibraryPresented = false
+            .accessibilityIdentifier("cache-library-list")
         }
         .confirmationDialog(
             "Delete Cached Video?",
@@ -641,6 +415,7 @@ struct ContentView: View {
         } message: { item in
             Text("Delete \(item.displayTitle) from the cache server.")
         }
+        .onExitCommand { isCacheLibraryPresented = false }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
@@ -648,11 +423,9 @@ struct ContentView: View {
 
     private var bilibiliCandidatesListScreen: some View {
         VStack(spacing: 0) {
-            nativeListHeader(
-                title: "Resolved Candidates",
-                closeAccessibilityIdentifier: "bilibili-candidates-close",
-                dismiss: { areBilibiliCandidatesPresented = false }
-            )
+            nativeListHeader(title: "Resolved Candidates", closeID: "bilibili-candidates-close") {
+                areBilibiliCandidatesPresented = false
+            }
             List {
                 Section("Selection") {
                     if bilibiliModel.isWaitingForCandidateSelection {
@@ -660,13 +433,11 @@ struct ContentView: View {
                             ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
                                 Text(
                                     mode == .all && bilibiliModel.isResolvedCandidateWindowTruncated
-                                        ? "Window"
-                                        : mode.title
+                                        ? "Window" : mode.title
                                 ).tag(mode)
                             }
                         }
                         .pickerStyle(.segmented)
-
                         if bilibiliModel.candidateSelectionMode == .range {
                             Picker("From", selection: $bilibiliModel.rangeStartCandidateID) {
                                 ForEach(bilibiliModel.resolvedCandidates) { candidate in
@@ -679,16 +450,10 @@ struct ContentView: View {
                                 }
                             }
                         }
-
-                        if let selectionSummary = bilibiliModel.candidateSelectionSummary {
-                            Text(selectionSummary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        if let summary = bilibiliModel.candidateSelectionSummary {
+                            Text(summary).font(.caption).foregroundStyle(.secondary)
                         }
-                        Text(candidatePaginationSummary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
+                        Text(candidatePaginationSummary).font(.caption).foregroundStyle(.secondary)
                         bilibiliReResolveButton
                         Button {
                             bilibiliModel.clearResolvedCandidateSelection()
@@ -698,28 +463,18 @@ struct ContentView: View {
                         .buttonStyle(.bordered)
                         .disabled(!bilibiliModel.canClearCandidateSelection)
                     } else {
-                        Text(bilibiliModel.statusMessage)
-                            .foregroundStyle(.secondary)
-                        if shouldShowStandaloneBilibiliNoticeAction {
-                            bilibiliReResolveButton
-                        }
+                        Text(bilibiliModel.statusMessage).foregroundStyle(.secondary)
+                        if shouldShowStandaloneBilibiliNoticeAction { bilibiliReResolveButton }
                     }
-
                     if let errorMessage = bilibiliModel.errorMessage {
-                        Text(errorMessage)
-                            .font(.callout)
-                            .foregroundStyle(.red)
+                        Text(errorMessage).font(.callout).foregroundStyle(.red)
                     }
-                    if let notice = bilibiliModel.fetchNotice {
-                        BilibiliFetchNoticeRow(notice: notice)
-                    }
+                    if let notice = bilibiliModel.fetchNotice { BilibiliFetchNoticeRow(notice: notice) }
                 }
-
                 if bilibiliModel.isWaitingForCandidateSelection {
                     Section("Candidates") {
                         if bilibiliModel.resolvedCandidates.isEmpty {
-                            Text("No candidates loaded")
-                                .foregroundStyle(.secondary)
+                            Text("No candidates loaded").foregroundStyle(.secondary)
                         }
                         ForEach(bilibiliModel.resolvedCandidates) { candidate in
                             Button {
@@ -728,16 +483,11 @@ struct ContentView: View {
                                 HStack(spacing: 10) {
                                     Image(
                                         systemName: bilibiliModel.isCandidateSelected(candidate)
-                                            ? "checkmark.circle.fill"
-                                            : "circle"
-                                    )
+                                            ? "checkmark.circle.fill" : "circle")
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(candidate.title)
-                                            .lineLimit(1)
+                                        Text(candidate.title).lineLimit(1)
                                         if !candidate.subtitle.isEmpty {
-                                            Text(candidate.subtitle)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                                            Text(candidate.subtitle).font(.caption).foregroundStyle(.secondary)
                                                 .lineLimit(1)
                                         }
                                     }
@@ -754,7 +504,6 @@ struct ContentView: View {
                                 )
                             }
                         }
-
                         if bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates {
                             Button {
                                 Task {
@@ -767,17 +516,12 @@ struct ContentView: View {
                                     bilibiliModel.isLoadingMoreCandidates
                                         ? "Loading Candidates"
                                         : (bilibiliModel.canRetryResolvedCandidatePage
-                                            ? "Retry Loading Candidates"
-                                            : "Load More Candidates"),
+                                            ? "Retry Loading Candidates" : "Load More Candidates"),
                                     systemImage: bilibiliModel.isLoadingMoreCandidates
-                                        ? "hourglass"
-                                        : "chevron.down.circle"
-                                )
+                                        ? "hourglass" : "chevron.down.circle")
                             }
                             .buttonStyle(.bordered)
-                            .disabled(
-                                !bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates
-                            )
+                            .disabled(!bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates)
                             .focused($focusedControl, equals: .bilibiliCandidateLoadMoreButton)
                         }
                     }
@@ -785,9 +529,7 @@ struct ContentView: View {
             }
             .accessibilityIdentifier("bilibili-candidates-list")
         }
-        .onExitCommand {
-            areBilibiliCandidatesPresented = false
-        }
+        .onExitCommand { areBilibiliCandidatesPresented = false }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
@@ -795,70 +537,56 @@ struct ContentView: View {
 
     private var bilibiliResultsListScreen: some View {
         VStack(spacing: 0) {
-            nativeListHeader(
-                title: "Task Results",
-                closeAccessibilityIdentifier: "bilibili-results-close",
-                dismiss: { areBilibiliResultsPresented = false }
-            )
+            nativeListHeader(title: "Task Results", closeID: "bilibili-results-close") {
+                areBilibiliResultsPresented = false
+            }
             List {
                 Section("Task") {
-                    Text(bilibiliModel.statusMessage)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("bilibili-task-status")
-
+                    Text(bilibiliModel.statusMessage).font(.callout).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("bilibili-results-task-status")
+                    TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                        let hasPlayer = model.player != nil
+                        Text(hasPlayer ? model.playbackState.displayTitle : "No active playback")
+                            .accessibilityValue(hasPlayer ? model.playbackState.rawValue : "empty")
+                            .accessibilityIdentifier("bilibili-results-playback-state")
+                    }
                     if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
                         ProgressView(value: bilibiliModel.progress)
                         if let summary = bilibiliModel.activePlaybackPolicySummary {
-                            Text(summary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(summary).font(.caption).foregroundStyle(.secondary)
                         }
                         if let badge = bilibiliModel.progressiveCacheStatusBadge {
                             Label(badge.label, systemImage: badge.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .font(.caption).foregroundStyle(.secondary)
                         }
-                        if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
-                            let fillProgress = fillStatus.progressFraction
+                        if let fill = bilibiliModel.progressiveCacheFillStatus,
+                            let fraction = fill.progressFraction
                         {
-                            ProgressView(value: fillProgress)
+                            ProgressView(value: fraction)
                             Text(
-                                "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                                "Offline fill: \(fill.progressBytes ?? 0) / \(fill.totalBytes) bytes (\(fill.progressPercentLabel ?? ""))"
                             )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-
                     if let errorMessage = bilibiliModel.errorMessage {
-                        Text(errorMessage)
-                            .font(.callout)
-                            .foregroundStyle(.red)
+                        Text(errorMessage).font(.callout).foregroundStyle(.red)
                     }
                     if let summary = bilibiliModel.taskResultSummary {
-                        Text(summary.statusMessage)
-                            .font(.callout)
+                        Text(summary.statusMessage).font(.callout)
                         ProgressView(value: summary.progress)
                         Text(taskResultsPaginationSummary(totalCount: summary.totalCount))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                    taskWatchControls
                 }
-
                 Section("Results") {
                     if let errorMessage = bilibiliModel.taskResultsErrorMessage {
-                        Text(errorMessage)
-                            .font(.callout)
-                            .foregroundStyle(.red)
+                        Text(errorMessage).font(.callout).foregroundStyle(.red)
                     }
                     if bilibiliModel.taskResultsErrorMessage != nil && !bilibiliModel.hasMoreTaskResults {
                         Button {
                             Task {
-                                await bilibiliModel.retryTaskResults(
-                                    serverAddressText: cacheModel.serverAddressText
-                                )
+                                await bilibiliModel.retryTaskResults(serverAddressText: cacheModel.serverAddressText)
                             }
                         } label: {
                             Label("Retry Results", systemImage: "arrow.clockwise")
@@ -867,52 +595,58 @@ struct ContentView: View {
                         .disabled(bilibiliModel.isLoadingMoreTaskResults)
                         .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
                     }
-
-                    if bilibiliModel.taskResults.isEmpty,
-                        !bilibiliModel.hasMoreTaskResults,
-                        !bilibiliModel.isLoadingMoreTaskResults
+                    if bilibiliModel.taskResults.isEmpty && !bilibiliModel.hasMoreTaskResults
+                        && !bilibiliModel.isLoadingMoreTaskResults
                     {
-                        Text("No task results")
-                            .foregroundStyle(.secondary)
+                        Text("No task results").foregroundStyle(.secondary)
                     }
-                    ForEach(bilibiliModel.taskResults) { result in
-                        taskResultRow(result)
-                    }
-
-                    if bilibiliModel.isLoadingMoreTaskResults {
-                        ProgressView("Loading results")
-                    }
+                    ForEach(bilibiliModel.taskResults) { result in taskResultRow(result) }
+                    if bilibiliModel.isLoadingMoreTaskResults { ProgressView("Loading results") }
                     if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {
                         Button {
                             Task {
-                                await bilibiliModel.loadMoreTaskResults(
-                                    serverAddressText: cacheModel.serverAddressText
-                                )
+                                await bilibiliModel.loadMoreTaskResults(serverAddressText: cacheModel.serverAddressText)
                             }
                         } label: {
                             Label(
                                 bilibiliModel.isLoadingMoreTaskResults ? "Loading Results" : "Load More Results",
                                 systemImage: bilibiliModel.isLoadingMoreTaskResults
-                                    ? "hourglass"
-                                    : "chevron.down.circle"
-                            )
+                                    ? "hourglass" : "chevron.down.circle")
                         }
                         .buttonStyle(.bordered)
-                        .disabled(
-                            !bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults
-                        )
+                        .disabled(!bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults)
                         .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
                     }
                 }
             }
             .accessibilityIdentifier("bilibili-results-list")
         }
-        .onExitCommand {
-            areBilibiliResultsPresented = false
-        }
+        .onExitCommand { areBilibiliResultsPresented = false }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private func taskResultRow(_ result: BilibiliTaskResultPresentation) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                Task {
+                    await playBilibiliTaskResult(result)
+                    areBilibiliResultsPresented = false
+                }
+            } label: {
+                Label("Play", systemImage: "play.fill").frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!bilibiliModel.canPlay(result: result))
+            .accessibilityLabel("Play \(result.title)")
+            .accessibilityIdentifier("bilibili-result-play-\(result.id)")
+            BilibiliTaskResultRow(result: result)
+            ForEach(result.artifacts) { artifact in BilibiliTaskArtifactRow(artifact: artifact) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
     }
 
     private var isUITesting: Bool {
@@ -1013,6 +747,40 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private var discoveryControls: some View {
+        if discoveryModel.isSearching || discoveryModel.errorMessage != nil || !discoveryModel.discoveredServers.isEmpty
+        {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(discoveryModel.statusMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                ForEach(discoveryModel.discoveredServers.prefix(4)) { server in
+                    Button {
+                        Task {
+                            await selectDiscoveredServer(server)
+                        }
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(server.displayName)
+                                Text(server.detailText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "network")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(cacheModel.isLoading)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var cacheLoadMoreButton: some View {
         if cacheModel.hasMoreItems {
             Button {
@@ -1030,6 +798,181 @@ struct ContentView: View {
             .disabled(!cacheModel.canLoadMore)
             .focused($focusedControl, equals: .cacheLoadMoreButton)
             .accessibilityIdentifier("cache-library-load-more")
+        }
+    }
+
+    private var bilibiliControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Bilibili")
+                .font(.title3.weight(.semibold))
+
+            TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
+                .keyboardType(.URL)
+                .submitLabel(.go)
+                .accessibilityIdentifier("bilibili-source")
+                .onSubmit {
+                    Task {
+                        await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                    }
+                }
+                .focused($focusedControl, equals: .bilibiliField)
+
+            Picker("Mode", selection: $bilibiliModel.submissionMode) {
+                ForEach(BilibiliTaskSubmissionMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("bilibili-mode")
+
+            HStack(spacing: 10) {
+                TextField("Quality", text: $bilibiliModel.qualityPreference)
+                    .textContentType(.none)
+
+                if bilibiliModel.submissionMode == .playback {
+                    TextField("Codec", text: $bilibiliModel.encodingPreference)
+                        .textContentType(.none)
+                }
+
+                TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
+                    .textContentType(.none)
+            }
+
+            if bilibiliModel.submissionMode == .playback {
+                bilibiliPlaybackPolicyControls
+            }
+
+            if bilibiliModel.submissionMode == .download {
+                bilibiliDownloadOptions
+            }
+
+            if let errorMessage = bilibiliModel.errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("bilibili-error")
+            }
+
+            if let notice = bilibiliModel.fetchNotice {
+                BilibiliFetchNoticeRow(notice: notice)
+            }
+
+            bilibiliResumptionControls
+
+            if shouldShowStandaloneBilibiliNoticeAction {
+                bilibiliReResolveButton
+            }
+
+            if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
+                VStack(alignment: .leading, spacing: 8) {
+                    ProgressView(value: bilibiliModel.progress)
+                    Text(bilibiliModel.statusMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("bilibili-task-status")
+                    if bilibiliModel.isReconnecting {
+                        Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("bilibili.watch.status")
+                    }
+                    if let message = bilibiliModel.watchErrorMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("bilibili.watch.error")
+                    }
+                    if bilibiliModel.canRetryTaskUpdates {
+                        Button {
+                            bilibiliModel.retryTaskUpdates()
+                        } label: {
+                            Label("Reconnect Updates", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("bilibili.watch.retry")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .focusSection()
+                    }
+                    if let summary = bilibiliModel.activePlaybackPolicySummary {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    if let badge = bilibiliModel.progressiveCacheStatusBadge {
+                        Label(badge.label, systemImage: badge.systemImage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
+                        let fillProgress = fillStatus.progressFraction
+                    {
+                        ProgressView(value: fillProgress)
+                        Text(
+                            "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label(bilibiliModel.submitButtonTitle, systemImage: "plus.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!bilibiliModel.canSubmit)
+                .focused($focusedControl, equals: .bilibiliSubmitButton)
+                .accessibilityIdentifier("bilibili-submit")
+
+                Button {
+                    Task {
+                        await playBilibiliTask()
+                    }
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                }
+                .disabled(!bilibiliModel.canPlay)
+                .accessibilityIdentifier("bilibili-play")
+
+                Button {
+                    Task {
+                        await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
+                }
+                .disabled(!bilibiliModel.canCancel)
+                .accessibilityIdentifier("bilibili-cancel")
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .disabled(!bilibiliModel.canRetry)
+                .accessibilityIdentifier("bilibili-retry")
+
+                Button {
+                    bilibiliModel.clearTask()
+                } label: {
+                    Label("Clear", systemImage: "trash")
+                }
+                .disabled(!bilibiliModel.canClear)
+                .accessibilityIdentifier("bilibili-clear")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
         }
     }
 
@@ -1203,65 +1146,6 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func taskResultRow(_ result: BilibiliTaskResultPresentation) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                Task {
-                    await playBilibiliTaskResult(result)
-                    areBilibiliResultsPresented = false
-                }
-            } label: {
-                Label("Play", systemImage: "play.fill")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .disabled(!bilibiliModel.canPlay(result: result))
-            .accessibilityLabel("Play \(result.title)")
-            .accessibilityIdentifier("bilibili-result-play-\(result.id)")
-
-            BilibiliTaskResultRow(result: result)
-
-            ForEach(result.artifacts) { artifact in
-                BilibiliTaskArtifactRow(artifact: artifact)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    @ViewBuilder
-    private var taskWatchControls: some View {
-        if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
-            VStack(alignment: .leading, spacing: 6) {
-                if bilibiliModel.isReconnecting {
-                    Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .accessibilityElement(children: .combine)
-                        .accessibilityIdentifier("bilibili.watch.status")
-                }
-                if let message = bilibiliModel.watchErrorMessage {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(2)
-                        .accessibilityIdentifier("bilibili.watch.error")
-                }
-                if bilibiliModel.canRetryTaskUpdates {
-                    Button {
-                        bilibiliModel.retryTaskUpdates()
-                    } label: {
-                        Label("Reconnect Updates", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("bilibili.watch.retry")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .focusSection()
-                }
-            }
-        }
-    }
-
     private var candidatePaginationSummary: String {
         let count = bilibiliModel.resolvedCandidates.count
         let noun = count == 1 ? "candidate" : "candidates"
@@ -1286,6 +1170,9 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             playerSurface
             PlaybackTimelineStatus(model: model)
+            if isUITesting {
+                PlaybackResumePositionObservationStatus(model: model)
+            }
             playbackControls
         }
     }
@@ -1612,6 +1499,40 @@ private struct PlaybackTimelineStatus: View {
     private static func safeSeconds(_ seconds: Double) -> Double {
         guard seconds.isFinite else { return 0 }
         return min(max(0, seconds), Double(Int32.max))
+    }
+}
+
+private struct PlaybackResumePositionObservationStatus: View {
+    @ObservedObject var model: PlayerViewModel
+
+    var body: some View {
+        if let observation = model.playbackResumePositionObservation {
+            Text("Restored playback position")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Playback resume observation")
+                .accessibilityValue(Self.value(for: observation))
+                .accessibilityIdentifier("playback-resume-observation")
+        }
+    }
+
+    private static func value(for observation: PlaybackResumePositionObservation) -> String {
+        let identity = observation.identity
+        let values: [String: String] = [
+            "source": observation.source.rawValue,
+            "requestID": observation.requestID.uuidString,
+            "serverID": identity.task.serverID,
+            "taskID": identity.task.taskID,
+            "resultID": identity.resultID ?? "",
+            "libraryItemID": identity.libraryItemID,
+            "variantID": identity.variantID,
+            "requested": String(observation.requestedPositionSeconds),
+            "observed": String(observation.observedPositionSeconds),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]) else {
+            return "{}"
+        }
+        return String(data: data, encoding: .utf8) ?? "{}"
     }
 }
 

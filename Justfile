@@ -68,5 +68,8 @@ test-tvos:
 test-ui-e2e-macos:
     bash scripts/test-ui-e2e.sh macos
 
+test-ui-e2e-macos-isolated:
+    bash scripts/test-ui-e2e.sh macos isolated
+
 test-ui-e2e-tvos:
     bash scripts/test-ui-e2e.sh tvos

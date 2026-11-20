@@ -22,6 +22,7 @@ class RecipeTests(unittest.TestCase):
         self.log = self.root / "calls.log"
         (scripts / "build-cache-server.sh").write_text(
             "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'build\\n' >> \"$CALL_LOG\"\n"
+            "if [[ \"${BUILD_RESULT:-0}\" != 0 ]]; then exit \"$BUILD_RESULT\"; fi\n"
         )
         (scripts / "local_build.py").touch()
         fakebin = self.root / "bin"
@@ -30,19 +31,13 @@ class RecipeTests(unittest.TestCase):
         fake_python.write_text(
             "#!/usr/bin/env bash\nset -euo pipefail\n"
             "printf 'python %s CACHE_SERVER_BINARY=%s PROJECT_PATH=%s MACOS_SCHEME=%s DERIVED_DATA_PATH=%s\\n' \"$*\" \"${CACHE_SERVER_BINARY-}\" \"${PROJECT_PATH-}\" \"${MACOS_SCHEME-}\" \"${DERIVED_DATA_PATH-}\" >> \"$CALL_LOG\"\n"
-            "if [[ \"$1\" == */local_build.py ]]; then\n"
-            "  case \"${PREPARE_RESULT:-/pinned/server}\" in\n"
-            "    fail) exit 23 ;;\n"
-            "    empty) exit 0 ;;\n"
-            "    *) printf '%s\\n' \"${PREPARE_RESULT:-/pinned/server}\" ;;\n"
-            "  esac\n"
-            "fi\n"
+            "if [[ \"$1\" == */ui-e2e.py && \"${UI_RESULT:-0}\" != 0 ]]; then exit \"$UI_RESULT\"; fi\n"
         )
         fake_python.chmod(0o755)
         (scripts / "build-cache-server.sh").chmod(0o755)
         self.env = os.environ.copy()
         self.env.update(PATH=f"{fakebin}:{self.env['PATH']}", CALL_LOG=str(self.log))
-        for key in ("CI", "LOCAL_BUILD_MODE", "CACHE_SERVER_BINARY", "PREPARE_RESULT"):
+        for key in ("CI", "LOCAL_BUILD_MODE", "CACHE_SERVER_BINARY", "UI_RESULT", "BUILD_RESULT"):
             self.env.pop(key, None)
 
     def tearDown(self) -> None:
@@ -59,7 +54,10 @@ class RecipeTests(unittest.TestCase):
 
     def test_explicit_binary_is_honored_on_both_platforms(self) -> None:
         for platform in ("macos", "tvos"):
-            for mode in ({"CI": "true"}, {"LOCAL_BUILD_MODE": "isolated"}):
+            modes = [{"CI": "true"}, {"LOCAL_BUILD_MODE": "isolated"}]
+            if platform == "macos":
+                modes.append({})
+            for mode in modes:
                 with self.subTest(platform=platform, mode=mode):
                     self.log.unlink(missing_ok=True)
                     result = self.run_wrapper(
@@ -71,25 +69,29 @@ class RecipeTests(unittest.TestCase):
                     self.assertIn(f"--platform {platform}", calls[0])
                     self.assertIn("CACHE_SERVER_BINARY=/fixture/server", calls[0])
 
-    def test_pinned_preparation_is_used_only_when_unset(self) -> None:
-        result = self.run_wrapper("macos", PREPARE_RESULT="/pinned/server")
+    def test_macos_defaults_to_local_signed_without_build_or_prepare(self) -> None:
+        result = self.run_wrapper("macos")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.calls()), 2)
-        self.assertIn("CACHE_SERVER_BINARY=/pinned/server", self.calls()[-1])
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--platform macos --mode local-signed", calls[0])
+        self.assertIn("CACHE_SERVER_BINARY= ", calls[0])
 
-    def test_prepare_failure_does_not_launch_ui_even_with_stale_default(self) -> None:
+    def test_local_signed_helper_failure_propagates_without_stale_binary_or_build(self) -> None:
         stale = self.root / "target/release/tvos-net-player-cache-server"
         stale.parent.mkdir(parents=True)
         stale.write_text("stale binary")
-        result = self.run_wrapper("macos", PREPARE_RESULT="fail")
+        result = self.run_wrapper("macos", UI_RESULT="23")
         self.assertEqual(result.returncode, 23)
         self.assertEqual(len(self.calls()), 1)
+        self.assertIn("--platform macos --mode local-signed", self.calls()[0])
+        self.assertNotIn(str(stale), self.calls()[0])
 
-    def test_empty_prepare_result_is_rejected(self) -> None:
-        result = self.run_wrapper("tvos", PREPARE_RESULT="empty")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("empty CACHE_SERVER_BINARY", result.stderr)
+    def test_isolated_build_failure_does_not_launch_ui(self) -> None:
+        result = self.run_wrapper("tvos", BUILD_RESULT="29")
+        self.assertEqual(result.returncode, 29)
         self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0], "build")
 
     def test_isolated_ci_uses_legacy_build_and_release_binary(self) -> None:
         for env in ({"CI": "true"}, {"LOCAL_BUILD_MODE": "isolated"}):

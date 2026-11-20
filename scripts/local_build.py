@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -52,13 +53,35 @@ class BuildError(RuntimeError):
     pass
 
 
-def _run(args: Sequence[str], *, check: bool = True, capture: bool = True) -> str:
+def _remaining_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BuildError("local build operation exceeded the shared UI E2E work deadline")
+    return remaining
+
+
+def _run(
+    args: Sequence[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    deadline: float | None = None,
+) -> str:
+    kwargs = {
+        "check": False,
+        "text": True,
+        "stdout": subprocess.PIPE if capture else sys.stderr,
+        "stderr": subprocess.PIPE if capture else sys.stderr,
+    }
+    timeout = _remaining_timeout(deadline)
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     try:
-        result = RUN(
-            list(args), check=False, text=True,
-            stdout=subprocess.PIPE if capture else sys.stderr,
-            stderr=subprocess.PIPE if capture else sys.stderr,
-        )
+        result = RUN(list(args), **kwargs)
+    except subprocess.TimeoutExpired as error:
+        raise BuildError(f"command exceeded the shared UI E2E work deadline: {args[0]}") from error
     except OSError as error:
         raise BuildError(f"could not run {args[0]}: {error}") from error
     if check and result.returncode:
@@ -104,8 +127,10 @@ def load_config(path: Path | None = None) -> dict:
     return config
 
 
-def verify_identity(config: dict) -> None:
-    identities = _run(["security", "find-identity", "-v", "-p", "codesigning"])
+def verify_identity(config: dict, *, deadline: float | None = None) -> None:
+    identities = _run(
+        ["security", "find-identity", "-v", "-p", "codesigning"], deadline=deadline
+    )
     wanted = config["identity_sha1"]
     if not re.search(rf"^\s*\d+\)\s+{wanted}\s+", identities, re.IGNORECASE | re.MULTILINE):
         raise BuildError("configured valid signing identity fingerprint is missing from the keychain")
@@ -179,14 +204,37 @@ def _write_receipt(root: Path, receipt: dict) -> None:
     temporary.replace(_receipt_path(root))
 
 
-def _codesign_details(path: Path) -> tuple[str, str, str, str, str]:
-    _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(path)])
-    result = RUN(["codesign", "-dv", "--verbose=4", str(path)], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _codesign_details(
+    path: Path, *, deadline: float | None = None,
+) -> tuple[str, str, str, str, str]:
+    _run(
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(path)],
+        deadline=deadline,
+    )
+
+    def metadata_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+        kwargs = {
+            "check": False,
+            "text": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        timeout = _remaining_timeout(deadline)
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        try:
+            return RUN(args, **kwargs)
+        except subprocess.TimeoutExpired as error:
+            raise BuildError(
+                f"signed metadata command exceeded the shared UI E2E work deadline: {path}"
+            ) from error
+
+    result = metadata_command(["codesign", "-dv", "--verbose=4", str(path)])
     details = _metadata_output(result, path)
     identifier = re.search(r"^Identifier=(.+)$", details, re.MULTILINE)
     team = re.search(r"^TeamIdentifier=(.+)$", details, re.MULTILINE)
     cdhash = re.search(r"^CDHash=(\S+)$", details, re.MULTILINE)
-    req_result = RUN(["codesign", "-d", "-r-", str(path)], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    req_result = metadata_command(["codesign", "-d", "-r-", str(path)])
     requirement_output = _metadata_output(req_result, path)
     requirement_match = re.search(r"^designated =>\s*(.+)$", requirement_output, re.MULTILINE)
     requirement = requirement_match.group(1).strip() if requirement_match else ""
@@ -196,10 +244,19 @@ def _codesign_details(path: Path) -> tuple[str, str, str, str, str]:
         raise BuildError(f"could not read code directory hash from {path}")
     with tempfile.TemporaryDirectory(prefix="tvos-local-cert-") as temporary:
         prefix = str(Path(temporary) / "cert")
-        _run(["codesign", "-d", f"--extract-certificates={prefix}", str(path)])
+        _run(
+            ["codesign", "-d", f"--extract-certificates={prefix}", str(path)],
+            deadline=deadline,
+        )
         leaf = Path(prefix + "0")
-        fingerprint = _run(["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(leaf), "-noout", "-fingerprint", "-sha1"])
-        subject = _run(["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(leaf), "-noout", "-subject", "-nameopt", "RFC2253"])
+        fingerprint = _run(
+            ["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(leaf), "-noout", "-fingerprint", "-sha1"],
+            deadline=deadline,
+        )
+        subject = _run(
+            ["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(leaf), "-noout", "-subject", "-nameopt", "RFC2253"],
+            deadline=deadline,
+        )
     match = re.search(r"=([A-Fa-f0-9:]{59})", fingerprint)
     organization = re.search(r"(?:^|,)OU=([^,]+)", subject.strip().removeprefix("subject="))
     if not match or not organization:
@@ -249,8 +306,15 @@ def _expected_identifier(target: str, path: Path) -> str:
     return IDENTIFIERS[target]
 
 
-def verify_product(target: str, path: Path, config: dict, previous: dict | None = None) -> dict:
-    identifier, team, cert_sha1, requirement, cdhash = _codesign_details(path)
+def verify_product(
+    target: str,
+    path: Path,
+    config: dict,
+    previous: dict | None = None,
+    *,
+    deadline: float | None = None,
+) -> dict:
+    identifier, team, cert_sha1, requirement, cdhash = _codesign_details(path, deadline=deadline)
     expected_id = _expected_identifier(target, path)
     if identifier != expected_id or team != config["team_id"]:
         raise BuildError(f"signed identifier/team mismatch for {path}")
@@ -265,11 +329,50 @@ def verify_product(target: str, path: Path, config: dict, previous: dict | None 
     }
     if target == NATIVE_NAVIGATION_TARGET:
         executable = _native_navigation_executable(path)
-        executable_metadata = _codesign_details(executable)
+        executable_metadata = _codesign_details(executable, deadline=deadline)
         if executable_metadata != (identifier, team, cert_sha1, requirement, cdhash):
             raise BuildError(f"native-navigation app and executable signatures do not match for {path}")
         details["executable_cdhash"] = executable_metadata[4]
     return details
+
+
+def verify_ui_e2e_bundle(
+    path: Path,
+    *,
+    expected_identifier: str,
+    config: dict,
+    previous: dict | None = None,
+    deadline: float | None = None,
+) -> dict:
+    if path.is_symlink() or not path.is_dir():
+        raise BuildError(f"UI E2E product is not a regular bundle: {path}")
+    info_path = path / "Contents/Info.plist"
+    try:
+        with info_path.open("rb") as stream:
+            info = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise BuildError(f"could not read UI E2E bundle metadata at {info_path}: {error}") from error
+    if not isinstance(info, dict) or info.get("CFBundleIdentifier") != expected_identifier:
+        actual = info.get("CFBundleIdentifier") if isinstance(info, dict) else None
+        raise BuildError(
+            f"UI E2E bundle identifier mismatch for {path}: "
+            f"expected {expected_identifier}, got {actual}"
+        )
+    identifier, team, cert_sha1, requirement, cdhash = _codesign_details(path, deadline=deadline)
+    if identifier != expected_identifier or team != config["team_id"]:
+        raise BuildError(f"UI E2E signed identifier/team mismatch for {path}")
+    if cert_sha1 != config["certificate_sha1"]:
+        raise BuildError(f"UI E2E leaf certificate fingerprint mismatch for {path}")
+    if previous is not None and previous.get("designated_requirement") != requirement:
+        raise BuildError(f"UI E2E designated requirement changed unexpectedly for {path.name}")
+    return {
+        "path": str(path),
+        "identifier": identifier,
+        "team_id": team,
+        "certificate_sha1": cert_sha1,
+        "designated_requirement": requirement,
+        "cdhash": cdhash,
+    }
 
 
 def _verify_legacy_native_navigation_product(path: Path, config: dict, previous: dict) -> None:
@@ -287,10 +390,10 @@ def _verify_legacy_native_navigation_product(path: Path, config: dict, previous:
         raise BuildError(f"known legacy native-navigation product does not match its diagnostic receipt: {path}")
 
 
-def _source_binding() -> dict:
+def _source_binding(*, deadline: float | None = None) -> dict:
     try:
-        head = _run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).strip()
-        dirty = bool(_run(["git", "-C", str(ROOT), "status", "--porcelain"]).strip())
+        head = _run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], deadline=deadline).strip()
+        dirty = bool(_run(["git", "-C", str(ROOT), "status", "--porcelain"], deadline=deadline).strip())
     except BuildError:
         head = "unknown"
         dirty = True
@@ -547,6 +650,55 @@ def status() -> dict:
             if actual["cdhash"] != item.get("cdhash"):
                 raise BuildError(f"signed product CDHash differs from its receipt for {target}")
         return receipt
+    finally:
+        lock.rmdir()
+
+
+def verify_existing_product(
+    target: str,
+    *,
+    config_file: Path | None = None,
+    deadline: float | None = None,
+    allow_historical_source: bool = False,
+) -> dict:
+    if target not in PRODUCTS:
+        raise BuildError(f"unsupported stable product: {target}")
+    config = load_config(config_file)
+    verify_identity(config, deadline=deadline)
+    root: Path = config["durable_root"]
+    root.mkdir(parents=True, exist_ok=True)
+    lock = _locked(root)
+    try:
+        receipt = _read_receipt(root)
+        for key in ("team_id", "identity_sha1", "certificate_sha1"):
+            if receipt.get(key) != config[key]:
+                raise BuildError(f"local build receipt {key} does not match the pinned signing profile")
+        item = receipt["products"].get(target)
+        expected_path = root / PRODUCTS[target]
+        if not item or Path(item["path"]) != expected_path:
+            raise BuildError(f"local build receipt has no stable product entry for {target}")
+        source = item.get("source")
+        if allow_historical_source:
+            # The old repository is audit data only; never resolve or access this path.
+            if (
+                not isinstance(source, dict)
+                or set(source) != {"repository", "head", "dirty"}
+                or not isinstance(source.get("repository"), str)
+                or not source["repository"]
+                or len(source["repository"]) > 4096
+                or "\x00" in source["repository"]
+                or not Path(source["repository"]).is_absolute()
+                or not isinstance(source.get("head"), str)
+                or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source["head"]) is None
+                or type(source.get("dirty")) is not bool
+            ):
+                raise BuildError(f"local build receipt source binding is invalid for {target}")
+        elif source != _source_binding(deadline=deadline):
+            raise BuildError(f"local build receipt source state does not match the current checkout for {target}")
+        actual = verify_product(target, expected_path, config, item, deadline=deadline)
+        if actual["cdhash"] != item.get("cdhash"):
+            raise BuildError(f"signed product CDHash differs from its receipt for {target}")
+        return actual
     finally:
         lock.rmdir()
 

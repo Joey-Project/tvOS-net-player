@@ -6,6 +6,12 @@ import XCTest
 final class UIPlaybackTests: XCTestCase {
     private enum SetupError: Error {
         case missingServerAddress(String)
+        case invalidServerAddress(String)
+    }
+
+    private enum InitialInput {
+        static let serverAddress = "UI_E2E_INITIAL_SERVER_ADDRESS"
+        static let bilibiliSource = "UI_E2E_INITIAL_BILIBILI_SOURCE"
     }
 
     private struct SourceInputError: Error, CustomStringConvertible {
@@ -36,8 +42,6 @@ final class UIPlaybackTests: XCTestCase {
             serverAddress = address
             app = XCUIApplication()
             app.launchArguments = ["--ui-testing"]
-            app.launch()
-            didLaunchApp = true
         }
     }
 
@@ -65,6 +69,7 @@ final class UIPlaybackTests: XCTestCase {
 
     func testConnectBrowseAndControlRealPlayback() throws {
         executionTimeAllowance = 600
+        launchApp()
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
         let initialStatus = app.staticTexts["app-status"]
@@ -82,8 +87,18 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(refresh.isEnabled, "Refresh should be disabled until an address is entered.")
         XCTAssertEqual(libraryItems.count, 0, "An isolated launch should not load any cache library items.")
 
+        guard let port = canonicalLoopbackHTTPPort(from: serverAddress) else {
+            throw SetupError.invalidServerAddress(
+                "UI_E2E_SERVER_ADDRESS must be canonical http://127.0.0.1:<port> with a valid nonzero port."
+            )
+        }
+
         clickVisible(addressField)
-        addressField.typeText(serverAddress)
+        addressField.typeText("127.0.0.1")
+        // Send the colon as a key event; whole-string typing can drop it under composition.
+        addressField.typeKey(";", modifierFlags: .shift)
+        addressField.typeText(String(port))
+        try requireServerAddressValue("127.0.0.1:\(port)", in: addressField, phase: "after text entry, before Connect")
         clickVisible(refresh)
 
         let libraryStatus = app.staticTexts["cache-library-status"]
@@ -268,39 +283,6 @@ final class UIPlaybackTests: XCTestCase {
             waitUntilTimelineState(state, equals: "paused", timeout: 10),
             "The replay must pause before seeking near EOF. \(accessibilityDescription(state))"
         )
-        // Anchor at the head so the fixture's non-ten-second tail avoids a 2x near-EOF click-latency race.
-        let backward = app.buttons["playback-skip-backward"]
-        for _ in 0..<12 {
-            let position = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
-            if position.current <= 0.1 {
-                break
-            }
-            clickVisible(backward)
-            XCTAssertNotNil(
-                waitForTimeline(timeout: 10) {
-                    if position.current <= 8 {
-                        return $0 <= 0.1
-                    }
-                    return $0 >= position.current - 12 && $0 <= position.current - 8
-                },
-                "Paused Backward did not reach the head from \(position.current). "
-                    + accessibilityDescription(timeline)
-            )
-            XCTAssertTrue(
-                waitUntilTimelineState(state, equals: "paused", timeout: 10),
-                "Seeking to the head must remain paused. \(accessibilityDescription(state))"
-            )
-        }
-        let head = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
-        XCTAssertLessThanOrEqual(
-            head.current, 0.1,
-            "The replay must be anchored at the head before the bounded EOF seek. \(accessibilityDescription(timeline))"
-        )
-        XCTAssertTrue(
-            waitUntilTimelineState(state, equals: "paused", timeout: 10),
-            "The head anchor must remain paused. \(accessibilityDescription(state))"
-        )
-
         let forward = app.buttons["playback-skip-forward"]
         for _ in 0..<12 {
             let position = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
@@ -321,12 +303,43 @@ final class UIPlaybackTests: XCTestCase {
             )
         }
 
-        let nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        var nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
         XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The bounded seek loop reached EOF too early.")
         XCTAssertLessThanOrEqual(
             nearEnd.duration - nearEnd.current, 10,
             "Twelve Forward actions did not reach the final ten seconds. \(accessibilityDescription(timeline))"
         )
+        if nearEnd.duration - nearEnd.current >= 10 {
+            guard state.value as? String == "paused" else {
+                XCTFail("The native timeline seek requires the paused state. \(accessibilityDescription(state))")
+                return
+            }
+            let timelineSliders = app.sliders.matching(NSPredicate(format: "label == %@", "timeline"))
+            guard timelineSliders.count == 1 else {
+                XCTFail("Expected one native timeline slider; found \(timelineSliders.count).")
+                return
+            }
+            let timelineSlider = timelineSliders.firstMatch
+            guard isVisible(timelineSlider) else {
+                XCTFail(
+                    "The native timeline slider must be visible and hittable without clicking it. "
+                        + accessibilityDescription(timelineSlider)
+                )
+                return
+            }
+            XCTAssertTrue(timelineSlider.isEnabled, "The native timeline slider must be enabled.")
+            timelineSlider.adjust(toNormalizedSliderPosition: (nearEnd.duration - 5) / nearEnd.duration)
+            XCTAssertNotNil(
+                waitForTimeline(timeout: 10) { (3...7).contains(nearEnd.duration - $0) },
+                "The paused native timeline seek did not land 3-7 seconds from EOF. "
+                    + "Timeline: \(accessibilityDescription(timeline)); slider: \(accessibilityDescription(timelineSlider))"
+            )
+            XCTAssertTrue(
+                waitUntilTimelineState(state, equals: "paused", timeout: 10),
+                "Seeking near EOF must remain paused. \(accessibilityDescription(state))"
+            )
+            nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        }
         XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The video must be paused before EOF.")
         XCTAssertLessThan(
             nearEnd.duration - nearEnd.current, 10,
@@ -562,6 +575,10 @@ final class UIPlaybackTests: XCTestCase {
         )
         app.terminate()
         app.launchArguments = ["--ui-testing", "--ui-testing-preserve-preferences"]
+        var relaunchEnvironment = app.launchEnvironment
+        relaunchEnvironment.removeValue(forKey: InitialInput.serverAddress)
+        relaunchEnvironment.removeValue(forKey: InitialInput.bilibiliSource)
+        app.launchEnvironment = relaunchEnvironment
         app.launch()
         app.activate()
         XCTAssertTrue(
@@ -598,15 +615,24 @@ final class UIPlaybackTests: XCTestCase {
                 + "; resumption message: "
                 + accessibilityDescription(identifiedElement("bilibili-resumption-message"))
         )
+        XCTAssertFalse(identifiedElement("playback-resume-observation").exists)
         clickVisible(continueButton, scrollingIn: controls)
         XCTAssertTrue(
             waitUntil(timeout: 30) {
                 playbackState.value as? String == "playing"
-                    && timelineSeconds().map { abs($0 - savedCheckpoint) <= 2 } == true
+                    && playbackResumeObservationMatches(checkpoint: savedCheckpoint, resultID: selectedResultID)
             },
-            "Explicit Continue did not restore the saved position near \(savedCheckpoint). "
-                + accessibilityDescription(timeline)
+            "Explicit Continue did not both restore the observed saved checkpoint near \(savedCheckpoint) "
+                + "and start playback. State: \(accessibilityDescription(playbackState)); observation: "
+                + accessibilityDescription(identifiedElement("playback-resume-observation"))
         )
+        XCTAssertEqual(playbackState.value as? String, "playing")
+        let resumeObservation = try XCTUnwrap(playbackResumeObservationValues())
+        XCTAssertEqual(resumeObservation["source"], "validated-resume-seek")
+        XCTAssertNotNil(UUID(uuidString: resumeObservation["requestID"] ?? ""))
+        XCTAssertEqual(resumeObservation["resultID"], selectedResultID)
+        XCTAssertLessThanOrEqual(abs(try XCTUnwrap(Double(resumeObservation["requested"] ?? "")) - savedCheckpoint), 2)
+        XCTAssertLessThanOrEqual(abs(try XCTUnwrap(Double(resumeObservation["observed"] ?? "")) - savedCheckpoint), 2)
         let restoredAt = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
         XCTAssertNotNil(
             waitForTimeline(timeout: 15) { $0 >= restoredAt + 1.5 },
@@ -615,11 +641,10 @@ final class UIPlaybackTests: XCTestCase {
     }
 
     private func prepareResumptionScenario() throws {
+        launchApp(initialServerAddress: serverAddress, initialSource: "BV1xK4y1P7mN")
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
-        XCTAssertTrue(serverAddressIsEmpty(addressField))
-        clickVisible(addressField)
-        addressField.typeText(serverAddress)
+        try requireServerAddressValue(serverAddress, in: addressField, phase: "after seeded launch")
 
         let refresh = app.buttons["cache-server-refresh"]
         XCTAssertTrue(refresh.waitForExistence(timeout: 10))
@@ -634,25 +659,61 @@ final class UIPlaybackTests: XCTestCase {
         let controls = app.scrollViews["player-control-scroll"]
         let sourceField = app.textFields["bilibili-source"]
         clickVisible(sourceField, scrollingIn: controls)
-        sourceField.typeText("BV1xK4y1P7mN")
-        try requireSourceValue("BV1xK4y1P7mN", in: sourceField, phase: "before enabling Submit")
+        try requireSourceValue("BV1xK4y1P7mN", in: sourceField, phase: "after seeded launch, before enabling Submit")
     }
 
     private func prepareTaskWatchScenario(source: String) throws {
+        launchApp(initialServerAddress: serverAddress, initialSource: source)
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
-        XCTAssertTrue(
-            serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))")
-        clickVisible(addressField)
-        addressField.typeText(serverAddress)
+        try requireServerAddressValue(serverAddress, in: addressField, phase: "after seeded launch")
 
         let controls = app.scrollViews["player-control-scroll"]
         let sourceField = app.textFields["bilibili-source"]
         clickVisible(sourceField, scrollingIn: controls)
-        XCTAssertTrue(
-            serverAddressIsEmpty(sourceField), "Unexpected initial source: \(accessibilityDescription(sourceField))")
-        sourceField.typeText(source)
-        try requireSourceValue(source, in: sourceField, phase: "after text entry, before Submit")
+        try requireSourceValue(source, in: sourceField, phase: "after seeded launch, before Submit")
+    }
+
+    private func launchApp(initialServerAddress: String? = nil, initialSource: String? = nil) {
+        var environment = app.launchEnvironment
+        environment.removeValue(forKey: InitialInput.serverAddress)
+        environment.removeValue(forKey: InitialInput.bilibiliSource)
+        if let initialServerAddress {
+            environment[InitialInput.serverAddress] = initialServerAddress
+        }
+        if let initialSource {
+            environment[InitialInput.bilibiliSource] = initialSource
+        }
+        app.launchEnvironment = environment
+        defer {
+            app.launchEnvironment.removeValue(forKey: InitialInput.serverAddress)
+            app.launchEnvironment.removeValue(forKey: InitialInput.bilibiliSource)
+        }
+        app.launch()
+        didLaunchApp = true
+    }
+
+    private func requireServerAddressValue(_ expected: String, in field: XCUIElement, phase: String) throws {
+        guard field.value as? String == expected else {
+            throw SourceInputError(
+                description: "Cache server address mismatch \(phase). "
+                    + "expected=\(String(reflecting: expected)), actual=\(accessibilityDescription(field))"
+            )
+        }
+    }
+
+    private func canonicalLoopbackHTTPPort(from address: String) -> Int? {
+        guard
+            let components = URLComponents(string: address),
+            components.scheme == "http",
+            components.host == "127.0.0.1",
+            let port = components.port,
+            (1...65_535).contains(port),
+            address == "http://127.0.0.1:\(port)"
+        else {
+            return nil
+        }
+        return port
     }
 
     private func requireSourceValue(_ expected: String, in field: XCUIElement, phase: String) throws {
@@ -828,6 +889,25 @@ final class UIPlaybackTests: XCTestCase {
 
     private func timelineSeconds() -> Double? {
         playbackTimeline()?.current
+    }
+
+    private func playbackResumeObservationValues() -> [String: String]? {
+        let value = identifiedElement("playback-resume-observation").value as? String
+        guard let value else { return nil }
+        guard let data = value.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+    }
+
+    private func playbackResumeObservationMatches(checkpoint: Double, resultID: String) -> Bool {
+        guard let observation = playbackResumeObservationValues(),
+            let requested = Double(observation["requested"] ?? ""),
+            let observed = Double(observation["observed"] ?? "")
+        else { return false }
+        return observation["source"] == "validated-resume-seek"
+            && UUID(uuidString: observation["requestID"] ?? "") != nil
+            && observation["resultID"] == resultID
+            && abs(requested - checkpoint) <= 2
+            && abs(observed - checkpoint) <= 2
     }
 
     private func waitForTimeline(timeout: TimeInterval, matching predicate: (Double) -> Bool) -> Double? {

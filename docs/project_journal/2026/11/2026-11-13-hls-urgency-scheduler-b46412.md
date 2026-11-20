@@ -106,10 +106,6 @@ superseded_by:
    clocks and explicit synchronization. Keep functional correctness separate
    from measured performance; real I/O and native playback retain bounded
    observation windows and their independently approved acceptance budgets.
-6. Collect bounded simulator, application and testmanagerd diagnostics for
-   tvOS relaunch snapshot/helper-connection loss. Do not infer a missing view,
-   autoplay or an incorrect source request from an unavailable snapshot or an
-   incomplete fixture flow; preserve the full five-case acceptance contract.
 
 ## High Preparation Slice Design
 - Continue from PR #107's production reporting and bounded request urgency.
@@ -351,49 +347,6 @@ superseded_by:
   same limit and report it. Short-fixture generation remains at 100 seconds;
   inspection, playback, faults, assertions, output, compilation and overall
   budgets are unchanged. A fixture timeout is not an ABR measurement.
-- macOS UI terminal-seek setup anchors at the head and navigates while paused.
-  It does not depend on a play/pause round trip finishing inside a ten-second
-  media tail at 2x speed. Natural completion, paused terminal clamping, Resume
-  and speed assertions remain required; production player behavior is unchanged.
-- tvOS list navigation follows the native-list decision below. Task UI setup
-  still confirms the complete server address before and after keyboard dismissal
-  within one shared ten-second input window. Silent reconciliation observes the
-  actual playing state rather than mutable playback status text, while requiring
-  the exact result to become Cached, healthy watch UI and timeline advancement.
-
-## tvOS Native List Decision
-- Use explicit entry points to independent native lists for the cache library,
-  resolved candidates and task outputs. Do not embed accumulated result arrays
-  in the mixed connection/submission form or replace the player controls.
-- Present each list on an opaque full-screen dark surface. Keep an explicitly
-  legible title and standard Done button outside the native List so rows cannot
-  scroll through the header or overlap the underlying connection/player UI.
-- Retain the existing view models, complete accumulated pages, opaque page tokens,
-  near-end candidate loading, manual retry, selection modes and range selection.
-  Empty, loading, error and more-results states remain visible. The cache list's
-  loaded-count/status remains outside its virtualized rows while paging and
-  browsing. Native Back/Done
-  returns to a stable entry control; output arrival never opens a list or starts
-  playback automatically.
-- Rows expose their real title, readiness and exact identity. Selecting a playable
-  cache/output row uses the existing playback path and returns to the player;
-  candidate selection alone neither submits a task nor starts playback. Cache
-  deletion keeps capability checks and explicit confirmation in the active list.
-- Acceptance uses real remote navigation into and out of the lists. Preserve
-  catalog pagination through item 50 to item 55, decoy-first navigation followed
-  by explicit second-result playback, watch recovery during progressing playback,
-  relaunch without autoplay and explicit Continue near the saved position.
-  Adapt navigation to the real UI, not business assertions or existing deadlines.
-- Keep native `AVPlayer` controls, one player/item, default buffering, scheduler
-  eligibility and the separate native media comparison unchanged. UI navigation
-  validation does not establish ABR improvement or audible audio acceptance.
-- The post-relaunch empty-player landmark retains its 25-second assertion.
-  Failure diagnostics use bounded, non-secret accessibility/state observations
-  and the existing failure-message/teardown artifact route. Missing observations
-  and internal checkpoint-validation outcomes remain unknown; an absent landmark
-  alone does not prove autoplay or an attached player. Do not change the two
-  explicit playback-source requests, producer helpers or report contract to
-  make an early relaunch failure pass.
 
 ## Load-Tolerant Test Timing
 - The deadline/cancellation retry fixture keeps its gated origin, terminal
