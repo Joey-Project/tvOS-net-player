@@ -6,6 +6,7 @@ import XCTest
 final class UIPlaybackTests: XCTestCase {
     private enum SetupError: Error {
         case missingServerAddress(String)
+        case invalidServerAddress(String)
     }
 
     private enum InitialInput {
@@ -86,9 +87,18 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(refresh.isEnabled, "Refresh should be disabled until an address is entered.")
         XCTAssertEqual(libraryItems.count, 0, "An isolated launch should not load any cache library items.")
 
+        guard let port = canonicalLoopbackHTTPPort(from: serverAddress) else {
+            throw SetupError.invalidServerAddress(
+                "UI_E2E_SERVER_ADDRESS must be canonical http://127.0.0.1:<port> with a valid nonzero port."
+            )
+        }
+
         clickVisible(addressField)
-        addressField.typeText(serverAddress)
-        try requireServerAddressValue(serverAddress, in: addressField, phase: "after text entry, before Connect")
+        addressField.typeText("127.0.0.1")
+        // Send the colon as a key event; whole-string typing can drop it under composition.
+        addressField.typeKey(";", modifierFlags: .shift)
+        addressField.typeText(String(port))
+        try requireServerAddressValue("127.0.0.1:\(port)", in: addressField, phase: "after text entry, before Connect")
         clickVisible(refresh)
 
         let libraryStatus = app.staticTexts["cache-library-status"]
@@ -690,6 +700,20 @@ final class UIPlaybackTests: XCTestCase {
                     + "expected=\(String(reflecting: expected)), actual=\(accessibilityDescription(field))"
             )
         }
+    }
+
+    private func canonicalLoopbackHTTPPort(from address: String) -> Int? {
+        guard
+            let components = URLComponents(string: address),
+            components.scheme == "http",
+            components.host == "127.0.0.1",
+            let port = components.port,
+            (1...65_535).contains(port),
+            address == "http://127.0.0.1:\(port)"
+        else {
+            return nil
+        }
+        return port
     }
 
     private func requireSourceValue(_ expected: String, in field: XCUIElement, phase: String) throws {

@@ -116,7 +116,7 @@ The fixed test identity does not replace production signing, provisioning, notar
 
 Local-signed tests only reuse and verify the stable server already recorded by the local build system; they do not rebuild it or rewrite its operator receipt. Prepare it separately with `just local-build server` when needed. The signing key remains in the macOS keychain, and no signing profile or private key is copied into test artifacts.
 
-macOS UI input coverage is layered. The catalog/playback case starts with an empty address field, uses simulated keyboard input, and verifies the exact text before connecting. The four downstream task-watch/resumption cases provide only initial form strings through `UI_E2E_INITIAL_SERVER_ADDRESS` and `UI_E2E_INITIAL_BILIBILI_SOURCE` on a fresh DEBUG `--ui-testing` launch. Connect, Submit, fixture requests and playback remain real; there is no automatic submission or injected task, result or checkpoint. The test removes both inputs after launch and before relaunch; the app independently ignores them on normal, non-DEBUG and preserve-preferences launches. No clipboard or host input-method changes are involved.
+macOS UI input coverage is layered. The catalog/playback case starts with an empty address field, types the fixture's loopback `IP:port` with an explicit Shift+semicolon key event for the ASCII colon, and verifies the exact text before connecting. This key sequence requires a compatible test keyboard layout; full HTTP(S) URL parsing is covered separately by unit tests. The four downstream task-watch/resumption cases provide only initial form strings through `UI_E2E_INITIAL_SERVER_ADDRESS` and `UI_E2E_INITIAL_BILIBILI_SOURCE` on a fresh DEBUG `--ui-testing` launch. Connect, Submit, fixture requests and playback remain real; there is no automatic submission or injected task, result or checkpoint. The test removes both inputs after launch and before relaunch; the app independently ignores them on normal, non-DEBUG and preserve-preferences launches. No clipboard or host input-method changes are involved.
 
 #### macOS 签名模式
 
@@ -126,7 +126,7 @@ macOS UI input coverage is layered. The catalog/playback case starts with an emp
 
 本机固定签名测试只复用并核验本机构建系统已有记录的固定 server，不自动重建，也不改写日常构建记录；需要时先单独运行 `just local-build server`。签名私钥留在 macOS 钥匙串中，测试产物不复制签名配置或私钥。
 
-macOS 的输入测试按层分开：目录/播放用例从空地址栏开始，使用模拟键盘输入，并在连接前精确核对文字；其余四项任务观察/续接用例只在全新的 DEBUG `--ui-testing` 启动中，通过 `UI_E2E_INITIAL_SERVER_ADDRESS` 和 `UI_E2E_INITIAL_BILIBILI_SOURCE` 提供表单初始文字。连接、提交、夹具请求和播放仍走真实路径，不自动提交，也不注入任务、结果或检查点。测试在启动后及重新启动前移除这两个值；App 对普通启动、非 DEBUG 构建和保留偏好的续接启动也会独立忽略它们。不使用剪贴板，不修改系统输入法。
+macOS 的输入测试按层分开：目录/播放用例从空地址栏开始，用模拟键盘输入夹具的回环 `IP:端口`，以 Shift+分号显式输入 ASCII 冒号，并在连接前精确核对文字。这一按键序列需要兼容的键盘布局；完整 HTTP(S) URL 的解析由单测另行覆盖。其余四项任务观察/续接用例只在全新的 DEBUG `--ui-testing` 启动中，通过 `UI_E2E_INITIAL_SERVER_ADDRESS` 和 `UI_E2E_INITIAL_BILIBILI_SOURCE` 提供表单初始文字。连接、提交、夹具请求和播放仍走真实路径，不自动提交，也不注入任务、结果或检查点。测试在启动后及重新启动前移除这两个值；App 对普通启动、非 DEBUG 构建和保留偏好的续接启动也会独立忽略它们。不使用剪贴板，不修改系统输入法。
 
 `just test-ui-e2e-macos` 和 `just test-ui-e2e-tvos` 是独立的 XCUITest 界面测试入口，不是现有 AppCore/hosted-view XCTest 的别名。它们启动隔离的真实 Rust LAN cache server，生成不含音轨的短视频和跨越 50 条分页边界的本地目录，再通过实际客户端界面连接、选片和操作播放。tvOS 入口需要已安装且可用的 simulator runtime；仓库没有 iOS app target，安装 iOS runtime 不会增加 iOS 客户端覆盖。
 
