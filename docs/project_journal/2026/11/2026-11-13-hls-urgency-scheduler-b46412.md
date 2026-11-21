@@ -3,9 +3,9 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-18
-branch: codex/hls-high-preparation
-pr: https://github.com/Joey-Project/tvOS-net-player/pull/108
+updated: 2026-11-21
+branch: codex/hls-high-preparation-replacement
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/114
 supersedes: []
 superseded_by:
 ---
@@ -338,6 +338,12 @@ superseded_by:
   qualifying plan was selected, while the bounded event rings still observed
   traffic. Counter summaries, matched-plan evidence and wire transfers remain
   separate observations.
+- Preserve up to one complete origin-body and one reader-bound ingress
+  witness per retained exact plan during the native comparison. Longer traffic
+  can otherwise evict positive overlap evidence before the final assessment.
+  Keep the existing ring and plan caps and the original admission, identity,
+  timing and range checks. A missing witness under truncation remains unknown;
+  retaining a witness does not establish exclusive coordinator attribution.
 - A structured cache read returning missing does not prove zero physical byte
   coverage. A stable exact range changing from missing to fully readable proves
   a positive lower bound on newly readable bytes, not an exact downloaded-byte
@@ -347,6 +353,15 @@ superseded_by:
   and decoded-high observations separately. Preparation after an already-issued
   high request cannot explain that request. No faster-selection claim follows
   solely from a completed plan or cache-readability change.
+- Measure time from each fixture's origin recovery to its first and third
+  distinct recovered-high decoded frames. Use only elapsed time within each
+  arm, not cross-arm absolute clocks or time since the first high request.
+  Retain bounded playback samples to compare progress over the same elapsed
+  window through both observed upshifts. Missing, malformed, truncated or
+  insufficient coverage does not establish continuity; interval samples and
+  access-log counters cannot rule out brief stalls or black frames. These
+  measurements do not change preparation eligibility or the native gates,
+  and do not establish exclusive attribution to the coordinator.
 - Keep pinned signing, stable executables, verified system/player mute, bounded
   output and deadlines. Standard native3 and accepted producer helpers remain
   unchanged; the new comparison does not replace those regression gates.

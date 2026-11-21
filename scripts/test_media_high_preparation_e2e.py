@@ -206,6 +206,31 @@ def arm(arm_name: str, *, eligible: bool = False, session_id: str | None = None)
     return value
 
 
+def recovery_measurement(
+    *, recovery: object = 1_000.0, third_observed: object = 1_500.0, end_seconds: int = 540,
+) -> dict[str, object]:
+    samples = [
+        {"display_time_seconds": display, "observed_monotonic_seconds": observed}
+        for display, observed in ((100.0, 1_010.0), (101.0, 1_020.0), (102.0, third_observed))
+    ]
+    timeline = [
+        {
+            "observed_monotonic_seconds": 1_000.0 + elapsed,
+            "playhead_seconds": float(max(0, elapsed)),
+            "time_control_status": "waiting" if elapsed == 20 else "playing",
+        }
+        for elapsed in range(-10, end_seconds + 11, 10)
+    ]
+    return {
+        "recovery_monotonic_seconds": recovery,
+        "high_samples": samples,
+        "timeline": {"truncated": False, "samples": timeline},
+        "access_log": {"truncated": False, "events": [
+            {"event_index": 1, "stalls": 2}, {"event_index": 2, "stalls": None},
+        ]},
+    }
+
+
 class MediaHighPreparationRunnerTests(unittest.TestCase):
     def test_probe_preflight_requires_cleanup_verification_self_test_case(self) -> None:
         binary = Path("/stable/probe")
@@ -687,6 +712,118 @@ class MediaHighPreparationRunnerTests(unittest.TestCase):
         self.assertEqual(summary["exclusive_attribution"], "not_proven")
         self.assertFalse(summary["causal_faster_selection_claim"])
         self.assertFalse(summary["latency_negative_evidence"])
+
+    def test_recovery_measurements_report_latency_and_shared_extended_continuity(self) -> None:
+        off, on = arm("off"), arm("on", eligible=True)
+        off_measurement = recovery_measurement(third_observed=1_510.0)
+        off_measurement["high_samples"][0]["observed_monotonic_seconds"] = 1_020.0  # type: ignore[index]
+        off_measurement["high_samples"][1]["observed_monotonic_seconds"] = 1_030.0  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        on_measurement = recovery_measurement(third_observed=1_505.0)
+        on["recovery_measurement"] = on_measurement
+        comparison = runner.validate_comparison(off, on)
+        measurement = comparison["recovery_measurements"]
+        latency = measurement["latency"]
+        self.assertEqual(latency["off"]["first_high_latency_seconds"], 20.0)
+        self.assertEqual(latency["off"]["third_high_latency_seconds"], 510.0)
+        self.assertEqual(latency["off_minus_on_third_high_latency_seconds"], 5.0)
+        self.assertTrue(latency["confirmed_earlier"])
+        self.assertEqual(measurement["continuity_early"]["status"], "available")
+        self.assertEqual(measurement["continuity_early"]["window_seconds"], 60)
+        extended = measurement["continuity_extended"]
+        self.assertEqual(extended["window_seconds"], 520)
+        self.assertEqual(extended["status"], "available")
+        self.assertEqual(extended["off"]["in_window_samples"], 53)
+        self.assertEqual(extended["off"]["nonplaying_observations"], 1)
+        self.assertEqual(
+            measurement["access_log_stalls"]["off"]["events"][1]["stalls"], None,
+        )
+        self.assertTrue(measurement["access_log_stalls"]["diagnostic_only"])
+        self.assertEqual(comparison["comparison_status"], "eligible")
+
+    def test_recovery_latency_slowdown_or_missing_recovery_is_not_confirmed_earlier(self) -> None:
+        off, on = arm("off"), arm("on")
+        off["recovery_measurement"] = recovery_measurement(third_observed=1_400.0)
+        on["recovery_measurement"] = recovery_measurement(third_observed=1_500.0)
+        slower = runner.validate_comparison(off, on)["recovery_measurements"]["latency"]
+        self.assertFalse(slower["confirmed_earlier"])
+        self.assertEqual(slower["off_minus_on_third_high_latency_seconds"], -100.0)
+        del on["recovery_measurement"]
+        missing = runner.validate_comparison(off, on)["recovery_measurements"]
+        self.assertIsNone(missing["latency"]["confirmed_earlier"])
+        self.assertEqual(missing["continuity_extended"]["status"], "unavailable")
+        self.assertEqual(runner.validate_comparison(off, on)["comparison_status"], "inconclusive")
+
+    def test_incomplete_invalid_and_truncated_measurements_are_unavailable(self) -> None:
+        invalid_values = (True, -1.0, float("nan"), float("inf"), 10**1000)
+        for invalid in invalid_values:
+            off, on = arm("off"), arm("on")
+            off["recovery_measurement"] = recovery_measurement(recovery=invalid)
+            on["recovery_measurement"] = recovery_measurement()
+            result = runner.validate_comparison(off, on)["recovery_measurements"]
+            with self.subTest(recovery=repr(invalid)):
+                self.assertEqual(result["latency"]["off"]["status"], "unavailable")
+                self.assertIsNone(result["latency"]["confirmed_earlier"])
+
+        off, on = arm("off"), arm("on")
+        off_measurement = recovery_measurement(end_seconds=60)
+        off_measurement["timeline"]["truncated"] = True  # type: ignore[index]
+        off_measurement["high_samples"][2]["observed_monotonic_seconds"] = True  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        on["recovery_measurement"] = recovery_measurement(end_seconds=60)
+        result = runner.validate_comparison(off, on)["recovery_measurements"]
+        self.assertEqual(result["latency"]["off"]["status"], "unavailable")
+        self.assertEqual(result["continuity_early"]["off"]["status"], "unavailable")
+        self.assertEqual(result["continuity_extended"]["status"], "unavailable")
+        self.assertEqual(result["access_log_stalls"]["off"]["status"], "available")
+
+        off_measurement = recovery_measurement()
+        off_measurement["high_samples"][0]["observed_monotonic_seconds"] = True  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        result = runner.validate_comparison(off, on)["recovery_measurements"]
+        self.assertEqual(result["latency"]["off"]["status"], "unavailable")
+        self.assertEqual(result["continuity_early"]["off"]["status"], "available")
+        self.assertEqual(result["continuity_extended"]["status"], "unavailable")
+        off_measurement["access_log"]["truncated"] = True  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        result = runner.validate_comparison(off, on)["recovery_measurements"]
+        self.assertEqual(result["access_log_stalls"]["off"]["status"], "unavailable")
+
+    def test_derived_latency_and_continuity_must_remain_finite_and_within_deadline(self) -> None:
+        off, on = arm("off"), arm("on")
+        off_measurement = recovery_measurement()
+        off_measurement["high_samples"][2]["observed_monotonic_seconds"] = 1_721.0  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        on["recovery_measurement"] = recovery_measurement()
+        result = runner.validate_comparison(off, on)["recovery_measurements"]
+        self.assertEqual(result["latency"]["off"]["status"], "unavailable")
+        self.assertIsNone(result["latency"]["confirmed_earlier"])
+
+        recovery = 1e-320
+        tiny_step = 5e-324
+        timeline = [
+            {"observed_monotonic_seconds": observed, "playhead_seconds": playhead,
+             "time_control_status": "playing"}
+            for observed, playhead in (
+                (recovery / 2, 0.0), (recovery, 0.0), (recovery + tiny_step, 1.0),
+                (recovery + 2 * tiny_step, 2.0), (recovery + 3 * tiny_step, 3.0),
+                (recovery + 4 * tiny_step, 4.0), (recovery + 5 * tiny_step, 5.0),
+                (recovery + 61.0, 6.0),
+            )
+        ]
+        timeline_measurement = {"truncated": False, "samples": timeline}
+        projected = runner._project_continuity(timeline_measurement, recovery, 60)
+        self.assertEqual(projected["status"], "unavailable")
+
+    def test_complete_timeline_regression_is_explicit_without_changing_eligibility(self) -> None:
+        off, on = arm("off"), arm("on", eligible=True)
+        off_measurement = recovery_measurement()
+        off_measurement["timeline"]["samples"][4]["playhead_seconds"] = 19.0  # type: ignore[index]
+        off["recovery_measurement"] = off_measurement
+        on["recovery_measurement"] = recovery_measurement()
+        comparison = runner.validate_comparison(off, on)
+        self.assertEqual(comparison["recovery_measurements"]["continuity_early"]["off"]["status"], "regression")
+        self.assertEqual(comparison["comparison_status"], "eligible")
 
     def test_ineligible_on_is_explicitly_inconclusive_not_latency_failure(self) -> None:
         summary = runner.validate_comparison(arm("off"), arm("on"))

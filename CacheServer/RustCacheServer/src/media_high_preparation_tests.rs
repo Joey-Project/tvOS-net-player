@@ -53,6 +53,9 @@ const HIGH_PREPARATION_CONTROL_VALIDITY_MILLIS: u64 = 5_000;
 const HIGH_PREPARATION_CONTROL_INTERVAL: Duration = Duration::from_secs(2);
 const HIGH_PREPARATION_PROTECTED_WALL_SECONDS: f64 = 20.0;
 const HIGH_PREPARATION_WINDOW_SECONDS: f64 = 20.0;
+const RECOVERY_HIGH_SAMPLE_LIMIT: usize = 3;
+const RECOVERY_TIMELINE_SAMPLE_LIMIT: usize = 96;
+const RECOVERY_ACCESS_LOG_EVENT_LIMIT: usize = 32;
 const ARM_TRANSPORT_BOUNDARY: &str = "in_process_generated_cache_service_trait";
 const OPT_IN_FIXTURE_GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -98,8 +101,11 @@ struct ArmReport {
     first_recovery_high_origin_request: Option<RecoveryRangeRequest>,
     first_recovery_high_completed_source_body: Option<FirstCompletedSourceBody>,
     first_recovery_high_decoded_monotonic_seconds: Option<f64>,
+    recovery_measurement: RecoveryMeasurementReport,
     recovery_preparation: Option<RecoveryPreparationReport>,
     inconclusive_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_assessment_diagnostics: Option<PlanAssessmentCountsReport>,
 }
 
 #[derive(Serialize)]
@@ -147,6 +153,15 @@ struct CoordinatorDiagnosticsReport {
     recent_plans: Vec<CoordinatorPlanSummaryReport>,
     projected_history_truncated: bool,
     source_history_completeness: &'static str,
+}
+
+#[derive(Serialize)]
+struct PlanAssessmentCountsReport {
+    completed: usize,
+    completed_exact_missing_to_readable: usize,
+    completed_with_origin_witness: usize,
+    completed_with_player_witness: usize,
+    eligible: usize,
 }
 
 #[derive(Serialize)]
@@ -208,6 +223,45 @@ fn cache_window_reason_name(reason: CacheWindowReason) -> &'static str {
 struct AttributionReport {
     exclusive_attribution: &'static str,
     causal_faster_selection_claim: bool,
+}
+
+#[derive(Serialize)]
+struct RecoveryMeasurementReport {
+    recovery_monotonic_seconds: Option<f64>,
+    high_samples: Vec<RecoveryHighSampleReport>,
+    timeline: Option<RecoveryTimelineReport>,
+    access_log: Option<RecoveryAccessLogReport>,
+}
+
+#[derive(Serialize)]
+struct RecoveryHighSampleReport {
+    display_time_seconds: f64,
+    observed_monotonic_seconds: f64,
+}
+
+#[derive(Serialize)]
+struct RecoveryTimelineReport {
+    truncated: bool,
+    samples: Vec<RecoveryTimelineSampleReport>,
+}
+
+#[derive(Serialize)]
+struct RecoveryTimelineSampleReport {
+    observed_monotonic_seconds: f64,
+    playhead_seconds: Option<f64>,
+    time_control_status: &'static str,
+}
+
+#[derive(Serialize)]
+struct RecoveryAccessLogReport {
+    truncated: bool,
+    events: Vec<RecoveryAccessLogEventReport>,
+}
+
+#[derive(Serialize)]
+struct RecoveryAccessLogEventReport {
+    event_index: u64,
+    stalls: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -390,6 +444,8 @@ struct CapturedPlan {
     terminal_observed_monotonic_seconds: Option<f64>,
     final_states: Option<Vec<ReadState>>,
     stable_maps: bool,
+    origin_overlap_witness: Option<RawRangeEvent>,
+    player_overlap_witness: Option<RawRangeEvent>,
 }
 
 #[derive(Default)]
@@ -1532,8 +1588,59 @@ fn retain_plan_candidates(
                 terminal_observed_monotonic_seconds: None,
                 final_states: None,
                 stable_maps: false,
+                origin_overlap_witness: None,
+                player_overlap_witness: None,
             },
         );
+    }
+}
+
+fn origin_event_matches_plan(
+    event: &RawRangeEvent,
+    captured: &CapturedPlan,
+    range: &CandidateRange,
+) -> bool {
+    event.status_code == StatusCode::PARTIAL_CONTENT.as_u16()
+        && event.body_complete == Some(true)
+        && event.request_started_monotonic_seconds >= captured.admitted_sample_monotonic_seconds
+        && event.bytes_observed == Some(event.range_end_exclusive.saturating_sub(event.range_start))
+        && event_overlaps_range(event, range)
+}
+
+fn player_event_matches_plan(
+    event: &RawRangeEvent,
+    captured: &CapturedPlan,
+    range: &CandidateRange,
+) -> bool {
+    event.status_code == StatusCode::PARTIAL_CONTENT.as_u16()
+        && event.request_started_monotonic_seconds >= captured.admitted_sample_monotonic_seconds
+        && event_overlaps_range(event, range)
+}
+
+fn retain_transfer_witnesses(ledger: &mut PlanLedger, transfers: &TransferLedger) {
+    let Ok(origin_events) = transfers.origin_events.lock() else {
+        return;
+    };
+    let Ok(player_events) = transfers.player_events.lock() else {
+        return;
+    };
+    for captured in ledger.entries.values_mut() {
+        if captured.origin_overlap_witness.is_none() {
+            captured.origin_overlap_witness = captured.before.ranges.iter().find_map(|range| {
+                origin_events
+                    .iter()
+                    .find(|event| origin_event_matches_plan(event, captured, range))
+                    .cloned()
+            });
+        }
+        if captured.player_overlap_witness.is_none() {
+            captured.player_overlap_witness = captured.before.ranges.iter().find_map(|range| {
+                player_events
+                    .iter()
+                    .find(|event| player_event_matches_plan(event, captured, range))
+                    .cloned()
+            });
+        }
     }
 }
 
@@ -1541,6 +1648,7 @@ async fn refresh_plan_ledger(
     state: &AppState,
     observation: &HighPreparationObservation,
     ledger: &mut PlanLedger,
+    transfers: &TransferLedger,
     candidate: Option<BeforeWindow>,
     binding: &ReaderBinding,
 ) -> Result<(), String> {
@@ -1580,6 +1688,7 @@ async fn refresh_plan_ledger(
             }
         }
     }
+    retain_transfer_witnesses(ledger, transfers);
     Ok(())
 }
 
@@ -1593,6 +1702,7 @@ async fn submit_challenged_update(
     probe: &AbortTask<Result<ProcessCapture, String>>,
     ticket: &HlsPlaybackContextTicket,
     ledger: &mut PlanLedger,
+    transfers: &TransferLedger,
     capture_before_state: bool,
 ) -> Result<Option<(HlsPlaybackContextTicket, HighPreparationObservation)>, ControlUpdateFailure> {
     if ticket.context_id != binding.context_id
@@ -1686,7 +1796,7 @@ async fn submit_challenged_update(
         );
     }
     let observation = state.hls_high_preparation.observation_for_tests();
-    refresh_plan_ledger(state, &observation, ledger, candidate, binding).await?;
+    refresh_plan_ledger(state, &observation, ledger, transfers, candidate, binding).await?;
     Ok(Some((next, observation)))
 }
 
@@ -1788,30 +1898,43 @@ fn assess_plan(
 
     if let Ok(events) = transfers.origin_events.lock() {
         for range in &captured.before.ranges {
-            if let Some(event) = events.iter().find(|event| {
-                event.status_code == StatusCode::PARTIAL_CONTENT.as_u16()
-                    && event.body_complete == Some(true)
-                    && event.request_started_monotonic_seconds
-                        >= captured.admitted_sample_monotonic_seconds
-                    && event.bytes_observed
-                        == Some(event.range_end_exclusive.saturating_sub(event.range_start))
-                    && event_overlaps_range(event, range)
-            }) {
+            if let Some(event) = events
+                .iter()
+                .find(|event| origin_event_matches_plan(event, captured, range))
+            {
                 origin_events.push(reported_transfer(event, captured, binding, range));
             }
         }
     }
+    if origin_events.is_empty()
+        && let Some(event) = captured.origin_overlap_witness.as_ref()
+        && let Some(range) = captured
+            .before
+            .ranges
+            .iter()
+            .find(|range| origin_event_matches_plan(event, captured, range))
+    {
+        origin_events.push(reported_transfer(event, captured, binding, range));
+    }
     if let Ok(events) = transfers.player_events.lock() {
         for range in &captured.before.ranges {
-            if let Some(event) = events.iter().find(|event| {
-                event.status_code == StatusCode::PARTIAL_CONTENT.as_u16()
-                    && event.request_started_monotonic_seconds
-                        >= captured.admitted_sample_monotonic_seconds
-                    && event_overlaps_range(event, range)
-            }) {
+            if let Some(event) = events
+                .iter()
+                .find(|event| player_event_matches_plan(event, captured, range))
+            {
                 player_events.push(reported_transfer(event, captured, binding, range));
             }
         }
+    }
+    if player_events.is_empty()
+        && let Some(event) = captured.player_overlap_witness.as_ref()
+        && let Some(range) = captured
+            .before
+            .ranges
+            .iter()
+            .find(|range| player_event_matches_plan(event, captured, range))
+    {
+        player_events.push(reported_transfer(event, captured, binding, range));
     }
     let completed_origin_overlap = !origin_events.is_empty();
     let player_overlap = !player_events.is_empty();
@@ -1892,6 +2015,130 @@ fn decode_first_recovery_high(probe: &Value) -> Option<f64> {
         .get("observed_monotonic_seconds")?
         .as_f64()
         .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn project_recovery_measurement(
+    probe: &Value,
+    recovery_monotonic_seconds: Option<f64>,
+) -> RecoveryMeasurementReport {
+    let recovery_monotonic_seconds =
+        recovery_monotonic_seconds.filter(|value| value.is_finite() && *value > 0.0);
+    let high_samples = probe
+        .get("video_size_expectations")
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.get(2))
+        .filter(|entry| entry.get("matched").and_then(Value::as_bool) == Some(true))
+        .and_then(|entry| entry.get("samples"))
+        .and_then(Value::as_array)
+        .and_then(|samples| {
+            if samples.len() > RECOVERY_HIGH_SAMPLE_LIMIT {
+                return None;
+            }
+            let projected = samples
+                .iter()
+                .map(|sample| {
+                    let display_time_seconds = sample
+                        .get("display_time_seconds")
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite() && *value >= 0.0)?;
+                    let observed_monotonic_seconds = sample
+                        .get("observed_monotonic_seconds")
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite() && *value > 0.0)?;
+                    Some(RecoveryHighSampleReport {
+                        display_time_seconds,
+                        observed_monotonic_seconds,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if projected.windows(2).any(|pair| {
+                pair[0].display_time_seconds >= pair[1].display_time_seconds
+                    || pair[0].observed_monotonic_seconds >= pair[1].observed_monotonic_seconds
+            }) {
+                return None;
+            }
+            Some(projected)
+        })
+        .unwrap_or_default();
+    let timeline = probe.get("playback_timeline").and_then(|timeline| {
+        let truncated = timeline.get("truncated")?.as_bool()?;
+        let samples = timeline.get("samples")?.as_array()?;
+        if samples.len() > RECOVERY_TIMELINE_SAMPLE_LIMIT {
+            return None;
+        }
+        let projected = samples
+            .iter()
+            .map(|sample| {
+                let observed_monotonic_seconds = sample
+                    .get("observed_monotonic_seconds")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite() && *value > 0.0)?;
+                let playhead_seconds = match sample.get("playhead_seconds") {
+                    Some(Value::Null) | None => None,
+                    Some(value) => Some(
+                        value
+                            .as_f64()
+                            .filter(|value| value.is_finite() && *value >= 0.0)?,
+                    ),
+                };
+                let time_control_status =
+                    match sample.get("time_control_status").and_then(Value::as_str)? {
+                        "playing" => "playing",
+                        "waiting" => "waiting",
+                        "paused" => "paused",
+                        _ => "other",
+                    };
+                Some(RecoveryTimelineSampleReport {
+                    observed_monotonic_seconds,
+                    playhead_seconds,
+                    time_control_status,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if projected
+            .windows(2)
+            .any(|pair| pair[0].observed_monotonic_seconds >= pair[1].observed_monotonic_seconds)
+        {
+            return None;
+        }
+        Some(RecoveryTimelineReport {
+            truncated,
+            samples: projected,
+        })
+    });
+    let access_log = probe.get("access_log_observations").and_then(|access_log| {
+        let truncated = access_log.get("truncated")?.as_bool()?;
+        let events = access_log.get("events")?.as_array()?;
+        if events.len() > RECOVERY_ACCESS_LOG_EVENT_LIMIT {
+            return None;
+        }
+        let projected = events
+            .iter()
+            .map(|event| {
+                let event_index = event.get("event_index")?.as_u64()?;
+                let stalls = match event.get("stalls") {
+                    Some(Value::Null) | None => None,
+                    Some(value) => Some(value.as_u64()?),
+                };
+                Some(RecoveryAccessLogEventReport {
+                    event_index,
+                    stalls,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(RecoveryAccessLogReport {
+            truncated,
+            events: projected,
+        })
+    });
+
+    RecoveryMeasurementReport {
+        recovery_monotonic_seconds,
+        high_samples,
+        timeline,
+        access_log,
+    }
 }
 
 fn first_high_request(report: &ReportStore) -> Option<RecoveryRangeRequest> {
@@ -2000,6 +2247,29 @@ fn build_arm_report(
         .filter_map(|plan_id| plans.entries.get(plan_id))
         .map(|plan| assess_plan(plan, binding, transfer_ledger))
         .collect::<Vec<_>>();
+    let completed_assessments = assessments
+        .iter()
+        .filter(|assessment| assessment.recovery.completed)
+        .collect::<Vec<_>>();
+    let assessment_counts = PlanAssessmentCountsReport {
+        completed: completed_assessments.len(),
+        completed_exact_missing_to_readable: completed_assessments
+            .iter()
+            .filter(|assessment| assessment.recovery.initial_missing_to_final_readable)
+            .count(),
+        completed_with_origin_witness: completed_assessments
+            .iter()
+            .filter(|assessment| !assessment.origin_events.is_empty())
+            .count(),
+        completed_with_player_witness: completed_assessments
+            .iter()
+            .filter(|assessment| !assessment.player_events.is_empty())
+            .count(),
+        eligible: assessments
+            .iter()
+            .filter(|assessment| assessment.eligible)
+            .count(),
+    };
     let chosen = assessments
         .iter()
         .position(|assessment| assessment.eligible)
@@ -2056,6 +2326,10 @@ fn build_arm_report(
         producer_history_limit: TRACKED_PLAN_LIMIT,
         truncated: plans.truncated,
     };
+    let recovery_monotonic_seconds = report
+        .lock()
+        .ok()
+        .and_then(|report| report.fault_timeline.recovery_after_monotonic_seconds);
     let transfer_event_retention = TransferEventRetentionReport {
         origin_recovery_range_events_observed: transfer_ledger
             .origin_events_observed
@@ -2123,8 +2397,13 @@ fn build_arm_report(
         first_recovery_high_origin_request: first_high_request(report),
         first_recovery_high_completed_source_body: first_completed_high_body(transfer_ledger),
         first_recovery_high_decoded_monotonic_seconds: decode_first_recovery_high(native_probe),
+        recovery_measurement: project_recovery_measurement(
+            native_probe,
+            recovery_monotonic_seconds,
+        ),
         recovery_preparation,
         inconclusive_reason: reason,
+        retained_assessment_diagnostics: Some(assessment_counts),
     })
 }
 
@@ -2718,6 +2997,7 @@ async fn run_arm(mode: ArmMode) -> Result<ArmReport, String> {
         &bad_high_marker,
         &recovery_marker,
         &origin,
+        &transfer_ledger,
         &fixture_report,
     )
     .await;
@@ -2752,6 +3032,7 @@ async fn run_arm_phase(
     bad_high_marker: &Path,
     recovery_marker: &Path,
     origin: &Arc<OriginState>,
+    transfers: &TransferLedger,
     report: &ReportStore,
 ) -> Result<
     (
@@ -2828,6 +3109,7 @@ async fn run_arm_phase(
             &probe,
             &ticket,
             &mut plans,
+            transfers,
             true,
         )
         .await
@@ -3198,6 +3480,116 @@ mod pure_helper_tests {
             deferred_resource_ranges: 0,
             window_readable: outcome == HighPreparationPlanOutcome::Completed,
         }
+    }
+
+    fn test_transfer_ledger() -> TransferLedger {
+        TransferLedger {
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_RECOVERY)),
+            binding: test_binding(),
+            origin_resources: HashMap::new(),
+            player_resources: HashMap::new(),
+            origin_events: Mutex::new(VecDeque::new()),
+            player_events: Mutex::new(VecDeque::new()),
+            origin_events_observed: std::sync::atomic::AtomicU64::new(0),
+            player_events_observed: std::sync::atomic::AtomicU64::new(0),
+            first_recovery_high_body: Mutex::new(None),
+            origin_events_truncated: AtomicBool::new(false),
+            player_events_truncated: AtomicBool::new(false),
+        }
+    }
+
+    fn test_transfer_event(status_code: u16, request_started: f64) -> RawRangeEvent {
+        RawRangeEvent {
+            resource_id: "video".to_owned(),
+            kind: HighPreparationResourceKind::Video,
+            range_start: 0,
+            range_end_exclusive: 10,
+            status_code,
+            body_complete: Some(true),
+            bytes_observed: Some(10),
+            request_started_monotonic_seconds: request_started,
+            completed_monotonic_seconds: Some(request_started + 0.1),
+        }
+    }
+
+    #[test]
+    fn retained_transfer_witness_survives_ring_churn_and_truncation() {
+        let before = test_before(100.0);
+        let binding = test_binding();
+        let mut plans = PlanLedger::default();
+        retain_plan_candidates(
+            &mut plans,
+            &[test_plan(
+                &before,
+                1,
+                HighPreparationPlanOutcome::Admitted,
+                1,
+            )],
+            Some(&before),
+            &binding,
+        );
+        let transfers = test_transfer_ledger();
+        transfers.record_origin_event(test_transfer_event(206, 101.0));
+        transfers.record_player_event(test_transfer_event(206, 101.0));
+        retain_transfer_witnesses(&mut plans, &transfers);
+
+        for _ in 0..=CAUSAL_EVENT_LIMIT {
+            let mut churn = test_transfer_event(500, 102.0);
+            churn.resource_id = "unrelated".to_owned();
+            transfers.record_origin_event(churn.clone());
+            transfers.record_player_event(churn);
+        }
+        assert!(transfers.origin_events_truncated.load(Ordering::Acquire));
+        assert!(transfers.player_events_truncated.load(Ordering::Acquire));
+        let assessment = assess_plan(&plans.entries[&1], &binding, &transfers);
+        assert_eq!(assessment.origin_events.len(), 1);
+        assert_eq!(assessment.player_events.len(), 1);
+        assert_eq!(assessment.origin_events[0].status_code, 206);
+        assert_eq!(assessment.player_events[0].status_code, 206);
+    }
+
+    #[test]
+    fn invalid_transfer_events_do_not_become_retained_witnesses() {
+        let before = test_before(100.0);
+        let binding = test_binding();
+        let mut plans = PlanLedger::default();
+        retain_plan_candidates(
+            &mut plans,
+            &[test_plan(
+                &before,
+                1,
+                HighPreparationPlanOutcome::Admitted,
+                1,
+            )],
+            Some(&before),
+            &binding,
+        );
+        let transfers = test_transfer_ledger();
+        let pre_admission = test_transfer_event(206, 99.0);
+        let mut incomplete = test_transfer_event(206, 101.0);
+        incomplete.body_complete = Some(false);
+        let mut ambiguous_length = test_transfer_event(206, 101.0);
+        ambiguous_length.bytes_observed = Some(9);
+        let wrong_status = test_transfer_event(200, 101.0);
+        let mut wrong_range = test_transfer_event(206, 101.0);
+        wrong_range.range_start = 10;
+        wrong_range.range_end_exclusive = 20;
+        for event in [
+            pre_admission.clone(),
+            incomplete,
+            ambiguous_length,
+            wrong_status.clone(),
+            wrong_range,
+        ] {
+            transfers.record_origin_event(event);
+        }
+        transfers.record_player_event(pre_admission);
+        transfers.record_player_event(wrong_status);
+        retain_transfer_witnesses(&mut plans, &transfers);
+
+        let captured = &plans.entries[&1];
+        assert!(captured.origin_overlap_witness.is_none());
+        assert!(captured.player_overlap_witness.is_none());
     }
 
     #[test]
@@ -3715,6 +4107,37 @@ mod pure_helper_tests {
                 completed_monotonic_seconds: Some(101.0),
             }),
             first_recovery_high_decoded_monotonic_seconds: Some(102.0),
+            recovery_measurement: project_recovery_measurement(
+                &serde_json::json!({
+                    "video_size_expectations": {"entries": [
+                        {}, {}, {"matched": true, "samples": [
+                            {"display_time_seconds": 1.0, "observed_monotonic_seconds": 102.0},
+                            {"display_time_seconds": 2.0, "observed_monotonic_seconds": 103.0},
+                            {"display_time_seconds": 3.0, "observed_monotonic_seconds": 104.0}
+                        ]}
+                    ]},
+                    "playback_timeline": {
+                        "truncated": false,
+                        "samples": (1..=RECOVERY_TIMELINE_SAMPLE_LIMIT)
+                            .map(|index| serde_json::json!({
+                                "observed_monotonic_seconds": 100.0 + index as f64,
+                                "playhead_seconds": 90.0,
+                                "time_control_status": "playing"
+                            }))
+                            .collect::<Vec<_>>()
+                    },
+                    "access_log_observations": {
+                        "truncated": false,
+                        "events": (0..RECOVERY_ACCESS_LOG_EVENT_LIMIT)
+                            .map(|event_index| serde_json::json!({
+                                "event_index": event_index,
+                                "stalls": event_index
+                            }))
+                            .collect::<Vec<_>>()
+                    }
+                }),
+                Some(101.0),
+            ),
             recovery_preparation: Some(RecoveryPreparationReport {
                 plan_id: 0,
                 window_start_seconds: 10.0,
@@ -3732,6 +4155,7 @@ mod pure_helper_tests {
                 selected_spans,
             }),
             inconclusive_reason: Some("x".repeat(160)),
+            retained_assessment_diagnostics: None,
         };
 
         let encoded = serde_json::to_vec(&report).expect("bounded arm report serializes");
@@ -3803,6 +4227,152 @@ mod pure_helper_tests {
             encoded.len() <= ARM_REPORT_LIMIT,
             "maximum bounded report serialized to {} bytes",
             encoded.len()
+        );
+    }
+
+    #[test]
+    fn recovery_measurement_projects_ordered_probe_observations() {
+        let probe = serde_json::json!({
+            "video_size_expectations": {"entries": [
+                {}, {}, {"matched": true, "samples": [
+                    {"display_time_seconds": 7.0, "observed_monotonic_seconds": 201.0},
+                    {"display_time_seconds": 8.0, "observed_monotonic_seconds": 202.0}
+                ]}
+            ]},
+            "playback_timeline": {"truncated": false, "samples": [{
+                "observed_monotonic_seconds": 200.0,
+                "playhead_seconds": 180.0,
+                "time_control_status": "waiting"
+            }]},
+            "access_log_observations": {"truncated": false, "events": [{
+                "event_index": 4,
+                "stalls": 2
+            }]}
+        });
+
+        let projected = serde_json::to_value(project_recovery_measurement(&probe, Some(199.0)))
+            .expect("recovery measurement serializes");
+        assert_eq!(projected["recovery_monotonic_seconds"], 199.0);
+        assert_eq!(projected["high_samples"][0]["display_time_seconds"], 7.0);
+        assert_eq!(
+            projected["high_samples"][1]["observed_monotonic_seconds"],
+            202.0
+        );
+        assert_eq!(
+            projected["timeline"]["samples"][0]["playhead_seconds"],
+            180.0
+        );
+        assert_eq!(
+            projected["timeline"]["samples"][0]["time_control_status"],
+            "waiting"
+        );
+        assert_eq!(projected["access_log"]["events"][0]["event_index"], 4);
+        assert_eq!(projected["access_log"]["events"][0]["stalls"], 2);
+    }
+
+    #[test]
+    fn recovery_measurement_keeps_missing_and_malformed_evidence_unknown() {
+        let probe = serde_json::json!({
+            "video_size_expectations": {"entries": [
+                {}, {}, {"matched": false, "samples": [
+                    {"display_time_seconds": 1.0, "observed_monotonic_seconds": 2.0}
+                ]}
+            ]},
+            "playback_timeline": {"truncated": true, "samples": [{
+                "observed_monotonic_seconds": 3.0,
+                "playhead_seconds": null,
+                "time_control_status": "paused"
+            }]},
+            "access_log_observations": {"truncated": true, "events": [{
+                "event_index": 0,
+                "stalls": null
+            }]}
+        });
+        let projected = project_recovery_measurement(&probe, Some(f64::NAN));
+        let value = serde_json::to_value(projected).expect("unknown evidence serializes");
+        assert_eq!(value["recovery_monotonic_seconds"], Value::Null);
+        assert_eq!(value["high_samples"], serde_json::json!([]));
+        assert_eq!(value["timeline"]["truncated"], true);
+        assert_eq!(
+            value["timeline"]["samples"][0]["playhead_seconds"],
+            Value::Null
+        );
+        assert_eq!(value["access_log"]["truncated"], true);
+        assert_eq!(value["access_log"]["events"][0]["stalls"], Value::Null);
+
+        let malformed_timeline = serde_json::json!({
+            "playback_timeline": {"truncated": false, "samples": [
+                {"observed_monotonic_seconds": 3.0, "playhead_seconds": 2.0, "time_control_status": "playing"},
+                {"observed_monotonic_seconds": "bad", "playhead_seconds": 2.0, "time_control_status": "playing"}
+            ]}
+        });
+        let projected = project_recovery_measurement(&malformed_timeline, None);
+        assert!(projected.timeline.is_none());
+
+        let malformed_rows = serde_json::json!({
+            "video_size_expectations": {"entries": [
+                {}, {}, {"matched": true, "samples": [
+                    {"display_time_seconds": 1.0, "observed_monotonic_seconds": 2.0},
+                    {"display_time_seconds": 2.0, "observed_monotonic_seconds": "bad"}
+                ]}
+            ]},
+            "access_log_observations": {"truncated": false, "events": [
+                {"event_index": 0, "stalls": 1},
+                {"event_index": "bad", "stalls": 2}
+            ]}
+        });
+        let projected = project_recovery_measurement(&malformed_rows, None);
+        assert!(projected.high_samples.is_empty());
+        assert!(projected.access_log.is_none());
+    }
+
+    #[test]
+    fn recovery_measurement_rejects_over_limit_and_gapped_observations() {
+        let high_samples = (0..=RECOVERY_HIGH_SAMPLE_LIMIT)
+            .map(|index| {
+                serde_json::json!({
+                    "display_time_seconds": index as f64,
+                    "observed_monotonic_seconds": 10.0 + index as f64
+                })
+            })
+            .collect::<Vec<_>>();
+        let duplicate_high_samples = serde_json::json!({
+            "video_size_expectations": {"entries": [
+                {}, {}, {"matched": true, "samples": [
+                    {"display_time_seconds": 1.0, "observed_monotonic_seconds": 10.0},
+                    {"display_time_seconds": 1.0, "observed_monotonic_seconds": 11.0}
+                ]}
+            ]}
+        });
+        let excessive = serde_json::json!({
+            "video_size_expectations": {"entries": [
+                {}, {}, {"matched": true, "samples": high_samples}
+            ]},
+            "playback_timeline": {
+                "truncated": false,
+                "samples": (0..=RECOVERY_TIMELINE_SAMPLE_LIMIT)
+                    .map(|index| serde_json::json!({
+                        "observed_monotonic_seconds": 10.0 + index as f64,
+                        "playhead_seconds": 1.0,
+                        "time_control_status": "playing"
+                    }))
+                    .collect::<Vec<_>>()
+            },
+            "access_log_observations": {
+                "truncated": false,
+                "events": (0..=RECOVERY_ACCESS_LOG_EVENT_LIMIT)
+                    .map(|event_index| serde_json::json!({"event_index": event_index}))
+                    .collect::<Vec<_>>()
+            }
+        });
+        let projected = project_recovery_measurement(&excessive, None);
+        assert!(projected.high_samples.is_empty());
+        assert!(projected.timeline.is_none());
+        assert!(projected.access_log.is_none());
+        assert!(
+            project_recovery_measurement(&duplicate_high_samples, None)
+                .high_samples
+                .is_empty()
         );
     }
 

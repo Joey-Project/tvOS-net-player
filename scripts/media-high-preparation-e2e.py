@@ -56,6 +56,9 @@ PRIVATE_CONTROL_PUBLISH_CASE = "high_preparation_control_publishes_private_atomi
 ARM_REPORTS = {"off": "off.json", "on": "on.json"}
 TRANSPORT_BOUNDARY = "in_process_generated_cache_service_trait"
 NEWLY_READABLE_SEMANTICS = "one_byte_lower_bound_per_exact_range_none_to_full_some_transition"
+RECOVERY_MEASUREMENT_NOTE = (
+    "Coarse sampled playback cannot exclude brief stalls or a black screen."
+)
 
 
 class HighPreparationError(RuntimeError):
@@ -769,6 +772,216 @@ def _player_ingress_overlap(
     )
 
 
+def _finite_number(value: Any, *, positive: bool = False) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and (not positive or value > 0)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _recovery_epoch(measurement: Any) -> int | float | None:
+    if not isinstance(measurement, dict):
+        return None
+    recovery = measurement.get("recovery_monotonic_seconds")
+    return recovery if _finite_number(recovery, positive=True) else None
+
+
+def _project_high_latency(measurement: Any, deadline_seconds: int) -> dict[str, Any]:
+    unavailable = {"status": "unavailable", "reason": "missing_or_invalid_data"}
+    if not isinstance(measurement, dict):
+        return unavailable
+    recovery = _recovery_epoch(measurement)
+    samples = measurement.get("high_samples")
+    if recovery is None or not isinstance(samples, list) \
+        or not 1 <= len(samples) <= 3:
+        return unavailable
+    previous_display = -math.inf
+    previous_observed = recovery
+    latencies: list[float] = []
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != {
+            "display_time_seconds", "observed_monotonic_seconds",
+        }:
+            return unavailable
+        display = sample["display_time_seconds"]
+        observed = sample["observed_monotonic_seconds"]
+        if not _finite_number(display) or display < 0 or not _finite_number(observed, positive=True) \
+            or display <= previous_display or observed <= previous_observed:
+            return unavailable
+        previous_display = display
+        previous_observed = observed
+        latency = observed - recovery
+        if not math.isfinite(latency) or not 0 <= latency <= deadline_seconds:
+            return unavailable
+        latencies.append(latency)
+    if len(latencies) < 3:
+        return unavailable
+    return {
+        "status": "available",
+        "recovery_monotonic_seconds": recovery,
+        "first_high_latency_seconds": latencies[0],
+        "third_high_latency_seconds": latencies[2],
+    }
+
+
+def _timeline_points(measurement: Any) -> list[tuple[float, float, str]] | None:
+    if not isinstance(measurement, dict) or set(measurement) != {"truncated", "samples"} \
+        or measurement.get("truncated") is not False:
+        return None
+    samples = measurement.get("samples")
+    if not isinstance(samples, list) or not 1 <= len(samples) <= 96:
+        return None
+    points: list[tuple[float, float, str]] = []
+    previous_observed = -math.inf
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != {
+            "observed_monotonic_seconds", "playhead_seconds", "time_control_status",
+        }:
+            return None
+        observed = sample["observed_monotonic_seconds"]
+        playhead = sample["playhead_seconds"]
+        status = sample["time_control_status"]
+        if not _finite_number(observed, positive=True) or observed <= previous_observed \
+            or not _finite_number(playhead) or playhead < 0 \
+            or type(status) is not str or status not in ("playing", "waiting", "paused", "other"):
+            return None
+        points.append((observed, playhead, status))
+        previous_observed = observed
+    return points
+
+
+def _project_continuity(measurement: Any, recovery: Any, duration: int) -> dict[str, Any]:
+    unavailable = {"status": "unavailable", "reason": "insufficient_or_invalid_samples"}
+    if not _finite_number(recovery, positive=True):
+        return unavailable
+    points = _timeline_points(measurement)
+    if points is None:
+        return unavailable
+    start, end = recovery, recovery + duration
+    if not math.isfinite(end):
+        return unavailable
+    in_window = [point for point in points if start <= point[0] <= end]
+    before = [point for point in points if point[0] < start]
+    after = [point for point in points if point[0] > end]
+    if not before or not after or len(in_window) < 5:
+        return unavailable
+    bracketed = [before[-1], *in_window, after[0]]
+    if any(right[0] - left[0] > 20 for left, right in zip(bracketed, bracketed[1:])):
+        return unavailable
+    if any(right[1] < left[1] for left, right in zip(in_window, in_window[1:])):
+        return {"status": "regression", "reason": "playhead_decreased"}
+    ratios = []
+    for left, right in zip(in_window, in_window[1:]):
+        ratio = (right[1] - left[1]) / (right[0] - left[0])
+        if not math.isfinite(ratio):
+            return unavailable
+        ratios.append(ratio)
+    return {
+        "status": "available",
+        "window_seconds": duration,
+        "in_window_samples": len(in_window),
+        "nonplaying_observations": sum(point[2] != "playing" for point in in_window),
+        "lowest_playhead_wall_ratio": min(ratios),
+        "limitation": RECOVERY_MEASUREMENT_NOTE,
+    }
+
+
+def _project_stalls(measurement: Any) -> dict[str, Any]:
+    unavailable = {"status": "unavailable", "reason": "missing_or_invalid_data"}
+    if not isinstance(measurement, dict) or set(measurement) != {"truncated", "events"} \
+        or measurement.get("truncated") is not False:
+        return unavailable
+    events = measurement.get("events")
+    if not isinstance(events, list) or len(events) > 32:
+        return unavailable
+    projected = []
+    previous_index = -1
+    for event in events:
+        if not isinstance(event, dict) or set(event) != {"event_index", "stalls"}:
+            return unavailable
+        index, stalls = event["event_index"], event["stalls"]
+        if type(index) is not int or not 0 <= index <= (2**64 - 1) or index <= previous_index \
+            or (stalls is not None and (type(stalls) is not int or not 0 <= stalls <= (2**64 - 1))):
+            return unavailable
+        projected.append({"event_index": index, "stalls": stalls})
+        previous_index = index
+    return {"status": "available", "events": projected}
+
+
+def _compare_measurements(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
+    off_latency = _project_high_latency(
+        off.get("recovery_measurement"), off["native"]["deadline_seconds"],
+    )
+    on_latency = _project_high_latency(
+        on.get("recovery_measurement"), on["native"]["deadline_seconds"],
+    )
+    latency: dict[str, Any] = {"off": off_latency, "on": on_latency}
+    if off_latency["status"] == "available" and on_latency["status"] == "available":
+        for name in ("first_high_latency_seconds", "third_high_latency_seconds"):
+            delta = off_latency[name] - on_latency[name]
+            latency[f"off_minus_on_{name}"] = delta
+        latency["confirmed_earlier"] = all(
+            latency[f"off_minus_on_{name}"] > 0
+            for name in ("first_high_latency_seconds", "third_high_latency_seconds")
+        )
+    else:
+        latency["confirmed_earlier"] = None
+
+    early = {"window_seconds": 60}
+    off_data = off.get("recovery_measurement")
+    on_data = on.get("recovery_measurement")
+    off_recovery = _recovery_epoch(off_data)
+    on_recovery = _recovery_epoch(on_data)
+    early_off = _project_continuity(
+        off_data.get("timeline") if isinstance(off_data, dict) else None,
+        off_recovery, 60,
+    )
+    early_on = _project_continuity(
+        on_data.get("timeline") if isinstance(on_data, dict) else None,
+        on_recovery, 60,
+    )
+    early.update({"off": early_off, "on": early_on})
+    early["status"] = (
+        "available"
+        if all(item["status"] == "available" for item in (early_off, early_on))
+        else "unavailable"
+    )
+
+    extended: dict[str, Any] = {"status": "unavailable", "reason": "third_high_latency_unavailable"}
+    if off_latency["status"] == "available" and on_latency["status"] == "available":
+        duration = max(60, math.ceil(max(
+            off_latency["third_high_latency_seconds"], on_latency["third_high_latency_seconds"],
+        ) / 10) * 10 + 10)
+        off_extended = _project_continuity(
+            off_data.get("timeline"), off_recovery, duration,
+        )
+        on_extended = _project_continuity(
+            on_data.get("timeline"), on_recovery, duration,
+        )
+        extended = {
+        "status": (
+            "available"
+            if all(item["status"] == "available" for item in (off_extended, on_extended))
+            else "unavailable"
+        ),
+            "window_seconds": duration,
+            "off": off_extended,
+            "on": on_extended,
+        }
+    return {
+        "latency": latency,
+        "continuity_early": early,
+        "continuity_extended": extended,
+        "access_log_stalls": {
+            "off": _project_stalls(off_data.get("access_log") if isinstance(off_data, dict) else None),
+            "on": _project_stalls(on_data.get("access_log") if isinstance(on_data, dict) else None),
+            "diagnostic_only": True,
+        },
+    }
+
+
 def validate_comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, Any]:
     validate_arm_report(off, expected_arm="off")
     validate_arm_report(on, expected_arm="on")
@@ -785,6 +998,7 @@ def validate_comparison(off: dict[str, Any], on: dict[str, Any]) -> dict[str, An
         "exclusive_attribution": "not_proven",
         "causal_faster_selection_claim": False,
         "latency_negative_evidence": False,
+        "recovery_measurements": _compare_measurements(off, on),
     }
 
 
