@@ -500,6 +500,7 @@ struct TransferLedger {
 #[derive(Clone)]
 struct OriginBodySeed {
     event: RawRangeEvent,
+    framed_length: Option<u64>,
 }
 
 struct OriginBodyStream {
@@ -920,6 +921,12 @@ async fn observe_origin_body(
     else {
         return response;
     };
+    let framed_length = validated_origin_body_length(
+        response.status(),
+        response.headers(),
+        range_start,
+        range_end_exclusive,
+    );
     let event = RawRangeEvent {
         resource_id: identity.resource_id,
         kind: identity.kind,
@@ -935,7 +942,10 @@ async fn observe_origin_body(
         Body::from_stream(OriginBodyStream {
             inner: Box::pin(body.into_data_stream()),
             ledger,
-            seed: OriginBodySeed { event },
+            seed: OriginBodySeed {
+                event,
+                framed_length,
+            },
             bytes_observed: 0,
             finished: false,
         })
@@ -1007,14 +1017,19 @@ fn player_request_identity(
 }
 
 impl OriginBodyStream {
-    fn finish(&mut self, body_complete: bool) {
+    fn finish(&mut self, may_complete: bool) {
         if self.finished {
             return;
         }
         self.finished = true;
         let mut event = self.seed.event.clone();
         let expected_bytes = event.range_end_exclusive.saturating_sub(event.range_start);
-        event.body_complete = Some(body_complete && self.bytes_observed == expected_bytes);
+        event.body_complete = Some(
+            may_complete
+                && expected_bytes > 0
+                && self.seed.framed_length == Some(expected_bytes)
+                && self.bytes_observed == expected_bytes,
+        );
         event.bytes_observed = Some(self.bytes_observed);
         event.completed_monotonic_seconds = monotonic_clock_seconds().ok();
         self.ledger.record_origin_event(event);
@@ -1046,8 +1061,56 @@ impl Stream for OriginBodyStream {
 
 impl Drop for OriginBodyStream {
     fn drop(&mut self) {
-        self.finish(false);
+        self.finish(true);
     }
+}
+
+fn validated_origin_body_length(
+    status: StatusCode,
+    headers: &axum::http::HeaderMap,
+    requested_start: u64,
+    requested_end_exclusive: u64,
+) -> Option<u64> {
+    if status != StatusCode::PARTIAL_CONTENT || requested_end_exclusive <= requested_start {
+        return None;
+    }
+    let expected_length = requested_end_exclusive.checked_sub(requested_start)?;
+    let single_header = |name: axum::http::header::HeaderName| {
+        let mut values = headers.get_all(name).iter();
+        let value = values.next()?;
+        values.next().is_none().then_some(value)
+    };
+    if headers.contains_key(axum::http::header::TRANSFER_ENCODING)
+        || headers.contains_key(axum::http::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    let content_length = parse_http_decimal(
+        single_header(axum::http::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?,
+    )?;
+    if content_length != expected_length {
+        return None;
+    }
+    let content_range = single_header(axum::http::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    let range = content_range.strip_prefix("bytes ")?;
+    let (bounds, total) = range.split_once('/')?;
+    let (start, inclusive_end) = bounds.split_once('-')?;
+    let start = parse_http_decimal(start)?;
+    let inclusive_end = parse_http_decimal(inclusive_end)?;
+    let total = parse_http_decimal(total)?;
+    let end_exclusive = inclusive_end.checked_add(1)?;
+    (start == requested_start && end_exclusive == requested_end_exclusive && total > inclusive_end)
+        .then_some(expected_length)
+}
+
+fn parse_http_decimal(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
 }
 
 fn push_recent(
@@ -3220,6 +3283,7 @@ fn write_arm_report(path: &Path, report: &ArmReport) -> Result<(), String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+    use futures_util::StreamExt;
 
     #[test]
     fn continuous_probe_arguments_include_both_phase_markers_with_fixed_limits() {
@@ -3496,6 +3560,216 @@ mod pure_helper_tests {
             origin_events_truncated: AtomicBool::new(false),
             player_events_truncated: AtomicBool::new(false),
         }
+    }
+
+    fn strict_origin_headers(start: u64, end_exclusive: u64, total: u64) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            (end_exclusive - start).to_string().parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{}/{total}", end_exclusive - 1)
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn origin_completion_requires_unambiguous_exact_partial_framing() {
+        let valid = strict_origin_headers(2, 6, 20);
+        assert_eq!(
+            validated_origin_body_length(StatusCode::PARTIAL_CONTENT, &valid, 2, 6),
+            Some(4)
+        );
+
+        let mut cases = Vec::new();
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.insert(axum::http::header::CONTENT_LENGTH, "3".parse().unwrap());
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.insert(axum::http::header::CONTENT_LENGTH, "+4".parse().unwrap());
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            "bytes 2-4/20".parse().unwrap(),
+        );
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.append(axum::http::header::CONTENT_LENGTH, "4".parse().unwrap());
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.append(
+            axum::http::header::CONTENT_RANGE,
+            "bytes 2-5/20".parse().unwrap(),
+        );
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.remove(axum::http::header::CONTENT_RANGE);
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.insert(
+            axum::http::header::TRANSFER_ENCODING,
+            "chunked".parse().unwrap(),
+        );
+        cases.push(headers);
+        let mut headers = strict_origin_headers(2, 6, 20);
+        headers.insert(
+            axum::http::header::CONTENT_ENCODING,
+            "gzip".parse().unwrap(),
+        );
+        cases.push(headers);
+        for headers in cases {
+            assert_eq!(
+                validated_origin_body_length(StatusCode::PARTIAL_CONTENT, &headers, 2, 6),
+                None
+            );
+        }
+        assert_eq!(
+            validated_origin_body_length(StatusCode::OK, &valid, 2, 6),
+            None
+        );
+    }
+
+    async fn observe_test_chunks(
+        headers: &axum::http::HeaderMap,
+        chunks: Vec<Result<Bytes, axum::Error>>,
+        consume_all: bool,
+    ) -> RawRangeEvent {
+        let ledger = Arc::new(test_transfer_ledger());
+        let event = RawRangeEvent {
+            resource_id: "video".to_owned(),
+            kind: HighPreparationResourceKind::Video,
+            range_start: 2,
+            range_end_exclusive: 6,
+            status_code: StatusCode::PARTIAL_CONTENT.as_u16(),
+            body_complete: None,
+            bytes_observed: None,
+            request_started_monotonic_seconds: 1.0,
+            completed_monotonic_seconds: None,
+        };
+        let mut stream = OriginBodyStream {
+            inner: Box::pin(futures_util::stream::iter(chunks)),
+            ledger: Arc::clone(&ledger),
+            seed: OriginBodySeed {
+                event,
+                framed_length: validated_origin_body_length(
+                    StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    2,
+                    6,
+                ),
+            },
+            bytes_observed: 0,
+            finished: false,
+        };
+        if consume_all {
+            while stream.next().await.is_some() {}
+        } else {
+            let _ = stream.next().await;
+        }
+        drop(stream);
+        assert_eq!(ledger.origin_events_observed.load(Ordering::Acquire), 1);
+        ledger
+            .origin_events
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn origin_body_failures_and_incomplete_drops_never_complete() {
+        let headers = strict_origin_headers(2, 6, 20);
+        let short = observe_test_chunks(&headers, vec![Ok(Bytes::from_static(b"abc"))], true).await;
+        assert_eq!(short.body_complete, Some(false));
+        assert_eq!(short.bytes_observed, Some(3));
+
+        let early_drop = observe_test_chunks(
+            &headers,
+            vec![Ok(Bytes::from_static(b"ab")), Ok(Bytes::from_static(b"cd"))],
+            false,
+        )
+        .await;
+        assert_eq!(early_drop.body_complete, Some(false));
+
+        let oversized =
+            observe_test_chunks(&headers, vec![Ok(Bytes::from_static(b"abcde"))], true).await;
+        assert_eq!(oversized.body_complete, Some(false));
+        assert_eq!(oversized.bytes_observed, Some(5));
+
+        let errored = observe_test_chunks(
+            &headers,
+            vec![
+                Ok(Bytes::from_static(b"ab")),
+                Err(axum::Error::new(std::io::Error::other("test stream error"))),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(errored.body_complete, Some(false));
+        assert_eq!(errored.bytes_observed, Some(2));
+    }
+
+    #[tokio::test]
+    async fn loopback_observer_records_exact_reader_stream_body_on_drop() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut ledger = test_transfer_ledger();
+        ledger.origin_resources.insert(
+            "high.mp4".to_owned(),
+            ResourceIdentity {
+                resource_id: "video".to_owned(),
+                kind: HighPreparationResourceKind::Video,
+            },
+        );
+        let ledger = Arc::new(ledger);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/high.mp4",
+                axum::routing::get(|| async {
+                    let (mut writer, reader) = tokio::io::duplex(16);
+                    tokio::spawn(async move { writer.write_all(b"cdef").await.unwrap() });
+                    let mut response =
+                        Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(reader)));
+                    *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CONTENT_LENGTH, "4".parse().unwrap());
+                    response.headers_mut().insert(
+                        axum::http::header::CONTENT_RANGE,
+                        "bytes 2-5/20".parse().unwrap(),
+                    );
+                    response
+                }),
+            )
+            .layer(from_fn_with_state(Arc::clone(&ledger), observe_origin_body));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let received = reqwest::Client::new()
+            .get(format!("http://{address}/high.mp4"))
+            .header(reqwest::header::RANGE, "bytes=2-5")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(received.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(received.bytes().await.unwrap().as_ref(), b"cdef");
+
+        let events = ledger.origin_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body_complete, Some(true));
+        assert_eq!(events[0].bytes_observed, Some(4));
+        assert!(events[0].completed_monotonic_seconds.is_some());
+        drop(events);
+        server.abort();
     }
 
     fn test_transfer_event(status_code: u16, request_started: f64) -> RawRangeEvent {

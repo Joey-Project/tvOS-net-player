@@ -344,6 +344,14 @@ superseded_by:
   Keep the existing ring and plan caps and the original admission, identity,
   timing and range checks. A missing witness under truncation remains unknown;
   retaining a witness does not establish exclusive coordinator attribution.
+- A framed HTTP response can finish without a final stream poll for EOF. The
+  fixture records complete source emission only for an exact 206 response
+  whose single Content-Range and Content-Length agree with the requested
+  range and actual bytes. Drop after all framed bytes have been emitted can
+  establish completion; early cancellation, truncation, stream errors,
+  oversize bodies and ambiguous framing cannot. A loopback HTTP regression
+  exercises the framed path; source emission still does not prove client
+  receipt or replace any existing playback or eligibility evidence.
 - A structured cache read returning missing does not prove zero physical byte
   coverage. A stable exact range changing from missing to fully readable proves
   a positive lower bound on newly readable bytes, not an exact downloaded-byte
