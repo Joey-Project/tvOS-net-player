@@ -1140,6 +1140,19 @@ fn exact_read_state(
     }
 }
 
+fn selected_preparation_bytes(
+    map: &PlaybackSidxMap,
+    selected: &crate::playback_request_urgency::PlaybackSidxPreparationRange,
+) -> Option<std::ops::Range<u64>> {
+    let end = if selected.end_seconds == map.media_end_seconds()? {
+        map.total_length()
+    } else {
+        selected.bytes.end
+    };
+    end.checked_sub(selected.bytes.start)?;
+    Some(selected.bytes.start..end)
+}
+
 fn challenge_response_is_fresh(
     sample: &NativeSample,
     request_id: &str,
@@ -1358,14 +1371,15 @@ async fn capture_before_window(
     let mut ranges = Vec::with_capacity(mapped.len());
     for (kind, resource, map) in mapped {
         let selected = map.preparation_range_for_window(window_start, window_end)?;
-        let expected = selected.bytes.end.checked_sub(selected.bytes.start)?;
+        let bytes = selected_preparation_bytes(&map, &selected)?;
+        let expected = bytes.end.checked_sub(bytes.start)?;
         if expected == 0 {
             return None;
         }
         let before = exact_read_state(
             state
                 .hls_cache
-                .read_resource_range(&binding.session_id, &resource, selected.bytes.clone())
+                .read_resource_range(&binding.session_id, &resource, bytes.clone())
                 .await,
             expected,
         );
@@ -1373,7 +1387,7 @@ async fn capture_before_window(
             kind,
             resource,
             map,
-            bytes: selected.bytes,
+            bytes,
             start_seconds: selected.start_seconds,
             end_seconds: selected.end_seconds,
             before,
@@ -3268,6 +3282,60 @@ mod pure_helper_tests {
         let mut ledger = PlanLedger::default();
         retain_plan_candidates(&mut ledger, &invalid, Some(&before), &binding);
         assert!(ledger.entries.is_empty());
+    }
+
+    #[test]
+    fn final_sidx_reference_matches_advertised_end_with_trailer() {
+        let map = Arc::new(
+            PlaybackSidxMap::new(
+                24,
+                vec![
+                    crate::playback_request_urgency::PlaybackSidxRange {
+                        bytes: 0..10,
+                        start_ticks: 0,
+                        end_ticks: 10,
+                        timescale: 1,
+                    },
+                    crate::playback_request_urgency::PlaybackSidxRange {
+                        bytes: 10..20,
+                        start_ticks: 10,
+                        end_ticks: 20,
+                        timescale: 1,
+                    },
+                ],
+            )
+            .expect("fixture map with an advertised trailer should be valid"),
+        );
+        let selected = map
+            .preparation_range_for_window(10.0, 20.0)
+            .expect("window should select the final SIDX reference");
+        assert_eq!(selected.bytes, 10..20);
+        let interior = map
+            .preparation_range_for_window(0.0, 10.0)
+            .expect("window should select the interior SIDX reference");
+        assert_eq!(selected_preparation_bytes(&map, &interior), Some(0..10));
+        assert_eq!(selected_preparation_bytes(&map, &selected), Some(10..24));
+
+        let mut before = test_before(100.0);
+        before.start_seconds = 10.0;
+        before.end_seconds = 20.0;
+        before.key.start_bits = 10.0_f64.to_bits();
+        before.key.end_bits = 20.0_f64.to_bits();
+        before.ranges[0].map = map.clone();
+        before.ranges[0].bytes = selected_preparation_bytes(&map, &selected)
+            .expect("final selected range should include the advertised trailer");
+        before.ranges[0].start_seconds = selected.start_seconds;
+        before.ranges[0].end_seconds = selected.end_seconds;
+
+        let mut plan = test_plan(&before, 12, HighPreparationPlanOutcome::Completed, 1);
+        plan.selected_spans[0].start_seconds = selected.start_seconds;
+        plan.selected_spans[0].end_seconds = selected.end_seconds;
+        plan.selected_spans[0].byte_length =
+            before.ranges[0].bytes.end - before.ranges[0].bytes.start;
+
+        assert!(plan_selected_ranges_match(&plan, &before, &test_binding()));
+        plan.selected_spans[0].byte_length = selected.bytes.end - selected.bytes.start;
+        assert!(!plan_selected_ranges_match(&plan, &before, &test_binding()));
     }
 
     #[test]
