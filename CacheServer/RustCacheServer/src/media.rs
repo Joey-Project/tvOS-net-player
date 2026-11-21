@@ -6556,6 +6556,7 @@ mod tests {
             let resource = session.variant.video.clone();
             let generation = insert_authorized_hls_session(&state, session);
             let reader_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+            let context_started_at = std::time::Instant::now();
             let ticket = state
                 .hls_playback_contexts
                 .open_with_reader_id("http-queue".to_owned(), generation, reader_id.to_owned())
@@ -6681,9 +6682,15 @@ mod tests {
                 resource.clone(),
             )
             .expect("reader should construct the verified urgency resolver");
+            let context_age = context_started_at.elapsed();
+            let context_binding = state
+                .hls_playback_contexts
+                .binding_for_update(&ticket.context_id);
+            let reader_snapshot = state.current_hls_playback_context_for_reader(reader_id);
             assert_eq!(
                 HlsRangePriority::FarFuturePlayback,
-                urgency.priority_for_range(&(far_start as u64..far_end as u64), Duration::ZERO)
+                urgency.priority_for_range(&(far_start as u64..far_end as u64), Duration::ZERO),
+                "unexpected urgency after {context_age:?}; current_binding={context_binding:?}; reader_snapshot={reader_snapshot:?}"
             );
             let far_url =
                 format!("{base_url}/hls/http-queue/segments/video.m4s?playback_reader={reader_id}");

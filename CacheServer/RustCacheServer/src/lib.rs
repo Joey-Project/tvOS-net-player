@@ -16,6 +16,7 @@ mod hls;
 mod hls_cache;
 mod hls_catalog;
 mod hls_fill_scheduler;
+pub(crate) mod hls_high_preparation;
 mod hls_media_refresh;
 mod hls_network_policy;
 mod hls_playback_context;
@@ -40,6 +41,8 @@ mod transcoding;
 
 #[cfg(all(test, target_os = "macos"))]
 mod media_acceptance_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod media_high_preparation_native_tests;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -88,6 +91,7 @@ use crate::{
         sanitized_completed_session, source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
+    hls_high_preparation::HighPreparationCoordinator,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
     hls_playback_context::{HlsPlaybackContextStore, PlaybackContextSnapshot},
     hls_playback_progress::{
@@ -154,6 +158,7 @@ pub struct AppState {
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_contexts: HlsPlaybackContextStore,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
+    pub(crate) hls_high_preparation: HighPreparationCoordinator,
     pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
     pub(crate) resolver_settings: Arc<resolver_settings::ResolverSettingsStore>,
     pub(crate) resolver_routing: Arc<resolver_routing::ResolverRoutingState>,
@@ -823,6 +828,7 @@ impl AppState {
         let hls_network_policy = HlsNetworkPolicy::default();
         let hls_playback_contexts = HlsPlaybackContextStore::default();
         let hls_playback_progress = HlsPlaybackProgressTracker::default();
+        let hls_high_preparation = HighPreparationCoordinator::default();
         let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
             restored_hls_sessions
         } else {
@@ -869,6 +875,7 @@ impl AppState {
             hls_network_policy,
             hls_playback_contexts,
             hls_playback_progress,
+            hls_high_preparation,
             bilibili_login: bilibili_login::BilibiliLoginManager::default(),
             resolver_settings,
             resolver_routing,
