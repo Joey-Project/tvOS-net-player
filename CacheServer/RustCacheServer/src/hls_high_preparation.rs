@@ -22,14 +22,14 @@ use crate::{
     },
     hls_cache::{
         HlsCacheFillControl, PlaybackPreparationBatch, PlaybackPreparationError,
-        PlaybackPreparationRequest,
+        PlaybackPreparationReadinessTarget, PlaybackPreparationRequest,
     },
     hls_playback_context::{PlaybackContextSnapshot, PlaybackTimingSample, is_canonical_uuid_v4},
     hls_playback_progress::PlaybackProgressIntent,
     hls_range_cache::HlsRangeError,
     hls_readiness::{CacheWindowInspection, CacheWindowReason, CacheWindowState, PlaybackWindow},
     playback_policy::variant_is_avplayer_h264_aac_hls_compatible,
-    playback_request_urgency::PlaybackSidxMap,
+    playback_request_urgency::{PlaybackSidxMap, PlaybackSidxPreparationRange},
 };
 
 const HIGH_PREPARATION_HISTORY_LIMIT: usize = 16;
@@ -820,6 +820,8 @@ fn build_high_preparation_draft(
         let selected = map
             .preparation_range_for_window(window.start_seconds, window.end_seconds())
             .ok_or(HighPreparationDeferReason::UnsafeWindow)?;
+        let bytes = selected_preparation_bytes(&map, &selected)
+            .ok_or(HighPreparationDeferReason::UnsafeWindow)?;
         let kind = match resource.request.kind {
             crate::bbdown_adapter::BilibiliMediaRequestKind::Video => {
                 HighPreparationResourceKind::Video
@@ -837,13 +839,13 @@ fn build_high_preparation_draft(
                 kind,
                 start_seconds: selected.start_seconds,
                 end_seconds: selected.end_seconds,
-                byte_length: selected.bytes.end - selected.bytes.start,
+                byte_length: bytes.end - bytes.start,
                 readable: false,
             });
         prepared_resources.push(PreparedHighResource {
             resource,
             map,
-            bytes: selected.bytes,
+            bytes,
         });
     }
 
@@ -892,6 +894,17 @@ fn build_high_preparation_draft(
         window,
         resources: prepared_resources,
     })
+}
+
+fn selected_preparation_bytes(
+    map: &PlaybackSidxMap,
+    selected: &PlaybackSidxPreparationRange,
+) -> Option<Range<u64>> {
+    let mut bytes = selected.bytes.clone();
+    if map.media_end_seconds() == Some(selected.end_seconds) {
+        bytes.end = map.total_length();
+    }
+    (bytes.start < bytes.end && bytes.end <= map.total_length()).then_some(bytes)
 }
 
 fn safe_future_start(sample: PlaybackTimingSample) -> Option<f64> {
@@ -1161,9 +1174,24 @@ async fn run_high_preparation_inner(
     coordinator: HighPreparationCoordinator,
     plan: HighPreparationPlan,
 ) {
+    let readiness_targets = plan
+        .resources
+        .iter()
+        .map(|prepared| PlaybackPreparationReadinessTarget {
+            resource: &prepared.resource,
+            map: Arc::clone(&prepared.map),
+            requested: prepared.bytes.clone(),
+        })
+        .collect::<Vec<_>>();
     let initial_inspection = state
         .hls_cache
-        .inspect_cached_playback_window(&plan.session_id, &plan.target, plan.window)
+        .inspect_cached_playback_preparation_window(
+            &plan.session_id,
+            plan.session_generation,
+            &plan.target,
+            plan.window,
+            &readiness_targets,
+        )
         .await;
     let initial_window_readable = match initial_inspection.state {
         CacheWindowState::Readable => Some(true),
@@ -1242,7 +1270,13 @@ async fn run_high_preparation_inner(
     let readable_resource_ranges = readable_spans.iter().filter(|readable| **readable).count();
     let final_inspection = state
         .hls_cache
-        .inspect_cached_playback_window(&plan.session_id, &plan.target, plan.window)
+        .inspect_cached_playback_preparation_window(
+            &plan.session_id,
+            plan.session_generation,
+            &plan.target,
+            plan.window,
+            &readiness_targets,
+        )
         .await;
     coordinator.record_final_inspection(plan.plan_id, final_inspection);
     let window_readable = final_inspection.state == CacheWindowState::Readable;
@@ -1445,6 +1479,7 @@ mod integration_tests {
         grpc_services::CacheGrpcService,
         hls::HlsPlaybackSession,
         playback_policy::PlaybackPolicy,
+        playback_request_urgency::PlaybackSidxRange,
     };
 
     const SESSION_ID: &str = "high-preparation-fixture";
@@ -1600,6 +1635,13 @@ mod integration_tests {
 
     impl Harness {
         async fn new(with_gate: bool) -> Self {
+            Self::new_with_trailing_sentinel(with_gate, false).await
+        }
+
+        async fn new_with_trailing_sentinel(
+            with_gate: bool,
+            include_trailing_sentinel: bool,
+        ) -> Self {
             let temp = tempfile::tempdir().expect("fixture cache directory should be created");
             let root = temp
                 .path()
@@ -1611,8 +1653,18 @@ mod integration_tests {
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
             });
-            let video = indexed_mp4(&[12_000, 18_000, 10_000, 10_000], FRAGMENT_BYTES, 0x31);
-            let audio = indexed_mp4(&[10_000, 15_000, 15_000, 10_000], FRAGMENT_BYTES / 2, 0x72);
+            let video_durations: &[u32] = if include_trailing_sentinel {
+                &[12_000, 18_000, 10_000, 10_000, 10_000, 10_000]
+            } else {
+                &[12_000, 18_000, 10_000, 10_000]
+            };
+            let audio_durations: &[u32] = if include_trailing_sentinel {
+                &[10_000, 15_000, 15_000, 10_000, 10_000, 10_000]
+            } else {
+                &[10_000, 15_000, 15_000, 10_000]
+            };
+            let video = indexed_mp4(video_durations, FRAGMENT_BYTES, 0x31);
+            let audio = indexed_mp4(audio_durations, FRAGMENT_BYTES / 2, 0x72);
             let (release, _) = watch::channel(false);
             let gate = with_gate.then(|| {
                 Arc::new(OriginGate {
@@ -1729,6 +1781,13 @@ mod integration_tests {
         }
 
         async fn request_uncached_playback_ranges(&self) -> Vec<OriginRange> {
+            self.request_uncached_playback_ranges_at(40.0).await
+        }
+
+        async fn request_uncached_playback_ranges_at(
+            &self,
+            playback_start_seconds: f64,
+        ) -> Vec<OriginRange> {
             let mut playback_origin_ranges = Vec::new();
             for (path, resource) in self.resource_pairs() {
                 let map = self
@@ -1736,11 +1795,6 @@ mod integration_tests {
                     .hls_cache
                     .playback_sidx_map(SESSION_ID, self.generation, &resource)
                     .expect("playlist should register exact SIDX map");
-                let playback_start_seconds = match path.as_str() {
-                    "video" => 40.0,
-                    "audio" => 40.0,
-                    _ => unreachable!("fixture resource kind is fixed"),
-                };
                 let playback_range = map
                     .preparation_range_for_window(
                         playback_start_seconds,
@@ -1752,7 +1806,7 @@ mod integration_tests {
                     "requested playback bytes must begin beyond the media startup probe"
                 );
                 assert!(
-                    playback_range.start_seconds >= 40.0,
+                    playback_range.start_seconds >= playback_start_seconds,
                     "playback fragment must not overlap the optional preparation window"
                 );
                 let origin_cursor = self.origin.ranges().len();
@@ -1823,6 +1877,34 @@ mod integration_tests {
                 ));
             }
             playback_origin_ranges
+        }
+
+        async fn assert_terminal_trailer_absent(&self, resource: &HlsMediaResource) {
+            let map = self
+                .state
+                .hls_cache
+                .playback_sidx_map(SESSION_ID, self.generation, resource)
+                .expect("production playlist should keep its registered map");
+            let media_end = map
+                .media_end_seconds()
+                .expect("registered map should expose its final media time");
+            let final_span = map
+                .preparation_range_for_window(media_end - 0.01, media_end)
+                .expect("final timing reference should be selectable");
+            let trailer = final_span.bytes.end..map.total_length();
+            assert!(
+                trailer.start < trailer.end,
+                "fixture includes terminal mfra"
+            );
+            assert!(
+                self.state
+                    .hls_cache
+                    .read_resource_range(SESSION_ID, resource, trailer)
+                    .await
+                    .expect("cached trailer probe should complete")
+                    .is_none(),
+                "playlist trailer probe must not checkpoint terminal mfra"
+            );
         }
 
         async fn open_context(
@@ -2319,9 +2401,36 @@ mod integration_tests {
         mp4_box(*b"mfra", &mfra_payload)
     }
 
+    #[test]
+    fn final_preparation_span_includes_advertised_terminal_bytes() {
+        let map = PlaybackSidxMap::new(
+            340,
+            vec![
+                PlaybackSidxRange {
+                    bytes: 10..100,
+                    start_ticks: 0,
+                    end_ticks: 10,
+                    timescale: 1,
+                },
+                PlaybackSidxRange {
+                    bytes: 100..300,
+                    start_ticks: 10,
+                    end_ticks: 20,
+                    timescale: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let earlier = map.preparation_range_for_window(1.0, 5.0).unwrap();
+        let last = map.preparation_range_for_window(10.0, 20.0).unwrap();
+
+        assert_eq!(10..100, selected_preparation_bytes(&map, &earlier).unwrap());
+        assert_eq!(100..340, selected_preparation_bytes(&map, &last).unwrap());
+    }
+
     #[tokio::test]
     async fn accepted_context_after_real_playback_supply_prepares_same_av_window() {
-        let harness = Harness::new(false).await;
+        let harness = Harness::new_with_trailing_sentinel(false, true).await;
         harness.load_maps().await;
         harness.state.maybe_start_hls_high_preparation(READER_ID);
         assert_eq!(
@@ -2359,7 +2468,7 @@ mod integration_tests {
             );
         }
 
-        let playback_ranges = harness.request_uncached_playback_ranges().await;
+        let playback_ranges = harness.request_uncached_playback_ranges_at(50.0).await;
         assert!(
             playback_ranges
                 .iter()
@@ -2373,6 +2482,17 @@ mod integration_tests {
         harness.close_context(&opened.context_id).await;
         let measured_context_started_at = std::time::Instant::now();
         let measured_context = harness.open_context().await;
+        let logical_window = PlaybackWindow::new(20.0, 20.0).unwrap();
+        let generic_before = harness
+            .state
+            .hls_cache
+            .inspect_cached_playback_window(SESSION_ID, &harness.session.variant, logical_window)
+            .await;
+        assert_eq!(CacheWindowState::Unknown, generic_before.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, generic_before.reason);
+        for (_, resource) in harness.resource_pairs() {
+            harness.assert_terminal_trailer_absent(&resource).await;
+        }
         let origin_before_preparation = harness.origin.ranges().len();
         let measured_update = harness
             .update_context(&measured_context, 0.0, 20.0, 1.0)
@@ -2477,22 +2597,32 @@ mod integration_tests {
             .unwrap();
         let selected_video = video_map.preparation_range_for_window(20.0, 40.0).unwrap();
         let selected_audio = audio_map.preparation_range_for_window(20.0, 40.0).unwrap();
+        let expected_video_bytes = selected_preparation_bytes(&video_map, &selected_video).unwrap();
+        let expected_audio_bytes = selected_preparation_bytes(&audio_map, &selected_audio).unwrap();
+        assert_eq!(
+            video_span.byte_length,
+            expected_video_bytes.end - expected_video_bytes.start
+        );
+        assert_eq!(
+            audio_span.byte_length,
+            expected_audio_bytes.end - expected_audio_bytes.start
+        );
         let inspection = harness
             .state
             .hls_cache
-            .inspect_cached_playback_window(
-                SESSION_ID,
-                &harness.session.variant,
-                PlaybackWindow::new(20.0, 20.0).unwrap(),
-            )
+            .inspect_cached_playback_window(SESSION_ID, &harness.session.variant, logical_window)
             .await;
-        assert_eq!(inspection.state, CacheWindowState::Readable);
+        assert_eq!(inspection.state, CacheWindowState::Unknown);
+        assert_eq!(inspection.reason, CacheWindowReason::IndexUnavailable);
+        for (_, resource) in harness.resource_pairs() {
+            harness.assert_terminal_trailer_absent(&resource).await;
+        }
 
         let new_origin_ranges = harness.origin.ranges();
         let new_origin_ranges = &new_origin_ranges[origin_before_preparation..];
         for (resource, selected) in [
-            ("video", selected_video.bytes),
-            ("audio", selected_audio.bytes),
+            ("video", expected_video_bytes),
+            ("audio", expected_audio_bytes),
         ] {
             assert!(
                 new_origin_ranges.iter().any(|transfer| {
@@ -2502,6 +2632,33 @@ mod integration_tests {
                         && transfer.body_bytes > 0
                 }),
                 "isolated origin should serve new bytes covering {resource} selection"
+            );
+            let selected_start = usize::try_from(selected.start).unwrap();
+            let selected_end = usize::try_from(selected.end).unwrap();
+            let mut served_ranges = new_origin_ranges
+                .iter()
+                .filter(|transfer| transfer.resource == resource && transfer.body_bytes > 0)
+                .map(|transfer| transfer.range.clone())
+                .collect::<Vec<_>>();
+            served_ranges.sort_by_key(|range| range.start);
+            let mut covered_until = selected_start;
+            for range in served_ranges {
+                let range_start = range.start.max(selected_start);
+                let range_end = range.end.min(selected_end);
+                if range_end <= covered_until {
+                    continue;
+                }
+                if range_start > covered_until {
+                    break;
+                }
+                covered_until = range_end;
+                if covered_until == selected_end {
+                    break;
+                }
+            }
+            assert_eq!(
+                selected_end, covered_until,
+                "origin bytes should cover the exact planned {resource} span"
             );
         }
         let aggregate = harness.state.hls_high_preparation.observation_for_tests();

@@ -254,6 +254,25 @@ superseded_by:
   deterministic fixtures and explicit synchronization. A classified defer is
   diagnostic evidence, not a demonstrated fix or a faster-decoding result.
 
+## Live SIDX Readiness
+- The playlist path can validate an MP4 index with a separately fetched trailer
+  without persisting that trailer. With a fixed registered map and source
+  identity, a disk-only inspection reports `IndexUnavailable` without the
+  trailer, `NotCached` with just the trailer added, and `Readable` only after
+  the selected media is also verified. The diagnostic does not identify the
+  exact branch taken by every historical native deferral.
+- Use the current identity-bound SIDX map and selected spans for the
+  coordinator's initial and final inspections. Validate initialization and
+  overlapping durable extents under the existing locks and read budgets.
+  Missing media with a trusted index is eligible; stale maps, identity changes
+  and integrity failures are not. Keep the public disk-based readiness query
+  and the complete-cache integrity policy unchanged.
+- A loopback regression establishes measured supply without touching the
+  trailer, then submits in-process context-service updates and verifies that
+  preparation covers both selected spans while the trailers remain absent.
+  This proves preparation and cache readability, not an earlier visible
+  upshift in a native OFF/ON comparison.
+
 ## Native Comparison Contract
 - `just test-media-high-preparation` is an opt-in, credential-free comparison
   with fresh sequential OFF and ON fixture/cache/player instances. The existing
