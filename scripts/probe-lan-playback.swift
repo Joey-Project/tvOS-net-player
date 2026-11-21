@@ -1054,52 +1054,89 @@ private enum HighPreparationControl {
         try requireDirectory(path)
     }
 
-    static func readChallenge(directory: String) throws -> HighPreparationChallenge? {
+    static func readChallenge(
+        directory: String,
+        beforeOpen: () throws -> Void = {}
+    ) throws -> HighPreparationChallenge? {
         try requireDirectory(directory)
         let path = URL(fileURLWithPath: directory).appendingPathComponent("challenge.json").path
         var entry = stat()
         guard Darwin.lstat(path, &entry) == 0 else {
             if errno == ENOENT { return nil }
-            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+            throw ProbeFailure(phase: "native_control", domain: NSPOSIXErrorDomain, code: Int(errno))
         }
-        guard entry.st_mode & S_IFMT == S_IFREG,
-            entry.st_size > 0, entry.st_size <= maximumMessageBytes
-        else {
-            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 1)
-        }
+        try requireValidChallengeMetadata(entry)
 
+        try beforeOpen()
         let descriptor = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else {
-            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+            throw ProbeFailure(phase: "native_control", domain: NSPOSIXErrorDomain, code: Int(errno))
         }
         defer { _ = Darwin.close(descriptor) }
         var opened = stat()
-        guard Darwin.fstat(descriptor, &opened) == 0,
-            opened.st_mode & S_IFMT == S_IFREG,
-            opened.st_dev == entry.st_dev, opened.st_ino == entry.st_ino,
-            opened.st_size == entry.st_size
-        else {
+        guard Darwin.fstat(descriptor, &opened) == 0 else {
+            throw ProbeFailure(phase: "native_control", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        try requireValidChallengeMetadata(opened)
+        let sameObject = opened.st_dev == entry.st_dev && opened.st_ino == entry.st_ino
+        guard !sameObject || sameChallengeContentState(entry, opened) else {
             throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 2)
         }
 
-        var bytes = [UInt8](repeating: 0, count: Int(opened.st_size))
+        var bytes = [UInt8](repeating: 0, count: maximumMessageBytes + 1)
         var offset = 0
         while offset < bytes.count {
             let count = bytes.withUnsafeMutableBufferPointer { buffer in
                 Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
             }
             if count < 0 && errno == EINTR { continue }
-            guard count > 0 else {
-                throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: Int(errno))
+            if count < 0 {
+                throw ProbeFailure(phase: "native_control", domain: NSPOSIXErrorDomain, code: Int(errno))
             }
+            if count == 0 { break }
             offset += count
         }
+        bytes.removeSubrange(offset..<bytes.count)
 
-        let challenge = try JSONDecoder().decode(HighPreparationChallenge.self, from: Data(bytes))
+        var afterRead = stat()
+        guard Darwin.fstat(descriptor, &afterRead) == 0 else {
+            throw ProbeFailure(phase: "native_control", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        try requireValidChallengeMetadata(afterRead)
+        guard opened.st_dev == afterRead.st_dev, opened.st_ino == afterRead.st_ino,
+            sameChallengeContentState(opened, afterRead), bytes.count == afterRead.st_size
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 2)
+        }
+        guard !bytes.isEmpty, bytes.count <= maximumMessageBytes else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 1)
+        }
+
+        let challenge: HighPreparationChallenge
+        do {
+            challenge = try JSONDecoder().decode(HighPreparationChallenge.self, from: Data(bytes))
+        } catch {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 3)
+        }
         guard challenge.isValid else {
             throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 3)
         }
-        return challenge
+        return sameObject ? challenge : nil
+    }
+
+    private static func requireValidChallengeMetadata(_ info: stat) throws {
+        guard info.st_mode & S_IFMT == S_IFREG,
+            info.st_uid == getuid(), info.st_mode & 0o777 == 0o600,
+            info.st_size > 0, info.st_size <= maximumMessageBytes
+        else {
+            throw ProbeFailure(phase: "native_control", domain: "HighPreparationControl", code: 1)
+        }
+    }
+
+    private static func sameChallengeContentState(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
     }
 
     static func publish(_ value: [String: Any], fileName: String, directory: String) throws {
@@ -1225,6 +1262,61 @@ private enum HighPreparationControl {
         let originalMask = Darwin.umask(0)
         _ = Darwin.umask(originalMask)
         defer { _ = Darwin.umask(originalMask) }
+        let firstChallenge = challengeFixture(sequence: 1)
+        let nextChallenge = challengeFixture(sequence: 2)
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        let challengePath = directory.appendingPathComponent("challenge.json").path
+        let observedChallenge = try readChallenge(directory: directory.path) {
+            try writeChallengeFixture(nextChallenge, directory: directory)
+        }
+        guard observedChallenge?.sequence == nil,
+            try readChallenge(directory: directory.path)?.sequence == nextChallenge["sequence"] as? UInt64
+        else {
+            throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 17)
+        }
+        try FileManager.default.removeItem(atPath: challengePath)
+
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        try expectChallengeFailure(domain: "HighPreparationControl", code: 2) {
+            _ = try readChallenge(directory: directory.path) {
+                try overwriteChallengeFixture(nextChallenge, path: challengePath)
+            }
+        }
+
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        try expectChallengeFailure(domain: "HighPreparationControl", code: 1) {
+            _ = try readChallenge(directory: directory.path) {
+                try writeChallengeFixture(nextChallenge, directory: directory, permissions: 0o644)
+            }
+        }
+
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        try expectChallengeFailure(domain: "HighPreparationControl", code: 3) {
+            _ = try readChallenge(directory: directory.path) {
+                try writeChallengeBytesFixture(Data("not-json".utf8), directory: directory)
+            }
+        }
+
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        try expectChallengeFailure(domain: NSPOSIXErrorDomain, code: Int(ELOOP)) {
+            _ = try readChallenge(directory: directory.path) {
+                try FileManager.default.removeItem(atPath: challengePath)
+                try FileManager.default.createSymbolicLink(atPath: challengePath, withDestinationPath: "missing-target")
+            }
+        }
+
+        try FileManager.default.removeItem(atPath: challengePath)
+        guard try readChallenge(directory: directory.path) == nil else {
+            throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 18)
+        }
+        try writeChallengeFixture(firstChallenge, directory: directory)
+        try expectChallengeFailure(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) {
+            _ = try readChallenge(
+                directory: directory.path,
+                beforeOpen: {
+                    try FileManager.default.removeItem(atPath: challengePath)
+                })
+        }
         for mask in [mode_t(0o022), mode_t(0o077)] {
             _ = Darwin.umask(mask)
             let value: [String: Any] = ["schema_version": 1, "status": "playing", "sequence": Int(mask)]
@@ -1277,7 +1369,118 @@ private enum HighPreparationControl {
                 throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 15)
             }
         }
-        return ["high_preparation_control_publishes_private_atomic_samples_under_umask_022_and_077"]
+        return [
+            "high_preparation_control_discards_valid_atomic_replacement_then_reads_fresh_challenge",
+            "high_preparation_control_rejects_same_inode_content_mutation",
+            "high_preparation_control_rejects_invalid_permission_malformed_and_symlink_replacements",
+            "high_preparation_control_treats_initial_missing_as_empty_and_post_lstat_unlink_as_posix_enoent",
+            "high_preparation_control_publishes_private_atomic_samples_under_umask_022_and_077",
+        ]
+    }
+
+    private static func challengeFixture(sequence: UInt64) -> [String: Any] {
+        [
+            "schema_version": 1,
+            "sample_request_id": sequence == 1
+                ? "10000000-0000-4000-8000-000000000001" : "20000000-0000-4000-8000-000000000002",
+            "context_id": "30000000-0000-4000-8000-000000000003",
+            "challenge": sequence == 1
+                ? "40000000-0000-4000-8000-000000000004" : "50000000-0000-4000-8000-000000000005",
+            "reader_id": "60000000-0000-4000-8000-000000000006",
+            "session_generation": 1,
+            "sequence": sequence,
+            "validity_millis": 1_000,
+        ]
+    }
+
+    private static func expectChallengeFailure(
+        domain: String,
+        code: Int,
+        operation: () throws -> Void
+    ) throws {
+        do {
+            try operation()
+        } catch let failure as ProbeFailure {
+            guard failure.domain == domain, failure.code == code else { throw failure }
+            return
+        }
+        throw ProbeFailure(phase: "self_test", domain: "HighPreparationControl", code: 20)
+    }
+
+    private static func writeChallengeFixture(
+        _ value: [String: Any],
+        directory: URL,
+        permissions: mode_t = 0o600
+    ) throws {
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        try writeChallengeBytesFixture(data, directory: directory, permissions: permissions)
+    }
+
+    private static func writeChallengeBytesFixture(
+        _ data: Data,
+        directory: URL,
+        permissions: mode_t = 0o600
+    ) throws {
+        let temporary = directory.appendingPathComponent("challenge-fixture-\(UUID().uuidString).tmp")
+        let descriptor = temporary.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var descriptorIsOpen = true
+        defer {
+            if descriptorIsOpen { _ = Darwin.close(descriptor) }
+        }
+        guard Darwin.fchmod(descriptor, permissions) == 0 else {
+            throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { bytes in
+                Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw ProbeFailure(
+                    phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(count == 0 ? EIO : errno)
+                )
+            }
+            offset += count
+        }
+        guard Darwin.close(descriptor) == 0 else {
+            descriptorIsOpen = false
+            throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        descriptorIsOpen = false
+        let result = temporary.path.withCString { source in
+            directory.appendingPathComponent("challenge.json").path.withCString { destination in
+                Darwin.rename(source, destination)
+            }
+        }
+        guard result == 0 else {
+            throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    private static func overwriteChallengeFixture(_ value: [String: Any], path: String) throws {
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        let descriptor = path.withCString { Darwin.open($0, O_WRONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard descriptor >= 0 else {
+            throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { _ = Darwin.close(descriptor) }
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { bytes in
+                Darwin.pwrite(descriptor, bytes.baseAddress!.advanced(by: offset), data.count - offset, off_t(offset))
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw ProbeFailure(phase: "self_test", domain: NSPOSIXErrorDomain, code: Int(count == 0 ? EIO : errno))
+            }
+            offset += count
+        }
     }
 
     private static func requireDirectory(_ path: String) throws {

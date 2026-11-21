@@ -281,13 +281,16 @@ superseded_by:
   Deterministic loopback regressions exercise the actual playlist route with
   strong, missing and weak validators in independent fresh states, before any
   coordinator update; a missing or weak validator cannot register either map.
-- Sample publication may atomically replace the pathname between inspection
-  and open. Discard a valid replacement observation and retry within the same
-  existing challenge deadline. Recheck type, ownership, private mode and bounded
-  size on the opened descriptor; reject in-place length/mtime changes, unstable
-  reads and malformed content. Rename/unlink-only ctime or link-count changes
-  are not content-mutation evidence. Fixed-time regressions separate permitted
-  publication from invalid replacements without requiring wall-clock freshness.
+- Sample and challenge publication can atomically replace a pathname between
+  inspection and open. The reader skips a valid replacement observation and
+  reads again on an existing poll without extending the challenge deadline.
+  Validate regular-file type, ownership, private mode and bounded size on the
+  descriptor; reject in-place length/mtime changes, unstable reads and
+  malformed content. Rename/unlink-only ctime or link-count changes are not
+  content-mutation evidence. The Swift challenge reader distinguishes an
+  initially absent challenge from a failed open after inspection and reports
+  POSIX failures separately from validation errors. Deterministic regressions
+  exercise the replacement boundary without relying on wall-clock timing.
 - Eligibility requires a completed recovery-phase preparation, matching
   reader/context/session generation and target window, actual missing-to-readable
   cache transitions, completed source-range overlap and known player-request
