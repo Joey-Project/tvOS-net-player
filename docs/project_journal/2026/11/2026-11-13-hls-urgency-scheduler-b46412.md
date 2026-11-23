@@ -3,9 +3,9 @@ id: 20261113-b46412
 title: HLS Playback Urgency Scheduler
 status: active
 created: 2026-11-13
-updated: 2026-11-14
-branch: codex/hls-seek-recovery
-pr:
+updated: 2026-11-21
+branch: codex/hls-high-preparation-replacement
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/114
 supersedes: []
 superseded_by:
 ---
@@ -13,8 +13,8 @@ superseded_by:
 # HLS Playback Urgency Scheduler
 
 ## Summary
-- Continue from accepted master `ab8ebe3791f229aac6cbe153c294022f109efea9`
-  after PR #106. Preserve one player/item, default buffering, full-fill intent,
+- Continue from accepted master `c30f67d65b6a1468b0c6b3cdcf3a3872b36c3a82`
+  after PR #109. Preserve one player/item, default buffering, full-fill intent,
   media identity validation and the existing strict acceptance budgets.
 - Approved ordering is missing near-term video/audio first, eligible high
   preparation before far-future low, and eventual complete fills. Insufficient
@@ -28,8 +28,10 @@ superseded_by:
 - Timing-based range priority protects a rate-scaled 20-second wall-time window,
   then eligible preparation before verified far playback reads. Pending spans
   age into continuity service after 2 seconds without progress; later spans can
-  yield again after successful progress. Automatic high preparation is not
-  enabled by this slice. Content identity and cancellation checks are unchanged.
+  yield again after successful progress. PR #107 delivered this foundation;
+  accepted context updates now invoke the bounded high-preparation coordinator
+  through the separately specified admission path below. Readiness and catalog
+  queries remain read-only. Content identity and cancellation checks are unchanged.
 - The current tvOS `VideoPlayer` and macOS `AVPlayerView` expose native seek
   controls outside AppCore. A time-jump notification can arrive after the
   player starts fetching the new position; local invalidation or a queued
@@ -84,21 +86,76 @@ superseded_by:
   bounded recovery instead of claiming complete input interception.
 
 ## Next Steps
-1. Integrate high preparation after the reporting and request-urgency slice.
-   Keep the diagnostic's unverified input-route coverage explicit. Reuse exact-ID withdrawal
-   for context retirement without blocking native seeks or pretending a late
-   callback is a pre-seek barrier. Preserve conservative fallback for evidence
-   that cannot support safe optional work.
-2. Consume validated SIDX ranges, exact reader/session/generation, fresh safe
-   continuous buffers and fresh representation-bound video plus required-audio
-   supply. Revalidate before admission and each new origin transfer; preserve
-   same-flight foreground promotion and immediate priority cancellation.
-3. Require complete local CI, fixed-signed native3 with verified mute, GHA CI/UI,
+1. Broaden controlled source/buffer conditions and use eligible OFF/ON results
+   to guide further recovery-latency work. PR #98's earlier failed preparation
+   is not a negative latency result for the current reader-bound path. Missing
+   supply and ineligible preparation remain explicit, not successful comparisons.
+2. Validate the complete shared AppCore-to-service reporting loop separately
+   from the isolated harness's in-process generated service calls. Keep native
+   controls, unverified input-route coverage and the lack of an all-route
+   pre-seek barrier explicit; preserve exact-ID retirement and conservative fallback.
+3. Continue visible-upshift optimization only from measured evidence. Retain
+   one player/item, default buffering and useful low-quality buffers; do not
+   infer faster decoding from source requests or prepared cache bytes alone.
+4. Require complete local CI, fixed-signed native3 with verified mute, GHA CI/UI,
    independent released artifact checks, current-head GitHub Codex review and
-   all resolved conversations before normal SHA-bound protected merge. Do not
-   alter helpers, deadlines or assertions to make the candidate pass.
-4. Complete PR #98's separate bounded OFF/ON comparison after production wiring;
-   a failed preparation is not a measured negative latency result.
+   all resolved conversations for follow-up changes before normal SHA-bound
+   protected merge. Keep independent controls, playback deadlines and assertions
+   intact; the separately approved fixture-generation allowance is specified below.
+5. Reduce load sensitivity in pure timing and lifecycle tests with controlled
+   clocks and explicit synchronization. Keep functional correctness separate
+   from measured performance; real I/O and native playback retain bounded
+   observation windows and their independently approved acceptance budgets.
+
+## High Preparation Slice Design
+- Continue from PR #107's production reporting and bounded request urgency.
+  Accepted context updates are the production trigger; catalog and readiness
+  queries remain read-only. No new control-plane or persistence schema is needed.
+- Target only the explicitly selected compatible primary variant under the
+  effective playback policy. The reader context does not identify the currently
+  decoded rung; media GETs must not be presented as decoded-quality evidence.
+- Require an exact live reader/context/session generation, safe continuous
+  buffer, validated per-resource SIDX maps and fresh target-video plus required
+  audio origin supply. Missing or insufficient evidence defers optional work;
+  there is no implicit unbounded probe to manufacture fresh capacity evidence.
+- Optional preparation uses 1.5-times nominal rate-scaled supply headroom,
+  distinct from the request classifier's minimum continuity-supply threshold.
+  Honor the actual master advertisement and effective network policy rather
+  than enabling only a nondefault client preference or bypassing degradation.
+- Normal HTTP 206 supply observations capture suspend-inclusive request start,
+  first delivered body byte and body completion. Successful evidence is
+  published only after the existing content/control/durable-write checks;
+  publication queueing does not refresh the captured completion time. A
+  completed range transfer is not whole-resource cache completion. Discovery,
+  cache hits, truncation and cancellation do not mint fresh successful supply.
+- Protect 20 wall-clock seconds scaled by the actual playback rate. Select a
+  separate 20-media-second logical preparation window after the greater of that
+  boundary and the measured continuous buffered end. Keep existing low buffers.
+- Select whole overlapping fragments independently for video and audio so they
+  cover the same logical interval. Their SIDX boundaries need not coincide;
+  this fills cache bytes and does not perform a client seek or a stream handoff.
+- Keep the existing 15-second, 8-MiB logical, 16-MiB expanded/attempted and
+  128-request batch bounds. Bound single-flight state and task count, rate-limit
+  retries, and revalidate live ownership and supply before new origin transfers.
+  Closing, expiration, seeking, session replacement or loss of a safe buffer
+  withdraws optional work without delaying native navigation.
+- The new opt-in native comparison must use challenge-followed actual player
+  timing, real reader propagation and the production coordinator. OFF disables
+  only the new coordinator, not the reporting or request-urgency baseline. Each
+  mode gets a fresh player/cache/fixture; failed preparation is inconclusive.
+- The isolated harness may invoke the actual generated context-service methods
+  in process. This exercises their validation and production post-Update hook,
+  not external gRPC transport or the full shared AppCore reporting loop. Keep
+  those boundaries explicit; do not describe this as full macOS GUI acceptance.
+- Use identical existing origin-failure stimulus in both arms, with no direct
+  network primer. If a real native high request first restores fresh supply,
+  later preparation cannot explain that earlier request. Recovery-phase newly
+  readable preparation is needed for a valid recovery comparison; initial-only
+  or ineligible work does not produce a latency conclusion.
+- Report prepared/readable high bytes, first high player request and decoded
+  high frames separately. Preserve the original strict native3 regression
+  cases and accepted producer helpers. No quality forcing, buffer cap, seek,
+  second player or media-identity substitution may create the measured upshift.
 
 ## Production Slice Coverage
 - Shared-player tests exercise negotiated reader URLs, original source identity,
@@ -124,6 +181,236 @@ superseded_by:
   full macOS AppCore-to-server engagement or faster automatic quality recovery.
   Fixed-signed native media regression acceptance, production high preparation
   and the separate OFF/ON measurement retain their distinct evidence boundaries.
+
+## Artifact Baseline
+- Use accepted release `c30f67d65b6a1468b0c6b3cdcf3a3872b36c3a82` after
+  PR #109 for the successor artifact controls. Its manifest SHA-256 is
+  `29bb6429c3f16286be99f77056058b4e66bcffd7031924ca81cbfef5fc8b68e0`.
+- Preserve the preceding controls and independent helper-migration proof.
+  The successor is selected from the normally merged, independently accepted
+  release, not from this candidate checkout or its own artifact declarations.
+- Ordinary acceptance keeps both UI/media producers outside the genuine
+  base-to-head diff. The complete native3, UI5-per-platform and fixture4 contracts,
+  source identities, deadlines and assertions remain unchanged. Packaging the
+  successor does not establish this feature's native comparison result.
+
+## Native Sample Phase Binding
+- Startup adaptation can produce low-resolution frames before the source fault
+  starts. First-seen samples alone must not stand in for evidence collected
+  inside the controlled fault and recovery windows.
+- Explicit fixture phase markers gate only expectation sampling: retain initial
+  high frames, collect new low frames after the bad-high transition, and collect
+  recovered high frames only after recovery. Each stage still requires three
+  distinct actual decoded pixel buffers and their original numeric timestamps.
+- Keep the existing 6-second baseline, 45-second fault, 600/130/30-second native
+  profiles, default buffering and one player. Markers never force quality,
+  seek or playback, fabricate frames, or replace the frame-level evidence with
+  periodic timeline dimensions. Missing or invalid phase evidence fails closed.
+- Calls without the new bad-high marker retain their original behavior,
+  including standard recovery-only invocations. The OFF and ON comparison
+  arms use the same paired phase markers and fixed fault timeline. Preserve
+  the existing output contract and independently released artifact producers.
+  Correct phase sampling is not proof of faster recovery or of a fault causing
+  an earlier startup downshift.
+
+## Bounded Probe Failure Diagnostics
+- A nonzero native probe exit remains a failure. Preserve its process status
+  and bounded process diagnostics, and project only known status, error phase,
+  error domain and an integer error code from the already-redacted JSON.
+  Unknown or malformed values remain explicitly unknown; they do not become
+  successful playback, fabricated zero codes or complete arm reports.
+- Never copy raw probe JSON, localized messages, addresses, paths, headers or
+  unrelated private fields into the failure line. Keep the existing 64 KiB
+  input limit, truncation rejection and successful-result behavior unchanged.
+- Normalize the imported native-command error at the comparison runner's call
+  boundary so the existing failed-summary handler retains a bounded diagnostic
+  pointing to the retained native log. Do not expose arbitrary exception text
+  or alter complete/inconclusive results, cleanup or artifact limits.
+- These changes preserve evidence for a later authorized diagnosis; they do
+  not establish the cause of an earlier probe exit or enable an automatic
+  replay. Playback, fixture-generation and total budgets remain unchanged.
+
+## Bounded Cache Inspection Diagnostics
+- Preserve the existing typed initial and final cache-window inspection
+  results before reducing them to readability booleans or a generic defer
+  reason. Retain only state, the existing closed reason enum and checked bytes
+  from the inspection already performed; do not add cache I/O or alter any
+  readiness, scheduling, identity, cancellation or completion decision.
+- An absent observation means the inspection did not run. Keep that distinct
+  from an observed Unknown result, and preserve the existing readability
+  booleans and logical range counters. Final inspection evidence can be absent
+  when an early defer or cancellation prevents reaching that stage.
+- Private comparison reports may add optional initial_inspection and
+  final_inspection objects to bounded recent-plan summaries and the selected
+  plan. Each object has exactly state, reason and unsigned checked_bytes;
+  enum values use static names. Never include raw errors, paths, URLs, headers
+  or private identity fields in these objects. Legacy reports without the
+  extension remain readable; malformed extensions fail closed.
+- Diagnostic metadata cannot grant preparation eligibility, clear history
+  truncation or substitute for complete-window readability and causal transfer
+  witnesses. Preserve the 16-record history, one selected plan, byte/range
+  limits, native playback assertions and every production/test deadline.
+- Exercise inspector reasons and recorder/serialization boundaries with
+  deterministic fixtures and explicit synchronization. A classified defer is
+  diagnostic evidence, not a demonstrated fix or a faster-decoding result.
+
+## Live SIDX Readiness
+- The playlist path can validate an MP4 index with a separately fetched trailer
+  without persisting that trailer. With a fixed registered map and source
+  identity, a disk-only inspection reports `IndexUnavailable` without the
+  trailer, `NotCached` with just the trailer added, and `Readable` only after
+  the selected media is also verified. The diagnostic does not identify the
+  exact branch taken by every historical native deferral.
+- Use the current identity-bound SIDX map and selected spans for the
+  coordinator's initial and final inspections. Validate initialization and
+  overlapping durable extents under the existing locks and read budgets.
+  Missing media with a trusted index is eligible; stale maps, identity changes
+  and integrity failures are not. Keep the public disk-based readiness query
+  and the complete-cache integrity policy unchanged.
+- A loopback regression establishes measured supply without touching the
+  trailer, then submits in-process context-service updates and verifies that
+  preparation covers both selected spans while the trailers remain absent.
+  This proves preparation and cache readability, not an earlier visible
+  upshift in a native OFF/ON comparison.
+
+## Native Comparison Contract
+- `just test-media-high-preparation` is an opt-in, credential-free comparison
+  with fresh sequential OFF and ON fixture/cache/player instances. The existing
+  capacity/failure stimulus and 600-second automatic phase are identical; OFF
+  disables only the preparation coordinator, not context or reader scheduling.
+- Both arms attach the same complete synthetic content identity before session
+  publication, while retaining distinct session and reader bindings. Fixture
+  construction rejects missing, incomplete or unexpected identity before player
+  startup. Pure regressions exercise the same constructor used by the native
+  arms; production identity requirements and preparation eligibility are unchanged.
+- Real generated service methods run in process and consume a new native
+  challenge-followed timing sample for every update. This does not establish
+  external gRPC transport, the complete AppCore reporter loop, GUI interaction,
+  audible audio, or the absence of visible black frames.
+- Reader-bound playlist preflight preserves the legacy canonical validation.
+  It separately checks every selected playlist URI and range against that
+  canonical content, allowing only the exact expected reader association.
+  Validation-only normalization never rewrites the served or player URL;
+  missing, duplicated, mismatched or unrelated query fields remain failures.
+- Immutable synthetic origin resources publish a strong ETag derived from the
+  resource name and complete file contents. Successful full, range and HEAD
+  responses share that validator; production source-binding checks are unchanged.
+  Preparation preflight requires both target-video and required-audio SIDX maps
+  for the current session generation before starting the native control phase.
+  Deterministic loopback regressions exercise the actual playlist route with
+  strong, missing and weak validators in independent fresh states, before any
+  coordinator update; a missing or weak validator cannot register either map.
+- Sample and challenge publication can atomically replace a pathname between
+  inspection and open. The reader skips a valid replacement observation and
+  reads again on an existing poll without extending the challenge deadline.
+  Validate regular-file type, ownership, private mode and bounded size on the
+  descriptor; reject in-place length/mtime changes, unstable reads and
+  malformed content. Rename/unlink-only ctime or link-count changes are not
+  content-mutation evidence. The Swift challenge reader distinguishes an
+  initially absent challenge from a failed open after inspection and reports
+  POSIX failures separately from validation errors. Deterministic regressions
+  exercise the replacement boundary without relying on wall-clock timing.
+- Eligibility requires a completed recovery-phase preparation, matching
+  reader/context/session generation and target window, actual missing-to-readable
+  cache transitions, completed source-range overlap and known player-request
+  overlap. Initial-only, already-readable, failed, stale or ambiguous cases are
+  inconclusive, not a successful comparison or evidence of slower preparation.
+- Capture the original before-state when a matching plan is admitted, even if
+  its spawned task has not recorded an origin request yet. Keep that snapshot
+  as the plan progresses and the native buffered end advances; admission alone
+  never satisfies completion, readability or transfer-overlap eligibility.
+- Retain a bounded, sanitized category for the first failed control update.
+  Diagnostic snapshots taken afterward are not the original failing sample;
+  unknown metadata stays unknown. Diagnostics never make a rejected update
+  acceptable or replace the required complete OFF/ON comparison.
+- Arm reports separately project the coordinator's existing admission,
+  completion and deferral counters plus at most 16 recent plan summaries.
+  These logical observations never change eligibility or expose raw reader
+  bindings, media URIs or paths. Projection truncation is explicit; source
+  history completeness remains unknown. Schema-1 reports without this optional
+  diagnostic object retain unknown diagnostics, not fabricated zero counts.
+- Integration-test terminal-observation timeouts report aggregate counters and
+  at most eight sanitized plan summaries, without raw media addresses or
+  request headers. The approved 16-second positive observation and completed-plan,
+  before-readability and aligned audio/video range assertions remain unchanged.
+- No matching exact before-state plan does not prove no coordinator admission
+  or no media transfer. Associated transfer arrays can be empty because no
+  qualifying plan was selected, while the bounded event rings still observed
+  traffic. Counter summaries, matched-plan evidence and wire transfers remain
+  separate observations.
+- Preserve up to one complete origin-body and one reader-bound ingress
+  witness per retained exact plan during the native comparison. Longer traffic
+  can otherwise evict positive overlap evidence before the final assessment.
+  Keep the existing ring and plan caps and the original admission, identity,
+  timing and range checks. A missing witness under truncation remains unknown;
+  retaining a witness does not establish exclusive coordinator attribution.
+- A framed HTTP response can finish without a final stream poll for EOF. The
+  fixture records complete source emission only for an exact 206 response
+  whose single Content-Range and Content-Length agree with the requested
+  range and actual bytes. Drop after all framed bytes have been emitted can
+  establish completion; early cancellation, truncation, stream errors,
+  oversize bodies and ambiguous framing cannot. A loopback HTTP regression
+  exercises the framed path; source emission still does not prove client
+  receipt or replace any existing playback or eligibility evidence.
+- A structured cache read returning missing does not prove zero physical byte
+  coverage. A stable exact range changing from missing to fully readable proves
+  a positive lower bound on newly readable bytes, not an exact downloaded-byte
+  delta. Foreground requests may share the same range flight; exclusive
+  attribution remains unproven. Logical resource counts are not origin attempts.
+- Retain first recovered-high request, completed source body, prepared window
+  and decoded-high observations separately. Preparation after an already-issued
+  high request cannot explain that request. No faster-selection claim follows
+  solely from a completed plan or cache-readability change.
+- Measure time from each fixture's origin recovery to its first and third
+  distinct recovered-high decoded frames. Use only elapsed time within each
+  arm, not cross-arm absolute clocks or time since the first high request.
+  Retain bounded playback samples to compare progress over the same elapsed
+  window through both observed upshifts. Missing, malformed, truncated or
+  insufficient coverage does not establish continuity; interval samples and
+  access-log counters cannot rule out brief stalls or black frames. These
+  measurements do not change preparation eligibility or the native gates,
+  and do not establish exclusive attribution to the coordinator.
+- Keep pinned signing, stable executables, verified system/player mute, bounded
+  output and deadlines. Standard native3 and accepted producer helpers remain
+  unchanged; the new comparison does not replace those regression gates.
+- Continuous-mode verification captures actual player mute and automatic-waiting
+  properties before cleanup, then serializes that snapshot. The signed probe
+  self-test exercises capture, release and serialization; a missing capture
+  cannot report either property as verified. The comparison preflight requires
+  this lifecycle regression before starting native media work.
+- Control publication uses a fully written, current-owner regular file with
+  exact `0600` permissions before atomic replacement in the private directory.
+  The publisher self-test covers both `022` and `077` umasks, and comparison
+  preflight requires it. The strict reader contract remains unchanged.
+- The opt-in comparison entry is outside the legacy native regression module's
+  test-name prefix. Discovery preflight checks the exact opt-in selector and
+  unchanged three-case legacy ignored-test selection before playback. Missing
+  opt-in configuration still fails; ordinary regression runs never select it.
+- Each opt-in arm and the legacy long-recovery fixture allow 240 seconds for
+  FFmpeg generation. Joey explicitly approved extending the legacy allowance
+  after it also exceeded 120 seconds before playback. Both opt-in arms use the
+  same limit and report it. Short-fixture generation remains at 100 seconds;
+  inspection, playback, faults, assertions, output, compilation and overall
+  budgets are unchanged. A fixture timeout is not an ABR measurement.
+
+## Load-Tolerant Test Timing
+- The deadline/cancellation retry fixture keeps its gated origin, terminal
+  deadline outcome, released permit/reader/flight checks and successful retry
+  assertions. Its retry observation covers the existing 15-second batch limit
+  instead of imposing a shorter 4-second deadline. Bounded phase diagnostics
+  and exact cached-byte readback distinguish failure evidence from completion;
+  this does not change production limits or prove that host load caused a failure.
+- The successful-live-context fixture sends generated timing updates every two
+  seconds instead of allowing its five-second context to expire during I/O.
+  The heartbeat ends with the observation future; cancellation tests retain
+  their original expiry, seek and generation-replacement expectations.
+- The positive preparation case observes for 16 seconds, covering the existing
+  15-second production job deadline without extending it. It still requires
+  `Completed`, the same audio/video window and readable cached resources.
+- Sustained host load is not itself proof of a failure's cause. Pure clock logic
+  should use controlled time where possible; real transfer and native-media
+  acceptance keep actual elapsed-time measurements and finite deadlines. Do not
+  use a blanket timeout increase to convert incomplete work into a pass.
 
 ## Public API Boundary
 - The Xcode 26.5 macOS `AVPlayerViewDelegate` contract has fullscreen and

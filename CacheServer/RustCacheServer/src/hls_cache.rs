@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch},
 };
 
 use crate::{
@@ -61,7 +61,7 @@ use crate::{
     },
     playback_policy::PlaybackPolicy,
     playback_request_urgency::PlaybackSidxMap,
-    suspend_clock::{SuspendClock, SystemSuspendClock},
+    suspend_clock::{SuspendClock, SuspendTimestamp, SystemSuspendClock},
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
         LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
@@ -98,6 +98,19 @@ const MAX_PLAYBACK_SIDX_MAP_BYTES: usize = 16 * 1024 * 1024;
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RangeFreshTiming {
+    started_at: Option<SuspendTimestamp>,
+    first_byte_at: Option<SuspendTimestamp>,
+    completed_at: Option<SuspendTimestamp>,
+}
+
+struct ObservedRangeBody {
+    bytes: Vec<u8>,
+    timing: RangeFreshTiming,
+}
+
+#[cfg(test)]
 type RangeChunkFetch = (
     Vec<u8>,
     String,
@@ -105,6 +118,15 @@ type RangeChunkFetch = (
     Option<String>,
     Duration,
     PersistedRangeManifest,
+);
+type ObservedRangeChunkFetch = (
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<String>,
+    Duration,
+    PersistedRangeManifest,
+    RangeFreshTiming,
 );
 type HlsRangeCompletion =
     Pin<Box<dyn Future<Output = Result<HlsRangePreparation, HlsRangeError>> + Send>>;
@@ -190,6 +212,12 @@ impl std::error::Error for PlaybackPreparationError {
 
 pub(crate) struct PlaybackPreparationRequest<'a> {
     pub(crate) resource: &'a HlsMediaResource,
+    pub(crate) requested: Range<u64>,
+}
+
+pub(crate) struct PlaybackPreparationReadinessTarget<'a> {
+    pub(crate) resource: &'a HlsMediaResource,
+    pub(crate) map: Arc<PlaybackSidxMap>,
     pub(crate) requested: Range<u64>,
 }
 
@@ -302,6 +330,21 @@ struct PlaybackSidxMapEntry {
     source_origin: String,
     strong_etag: String,
     map: Arc<PlaybackSidxMap>,
+}
+
+struct OwnedPlaybackPreparationReadinessTarget {
+    resource: HlsMediaResource,
+    map: Arc<PlaybackSidxMap>,
+    requested: Range<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaybackSidxReadinessBinding {
+    total_length: u64,
+    prefix_length: u64,
+    prefix_sha256: String,
+    source_origin: String,
+    strong_etag: String,
 }
 
 pub(crate) struct HlsRangeEnsure {
@@ -776,7 +819,7 @@ impl HlsCacheStore {
         }
     }
 
-    fn validate_playback_preparation_batch(
+    pub(crate) fn validate_playback_preparation_batch(
         &self,
         batch: &PlaybackPreparationBatch<'_>,
     ) -> Result<(), PlaybackPreparationError> {
@@ -1109,23 +1152,10 @@ impl HlsCacheStore {
             resources.push(audio.clone());
         }
         resources.sort_by(|left, right| left.id.cmp(&right.id));
-        if resources.windows(2).any(|pair| pair[0].id == pair[1].id) {
-            return CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 0);
-        }
-        let mut publication_guards = Vec::with_capacity(resources.len());
-        for resource in &resources {
-            let key = match self.range_resource_key(session_id, resource) {
-                Ok(key) => key,
-                Err(_) => {
-                    return CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 0);
-                }
-            };
-            let lock = self.range_publication_lock(&key);
-            match lock.try_lock_owned() {
-                Ok(guard) => publication_guards.push(guard),
-                Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
-            }
-        }
+        let publication_guards = match self.try_lock_readiness_resources(session_id, &resources) {
+            Ok(guards) => guards,
+            Err(reason) => return CacheWindowInspection::unknown(reason, 0),
+        };
 
         let store = self.clone();
         let session_id = session_id.to_owned();
@@ -1156,6 +1186,114 @@ impl HlsCacheStore {
         }
     }
 
+    pub(crate) async fn inspect_cached_playback_preparation_window(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        variant: &HlsVariant,
+        window: PlaybackWindow,
+        targets: &[PlaybackPreparationReadinessTarget<'_>],
+    ) -> CacheWindowInspection {
+        if !window.is_valid() {
+            return CacheWindowInspection::unknown(CacheWindowReason::OutOfRange, 0);
+        }
+        let mut resources = vec![variant.video.clone()];
+        if let Some(audio) = &variant.audio {
+            resources.push(audio.clone());
+        }
+        resources.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut ordered_targets = targets.iter().collect::<Vec<_>>();
+        ordered_targets.sort_by(|left, right| left.resource.id.cmp(&right.resource.id));
+        if resources.len() != ordered_targets.len()
+            || resources.windows(2).any(|pair| pair[0].id == pair[1].id)
+            || ordered_targets
+                .windows(2)
+                .any(|pair| pair[0].resource.id == pair[1].resource.id)
+            || resources
+                .iter()
+                .zip(&ordered_targets)
+                .any(|(resource, target)| resource != target.resource)
+        {
+            return CacheWindowInspection::unknown(CacheWindowReason::IdentityChanged, 0);
+        }
+
+        let permit = match Arc::clone(&self.readiness_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
+        };
+        let activity = match self
+            .range_cache
+            .enter(session_id, HlsRangePriority::Background)
+        {
+            Ok(activity) => activity,
+            Err(_) => return CacheWindowInspection::unknown(CacheWindowReason::Busy, 0),
+        };
+        let publication_guards = match self.try_lock_readiness_resources(session_id, &resources) {
+            Ok(guards) => guards,
+            Err(reason) => return CacheWindowInspection::unknown(reason, 0),
+        };
+        let owned_targets = ordered_targets
+            .into_iter()
+            .map(|target| OwnedPlaybackPreparationReadinessTarget {
+                resource: target.resource.clone(),
+                map: Arc::clone(&target.map),
+                requested: target.requested.clone(),
+            })
+            .collect::<Vec<_>>();
+        let store = self.clone();
+        let session_id = session_id.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _activity = activity;
+            let _publication_guards = publication_guards;
+            #[cfg(test)]
+            {
+                let hook = {
+                    store
+                        .readiness_job_hook
+                        .lock()
+                        .expect("readiness test hook lock should not be poisoned")
+                        .clone()
+                };
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            store.inspect_cached_playback_preparation_window_sync(
+                &session_id,
+                session_generation,
+                window,
+                &owned_targets,
+            )
+        })
+        .await
+        {
+            Ok(inspection) => inspection,
+            Err(_) => CacheWindowInspection::unknown(CacheWindowReason::IoFailure, 0),
+        }
+    }
+
+    fn try_lock_readiness_resources(
+        &self,
+        session_id: &str,
+        resources: &[HlsMediaResource],
+    ) -> Result<Vec<OwnedMutexGuard<()>>, CacheWindowReason> {
+        if resources.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let mut publication_guards = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let key = self
+                .range_resource_key(session_id, resource)
+                .map_err(|_| CacheWindowReason::IdentityChanged)?;
+            match self.range_publication_lock(&key).try_lock_owned() {
+                Ok(guard) => publication_guards.push(guard),
+                Err(_) => return Err(CacheWindowReason::Busy),
+            }
+        }
+        Ok(publication_guards)
+    }
+
     fn inspect_cached_playback_window_sync(
         &self,
         session_id: &str,
@@ -1181,6 +1319,215 @@ impl HlsCacheStore {
         } else {
             CacheWindowInspection::readable(budget.checked_bytes)
         }
+    }
+
+    fn inspect_cached_playback_preparation_window_sync(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        window: PlaybackWindow,
+        targets: &[OwnedPlaybackPreparationReadinessTarget],
+    ) -> CacheWindowInspection {
+        let mut budget = HlsReadinessBudget::default();
+        let mut requested_bytes = 0_u64;
+        let mut missing = false;
+        for target in targets {
+            let Some(length) = target.requested.end.checked_sub(target.requested.start) else {
+                return CacheWindowInspection::unknown(
+                    CacheWindowReason::IndexUnavailable,
+                    budget.checked_bytes,
+                );
+            };
+            requested_bytes = match requested_bytes.checked_add(length) {
+                Some(total) if total <= HLS_READINESS_BUDGET_BYTES => total,
+                _ => {
+                    return CacheWindowInspection::unknown(
+                        CacheWindowReason::BudgetExceeded,
+                        budget.checked_bytes,
+                    );
+                }
+            };
+            let target_missing = match self.inspect_preparation_target_sync(
+                session_id,
+                session_generation,
+                target,
+                window,
+                &mut budget,
+            ) {
+                Ok(missing) => missing,
+                Err(reason) => {
+                    return CacheWindowInspection::unknown(reason, budget.checked_bytes);
+                }
+            };
+            missing |= target_missing;
+        }
+        if missing {
+            CacheWindowInspection::missing(CacheWindowReason::NotCached, budget.checked_bytes)
+        } else {
+            CacheWindowInspection::readable(budget.checked_bytes)
+        }
+    }
+
+    fn inspect_preparation_target_sync(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        target: &OwnedPlaybackPreparationReadinessTarget,
+        window: PlaybackWindow,
+        budget: &mut HlsReadinessBudget,
+    ) -> Result<bool, CacheWindowReason> {
+        let binding = self.playback_sidx_readiness_binding(
+            session_id,
+            session_generation,
+            &target.resource,
+            &target.map,
+        )?;
+        let Some(selected) = target
+            .map
+            .preparation_range_for_window(window.start_seconds, window.end_seconds())
+        else {
+            return Err(CacheWindowReason::IndexUnavailable);
+        };
+        let mut expected = selected.bytes.clone();
+        if target.map.media_end_seconds() == Some(selected.end_seconds) {
+            expected.end = binding.total_length;
+        }
+        if expected != target.requested
+            || expected.start >= expected.end
+            || expected.end > binding.total_length
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+
+        let loaded = self
+            .load_range_manifest_for_readiness(session_id, &target.resource, budget)?
+            .ok_or(CacheWindowReason::IndexUnavailable)?;
+        let manifest = &loaded.manifest;
+        if manifest.resource_id != target.resource.id
+            || manifest.total_length != Some(binding.total_length)
+            || manifest.prefix_length != binding.prefix_length
+            || manifest.prefix_sha256.as_deref() != Some(binding.prefix_sha256.as_str())
+            || manifest.strong_etag.as_deref() != Some(binding.strong_etag.as_str())
+            || manifest.validator_origin.as_deref() != Some(binding.source_origin.as_str())
+            || !manifest.validated_origins.iter().any(|origin| {
+                origin.origin == binding.source_origin
+                    && origin.prefix_sha256 == binding.prefix_sha256
+                    && origin.strong_etag.as_deref() == Some(binding.strong_etag.as_str())
+            })
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        if binding.prefix_length == 0
+            || binding.prefix_length > binding.total_length
+            || binding.prefix_length > HLS_READINESS_MAX_SIDX_PREFIX_BYTES
+            || binding.prefix_length > (HLS_READINESS_MAX_BUFFER_BYTES / 4) as u64
+            || !range_is_covered(&manifest.extents, 0..binding.prefix_length)
+        {
+            return Err(
+                if binding.prefix_length > HLS_READINESS_MAX_SIDX_PREFIX_BYTES
+                    || binding.prefix_length > (HLS_READINESS_MAX_BUFFER_BYTES / 4) as u64
+                {
+                    CacheWindowReason::BudgetExceeded
+                } else {
+                    CacheWindowReason::IndexUnavailable
+                },
+            );
+        }
+
+        let bridge_end = (selected.start_seconds == 0.0).then_some(selected.bytes.start);
+        if let Some(bridge_end) = bridge_end
+            && bridge_end > 0
+            && !range_is_covered(&manifest.extents, 0..bridge_end)
+        {
+            return Err(CacheWindowReason::IndexUnavailable);
+        }
+        let mut ranges = vec![0..binding.prefix_length, target.requested.clone()];
+        if let Some(bridge_end) = bridge_end.filter(|end| *end > binding.prefix_length) {
+            ranges.push(binding.prefix_length..bridge_end);
+        }
+        let (outputs, missing) = self.read_checkpoint_ranges_for_readiness(
+            session_id,
+            &target.resource,
+            &loaded,
+            &ranges,
+            &[0],
+            budget,
+        )?;
+        let prefix = outputs
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(CacheWindowReason::IndexUnavailable)?;
+        if sha256_hex(&prefix) != binding.prefix_sha256 {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        let initialization_length =
+            mp4_initialization_length(&prefix).ok_or(CacheWindowReason::IndexUnavailable)?;
+        if initialization_length == 0
+            || initialization_length > binding.prefix_length
+            || initialization_length >= binding.total_length
+            || selected.bytes.start < initialization_length
+        {
+            return Err(CacheWindowReason::IndexUnavailable);
+        }
+        if !matches!(
+            self.playback_sidx_readiness_binding(
+                session_id,
+                session_generation,
+                &target.resource,
+                &target.map,
+            ),
+            Ok(current) if current == binding
+        ) {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        Ok(missing)
+    }
+
+    fn playback_sidx_readiness_binding(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        resource: &HlsMediaResource,
+        expected_map: &Arc<PlaybackSidxMap>,
+    ) -> Result<PlaybackSidxReadinessBinding, CacheWindowReason> {
+        let key = PlaybackSidxMapKey {
+            session_id: session_id.to_owned(),
+            resource_id: resource.id.clone(),
+        };
+        let maps = self
+            .playback_sidx_maps
+            .lock()
+            .expect("HLS playback SIDX map registry poisoned");
+        let Some(entry) = maps.get(&key) else {
+            return Err(CacheWindowReason::IndexUnavailable);
+        };
+        if entry.session_generation != session_generation
+            || !Arc::ptr_eq(&entry.map, expected_map)
+            || entry.cache_key != resource.request.cache_key
+            || entry.total_length != entry.map.total_length()
+            || resource
+                .request
+                .size
+                .is_some_and(|total| total != entry.total_length)
+            || !strong_etag_string_is_valid(&entry.strong_etag)
+            || media_url_origin(&entry.source_origin).as_deref()
+                != Some(entry.source_origin.as_str())
+            || !std::iter::once(resource.request.url.as_str())
+                .chain(resource.request.backup_urls.iter().map(String::as_str))
+                .any(|candidate| {
+                    media_url_origin(candidate).as_deref() == Some(entry.source_origin.as_str())
+                })
+        {
+            return Err(CacheWindowReason::IdentityChanged);
+        }
+        Ok(PlaybackSidxReadinessBinding {
+            total_length: entry.total_length,
+            prefix_length: entry.prefix_length,
+            prefix_sha256: entry.prefix_sha256.clone(),
+            source_origin: entry.source_origin.clone(),
+            strong_etag: entry.strong_etag.clone(),
+        })
     }
 
     fn inspect_resource_window_sync(
@@ -4514,15 +4861,15 @@ impl HlsCacheStore {
         resource: &HlsMediaResource,
         range: Range<u64>,
         mut fetch: F,
-    ) -> Result<(u64, RangeChunkFetch), HlsRangeError>
+    ) -> Result<(u64, ObservedRangeChunkFetch), HlsRangeError>
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = Result<RangeChunkFetch, HlsRangeError>>,
+        Fut: Future<Output = Result<ObservedRangeChunkFetch, HlsRangeError>>,
     {
         let mut fetched = fetch().await?;
         let mut retried = false;
         loop {
-            let (bytes, final_url, etag, last_modified, _, expected) = &fetched;
+            let (bytes, final_url, etag, last_modified, _, expected, _) = &fetched;
             match self
                 .commit_range_extent_with_failure(
                     session_id,
@@ -6495,7 +6842,8 @@ impl HlsCacheStore {
                         )
                     })
                     .await;
-                let (durable_bytes, (bytes, final_url, _, _, elapsed, _)) = match committed {
+                let (durable_bytes, (bytes, final_url, _, _, elapsed, _, timing)) = match committed
+                {
                     Ok(committed) => committed,
                     Err(HlsRangeError::QuotaExceeded)
                         if maintenance_passes < RANGE_MAINTENANCE_PASSES_PER_ATTEMPT =>
@@ -6530,17 +6878,29 @@ impl HlsCacheStore {
                 drop(admission);
                 drop(permit);
                 progress(durable_bytes);
-                self.record_cdn_observation(
-                    resource,
-                    &final_url,
-                    passive_cache_observation(
-                        CdnObservationOutcome::Partial,
-                        bytes.len() as u64,
-                        Some(elapsed),
-                        Some(elapsed),
-                        Some(true),
-                    ),
+                let first_byte_latency = timing
+                    .started_at
+                    .zip(timing.first_byte_at)
+                    .and_then(|(started, first_byte)| first_byte.checked_elapsed_since(started));
+                let mut observation = passive_cache_observation(
+                    CdnObservationOutcome::Complete,
+                    bytes.len() as u64,
+                    Some(elapsed),
+                    first_byte_latency,
+                    Some(true),
                 );
+                if self
+                    .range_cache
+                    .check_priority_control(&chunk_key, current_priority, control)
+                    .is_ok()
+                {
+                    observation = observation.with_fresh_timing(
+                        timing.started_at,
+                        timing.first_byte_at,
+                        timing.completed_at,
+                    );
+                }
+                self.record_cdn_observation(resource, &final_url, observation);
                 let maintenance_budget = if current_priority == HlsRangePriority::Background {
                     RANGE_MAINTENANCE_PASSES_PER_ATTEMPT
                 } else {
@@ -6725,6 +7085,35 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        self.read_range_body_observed_with_resolver(
+            response,
+            expected_length,
+            key,
+            priority,
+            priority_resolver,
+            pending_since,
+            control,
+            None,
+        )
+        .await
+        .map(|observed| observed.bytes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_range_body_observed_with_resolver<F>(
+        &self,
+        response: reqwest::Response,
+        expected_length: u64,
+        key: &RangeChunkKey,
+        priority: HlsRangePriority,
+        priority_resolver: Option<&HlsRangePriorityResolver>,
+        pending_since: Instant,
+        control: &F,
+        started_at: Option<SuspendTimestamp>,
+    ) -> Result<ObservedRangeBody, HlsRangeError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
         if response
             .content_length()
             .is_some_and(|length| length != expected_length)
@@ -6738,6 +7127,8 @@ impl HlsCacheStore {
         })?;
         let mut bytes = Vec::with_capacity(capacity);
         let mut stream = response.bytes_stream();
+        let suspend_clock = SystemSuspendClock;
+        let mut first_byte_at = None;
         loop {
             let current_priority = priority_resolver.map_or(priority, |resolver| {
                 self.range_cache
@@ -6751,6 +7142,9 @@ impl HlsCacheStore {
             };
             let Some(next) = next else { break };
             let chunk = next.map_err(|error| HlsRangeError::Network(error.without_url()))?;
+            if !chunk.is_empty() && first_byte_at.is_none() {
+                first_byte_at = suspend_clock.now();
+            }
             if bytes.len().saturating_add(chunk.len()) > capacity {
                 return Err(HlsRangeError::InvalidResponse(
                     "upstream range body exceeds requested length".to_owned(),
@@ -6763,7 +7157,15 @@ impl HlsCacheStore {
                 "upstream range body is shorter than requested".to_owned(),
             ));
         }
-        Ok(bytes)
+        let completed_at = suspend_clock.now();
+        Ok(ObservedRangeBody {
+            bytes,
+            timing: RangeFreshTiming {
+                started_at,
+                first_byte_at,
+                completed_at,
+            },
+        })
     }
 
     // Candidate ranking depends on both chunk index and key while control remains caller-owned.
@@ -6827,6 +7229,11 @@ impl HlsCacheStore {
             readiness,
         )
         .await
+        .map(
+            |(bytes, final_url, etag, last_modified, elapsed, manifest, _)| {
+                (bytes, final_url, etag, last_modified, elapsed, manifest)
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6843,7 +7250,7 @@ impl HlsCacheStore {
         pending_since: Instant,
         flight_readiness: watch::Sender<Option<HlsRangeReadiness>>,
         readiness: Option<watch::Sender<Option<HlsRangeReadiness>>>,
-    ) -> Result<RangeChunkFetch, HlsRangeError>
+    ) -> Result<ObservedRangeChunkFetch, HlsRangeError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
@@ -6937,6 +7344,7 @@ impl HlsCacheStore {
             }
 
             let started = Instant::now();
+            let suspend_started_at = SystemSuspendClock.now();
             let response = match self
                 .send_range_request_with_resolver(
                     client,
@@ -7165,8 +7573,8 @@ impl HlsCacheStore {
             if let Some(sender) = readiness.as_ref() {
                 sender.send_replace(Some(outcome));
             }
-            let body = match self
-                .read_range_body_with_resolver(
+            let observed_body = match self
+                .read_range_body_observed_with_resolver(
                     response,
                     length,
                     chunk_key,
@@ -7174,6 +7582,7 @@ impl HlsCacheStore {
                     priority_resolver,
                     pending_since,
                     control,
+                    suspend_started_at,
                 )
                 .await
             {
@@ -7210,12 +7619,13 @@ impl HlsCacheStore {
                 modified = loaded.manifest.last_modified.clone();
             }
             return Ok((
-                body,
+                observed_body.bytes,
                 final_url,
                 etag,
                 modified,
                 started.elapsed(),
                 loaded.manifest,
+                observed_body.timing,
             ));
         }
         Err(if range_unsupported_seen {
@@ -12479,7 +12889,15 @@ mod tests {
                                 "{case}"
                             );
                         }
-                        Ok(response)
+                        Ok((
+                            response.0,
+                            response.1,
+                            response.2,
+                            response.3,
+                            response.4,
+                            response.5,
+                            RangeFreshTiming::default(),
+                        ))
                     }
                 },
             );
@@ -12524,7 +12942,7 @@ mod tests {
                 .expect("new validator should publish after byte validation");
 
             release_old_response.notify_one();
-            let (durable_bytes, (published, _, published_etag, _, _, _)) =
+            let (durable_bytes, (published, _, published_etag, _, _, _, _)) =
                 fill.await.unwrap_or_else(|error| {
                     panic!("fresh response should publish for {case}: {error}")
                 });
@@ -12646,7 +13064,15 @@ mod tests {
                             .await
                             .expect("second verified validator change should publish");
                     }
-                    Ok(response)
+                    Ok((
+                        response.0,
+                        response.1,
+                        response.2,
+                        response.3,
+                        response.4,
+                        response.5,
+                        RangeFreshTiming::default(),
+                    ))
                 }
             },
         );
@@ -13237,6 +13663,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SampleResponseFault {
         ShortBody,
+        TruncatedBody,
         WrongRange,
         Status(StatusCode),
     }
@@ -13283,7 +13710,13 @@ mod tests {
                 .body(Body::empty())
                 .expect("sample status response should build");
         }
-        if is_sample && matches!(fixture.sample_fault, Some(SampleResponseFault::ShortBody)) {
+        let expected_body_length = body.len();
+        if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::ShortBody | SampleResponseFault::TruncatedBody)
+            )
+        {
             body.pop();
         }
         let (reported_start, reported_end) =
@@ -13292,6 +13725,15 @@ mod tests {
             } else {
                 (start, end)
             };
+        let declared_body_length = if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::TruncatedBody)
+            ) {
+            expected_body_length
+        } else {
+            body.len()
+        };
         let (prefix_etag, tail_etag) = if fixture
             .etag_epoch
             .as_ref()
@@ -13302,9 +13744,21 @@ mod tests {
             (fixture.prefix_etag, fixture.tail_etag)
         };
         let etag = if start == 0 { prefix_etag } else { tail_etag };
+        let response_body = if is_sample
+            && matches!(
+                fixture.sample_fault,
+                Some(SampleResponseFault::TruncatedBody)
+            ) {
+            Body::from_stream(futures_util::stream::iter([
+                Ok::<_, std::io::Error>(body),
+                Err(std::io::Error::other("fixture truncated the range body")),
+            ]))
+        } else {
+            Body::from(body)
+        };
         Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(CONTENT_LENGTH, body.len().to_string())
+            .header(CONTENT_LENGTH, declared_body_length.to_string())
             .header(
                 reqwest::header::CONTENT_RANGE,
                 format!(
@@ -13313,7 +13767,7 @@ mod tests {
                 ),
             )
             .header(reqwest::header::ETAG, etag)
-            .body(Body::from(body))
+            .body(response_body)
             .expect("range response should build")
     }
 
@@ -13378,6 +13832,41 @@ mod tests {
         )
         .await;
         (url, task, request_count)
+    }
+
+    async fn seed_origin_supply_test_prefix(
+        store: &HlsCacheStore,
+        session: &HlsPlaybackSession,
+        body: &[u8],
+        source_url: &str,
+    ) {
+        let resource = &session.variant.video;
+        let key = store
+            .range_resource_key(&session.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&session.id, resource, &key)
+            .expect("range manifest should be initialized");
+        let loaded = store
+            .publish_range_manifest(&session.id, resource, loaded, |manifest| {
+                manifest.total_length = Some(body.len() as u64);
+            })
+            .await
+            .expect("range total should be checkpointed");
+        let prefix_end = RANGE_STARTUP_CHUNK_BYTES.min(body.len() as u64);
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &loaded.manifest,
+                0..prefix_end,
+                &body[..prefix_end as usize],
+                source_url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("startup prefix should be seeded");
     }
 
     async fn start_switchable_etag_range_upstream(
@@ -14392,6 +14881,216 @@ mod tests {
                 .range_cache
                 .enter(&session.id, HlsRangePriority::Foreground)
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_206_range_records_origin_supply_after_durable_publication() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-supply", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+
+        let ready = store
+            .ensure_resource_range(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                requested.clone(),
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("uncached range should be supplied over HTTP 206");
+
+        assert_eq!(requested, ready.requested);
+        assert_eq!(1, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            body[requested.start as usize..requested.end as usize],
+            store
+                .read_durable_range(&session.id, &session.variant.video, requested)
+                .await
+                .expect("published range should be readable")
+                .expect("range should be durable")
+        );
+        assert!(
+            store
+                .cached_resource(&session.id, &session.variant.video.id)
+                .is_none(),
+            "a complete 206 transfer must not mark the whole resource cached"
+        );
+        let supply = history
+            .recent_origin_supply(&session.variant.video.request)
+            .expect("durable 206 body should publish a fresh origin measurement");
+        assert!(supply.throughput_bps > 0);
+        assert!(supply.first_byte_latency.is_some());
+    }
+
+    #[tokio::test]
+    async fn range_cache_hit_does_not_record_origin_supply() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            None,
+            None,
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-cache-hit", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+        let loaded = store
+            .load_range_manifest_serialized(&session.id, &session.variant.video)
+            .await
+            .expect("range manifest should load")
+            .expect("range manifest should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                requested.clone(),
+                &body[requested.start as usize..requested.end as usize],
+                &url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("requested range should be seeded");
+
+        store
+            .ensure_resource_range(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                requested,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("cached range should be returned");
+
+        assert_eq!(0, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_206_range_does_not_record_origin_supply() {
+        let total = RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES * 4;
+        let body = Arc::new(vec![0x55; total as usize]);
+        let requested =
+            RANGE_STARTUP_CHUNK_BYTES..RANGE_STARTUP_CHUNK_BYTES + RANGE_FOREGROUND_CHUNK_BYTES;
+        let (url, _server, request_count) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"v1\"",
+            "\"v1\"",
+            false,
+            Some(SampleResponseFault::TruncatedBody),
+            Some(requested.start as usize),
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("range-origin-truncated", &url);
+        session.variant.video.request.size = Some(total);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        seed_origin_supply_test_prefix(&store, &session, &body, &url).await;
+
+        assert!(
+            store
+                .ensure_resource_range(
+                    &reqwest::Client::new(),
+                    &session.id,
+                    &session.variant.video,
+                    requested,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .is_err(),
+            "truncated origin response should not be published"
+        );
+        assert_eq!(1, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
+        );
+    }
+
+    #[tokio::test]
+    async fn range_discovery_probe_does_not_record_origin_supply() {
+        let (url, _server) =
+            start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_range_probe)))
+                .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp)
+            .with_range_budget(16 * 1024 * 1024)
+            .with_cdn_history(Arc::clone(&history));
+        let session = sample_session("range-origin-probe", &url);
+        store
+            .save_session(&session)
+            .expect("session should be saved");
+        let key = store
+            .range_resource_key(&session.id, &session.variant.video)
+            .expect("range key should be valid");
+
+        let total = store
+            .discover_range_total(
+                &reqwest::Client::new(),
+                &session.variant.video,
+                &key,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("range discovery probe should succeed");
+
+        assert_eq!(fake_mp4().len() as u64, total);
+        assert_eq!(
+            None,
+            history.recent_origin_supply(&session.variant.video.request)
         );
     }
 
@@ -19212,6 +19911,77 @@ done
     }
 
     #[tokio::test]
+    async fn cache_readiness_malformed_metadata_reports_exact_typed_failure() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "readiness-malformed-metadata",
+            "https://example.test/video.m4s",
+        );
+        let resource = &session.variant.video;
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("resource metadata path should be valid");
+        store
+            .ensure_cache_directory(
+                metadata_path
+                    .parent()
+                    .expect("metadata parent should exist"),
+            )
+            .expect("metadata directory should be created");
+        fs::write(&metadata_path, b"{").expect("malformed metadata should be written");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, result.reason);
+        assert_eq!(1, result.checked_bytes);
+    }
+
+    #[tokio::test]
+    async fn cache_readiness_oversized_metadata_is_rejected_before_reading() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "readiness-oversized-metadata",
+            "https://example.test/video.m4s",
+        );
+        let resource = &session.variant.video;
+        let metadata_path = store
+            .resource_metadata_path(&session.id, &resource.id)
+            .expect("resource metadata path should be valid");
+        store
+            .ensure_cache_directory(
+                metadata_path
+                    .parent()
+                    .expect("metadata parent should exist"),
+            )
+            .expect("metadata directory should be created");
+        fs::File::create(&metadata_path)
+            .expect("metadata file should be created")
+            .set_len(RANGE_MAX_MANIFEST_BYTES + 1)
+            .expect("oversized metadata length should be set sparsely");
+
+        let result = store
+            .inspect_cached_playback_window(
+                &session.id,
+                &session.variant,
+                PlaybackWindow::new(0.0, 1.0).expect("window should be valid"),
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, result.reason);
+        assert_eq!(0, result.checked_bytes);
+    }
+
+    #[tokio::test]
     async fn cache_readiness_complete_video_and_audio_include_init_ranges() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
@@ -19359,6 +20129,436 @@ done
     }
 
     #[tokio::test]
+    async fn cache_readiness_uses_disk_index_evidence_with_registered_sidx_map() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://example.test/video.m4s";
+        let source_origin = "https://example.test:443";
+        let strong_etag = "\"readiness-sidx-v1\"";
+        let mut session = sample_session("readiness-sidx-map", source_url);
+        let (mut body, prefix_length) = readiness_sidx_fixture();
+        let trailer_offset = body.len() as u64;
+        let trailer = readiness_terminal_mfra_fixture();
+        body.extend_from_slice(&trailer);
+        let total_length = body.len() as u64;
+        session.variant.video.request.size = Some(total_length);
+
+        let initialization_length =
+            mp4_initialization_length(&body).expect("fixture initialization should be valid");
+        let index = crate::mp4_segments::mp4_sidx_index(
+            &body[..prefix_length as usize],
+            initialization_length,
+            total_length,
+        )
+        .expect("fixture SIDX should be valid");
+        assert_eq!(trailer_offset, index.trailing_offset);
+        assert_eq!(trailer.len() as u64, index.trailing_length);
+        let timing_ranges = crate::mp4_segments::mp4_sidx_timing_ranges(index, &trailer)
+            .expect("terminal mfra should validate");
+        let map = PlaybackSidxMap::new(
+            total_length,
+            timing_ranges
+                .into_iter()
+                .map(|range| crate::playback_request_urgency::PlaybackSidxRange {
+                    bytes: range.bytes,
+                    start_ticks: range.start_ticks,
+                    end_ticks: range.end_ticks,
+                    timescale: range.timescale,
+                })
+                .collect(),
+        )
+        .expect("fixture timing ranges should form a playback map");
+
+        seed_range_prefix(
+            &store,
+            &session,
+            source_url,
+            &body,
+            prefix_length,
+            strong_etag,
+        )
+        .await;
+        store.register_playback_sidx_map(
+            &session.id,
+            1,
+            &session.variant.video,
+            map,
+            source_origin,
+            strong_etag,
+        );
+        assert!(
+            store
+                .playback_sidx_map(&session.id, 1, &session.variant.video)
+                .is_some(),
+            "identity-validated playback map should be registered"
+        );
+
+        let window = PlaybackWindow::new(1.0, 0.5).expect("window should be valid");
+        let inspect =
+            || store.inspect_cached_playback_window(&session.id, &session.variant, window);
+        let missing_trailer = inspect().await;
+        assert_eq!(CacheWindowState::Unknown, missing_trailer.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, missing_trailer.reason);
+
+        let trailer_range = trailer_offset..total_length;
+        seed_validated_readiness_extent(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            trailer_range.clone(),
+            source_url,
+            strong_etag,
+        )
+        .await;
+        assert!(
+            store
+                .playback_sidx_map(&session.id, 1, &session.variant.video)
+                .is_some(),
+            "adding the on-disk trailer should not replace the registered map"
+        );
+        let missing_media = inspect().await;
+        assert_eq!(CacheWindowState::Missing, missing_media.state);
+        assert_eq!(CacheWindowReason::NotCached, missing_media.reason);
+
+        let segments = crate::mp4_segments::mp4_sidx_segment_ranges(
+            crate::mp4_segments::mp4_sidx_index(
+                &body[..prefix_length as usize],
+                initialization_length,
+                total_length,
+            )
+            .expect("fixture SIDX should remain valid"),
+            &trailer,
+        )
+        .expect("fixture media ranges should parse");
+        let selected = selected_playback_ranges(
+            initialization_length,
+            total_length,
+            &segments
+                .into_iter()
+                .map(|range| HlsMediaSegment {
+                    byte_range_offset: range.offset,
+                    byte_range_length: range.length,
+                    duration_millis: range.duration_millis,
+                })
+                .collect::<Vec<_>>(),
+            window,
+        )
+        .expect("selected playback ranges should be valid");
+        for range in &selected {
+            seed_validated_readiness_extent(
+                &store,
+                &session.id,
+                &session.variant.video,
+                &body,
+                range.clone(),
+                source_url,
+                strong_etag,
+            )
+            .await;
+        }
+        let readable = inspect().await;
+        assert_eq!(CacheWindowState::Readable, readable.state);
+        assert_eq!(CacheWindowReason::None, readable.reason);
+        assert!(
+            store
+                .playback_sidx_map(&session.id, 1, &session.variant.video)
+                .is_some(),
+            "readiness checks should leave the registered map intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_readiness_uses_current_map_without_checkpointed_trailer() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://example.test/video.m4s";
+        let strong_etag = "\"prep-readiness-v1\"";
+        let mut session = sample_session("prep-readiness-map", source_url);
+        let (mut body, prefix_length) = readiness_sidx_fixture();
+        let trailer_offset = body.len() as u64;
+        let trailer = readiness_terminal_mfra_fixture();
+        body.extend_from_slice(&trailer);
+        let total_length = body.len() as u64;
+        session.variant.video.request.size = Some(total_length);
+        let initialization_length = mp4_initialization_length(&body).unwrap();
+        let map =
+            readiness_playback_sidx_map(&body, prefix_length, initialization_length, &trailer);
+        let map = register_video_readiness_map(
+            &store,
+            &session,
+            1,
+            &body,
+            prefix_length,
+            map,
+            strong_etag,
+        )
+        .await;
+        let window = PlaybackWindow::new(0.0, 0.5).unwrap();
+        let selected = map
+            .preparation_range_for_window(window.start_seconds, window.end_seconds())
+            .unwrap();
+        assert!(selected.end_seconds < map.media_end_seconds().unwrap());
+        let targets = [PlaybackPreparationReadinessTarget {
+            resource: &session.variant.video,
+            map: Arc::clone(&map),
+            requested: selected.bytes.clone(),
+        }];
+
+        let generic_before = store
+            .inspect_cached_playback_window(&session.id, &session.variant, window)
+            .await;
+        assert_eq!(CacheWindowState::Unknown, generic_before.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, generic_before.reason);
+        let missing = store
+            .inspect_cached_playback_preparation_window(
+                &session.id,
+                1,
+                &session.variant,
+                window,
+                &targets,
+            )
+            .await;
+        assert_eq!(CacheWindowState::Missing, missing.state);
+        assert_eq!(CacheWindowReason::NotCached, missing.reason);
+
+        seed_validated_readiness_extent(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            selected.bytes,
+            source_url,
+            strong_etag,
+        )
+        .await;
+        let readable = store
+            .inspect_cached_playback_preparation_window(
+                &session.id,
+                1,
+                &session.variant,
+                window,
+                &targets,
+            )
+            .await;
+        assert_eq!(CacheWindowState::Readable, readable.state);
+        assert_eq!(CacheWindowReason::None, readable.reason);
+        assert!(
+            store
+                .read_resource_range(
+                    &session.id,
+                    &session.variant.video,
+                    trailer_offset..total_length,
+                )
+                .await
+                .expect("trailer read should complete")
+                .is_none(),
+            "preparation readiness must not depend on or publish the trailer"
+        );
+        let generic_after = store
+            .inspect_cached_playback_window(&session.id, &session.variant, window)
+            .await;
+        assert_eq!(CacheWindowState::Unknown, generic_after.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, generic_after.reason);
+    }
+
+    #[tokio::test]
+    async fn preparation_readiness_rejects_stale_map_without_pruning_current_generation() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://example.test/video.m4s";
+        let source_origin = "https://example.test:443";
+        let strong_etag = "\"prep-readiness-stale-v1\"";
+        let mut session = sample_session("prep-readiness-stale", source_url);
+        let (mut body, prefix_length) = readiness_sidx_fixture();
+        let trailer = readiness_terminal_mfra_fixture();
+        body.extend_from_slice(&trailer);
+        let total_length = body.len() as u64;
+        session.variant.video.request.size = Some(total_length);
+        let initialization_length = mp4_initialization_length(&body).unwrap();
+        let map_value =
+            readiness_playback_sidx_map(&body, prefix_length, initialization_length, &trailer);
+        let stale_map = register_video_readiness_map(
+            &store,
+            &session,
+            1,
+            &body,
+            prefix_length,
+            map_value.clone(),
+            strong_etag,
+        )
+        .await;
+        store.register_playback_sidx_map(
+            &session.id,
+            2,
+            &session.variant.video,
+            map_value,
+            source_origin,
+            strong_etag,
+        );
+        let current_map = store
+            .playback_sidx_map(&session.id, 2, &session.variant.video)
+            .expect("new generation map should be registered");
+        assert!(!Arc::ptr_eq(&stale_map, &current_map));
+        let window = PlaybackWindow::new(0.0, 0.5).unwrap();
+        let selected = stale_map
+            .preparation_range_for_window(window.start_seconds, window.end_seconds())
+            .unwrap();
+        let targets = [PlaybackPreparationReadinessTarget {
+            resource: &session.variant.video,
+            map: stale_map,
+            requested: selected.bytes,
+        }];
+
+        let result = store
+            .inspect_cached_playback_preparation_window(
+                &session.id,
+                1,
+                &session.variant,
+                window,
+                &targets,
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+        assert!(Arc::ptr_eq(
+            &current_map,
+            &store
+                .playback_sidx_map(&session.id, 2, &session.variant.video)
+                .expect("stale inspection must not prune the current map")
+        ));
+    }
+
+    #[tokio::test]
+    async fn preparation_readiness_rejects_corrupt_prefix_extent() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://example.test/video.m4s";
+        let strong_etag = "\"prep-readiness-corrupt-v1\"";
+        let mut session = sample_session("prep-readiness-corrupt", source_url);
+        let (mut body, prefix_length) = readiness_sidx_fixture();
+        let trailer = readiness_terminal_mfra_fixture();
+        body.extend_from_slice(&trailer);
+        session.variant.video.request.size = Some(body.len() as u64);
+        let initialization_length = mp4_initialization_length(&body).unwrap();
+        let map =
+            readiness_playback_sidx_map(&body, prefix_length, initialization_length, &trailer);
+        let map = register_video_readiness_map(
+            &store,
+            &session,
+            1,
+            &body,
+            prefix_length,
+            map,
+            strong_etag,
+        )
+        .await;
+        let window = PlaybackWindow::new(0.0, 0.5).unwrap();
+        let selected = map
+            .preparation_range_for_window(window.start_seconds, window.end_seconds())
+            .unwrap();
+        seed_validated_readiness_extent(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            selected.bytes.clone(),
+            source_url,
+            strong_etag,
+        )
+        .await;
+        let data_path = store
+            .resource_range_data_path(&session.id, &session.variant.video.id)
+            .expect("checkpoint data path should be valid");
+        let mut data = fs::OpenOptions::new()
+            .write(true)
+            .open(data_path)
+            .expect("checkpoint data should open");
+        data.seek(SeekFrom::Start(0)).unwrap();
+        data.write_all(b"X").unwrap();
+        data.sync_all().unwrap();
+        let targets = [PlaybackPreparationReadinessTarget {
+            resource: &session.variant.video,
+            map,
+            requested: selected.bytes,
+        }];
+
+        let result = store
+            .inspect_cached_playback_preparation_window(
+                &session.id,
+                1,
+                &session.variant,
+                window,
+                &targets,
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+    }
+
+    #[tokio::test]
+    async fn preparation_readiness_rejects_unverified_first_reference_bridge() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_url = "https://example.test/video.m4s";
+        let strong_etag = "\"prep-readiness-bridge-v1\"";
+        let mut session = sample_session("prep-readiness-bridge", source_url);
+        let (mut body, full_prefix_length) = readiness_sidx_fixture();
+        let trailer = readiness_terminal_mfra_fixture();
+        body.extend_from_slice(&trailer);
+        session.variant.video.request.size = Some(body.len() as u64);
+        let initialization_length = mp4_initialization_length(&body).unwrap();
+        let map =
+            readiness_playback_sidx_map(&body, full_prefix_length, initialization_length, &trailer);
+        let map = register_video_readiness_map(
+            &store,
+            &session,
+            1,
+            &body,
+            initialization_length,
+            map,
+            strong_etag,
+        )
+        .await;
+        let window = PlaybackWindow::new(0.0, 0.5).unwrap();
+        let selected = map
+            .preparation_range_for_window(window.start_seconds, window.end_seconds())
+            .unwrap();
+        assert_eq!(0.0, selected.start_seconds);
+        assert!(selected.bytes.start > initialization_length);
+        seed_validated_readiness_extent(
+            &store,
+            &session.id,
+            &session.variant.video,
+            &body,
+            selected.bytes.clone(),
+            source_url,
+            strong_etag,
+        )
+        .await;
+        let targets = [PlaybackPreparationReadinessTarget {
+            resource: &session.variant.video,
+            map,
+            requested: selected.bytes,
+        }];
+
+        let result = store
+            .inspect_cached_playback_preparation_window(
+                &session.id,
+                1,
+                &session.variant,
+                window,
+                &targets,
+            )
+            .await;
+
+        assert_eq!(CacheWindowState::Unknown, result.state);
+        assert_eq!(CacheWindowReason::IndexUnavailable, result.reason);
+    }
+
+    #[tokio::test]
     async fn cache_readiness_partial_sidx_checks_video_audio_and_charges_extents() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
@@ -19477,6 +20677,16 @@ done
 
         assert_eq!(CacheWindowState::Unknown, result.state);
         assert_eq!(CacheWindowReason::IdentityChanged, result.reason);
+        assert_eq!(
+            fs::metadata(
+                store
+                    .resource_metadata_path(&session.id, &session.variant.video.id)
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            result.checked_bytes
+        );
     }
 
     #[tokio::test]
@@ -19639,6 +20849,7 @@ done
 
         assert_eq!(CacheWindowState::Unknown, result.state);
         assert_eq!(CacheWindowReason::Busy, result.reason);
+        assert_eq!(0, result.checked_bytes);
         assert_eq!((0, 0), store.range_activity_counts());
     }
 
@@ -19747,6 +20958,7 @@ done
         assert!(both_entered, "both inspection jobs should enter the hook");
         assert_eq!(CacheWindowState::Unknown, third_result.state);
         assert_eq!(CacheWindowReason::Busy, third_result.reason);
+        assert_eq!(0, third_result.checked_bytes);
         assert_eq!((2, 0), active_while_blocked);
         assert_eq!((0, 0), store.range_activity_counts());
     }
@@ -20231,6 +21443,36 @@ done
         }
     }
 
+    async fn seed_validated_readiness_extent(
+        store: &HlsCacheStore,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        body: &[u8],
+        range: Range<u64>,
+        source_url: &str,
+        strong_etag: &str,
+    ) {
+        let loaded = store
+            .load_range_manifest(session_id, resource)
+            .expect("validated range manifest should load")
+            .expect("validated range manifest should exist");
+        let start = usize::try_from(range.start).expect("range start should fit usize");
+        let end = usize::try_from(range.end).expect("range end should fit usize");
+        store
+            .commit_range_extent(
+                session_id,
+                resource,
+                &loaded.manifest,
+                range,
+                &body[start..end],
+                source_url,
+                Some(strong_etag.to_owned()),
+                None,
+            )
+            .await
+            .expect("validated extent should be committed");
+    }
+
     fn readiness_sidx_fixture() -> (Vec<u8>, u64) {
         let mut initialization = Vec::new();
         initialization.extend(mp4_box(*b"ftyp", b"isom"));
@@ -20260,5 +21502,75 @@ done
         ]
         .concat();
         (body, prefix_length)
+    }
+
+    fn readiness_terminal_mfra_fixture() -> Vec<u8> {
+        let mut tfra_payload = vec![0_u8; 4];
+        tfra_payload.extend(1_u32.to_be_bytes());
+        tfra_payload.extend(0_u32.to_be_bytes());
+        tfra_payload.extend(0_u32.to_be_bytes());
+        let tfra = mp4_box(*b"tfra", &tfra_payload);
+        let mfro_size = 16_u32;
+        let mfra_size = 8 + u32::try_from(tfra.len()).expect("tfra size should fit") + mfro_size;
+        let mut mfro_payload = vec![0_u8; 4];
+        mfro_payload.extend(mfra_size.to_be_bytes());
+        let mut mfra_payload = tfra;
+        mfra_payload.extend(mp4_box(*b"mfro", &mfro_payload));
+        mp4_box(*b"mfra", &mfra_payload)
+    }
+
+    fn readiness_playback_sidx_map(
+        body: &[u8],
+        prefix_length: u64,
+        initialization_length: u64,
+        trailer: &[u8],
+    ) -> PlaybackSidxMap {
+        let index = crate::mp4_segments::mp4_sidx_index(
+            &body[..prefix_length as usize],
+            initialization_length,
+            body.len() as u64,
+        )
+        .expect("fixture SIDX should parse");
+        let ranges = crate::mp4_segments::mp4_sidx_timing_ranges(index, trailer)
+            .expect("fixture trailer should validate");
+        PlaybackSidxMap::new(
+            body.len() as u64,
+            ranges
+                .into_iter()
+                .map(|range| crate::playback_request_urgency::PlaybackSidxRange {
+                    bytes: range.bytes,
+                    start_ticks: range.start_ticks,
+                    end_ticks: range.end_ticks,
+                    timescale: range.timescale,
+                })
+                .collect(),
+        )
+        .expect("fixture timing ranges should form a map")
+    }
+
+    async fn register_video_readiness_map(
+        store: &HlsCacheStore,
+        session: &HlsPlaybackSession,
+        generation: u64,
+        body: &[u8],
+        prefix_length: u64,
+        map: PlaybackSidxMap,
+        strong_etag: &str,
+    ) -> Arc<PlaybackSidxMap> {
+        let source_url = session.variant.video.request.url.as_str();
+        let source_origin =
+            media_url_origin(source_url).expect("fixture source origin should be valid");
+        seed_range_prefix(store, session, source_url, body, prefix_length, strong_etag).await;
+        store.register_playback_sidx_map(
+            &session.id,
+            generation,
+            &session.variant.video,
+            map,
+            &source_origin,
+            strong_etag,
+        );
+        store
+            .playback_sidx_map(&session.id, generation, &session.variant.video)
+            .expect("fixture map should register")
     }
 }

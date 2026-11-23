@@ -31,6 +31,7 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
@@ -62,6 +63,16 @@ use crate::{
     playback_policy::{PlaybackPolicy, TranscodingPreference, WeakNetworkPreference},
     transcoding::HlsTranscodingPlan,
 };
+
+#[cfg(test)]
+#[path = "media_high_preparation_fixture_tests.rs"]
+mod media_high_preparation_fixture_tests;
+#[path = "media_high_preparation_tests.rs"]
+mod media_high_preparation_tests;
+
+pub(crate) async fn run_native_high_preparation_off_on_comparison() {
+    media_high_preparation_tests::run_native_high_preparation_off_on_comparison().await;
+}
 
 const ABR_CASE_FULL_NAME: &str =
     "media_acceptance_tests::native_progressive_adaptation_and_recovery";
@@ -445,6 +456,7 @@ struct PlaylistExpectations {
 
 struct ProbeMarkerPaths {
     ready: Option<PathBuf>,
+    bad_high: Option<PathBuf>,
     recovery_observation: Option<PathBuf>,
 }
 
@@ -546,6 +558,7 @@ struct CaptureTaskOutcome {
 
 struct OriginMedia {
     path: PathBuf,
+    strong_etag: String,
     representation_code: u8,
     initialization_length: u64,
     fragments: Vec<Mp4SegmentRange>,
@@ -984,6 +997,11 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         &directories.fixtures,
         fixture_duration,
         &report,
+        if case.uses_long_profile() {
+            LONG_RECOVERY_FFMPEG_TIMEOUT
+        } else {
+            FFMPEG_TIMEOUT
+        },
     )
     .await
     .map_err(|error| format!("phase=fixture-preparation; {error}"))?;
@@ -1157,7 +1175,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         Arc::clone(&origin.phase),
         Arc::clone(&origin.epoch),
     ));
-    let media_router = crate::media_router(state).layer(from_fn_with_state(
+    let media_router = crate::media_router(state.clone()).layer(from_fn_with_state(
         Arc::clone(&telemetry),
         record_lan_ingress,
     ));
@@ -1180,6 +1198,14 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         case.uses_long_profile(),
     )
     .await?;
+    if case.uses_progressive_abr() {
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&session.id)
+            .map(|handle| handle.generation)
+            .ok_or_else(|| "high-preparation session generation is not registered".to_owned())?;
+        require_high_playback_sidx_maps(&state, &session, generation)?;
+    }
     if let Ok(mut data) = report.lock() {
         data.hls_playlist_preflight = Some(playlist_preflight);
     }
@@ -1223,6 +1249,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
     let recovery_marker_path = case
         .uses_progressive_abr()
         .then(|| temporary_root.join("recovery-observation.trigger"));
+    let bad_high_marker_path = case
+        .uses_progressive_abr()
+        .then(|| temporary_root.join("bad-high.trigger"));
     let minimum_steady_play_seconds =
         matches!(case, NativeCase::BufferedContinuity).then_some(MINIMUM_STEADY_PLAY_SECONDS);
     let probe_timeout = Duration::from_secs(probe_deadline) + PROBE_EXIT_GRACE;
@@ -1236,6 +1265,7 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
         expected_sizes.to_owned(),
         ProbeMarkerPaths {
             ready: ready_marker_path.clone(),
+            bad_high: bad_high_marker_path.clone(),
             recovery_observation: recovery_marker_path.clone(),
         },
         minimum_steady_play_seconds,
@@ -1248,6 +1278,9 @@ async fn run_case(case: NativeCase, report: ReportStore) -> Result<(), String> {
             ready_marker_path
                 .as_deref()
                 .expect("ABR marker path is present"),
+            bad_high_marker_path
+                .as_deref()
+                .expect("ABR bad-high marker path is present"),
             &report,
             recovery_marker_path
                 .as_deref()
@@ -1403,6 +1436,40 @@ fn publish_playable_session(
         .map_err(|_| {
             "local playback task could not pass production publication checks".to_owned()
         })?;
+    Ok(())
+}
+
+pub(super) fn require_high_playback_sidx_maps(
+    state: &AppState,
+    session: &HlsPlaybackSession,
+    expected_generation: u64,
+) -> Result<(), String> {
+    let handle = state
+        .hls_sessions
+        .get_with_generation(&session.id)
+        .filter(|handle| {
+            handle.generation == expected_generation
+                && handle.session.variant.id == session.variant.id
+        })
+        .ok_or_else(|| "high-preparation session generation or variant changed".to_owned())?;
+    let generation = handle.generation;
+    let audio = session.variant.audio.as_ref().ok_or_else(|| {
+        "high-preparation target variant has no required audio resource".to_owned()
+    })?;
+    for (label, resource) in [
+        ("high video", &session.variant.video),
+        ("required audio", audio),
+    ] {
+        if state
+            .hls_cache
+            .playback_sidx_map(&session.id, generation, resource)
+            .is_none()
+        {
+            return Err(format!(
+                "high-preparation {label} playback SIDX map was not registered for the current session generation"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1612,6 +1679,7 @@ async fn generate_and_inspect_fixture(
     directory: &Path,
     duration: u32,
     report: &ReportStore,
+    generation_timeout: Duration,
 ) -> Result<MediaFixture, String> {
     let mut command = Command::new(ffmpeg);
     let video_input = format!("testsrc2=size=640x360:rate=30:duration={duration}");
@@ -1681,17 +1749,7 @@ async fn generate_and_inspect_fixture(
     }
     push_audio_output(&mut arguments, "audio.mp4", duration, audio_limit);
     command.current_dir(directory).args(arguments);
-    let generated = run_process(
-        command,
-        "fixture-generation",
-        if case.uses_long_profile() {
-            LONG_RECOVERY_FFMPEG_TIMEOUT
-        } else {
-            FFMPEG_TIMEOUT
-        },
-        1024,
-    )
-    .await?;
+    let generated = run_process(command, "fixture-generation", generation_timeout, 1024).await?;
     if !generated.success {
         return Err(format!(
             "FFmpeg fixture generation failed with exit code {}; {}",
@@ -2314,6 +2372,7 @@ fn make_origin_state(
         "high.mp4".to_owned(),
         OriginMedia {
             path: fixture.high_video.path.clone(),
+            strong_etag: fixture_strong_etag("high.mp4", &fixture.high_video.path)?,
             representation_code: 1,
             initialization_length: fixture.high_video.record.initialization_bytes,
             fragments: fixture.high_video.fragments.clone(),
@@ -2325,6 +2384,7 @@ fn make_origin_state(
             "low.mp4".to_owned(),
             OriginMedia {
                 path: low.path.clone(),
+                strong_etag: fixture_strong_etag("low.mp4", &low.path)?,
                 representation_code: 2,
                 initialization_length: low.record.initialization_bytes,
                 fragments: low.fragments.clone(),
@@ -2336,6 +2396,7 @@ fn make_origin_state(
         "audio.mp4".to_owned(),
         OriginMedia {
             path: fixture.audio.path.clone(),
+            strong_etag: fixture_strong_etag("audio.mp4", &fixture.audio.path)?,
             representation_code: 3,
             initialization_length: fixture.audio.record.initialization_bytes,
             fragments: fixture.audio.fragments.clone(),
@@ -2438,6 +2499,7 @@ async fn origin_response(
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_TYPE, media.content_type)
         .header(CONTENT_LENGTH, range.length.to_string())
+        .header("etag", media.strong_etag.as_str())
         .header("cache-control", "no-store");
     if range.partial {
         let end = range.start.saturating_add(range.length).saturating_sub(1);
@@ -2484,6 +2546,29 @@ async fn origin_response(
     builder
         .body(body)
         .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn fixture_strong_etag(resource_name: &str, path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|_| "fixture media could not be opened".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(resource_name.as_bytes());
+    digest.update([0]);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "fixture media could not be hashed".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let value = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("\"{value}\""))
 }
 
 fn pacing_rate_bits_per_second(
@@ -2798,6 +2883,7 @@ async fn run_abr_fault_timeline(
     origin: &Arc<OriginState>,
     probe: &mut AbortTask<Result<ProcessCapture, String>>,
     marker_path: &Path,
+    bad_high_trigger_path: &Path,
     report: &ReportStore,
     recovery_observation_path: &Path,
 ) -> Result<(), String> {
@@ -2831,11 +2917,16 @@ async fn run_abr_fault_timeline(
         report_data.fault_timeline.baseline_start_elapsed_ms = Some(baseline_elapsed_ms);
     }
     wait_while_probe_runs(origin, probe, BASELINE_WINDOW).await?;
-    origin.set_phase(PHASE_BAD_HIGH)?;
+    begin_bad_high_phase(origin, bad_high_trigger_path)?;
     wait_while_probe_runs(origin, probe, BAD_HIGH_WINDOW).await?;
     origin.set_phase(PHASE_RECOVERY)?;
     create_empty_private_marker(recovery_observation_path)?;
     Ok(())
+}
+
+fn begin_bad_high_phase(origin: &OriginState, trigger_path: &Path) -> Result<(), String> {
+    origin.set_phase(PHASE_BAD_HIGH)?;
+    create_empty_private_marker(trigger_path)
 }
 
 fn create_empty_private_marker(path: &Path) -> Result<(), String> {
@@ -2962,8 +3053,55 @@ async fn run_native_probe(
     minimum_steady_play_seconds: Option<u64>,
 ) -> Result<ProcessCapture, String> {
     ensure_loopback_url(&master_url)?;
+    let command = build_native_probe_command(
+        probe_path,
+        master_url,
+        duration,
+        deadline,
+        expected_sizes,
+        marker_paths,
+        minimum_steady_play_seconds,
+    );
+    run_process(
+        command,
+        "native-probe",
+        Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
+        MAX_PROBE_JSON_BYTES,
+    )
+    .await
+}
+
+fn build_native_probe_command(
+    probe_path: PathBuf,
+    master_url: String,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: String,
+    marker_paths: ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
+) -> Command {
+    let arguments = native_probe_arguments(
+        master_url,
+        duration,
+        deadline,
+        expected_sizes,
+        marker_paths,
+        minimum_steady_play_seconds,
+    );
     let mut command = Command::new(probe_path);
-    command.args([
+    command.args(arguments);
+    command
+}
+
+fn native_probe_arguments(
+    master_url: String,
+    duration: u64,
+    deadline: u64,
+    expected_sizes: String,
+    marker_paths: ProbeMarkerPaths,
+    minimum_steady_play_seconds: Option<u64>,
+) -> Vec<String> {
+    let mut arguments = vec![
         "--url".to_owned(),
         master_url,
         "--duration".to_owned(),
@@ -2972,33 +3110,33 @@ async fn run_native_probe(
         deadline.to_string(),
         "--expect-video-sizes".to_owned(),
         expected_sizes,
-    ]);
+    ];
     if let Some(path) = marker_paths.ready {
-        command.args([
+        arguments.extend([
             "--ready-marker".to_owned(),
             path.to_string_lossy().into_owned(),
             "--controls-after-video-size-expectations".to_owned(),
         ]);
     }
+    if let Some(path) = marker_paths.bad_high {
+        arguments.extend([
+            "--bad-high-trigger".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
     if let Some(path) = marker_paths.recovery_observation {
-        command.args([
+        arguments.extend([
             "--recovery-observation-trigger".to_owned(),
             path.to_string_lossy().into_owned(),
         ]);
     }
     if let Some(seconds) = minimum_steady_play_seconds {
-        command.args([
+        arguments.extend([
             "--minimum-steady-play-seconds".to_owned(),
             seconds.to_string(),
         ]);
     }
-    run_process(
-        command,
-        "native-probe",
-        Duration::from_secs(deadline) + PROBE_EXIT_GRACE,
-        MAX_PROBE_JSON_BYTES,
-    )
-    .await
+    arguments
 }
 
 fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<Value, String> {
@@ -3020,15 +3158,105 @@ fn parse_probe_result(process: ProcessCapture, report: &ReportStore) -> Result<V
     }
     if !process.success {
         return Err(format!(
-            "native probe exited with status {}; {}",
+            "native probe exited with status {}; {}; {}",
             process
                 .status_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned()),
+            probe_failure_diagnostics(&value),
             process.diagnostics()
         ));
     }
     Ok(value)
+}
+
+fn probe_failure_diagnostics(value: &Value) -> String {
+    fn classified_string(value: Option<&Value>, known: &'static [&'static str]) -> &'static str {
+        match value {
+            Some(Value::String(value)) => known
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == value)
+                .unwrap_or("other"),
+            _ => "unknown",
+        }
+    }
+
+    const STATUSES: &[&str] = &[
+        "complete",
+        "completed",
+        "drift",
+        "ended_early",
+        "failed",
+        "inconclusive",
+        "unsupported",
+        "unsupported_duration",
+        "validated",
+    ];
+    const PHASES: &[&str] = &[
+        "audible_media_group",
+        "cli",
+        "continuous_high_preparation",
+        "continuous_play",
+        "decode",
+        "duration_remainder",
+        "mute",
+        "native_control",
+        "pause",
+        "play",
+        "rate_1_25",
+        "rate_reset",
+        "ready",
+        "ready_marker",
+        "resume",
+        "runtime",
+        "seek_back_play",
+        "seek_forward_play",
+        "self_test",
+        "video_size_expectations",
+    ];
+    const DOMAINS: &[&str] = &[
+        "AVFoundationErrorDomain",
+        "AVPlayer",
+        "AVPlayerItem",
+        "AVPlayerItemVideoOutput",
+        "AVPlayerMute",
+        "BoundedObservations",
+        "CoreMediaErrorDomain",
+        "DecodedVideoSizeTracker",
+        "HighPreparationControl",
+        "LoadedTimeRangeDiagnostics",
+        "NSCocoaErrorDomain",
+        "NSOSStatusErrorDomain",
+        "NSPOSIXErrorDomain",
+        "NSURLErrorDomain",
+        "NativeMonotonicClock",
+        "PlaybackPolicy",
+        "PlaybackTimelineDiagnostics",
+        "PlayerErrorLogDiagnostics",
+        "PlayerSetup",
+        "Probe",
+        "ProbeCLI",
+        "ProbeDeadline",
+        "ProbePlayback",
+        "ProbeSelfTest",
+        "ReadyMarker",
+        "RecoveryObservationTrigger",
+        "VideoSizeExpectationTracker",
+        "VideoSizePhasePolicy",
+    ];
+
+    let error = value.get("error");
+    let status = classified_string(value.get("status"), STATUSES);
+    let phase = classified_string(error.and_then(|error| error.get("phase")), PHASES);
+    let domain = classified_string(error.and_then(|error| error.get("domain")), DOMAINS);
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    format!("probe_status={status} probe_phase={phase} probe_domain={domain} probe_code={code}")
 }
 
 fn validate_probe_result(
@@ -5002,7 +5230,8 @@ mod origin_request_diagnostic_tests {
             media: HashMap::from([(
                 "high.mp4".to_owned(),
                 OriginMedia {
-                    path,
+                    path: path.clone(),
+                    strong_etag: fixture_strong_etag("high.mp4", &path).unwrap(),
                     representation_code: 1,
                     initialization_length: 100,
                     fragments: sample_fragments().to_vec(),
@@ -5094,6 +5323,109 @@ mod origin_request_diagnostic_tests {
             .unwrap();
         assert_eq!(first_media.range_start, 250);
         assert_eq!(first_media.media_window.unwrap().first_fragment_index, 1);
+    }
+
+    #[tokio::test]
+    async fn immutable_fixture_etag_is_shared_by_ranges_and_head_but_scoped_to_resource() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bytes = vec![0_u8; 500];
+        let high_path = temporary.path().join("high.mp4");
+        let audio_path = temporary.path().join("audio.mp4");
+        let changed_path = temporary.path().join("changed.mp4");
+        tokio::fs::write(&high_path, &bytes).await.unwrap();
+        tokio::fs::write(&audio_path, &bytes).await.unwrap();
+        tokio::fs::write(&changed_path, vec![1_u8; 500])
+            .await
+            .unwrap();
+        let high_etag = fixture_strong_etag("high.mp4", &high_path).unwrap();
+        let audio_etag = fixture_strong_etag("audio.mp4", &audio_path).unwrap();
+        let changed_etag = fixture_strong_etag("high.mp4", &changed_path).unwrap();
+        assert_ne!(high_etag, audio_etag);
+        assert_ne!(high_etag, changed_etag);
+
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = Arc::new(OriginState {
+            media: HashMap::from([
+                (
+                    "high.mp4".to_owned(),
+                    OriginMedia {
+                        path: high_path,
+                        strong_etag: high_etag.clone(),
+                        representation_code: 1,
+                        initialization_length: 100,
+                        fragments: sample_fragments().to_vec(),
+                        content_type: "video/mp4",
+                    },
+                ),
+                (
+                    "audio.mp4".to_owned(),
+                    OriginMedia {
+                        path: audio_path,
+                        strong_etag: audio_etag.clone(),
+                        representation_code: 3,
+                        initialization_length: 100,
+                        fragments: sample_fragments().to_vec(),
+                        content_type: "audio/mp4",
+                    },
+                ),
+            ]),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report,
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        });
+        let range_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, "bytes=150-199".parse().unwrap());
+            headers
+        };
+
+        let full = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers().get("etag").unwrap(), high_etag.as_str());
+
+        let range = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            range_headers(),
+            false,
+        )
+        .await;
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range.headers().get("etag").unwrap(), high_etag.as_str());
+
+        let head = origin_response(
+            Arc::clone(&origin),
+            "high.mp4".to_owned(),
+            range_headers(),
+            true,
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(head.headers().get("etag").unwrap(), high_etag.as_str());
+        assert!(
+            axum::body::to_bytes(head.into_body(), 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut weak = HeaderMap::new();
+        weak.insert("etag", "W/\"weak\"".parse().unwrap());
+        assert_eq!(None, crate::hls_cache::strong_etag(&weak));
+        assert_eq!(None, crate::hls_cache::strong_etag(&HeaderMap::new()));
+
+        let audio = origin_response(origin, "audio.mp4".to_owned(), range_headers(), false).await;
+        assert_eq!(audio.headers().get("etag").unwrap(), audio_etag.as_str());
     }
 
     #[test]
@@ -6701,6 +7033,130 @@ mod recovery_observation_tests {
     }
 
     #[test]
+    fn bad_high_marker_is_created_only_after_the_fault_phase_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("bad-high.trigger");
+        let report = Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )));
+        let origin = OriginState {
+            media: HashMap::new(),
+            case: NativeCase::ProgressiveAbr,
+            phase: Arc::new(AtomicU8::new(PHASE_BASELINE)),
+            epoch: Arc::new(Mutex::new(Instant::now())),
+            report,
+            pacers: std::array::from_fn(|_| RepresentationPacer::default()),
+        };
+
+        assert!(!marker.exists());
+        assert_eq!(origin.phase.load(Ordering::Acquire), PHASE_BASELINE);
+        begin_bad_high_phase(&origin, &marker).unwrap();
+        assert_eq!(origin.phase.load(Ordering::Acquire), PHASE_BAD_HIGH);
+        let metadata = std::fs::symlink_metadata(&marker).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(begin_bad_high_phase(&origin, &marker).is_err());
+    }
+
+    #[test]
+    fn native_probe_arguments_include_phase_markers_in_order_and_preserve_legacy_shape() {
+        let buffered_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            130,
+            175,
+            "640x360,320x180".to_owned(),
+            ProbeMarkerPaths {
+                ready: Some(PathBuf::from("/tmp/ready.json")),
+                bad_high: Some(PathBuf::from("/tmp/bad-high.trigger")),
+                recovery_observation: Some(PathBuf::from("/tmp/recovery.trigger")),
+            },
+            Some(110),
+        );
+        assert_eq!(
+            buffered_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "130",
+                "--deadline",
+                "175",
+                "--expect-video-sizes",
+                "640x360,320x180",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--controls-after-video-size-expectations",
+                "--bad-high-trigger",
+                "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+                "--minimum-steady-play-seconds",
+                "110",
+            ]
+        );
+
+        let abr_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            600,
+            720,
+            "640x360,320x180,640x360".to_owned(),
+            ProbeMarkerPaths {
+                ready: Some(PathBuf::from("/tmp/ready.json")),
+                bad_high: Some(PathBuf::from("/tmp/bad-high.trigger")),
+                recovery_observation: Some(PathBuf::from("/tmp/recovery.trigger")),
+            },
+            None,
+        );
+        assert_eq!(
+            abr_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "600",
+                "--deadline",
+                "720",
+                "--expect-video-sizes",
+                "640x360,320x180,640x360",
+                "--ready-marker",
+                "/tmp/ready.json",
+                "--controls-after-video-size-expectations",
+                "--bad-high-trigger",
+                "/tmp/bad-high.trigger",
+                "--recovery-observation-trigger",
+                "/tmp/recovery.trigger",
+            ]
+        );
+
+        let legacy_arguments = native_probe_arguments(
+            "http://127.0.0.1/master.m3u8".to_owned(),
+            30,
+            45,
+            "640x360".to_owned(),
+            ProbeMarkerPaths {
+                ready: None,
+                bad_high: None,
+                recovery_observation: None,
+            },
+            None,
+        );
+        assert_eq!(
+            legacy_arguments,
+            [
+                "--url",
+                "http://127.0.0.1/master.m3u8",
+                "--duration",
+                "30",
+                "--deadline",
+                "45",
+                "--expect-video-sizes",
+                "640x360",
+            ]
+        );
+    }
+
+    #[test]
     fn loaded_ranges_are_not_joined_across_gaps() {
         let mut gapped = observation(211.0, 10.0);
         gapped["player_state"]["playhead_seconds"] = json!(5.0);
@@ -6713,5 +7169,218 @@ mod recovery_observation_tests {
 
         let evidence = validate_player_observation(&gapped, 160.0).unwrap();
         assert_eq!(evidence.range_end, 10.0);
+    }
+}
+
+#[cfg(test)]
+mod probe_result_diagnostic_tests {
+    use super::*;
+
+    fn report() -> ReportStore {
+        Arc::new(Mutex::new(AcceptanceReport::new(
+            NativeCase::ProgressiveAbr,
+        )))
+    }
+
+    fn process(stdout: Vec<u8>, success: bool) -> ProcessCapture {
+        ProcessCapture {
+            status_code: Some(if success { 0 } else { 2 }),
+            status_signal: None,
+            success,
+            stdout,
+            stdout_truncated: false,
+            stderr_tail: Vec::new(),
+            stderr_truncated: false,
+            context: ChildProcessContext {
+                phase: "native-control".to_owned(),
+                executable: "probe".to_owned(),
+                deadline: Duration::from_secs(20),
+            },
+            elapsed: Duration::from_millis(123),
+        }
+    }
+
+    #[test]
+    fn failed_probe_exposes_only_allowlisted_structured_diagnostics() {
+        let report = report();
+        let payload = serde_json::json!({
+            "status": "failed",
+            "error": {
+                "phase": "continuous_play",
+                "domain": "AVFoundationErrorDomain",
+                "code": -11828,
+                "message": "private error detail",
+                "url": "https://example.invalid/private?detail=private-url-canary"
+            },
+            "reader_id": "private-reader-canary",
+            "headers": {"x-private-canary": "private-header-canary"}
+        });
+        let error = parse_probe_result(
+            process(serde_json::to_vec(&payload).unwrap(), false),
+            &report,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("native probe exited with status 2"));
+        assert!(error.contains(
+            "probe_status=failed probe_phase=continuous_play probe_domain=AVFoundationErrorDomain probe_code=-11828"
+        ));
+        assert!(error.contains("phase=native-control"));
+        assert!(error.contains("executable=probe"));
+        assert!(error.len() < 2048);
+        for private_value in [
+            "private error detail",
+            "example.invalid",
+            "private-url-canary",
+            "private-reader-canary",
+            "private-header-canary",
+            "x-private-canary",
+        ] {
+            assert!(!error.contains(private_value));
+        }
+
+        let stored = report.lock().unwrap().probe.clone().unwrap();
+        assert_eq!(stored["error"]["url"], "[redacted]");
+        assert_eq!(stored["reader_id"], "private-reader-canary");
+    }
+
+    #[test]
+    fn malformed_or_unrecognized_diagnostic_fields_use_fixed_fallbacks() {
+        let cases = [
+            (
+                serde_json::json!({"status": "failed"}),
+                "probe_status=failed probe_phase=unknown probe_domain=unknown probe_code=unknown",
+            ),
+            (
+                serde_json::json!({"status": 2, "error": "wrong-type"}),
+                "probe_status=unknown probe_phase=unknown probe_domain=unknown probe_code=unknown",
+            ),
+            (
+                serde_json::json!({
+                    "status": "future-status\nprivate",
+                    "error": {
+                        "phase": "future-phase\nprivate",
+                        "domain": "private.domain\nprivate",
+                        "code": "-11828"
+                    }
+                }),
+                "probe_status=other probe_phase=other probe_domain=other probe_code=unknown",
+            ),
+            (
+                serde_json::json!({
+                    "status": "x".repeat(2048),
+                    "error": {
+                        "phase": "y".repeat(2048),
+                        "domain": "z".repeat(2048),
+                        "code": 1.5
+                    }
+                }),
+                "probe_status=other probe_phase=other probe_domain=other probe_code=unknown",
+            ),
+        ];
+
+        for (payload, expected_diagnostics) in cases {
+            let report = report();
+            let error = parse_probe_result(
+                process(serde_json::to_vec(&payload).unwrap(), false),
+                &report,
+            )
+            .unwrap_err();
+            assert!(error.contains("native probe exited with status 2"));
+            assert!(error.contains(expected_diagnostics));
+            assert!(error.len() < 2048);
+            assert!(!error.contains("future"));
+            assert!(!error.contains("private"));
+        }
+
+        for (value, expected_code) in [
+            (serde_json::json!(true), "unknown".to_owned()),
+            (serde_json::json!(1.5), "unknown".to_owned()),
+            (serde_json::json!(u64::MAX), "unknown".to_owned()),
+            (serde_json::json!(i64::MIN), i64::MIN.to_string()),
+            (serde_json::json!(i64::MAX), i64::MAX.to_string()),
+        ] {
+            let diagnostic = probe_failure_diagnostics(&serde_json::json!({
+                "status": "failed",
+                "error": {
+                    "phase": "seek_forward_play",
+                    "domain": "ProbePlayback",
+                    "code": value
+                }
+            }));
+            assert!(diagnostic.contains(&format!(
+                "probe_status=failed probe_phase=seek_forward_play probe_domain=ProbePlayback probe_code={expected_code}"
+            )));
+            assert!(diagnostic.len() < 512);
+        }
+
+        let diagnostic = probe_failure_diagnostics(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "phase": "future-phase",
+                "domain": "private.domain",
+                "code": 1
+            }
+        }));
+        assert!(diagnostic.contains("probe_status=failed"));
+        assert!(diagnostic.contains("probe_phase=other"));
+        assert!(diagnostic.contains("probe_domain=other"));
+        assert!(diagnostic.len() < 512);
+    }
+
+    #[test]
+    fn nonzero_exit_never_passes_even_when_payload_claims_success() {
+        let report = report();
+        let error = parse_probe_result(
+            process(
+                br#"{"status":"validated","error":{"phase":"ready","domain":"Probe","code":0}}"#
+                    .to_vec(),
+                false,
+            ),
+            &report,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("native probe exited with status 2"));
+        assert!(error.contains("probe_status=validated"));
+    }
+
+    #[test]
+    fn successful_probe_keeps_existing_redaction_and_report_behavior() {
+        let report = report();
+        let payload = br#"{"status":"validated","url":"https://example.invalid/private","detail":"not rendered"}"#.to_vec();
+        let result = parse_probe_result(process(payload, true), &report).unwrap();
+
+        assert_eq!(result["url"], "[redacted]");
+        assert_eq!(
+            report.lock().unwrap().probe.as_ref().unwrap()["url"],
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn truncated_oversized_and_malformed_probe_json_still_fails() {
+        let report = report();
+        let mut truncated = process(br#"{"status":"failed"}"#.to_vec(), false);
+        truncated.stdout_truncated = true;
+        assert!(
+            parse_probe_result(truncated, &report)
+                .unwrap_err()
+                .contains("exceeded its 64 KiB bound")
+        );
+
+        let oversized = process(vec![b' '; MAX_PROBE_JSON_BYTES + 1], false);
+        assert!(
+            parse_probe_result(oversized, &report)
+                .unwrap_err()
+                .contains("exceeded its 64 KiB bound")
+        );
+
+        let malformed = process(b"not-json".to_vec(), false);
+        assert!(
+            parse_probe_result(malformed, &report)
+                .unwrap_err()
+                .contains("did not return bounded JSON")
+        );
     }
 }

@@ -132,7 +132,7 @@ impl PlaybackRequestUrgency {
     }
 }
 
-fn origin_supply_supports_playback_rate(
+pub(crate) fn origin_supply_supports_playback_rate(
     throughput_bps: u64,
     nominal_bitrate_bps: u64,
     playback_rate: f64,
@@ -246,6 +246,57 @@ impl PlaybackSidxMap {
     pub(crate) fn total_length(&self) -> u64 {
         self.total_length
     }
+
+    pub(crate) fn media_end_seconds(&self) -> Option<f64> {
+        let last = self.ranges.last()?;
+        let end = last.end_ticks as f64 / last.timescale as f64;
+        (end.is_finite() && end > 0.0).then_some(end)
+    }
+
+    pub(crate) fn preparation_range_for_window(
+        &self,
+        window_start_seconds: f64,
+        window_end_seconds: f64,
+    ) -> Option<PlaybackSidxPreparationRange> {
+        if !window_start_seconds.is_finite()
+            || window_start_seconds < 0.0
+            || !window_end_seconds.is_finite()
+            || window_end_seconds <= window_start_seconds
+        {
+            return None;
+        }
+
+        let mut first: Option<(&PlaybackSidxRange, f64)> = None;
+        let mut last: Option<(&PlaybackSidxRange, f64)> = None;
+        for range in &self.ranges {
+            let start = range.start_ticks as f64 / range.timescale as f64;
+            let end = range.end_ticks as f64 / range.timescale as f64;
+            if !start.is_finite()
+                || !end.is_finite()
+                || start >= window_end_seconds
+                || end <= window_start_seconds
+                || end <= start
+            {
+                continue;
+            }
+            first.get_or_insert((range, start));
+            last = Some((range, end));
+        }
+        let (first_range, start_seconds) = first?;
+        let (last_range, end_seconds) = last?;
+        Some(PlaybackSidxPreparationRange {
+            bytes: first_range.bytes.start..last_range.bytes.end,
+            start_seconds,
+            end_seconds,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PlaybackSidxPreparationRange {
+    pub(crate) bytes: Range<u64>,
+    pub(crate) start_seconds: f64,
+    pub(crate) end_seconds: f64,
 }
 
 #[cfg(test)]
